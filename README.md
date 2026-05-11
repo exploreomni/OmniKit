@@ -50,21 +50,21 @@ No Docker, no database, no backend service, no Supabase account — nothing else
 
 Step-by-step from zero:
 
-1. **Get the folder.** Copy the `OmniKit-Local/` directory to wherever you want it on your machine (e.g. `~/dev/OmniKit-Local`).
-2. **Open a terminal in that folder.**
+1. **Clone the repo.**
    ```bash
-   cd OmniKit-Local
+   git clone https://github.com/austin-like-texas/OmniKit.git
+   cd OmniKit
    ```
-3. **Install dependencies.**
+2. **Install dependencies.**
    ```bash
    npm install
    ```
    This takes about a minute the first time.
-4. **Start the app.**
+3. **Start the app.**
    ```bash
    npm run dev
    ```
-5. **Open it.** Your browser should open automatically at `http://localhost:5173`. If it doesn't, open that URL yourself.
+4. **Open it.** Your browser should open automatically at `http://localhost:5173`. If it doesn't, open that URL yourself.
 
 That's it. You now have the full app running on one port, with the API proxy mounted inside the Vite dev server.
 
