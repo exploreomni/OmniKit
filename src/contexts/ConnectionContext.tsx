@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useCallback, type ReactNode } from 'react';
+import { createContext, useContext, useReducer, useCallback, useEffect, type ReactNode } from 'react';
 import type { ConnectionConfig, ConnectionStatus } from '@/types';
 
 interface ConnectionState {
@@ -16,6 +16,53 @@ const initialConnection: ConnectionConfig = {
   status: 'untested',
   errorMessage: '',
 };
+
+const SESSION_CONNECTION_KEY = 'omnikit:activeConnection:v1';
+
+function readSessionConnection(): ConnectionConfig {
+  if (typeof window === 'undefined') return { ...initialConnection };
+
+  try {
+    const raw = window.sessionStorage.getItem(SESSION_CONNECTION_KEY);
+    if (!raw) return { ...initialConnection };
+
+    const parsed = JSON.parse(raw) as Partial<ConnectionConfig>;
+    const baseUrl = typeof parsed.baseUrl === 'string' ? parsed.baseUrl : '';
+    const apiKey = typeof parsed.apiKey === 'string' ? parsed.apiKey : '';
+    const status = parsed.status === 'success' && baseUrl && apiKey ? 'success' : 'untested';
+
+    return {
+      baseUrl,
+      apiKey,
+      status,
+      errorMessage: '',
+    };
+  } catch {
+    return { ...initialConnection };
+  }
+}
+
+function writeSessionConnection(connection: ConnectionConfig) {
+  if (typeof window === 'undefined') return;
+
+  try {
+    if (!connection.baseUrl && !connection.apiKey) {
+      window.sessionStorage.removeItem(SESSION_CONNECTION_KEY);
+      return;
+    }
+
+    window.sessionStorage.setItem(
+      SESSION_CONNECTION_KEY,
+      JSON.stringify({
+        baseUrl: connection.baseUrl,
+        apiKey: connection.apiKey,
+        status: connection.status,
+      }),
+    );
+  } catch {
+    // Session persistence is convenience-only. Keep the in-memory connection usable if storage is blocked.
+  }
+}
 
 function connectionReducer(state: ConnectionState, action: ConnectionAction): ConnectionState {
   switch (action.type) {
@@ -41,22 +88,32 @@ interface ConnectionContextValue {
 const ConnectionContext = createContext<ConnectionContextValue | null>(null);
 
 export function ConnectionProvider({ children }: { children: ReactNode }) {
-  const [state, dispatch] = useReducer(connectionReducer, {
-    connection: { ...initialConnection },
-    isConnected: false,
+  const [state, dispatch] = useReducer(connectionReducer, undefined, () => {
+    const connection = readSessionConnection();
+    return {
+      connection,
+      isConnected: connection.status === 'success',
+    };
   });
 
+  useEffect(() => {
+    writeSessionConnection(state.connection);
+  }, [state.connection]);
+
   const updateConnection = useCallback((payload: Partial<ConnectionConfig>) => {
+    writeSessionConnection({ ...state.connection, ...payload });
     dispatch({ type: 'UPDATE', payload });
-  }, []);
+  }, [state.connection]);
 
   const resetConnection = useCallback(() => {
+    writeSessionConnection({ ...initialConnection });
     dispatch({ type: 'RESET' });
   }, []);
 
   const setStatus = useCallback((status: ConnectionStatus, errorMessage = '') => {
+    writeSessionConnection({ ...state.connection, status, errorMessage });
     dispatch({ type: 'UPDATE', payload: { status, errorMessage } });
-  }, []);
+  }, [state.connection]);
 
   return (
     <ConnectionContext.Provider value={{

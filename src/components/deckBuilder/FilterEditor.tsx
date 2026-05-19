@@ -107,7 +107,7 @@ export function FilterEditor({
   return (
     <div className="space-y-4">
       {inheritedActiveCount > 0 && (
-        <div className="flex items-start gap-2 p-3 rounded-card border border-omni-200/60 bg-omni-100/30">
+        <div className="flex items-start gap-2 p-3 rounded-card border border-border bg-surface-secondary">
           <Link2 size={14} className="mt-0.5 text-omni-700 flex-shrink-0" />
           <div className="flex-1 text-[12px] text-content-secondary leading-snug">
             <span className="font-medium text-content-primary">{inheritedActiveCount}</span> filter
@@ -128,7 +128,7 @@ export function FilterEditor({
       )}
 
       {savedSets.length > 0 && (
-        <div className="flex flex-wrap items-center gap-2 p-3 rounded-card bg-omni-100/30 border border-omni-200/40">
+        <div className="flex flex-wrap items-center gap-2 p-3 rounded-card bg-surface-secondary border border-border">
           <span className="text-[11px] font-medium text-content-secondary">Saved sets:</span>
           {savedSets.map((set) => (
             <button

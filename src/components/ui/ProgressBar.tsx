@@ -8,20 +8,20 @@ interface ProgressBarProps {
   tone?: 'brand' | 'danger' | 'success';
 }
 
-const TONES = {
+  const TONES = {
   brand: {
-    fill: 'linear-gradient(90deg, #C8186A 0%, #FF4794 100%)',
-    track: 'rgba(255,71,148,0.14)',
-    text: '#C8186A',
+    fill: '#C83B70',
+    track: '#F1F4F8',
+    text: '#C83B70',
   },
   danger: {
-    fill: 'linear-gradient(90deg, #B91C1C 0%, #EF4444 100%)',
-    track: 'rgba(239,68,68,0.14)',
+    fill: '#B91C1C',
+    track: '#FEE2E2',
     text: '#B91C1C',
   },
   success: {
-    fill: 'linear-gradient(90deg, #047857 0%, #10B981 100%)',
-    track: 'rgba(16,185,129,0.14)',
+    fill: '#047857',
+    track: '#DCFCE7',
     text: '#047857',
   },
 };
@@ -58,7 +58,7 @@ export function ProgressBar({ current, total, label, indeterminate, tone = 'bran
               width: '40%',
               background: t.fill,
               animation: reduced ? undefined : 'progressSweep 1.6s ease-in-out infinite',
-              boxShadow: '0 0 8px rgba(255,71,148,0.35)',
+	              boxShadow: 'none',
             }}
           />
         ) : (
@@ -68,13 +68,13 @@ export function ProgressBar({ current, total, label, indeterminate, tone = 'bran
               width: `${pct}%`,
               background: t.fill,
               transition: reduced ? 'none' : 'width 420ms cubic-bezier(0.22, 1, 0.36, 1)',
-              boxShadow: '0 0 6px rgba(255,71,148,0.25)',
+	              boxShadow: 'none',
             }}
           />
         )}
         <div
           className="absolute inset-x-0 top-0 h-px pointer-events-none"
-          style={{ background: 'linear-gradient(90deg, transparent, rgba(255,255,255,0.6), transparent)' }}
+          style={{ background: 'transparent' }}
           aria-hidden
         />
       </div>

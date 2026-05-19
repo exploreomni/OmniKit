@@ -4,7 +4,11 @@ import { layoutForRole, resolveKitOrDefault } from './templateStore';
 import type {
   BrandConfig,
   DashboardTile,
+  InsightFormat,
   LayoutKit,
+  SlideFitMode,
+  SlideOverride,
+  SlideOverlay,
   SlideLayout,
   TileColumn,
   TileRenderKind,
@@ -17,6 +21,7 @@ export interface DeckTileEntry {
   result?: TileResult;
   insight?: string;
   forceImage?: boolean;
+  slideOverride?: SlideOverride;
 }
 
 export interface BuildDeckInput {
@@ -179,26 +184,114 @@ function addTitle(slide: PptxGenJS.Slide, brand: BrandConfig, layout: SlideLayou
   });
 }
 
-function addInsightPanel(ctx: RenderCtx, insight: string | undefined) {
+function insightTextFor(text: string | undefined, format: InsightFormat = 'paragraph'): string {
+  const clean = (text || '').trim();
+  if (!clean) return 'Add insight here...';
+  if (format !== 'bullets') return clean;
+  return clean
+    .split('\n')
+    .map((line) => line.replace(/^[•*-]\s*/, '').trim())
+    .filter(Boolean)
+    .map((line) => `• ${line}`)
+    .join('\n');
+}
+
+function addInsightPanel(
+  ctx: RenderCtx,
+  insight: string | undefined,
+  box?: { x: number; y: number; w: number; h: number },
+  format: InsightFormat = 'paragraph',
+) {
   const { slide, brand, layout } = ctx;
-  if (!layout.insightPanel) return;
   const body = ctx.body;
-  const panelX = body.x + body.w + 0.3;
-  const panelY = body.y;
-  const panelW = Math.max(1.5, SLIDE_W - panelX - 0.5);
+  if (!layout.insightPanel && !box && !insight?.trim()) return;
+  const fallbackX = body.x + body.w + 0.3;
+  const panel = box || {
+    x: fallbackX < SLIDE_W - 1.9 ? fallbackX : 0.6,
+    y: fallbackX < SLIDE_W - 1.9 ? body.y : SLIDE_H - 1.8,
+    w: fallbackX < SLIDE_W - 1.9 ? Math.max(1.5, SLIDE_W - fallbackX - 0.5) : SLIDE_W - 1.2,
+    h: fallbackX < SLIDE_W - 1.9 ? body.h : 1.25,
+  };
   slide.addShape('rect', {
-    x: panelX, y: panelY, w: panelW, h: body.h,
+    x: panel.x, y: panel.y, w: panel.w, h: panel.h,
     fill: { color: 'F8F1F5' },
     line: { color: hex(brand.accentColor), width: 0.75 },
   });
   slide.addText('Insights', {
-    x: panelX + 0.2, y: panelY + 0.15, w: panelW - 0.4, h: 0.4,
+    x: panel.x + 0.2, y: panel.y + 0.15, w: panel.w - 0.4, h: 0.35,
     fontFace: brand.fontFamily, fontSize: 12, bold: true, color: hex(brand.primaryColor),
   });
-  slide.addText(insight || 'Add insight here…', {
-    x: panelX + 0.2, y: panelY + 0.6, w: panelW - 0.4, h: body.h - 0.8,
+  slide.addText(insightTextFor(insight, format), {
+    x: panel.x + 0.2, y: panel.y + 0.55, w: panel.w - 0.4, h: Math.max(0.3, panel.h - 0.7),
     fontFace: brand.fontFamily, fontSize: 12, color: hex(brand.bodyTextColor || '333333'), valign: 'top',
   });
+}
+
+function addOverlays(slide: PptxGenJS.Slide, brand: BrandConfig, overlays: SlideOverlay[] | undefined) {
+  if (!overlays || overlays.length === 0) return;
+  for (const overlay of overlays) {
+    const color = hex(overlay.color || brand.accentColor);
+    if (overlay.type === 'arrow' || overlay.type === 'line') {
+      slide.addShape('line', {
+        x: overlay.x,
+        y: overlay.y,
+        w: overlay.w,
+        h: overlay.h,
+        rotate: overlay.rotation,
+        line: { color, width: 2, endArrowType: overlay.type === 'arrow' ? 'triangle' : 'none' },
+      });
+    } else if (overlay.type === 'box') {
+      slide.addShape('rect', {
+        x: overlay.x,
+        y: overlay.y,
+        w: overlay.w,
+        h: overlay.h,
+        rotate: overlay.rotation,
+        fill: { color: 'FFFFFF', transparency: 100 },
+        line: { color, width: 1.75 },
+      });
+    } else if (overlay.type === 'symbol') {
+      slide.addShape('ellipse', {
+        x: overlay.x,
+        y: overlay.y,
+        w: overlay.w,
+        h: overlay.h,
+        rotate: overlay.rotation,
+        fill: { color: 'FFFFFF', transparency: 10 },
+        line: { color, width: 1.5 },
+      });
+      slide.addText(overlay.text || '!', {
+        x: overlay.x,
+        y: overlay.y + overlay.h * 0.08,
+        w: overlay.w,
+        h: overlay.h,
+        rotate: overlay.rotation,
+        fontFace: brand.fontFamily,
+        fontSize: Math.max(12, overlay.h * 30),
+        bold: true,
+        color,
+        align: 'center',
+        valign: 'middle',
+      });
+    } else {
+      slide.addText(overlay.text || 'Key takeaway', {
+        x: overlay.x,
+        y: overlay.y,
+        w: overlay.w,
+        h: overlay.h,
+        rotate: overlay.rotation,
+        fontFace: brand.fontFamily,
+        fontSize: 12,
+        bold: true,
+        color,
+        valign: 'middle',
+        fit: 'shrink',
+        fill: { color: 'FFFFFF', transparency: 5 },
+        line: { color, width: 1 },
+        margin: 0.08,
+      });
+    }
+  }
 }
 
 function addFooter(slide: PptxGenJS.Slide, brand: BrandConfig, layout: SlideLayout, dashboardName: string, dateLabel: string) {
@@ -374,11 +467,34 @@ function renderUnsupported(ctx: RenderCtx, tileName: string) {
   });
 }
 
-function renderImage(ctx: RenderCtx, pngDataUrl: string) {
+function renderImage(ctx: RenderCtx, pngDataUrl: string, fit: SlideFitMode = 'contain') {
   const { slide, body, layout } = ctx;
   const gutter = layout.insightPanel ? 0.1 : 0;
   const maxW = Math.max(0.5, body.w - gutter);
   const maxH = body.h;
+
+  if (fit === 'stretch') {
+    slide.addImage({
+      data: pngDataUrl,
+      x: body.x,
+      y: body.y,
+      w: maxW,
+      h: maxH,
+    });
+    return;
+  }
+
+  if (fit === 'cover') {
+    slide.addImage({
+      data: pngDataUrl,
+      x: body.x,
+      y: body.y,
+      w: maxW,
+      h: maxH,
+      sizing: { type: 'cover', w: maxW, h: maxH },
+    });
+    return;
+  }
 
   const size = decodePngSize(pngDataUrl);
   let w = maxW;
@@ -415,7 +531,8 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
   pptx.layout = 'LAYOUT_WIDE';
   pptx.title = `${input.dashboardName} - Generated Deck`;
 
-  const kit = resolveKitOrDefault(input.template || input.brand);
+  const baseKit = resolveKitOrDefault(input.template || input.brand);
+  const kit = input.brand ? { ...baseKit, brand: input.brand } : baseKit;
   const brand = kit.brand;
   pptx.company = brand.name;
 
@@ -449,14 +566,15 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
   for (const entry of input.tiles) {
     const slide = pptx.addSlide();
     paintLayoutChrome(slide, brand, contentLayout, brand.logoDataUrl);
-    addTitle(slide, brand, contentLayout, entry.tile.name);
+    addTitle(slide, brand, contentLayout, entry.slideOverride?.title || entry.tile.name);
 
-    const body = contentLayout.bodyBox || { x: 0.5, y: 1.1, w: 8.6, h: 5.6 };
+    const body = entry.slideOverride?.bodyBox || contentLayout.bodyBox || { x: 0.5, y: 1.1, w: 8.6, h: 5.6 };
     const ctx: RenderCtx = { slide, brand, layout: contentLayout, body };
+    const fit = entry.slideOverride?.fit || 'contain';
 
     const wantImage = entry.forceImage && entry.pngDataUrl;
     if (wantImage) {
-      renderImage(ctx, entry.pngDataUrl!);
+      renderImage(ctx, entry.pngDataUrl!, fit);
     } else if (entry.result) {
       const kind: TileRenderKind = entry.result.renderKind;
       try {
@@ -473,13 +591,17 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
         renderTable(ctx, entry.result);
       }
     } else if (entry.pngDataUrl) {
-      renderImage(ctx, entry.pngDataUrl);
+      renderImage(ctx, entry.pngDataUrl, fit);
     } else {
       renderEmpty(ctx);
     }
 
-    addInsightPanel(ctx, entry.insight);
+    addInsightPanel(ctx, entry.insight, entry.slideOverride?.insightBox, entry.slideOverride?.insightFormat);
+    addOverlays(slide, brand, entry.slideOverride?.overlays);
     addFooter(slide, brand, contentLayout, input.dashboardName, dateLabel);
+    if (entry.slideOverride?.speakerNotes?.trim()) {
+      slide.addNotes(insightTextFor(entry.slideOverride.speakerNotes, entry.slideOverride.speakerNotesFormat));
+    }
   }
 
   if (input.includeAppendix) {

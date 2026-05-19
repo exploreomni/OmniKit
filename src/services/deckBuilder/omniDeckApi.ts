@@ -1,5 +1,5 @@
 import { tableFromIPC } from 'apache-arrow';
-import { listDocuments, omniProxy, omniProxyDownload, listTopics, getTopic } from '@/services/omniApi';
+import { getDashboardFilters, listDocuments, omniProxy, omniProxyDownload, listTopics, getTopic } from '@/services/omniApi';
 import { deckLog, describeError } from './log';
 import type { DashboardFilter, DashboardTile, FilterOverride, TopicFieldRef } from './types';
 import type { CachedDashboard } from './localCache';
@@ -94,7 +94,7 @@ export async function fetchDashboardList(
   baseUrl: string,
   apiKey: string
 ): Promise<CachedDashboard[]> {
-  const data = await listDocuments(baseUrl, apiKey);
+  const data = await listDocuments(baseUrl, apiKey, undefined, { allPages: true, pageSize: 100 });
   const docs: Array<Record<string, unknown>> = Array.isArray(data?.documents) ? data.documents : [];
   return docs
     .map((d) => ({
@@ -201,6 +201,72 @@ function readDocFilters(doc: DocumentResponse): DocFilterEntry[] {
       }
     }
   }
+  return out;
+}
+
+function readDashboardFiltersResponse(data: unknown): DocFilterEntry[] {
+  const out: DocFilterEntry[] = [];
+  if (!isObj(data)) return out;
+
+  const filters = data.filters;
+  if (isObj(filters)) {
+    for (const [field, raw] of Object.entries(filters)) {
+      if (!isObj(raw)) continue;
+      const meta = raw as Record<string, unknown>;
+      const values =
+        Array.isArray(meta.values) ? meta.values.slice() :
+        Array.isArray(meta.defaultValues) ? meta.defaultValues.slice() :
+        Array.isArray(meta.default_values) ? meta.default_values.slice() :
+        undefined;
+      out.push({
+        field,
+        label:
+          (typeof meta.label === 'string' && meta.label) ||
+          (typeof meta.name === 'string' && meta.name) ||
+          humanizeField(field),
+        kind: typeof meta.kind === 'string' ? meta.kind : undefined,
+        type: typeof meta.type === 'string' ? meta.type : undefined,
+        values,
+        isNegative: meta.is_negative === true || meta.isNegative === true,
+        topic:
+          (typeof meta.topic === 'string' && meta.topic) ||
+          (typeof meta.topic_name === 'string' && meta.topic_name) ||
+          (typeof meta.topicName === 'string' && meta.topicName) ||
+          undefined,
+      });
+    }
+  }
+
+  if (Array.isArray(data.controls)) {
+    for (const control of data.controls) {
+      if (!isObj(control)) continue;
+      const field =
+        (typeof control.field === 'string' && control.field) ||
+        (typeof control.id === 'string' && control.id) ||
+        undefined;
+      if (!field) continue;
+      const options = Array.isArray(control.options)
+        ? control.options
+            .map((option) => {
+              if (!isObj(option)) return option;
+              return option.value ?? option.label;
+            })
+            .filter((v) => v !== undefined && v !== null)
+        : undefined;
+      out.push({
+        field,
+        label:
+          (typeof control.label === 'string' && control.label) ||
+          (typeof control.name === 'string' && control.name) ||
+          humanizeField(field),
+        kind: typeof control.kind === 'string' ? control.kind : undefined,
+        type: typeof control.type === 'string' ? control.type : undefined,
+        values: options,
+        isNegative: false,
+      });
+    }
+  }
+
   return out;
 }
 
@@ -442,7 +508,18 @@ export async function fetchDashboardSummary(
     sample: tiles.slice(0, 3).map((t) => ({ id: t.id, name: t.name })),
   });
 
-  const docFilters = readDocFilters(doc);
+  let apiFilterEntries: DocFilterEntry[] = [];
+  try {
+    const dashboardFilters = await getDashboardFilters(baseUrl, apiKey, dashboardId);
+    apiFilterEntries = readDashboardFiltersResponse(dashboardFilters);
+    deckLog.info('inspect', `Fetched ${apiFilterEntries.length} dashboard filter/control entries from /filters`, {
+      fields: apiFilterEntries.map((f) => f.field),
+    });
+  } catch (err) {
+    deckLog.warn('inspect', 'Dashboard filters endpoint failed; falling back to document query filters', describeError(err));
+  }
+
+  const docFilters = [...readDocFilters(doc), ...apiFilterEntries];
   const filters = extractDashboardFilters(tiles, docFilters);
   const docTopics = readDocTopics(doc);
   const tileTopics = getDashboardTopics(tiles);
@@ -642,10 +719,18 @@ async function exportTileAsPngInner(
           break;
         } catch (err) {
           const e = describeError(err);
-          if (e.status === 409 && attempt < maxConflictRetries) {
-            onStatusChange?.(`Dashboard busy, retrying (${attempt + 1}/${maxConflictRetries})`);
-            deckLog.info(scope, `Download conflict (409), waiting ${conflictDelayMs}ms before retry ${attempt + 1}/${maxConflictRetries}`);
-            await new Promise((r) => setTimeout(r, conflictDelayMs));
+          if ((e.status === 409 || e.status === 429) && attempt < maxConflictRetries) {
+            const retryDelayMs = e.status === 429 ? 6000 : conflictDelayMs;
+            onStatusChange?.(
+              e.status === 429
+                ? `Omni rate limited this export, retrying (${attempt + 1}/${maxConflictRetries})`
+                : `Dashboard busy, retrying (${attempt + 1}/${maxConflictRetries})`
+            );
+            deckLog.info(
+              scope,
+              `Download ${e.status === 429 ? 'rate limit' : 'conflict'} (${e.status}), waiting ${retryDelayMs}ms before retry ${attempt + 1}/${maxConflictRetries}`
+            );
+            await new Promise((r) => setTimeout(r, retryDelayMs));
             continue;
           }
           const note = `${shape}: start failed${e.status ? ` [HTTP ${e.status}]` : ''}: ${e.message}${e.detail ? ` | ${e.detail.slice(0, 240)}` : ''}`;

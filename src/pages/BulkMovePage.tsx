@@ -20,6 +20,7 @@ import { SkeletonRow } from '@/components/ui/SkeletonRow';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { BulkOperationAnimation } from '@/components/ui/BulkOperationAnimation';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { Blobby } from '@/components/ui/Blobby';
 import type { OmniFolder, OmniDocument, BulkOperationResult, BulkOperationSummary } from '@/types';
 
 function FolderNode({
@@ -315,7 +316,7 @@ export function BulkMovePage() {
       setLoadingFolders(true);
       setError('');
       try {
-        const res = await listFolders(connection.baseUrl, connection.apiKey);
+        const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
         if (res.error) {
           setError(`API error: ${res.error}`);
           return;
@@ -335,7 +336,7 @@ export function BulkMovePage() {
     setLoadingDocs(true);
     setError('');
     try {
-      const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id);
+      const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id, { allPages: true, pageSize: 100 });
       if (res.error) {
         setError(`API error: ${res.error}`);
         return;
@@ -486,7 +487,9 @@ export function BulkMovePage() {
       <div className="space-y-5">
         <PageHeader
           title="Bulk Move Results"
+          icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
           actions={
+            debugMode && (
             <button
               onClick={toggleDebugMode}
               className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-button border transition-colors ${
@@ -498,6 +501,7 @@ export function BulkMovePage() {
               <Bug size={13} />
               {debugMode ? 'Debug ON' : 'Debug'}
             </button>
+            )
           }
         />
 
@@ -573,6 +577,7 @@ export function BulkMovePage() {
       <PageHeader
         title="Bulk Move Dashboards"
         description="Move dashboards to a different folder in place. Document IDs, permissions, favorites, and embed links are preserved."
+        icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
         actions={
           <div className="flex items-center gap-2">
             {canMove && (
@@ -648,7 +653,7 @@ export function BulkMovePage() {
               <div className="empty-state">
                 <div className="empty-state-mascot">
                   <img
-                    src={selectedFolderId ? '/blobby-empty.webp' : '/blobby-getting-started.webp'}
+                    src={selectedFolderId ? '/blobby-empty.png' : '/blobby-getting-started.png'}
                     alt={selectedFolderId ? 'No dashboards' : 'Select a folder'}
                     className="w-14 h-14 object-contain animate-float"
                     style={{ animationDuration: '3s' }}
@@ -666,7 +671,7 @@ export function BulkMovePage() {
                 <label
                   key={doc.id || `doc-${index}`}
                   className={`flex items-center px-4 py-2.5 border-b border-border/50 cursor-pointer hover:bg-surface-secondary transition-colors ${
-                    isSelected(doc) ? 'bg-omni-50/40' : ''
+                    isSelected(doc) ? 'bg-surface-secondary' : ''
                   }`}
                 >
                   <input

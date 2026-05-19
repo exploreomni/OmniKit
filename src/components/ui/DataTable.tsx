@@ -108,11 +108,14 @@ export function DataTable<T extends Record<string, unknown>>({
 
   return (
     <div className="card p-0 overflow-hidden">
-      <div className="bg-surface-secondary px-4 py-2.5 border-b border-border flex gap-2">
+      <div
+        className="px-4 py-3 border-b border-border flex gap-2"
+        style={{ background: '#F8F9FD' }}
+      >
         {columns.map((col) => (
           <div
             key={col.key}
-            className={`text-[10px] font-semibold text-content-secondary uppercase tracking-wider flex items-center gap-1 flex-1 min-w-0 ${col.numeric ? 'justify-end' : ''} ${col.className || ''} ${col.sortable ? 'cursor-pointer select-none hover:text-content-primary transition-colors' : ''}`}
+            className={`text-[10px] font-bold text-content-secondary uppercase tracking-wider flex items-center gap-1 flex-1 min-w-0 ${col.numeric ? 'justify-end' : ''} ${col.className || ''} ${col.sortable ? 'cursor-pointer select-none hover:text-omni-700 transition-colors' : ''}`}
             onClick={col.sortable ? () => handleSort(col.key) : undefined}
           >
             <span className="truncate">{col.label}</span>
@@ -138,7 +141,7 @@ export function DataTable<T extends Record<string, unknown>>({
             return (
               <div key={rowKey}>
                 <div
-                  className={`px-4 py-2.5 border-b border-border/50 flex gap-2 items-center transition-colors ${onRowClick || expandedContent ? 'cursor-pointer hover:bg-omni-50/40' : 'hover:bg-surface-secondary/80'}`}
+                  className={`px-4 py-3 border-b border-border/50 flex gap-2 items-center transition-colors ${onRowClick || expandedContent ? 'cursor-pointer hover:bg-surface-secondary' : 'hover:bg-surface-secondary'}`}
                   onClick={() => {
                     if (expandedContent) toggleRow(rowKey);
                     else if (onRowClick) onRowClick(row);
@@ -166,7 +169,7 @@ export function DataTable<T extends Record<string, unknown>>({
       </div>
 
       {(totalPages > 1 || data.length > 0) && (
-        <div className="flex items-center justify-between px-4 py-2.5 border-t border-border bg-surface-secondary">
+        <div className="flex items-center justify-between px-4 py-3 border-t border-border bg-white">
           <span className="text-xs text-content-secondary tabular-nums">
             {serverPagination
               ? `${serverPagination.totalRecords.toLocaleString()} total records`

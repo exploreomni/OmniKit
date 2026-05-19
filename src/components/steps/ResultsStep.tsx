@@ -48,6 +48,8 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
   const total = state.migrationResults.length;
   const hasFailures = (state.migrationSummary?.failed ?? 0) > 0;
   const currentItemName = state.migrationResults.find((r) => r.status === 'in_progress')?.name;
+  const operationLabel = state.sameInstance ? 'Model Remap' : 'Migration';
+  const operationLabelLower = state.sameInstance ? 'model remap' : 'migration';
 
   function hostnameFromUrl(url: string | undefined): string | undefined {
     if (!url) return undefined;
@@ -100,7 +102,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `migration-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+    a.download = `${state.sameInstance ? 'model-remap' : 'migration'}-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -110,10 +112,10 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
       {!completed && (
         <div>
           <h2 className="text-2xl font-semibold text-content-primary">
-            Migration In Progress
+            {operationLabel} In Progress
           </h2>
           <p className="text-sm text-content-secondary mt-1">
-            Your dashboards are being migrated. Do not close this tab.
+            Your dashboards are being {state.sameInstance ? 'remapped' : 'migrated'}. Do not close this tab.
           </p>
         </div>
       )}
@@ -124,6 +126,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
           total={total}
           completed={completed}
           hasFailures={hasFailures}
+          mode={state.sameInstance ? 'remap' : 'migration'}
           currentItem={currentItemName}
           sourceHost={hostnameFromUrl(state.source.baseUrl)}
           targetHost={hostnameFromUrl(state.sameInstance ? state.source.baseUrl : state.target.baseUrl)}
@@ -233,14 +236,14 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
             </button>
             <button onClick={onReset} className="btn-primary text-sm">
               <RefreshCw size={14} />
-              Start New Migration
+              Start New {operationLabel}
             </button>
           </div>
 
           <div className="flex items-start gap-2 px-4 py-3 bg-yellow-50 border border-yellow-200 rounded-card">
             <AlertTriangle size={14} className="text-yellow-600 mt-0.5 flex-shrink-0" />
             <p className="text-xs text-yellow-800 leading-relaxed">
-              Closing this tab will discard all results and credentials. Download your log first if needed.
+              Closing this tab will discard all {operationLabelLower} results and credentials. Download your log first if needed.
             </p>
           </div>
         </>

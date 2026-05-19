@@ -1,6 +1,16 @@
 import { useEffect } from 'react';
 
 export type BlobbyMood =
+  | 'dashboard'
+  | 'connections'
+  | 'content'
+  | 'governance'
+  | 'groups'
+  | 'labels'
+  | 'model'
+  | 'semantic'
+  | 'users'
+  | 'embed'
   | 'rocket'
   | 'migration'
   | 'celebrating'
@@ -9,8 +19,10 @@ export type BlobbyMood =
   | 'thinking'
   | 'error'
   | 'sad'
+  | 'schedule'
   | 'warning'
   | 'waving'
+  | 'deck-package'
   | 'download'
   | 'upload'
   | 'ready'
@@ -18,21 +30,33 @@ export type BlobbyMood =
   | 'pending';
 
 const MOOD_TO_SRC: Record<BlobbyMood, string> = {
+  dashboard: '/blobby-dashboard.webp',
+  connections: '/blobby-connections.png',
+  content: '/blobby-governance.webp',
+  governance: '/blobby-governance.webp',
+  groups: '/blobby-groups.webp',
+  labels: '/blobby-labels.png',
+  model: '/blobby-reference.png',
+  semantic: '/blobby-semantic.webp',
+  users: '/blobby-users.webp',
+  embed: '/blobby-embed.webp',
   rocket: '/blobby-rocket.webp',
   migration: '/blobby-migration.webp',
   celebrating: '/blobby-celebrating.webp',
-  success: '/blobby-success.webp',
-  'in-progress': '/blobby-in-progress.webp',
+  success: '/blobby-connection-success.png',
+  'in-progress': '/blobby-connection-testing.png',
   thinking: '/blobby-thinking.webp',
-  error: '/blobby-error.webp',
-  sad: '/blobby-sad.webp',
-  warning: '/blobby-warning.webp',
-  waving: '/blobby-waving.webp',
-  download: '/blobby-download.webp',
-  upload: '/blobby-upload.webp',
+  error: '/blobby-error.png',
+  sad: '/blobby-sad.png',
+  schedule: '/blobby-pending.png',
+  warning: '/blobby-warning.png',
+  waving: '/blobby-waving.png',
+  'deck-package': '/blobby-powerpoint-delivery.png',
+  download: '/blobby-download.png',
+  upload: '/blobby-upload.png',
   ready: '/blobby-ready.webp',
-  skipped: '/blobby-skipped.webp',
-  pending: '/blobby-pending.webp',
+  skipped: '/blobby-empty.png',
+  pending: '/blobby-pending.png',
 };
 
 interface BlobbyProps {

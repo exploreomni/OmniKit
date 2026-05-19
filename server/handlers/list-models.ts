@@ -13,6 +13,20 @@ function extractArray(data: unknown): unknown[] | null {
   return null;
 }
 
+interface PageInfo {
+  hasNextPage?: boolean;
+  nextCursor?: string;
+  pageSize?: number;
+  totalRecords?: number;
+}
+
+function extractPageInfo(data: unknown): PageInfo | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const pageInfo = (data as Record<string, unknown>).pageInfo;
+  if (!pageInfo || typeof pageInfo !== "object" || Array.isArray(pageInfo)) return null;
+  return pageInfo as PageInfo;
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function extractString(
@@ -66,6 +80,12 @@ function normalizeModel(raw: Record<string, unknown>) {
     extractNestedString(raw, "baseModel", "id") ||
     undefined;
 
+  const branches = Array.isArray(raw.branches)
+    ? raw.branches
+        .filter((branch): branch is Record<string, unknown> => Boolean(branch) && typeof branch === "object" && !Array.isArray(branch))
+        .map((branch) => normalizeModel(branch))
+    : undefined;
+
   return {
     id,
     name,
@@ -74,12 +94,28 @@ function normalizeModel(raw: Record<string, unknown>) {
     connectionName,
     baseModelId,
     kind: extractString(raw, "kind", "model_kind", "modelKind", "type") || undefined,
+    createdAt: extractString(raw, "createdAt", "created_at") || undefined,
+    updatedAt: extractString(raw, "updatedAt", "updated_at") || undefined,
+    deletedAt: extractString(raw, "deletedAt", "deleted_at") || null,
+    branches,
   };
 }
 
 export default async function handler(req: Request): Promise<Response> {
   try {
-    const { base_url, api_key, model_kind, connection_id } = await req.json();
+    const {
+      base_url,
+      api_key,
+      model_kind,
+      connection_id,
+      include_deleted,
+      include,
+      sort_field,
+      sort_direction,
+      page_size,
+      cursor,
+      all_pages,
+    } = await req.json();
 
     const urlError = validateBaseUrl(base_url);
     if (urlError) {
@@ -94,57 +130,71 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const cleanUrl = base_url.replace(/\/+$/, "");
-    const params = new URLSearchParams();
-    const effectiveKind = model_kind || "SHARED";
-    params.set("modelKind", effectiveKind);
-    if (connection_id) {
-      params.set("connectionId", connection_id);
-    }
+    const pageSize = Math.min(Math.max(Number(page_size || 100), 1), 100);
+    const allRaw: unknown[] = [];
+    let nextCursor = typeof cursor === "string" ? cursor : undefined;
+    let lastPageInfo: PageInfo | null = null;
+    let pagesFetched = 0;
 
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    do {
+      const params = new URLSearchParams();
+      if (model_kind) params.set("modelKind", model_kind);
+      if (connection_id) params.set("connectionId", connection_id);
+      if (include_deleted === true) params.set("includeDeleted", "true");
+      if (include) params.set("include", include);
+      params.set("pageSize", String(pageSize));
+      params.set("sortField", sort_field || "name");
+      params.set("sortDirection", sort_direction || "asc");
+      if (nextCursor) params.set("cursor", nextCursor);
 
-    const response = await fetch(
-      `${cleanUrl}/api/v1/models?${params.toString()}`,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${api_key}`,
-          "Content-Type": "application/json",
-        },
-        signal: controller.signal,
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const response = await fetch(
+        `${cleanUrl}/api/v1/models?${params.toString()}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${api_key}`,
+            "Content-Type": "application/json",
+          },
+          signal: controller.signal,
+        }
+      );
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const text = await response.text();
+        return new Response(
+          JSON.stringify({
+            error: `Omni API returned ${response.status}.`,
+            detail: text.slice(0, 500),
+            models: [],
+          }),
+          { status: response.status, headers: jsonHeaders }
+        );
       }
-    );
-    clearTimeout(timeout);
 
-    if (!response.ok) {
-      const text = await response.text();
-      return new Response(
-        JSON.stringify({
-          error: `Omni API returned ${response.status}.`,
-          detail: text.slice(0, 500),
-          models: [],
-        }),
-        { status: response.status, headers: jsonHeaders }
-      );
-    }
+      const data = await response.json();
+      const raw = extractArray(data);
+      if (raw === null) {
+        return new Response(
+          JSON.stringify({
+            error: "Could not find a model list in the Omni API response.",
+            models: [],
+          }),
+          { headers: jsonHeaders }
+        );
+      }
 
-    const data = await response.json();
-    const raw = extractArray(data);
+      allRaw.push(...raw);
+      lastPageInfo = extractPageInfo(data);
+      pagesFetched += 1;
+      nextCursor = lastPageInfo?.hasNextPage ? lastPageInfo.nextCursor : undefined;
+    } while (all_pages === true && nextCursor && pagesFetched < 50);
 
-    if (raw === null) {
-      return new Response(
-        JSON.stringify({
-          error: "Could not find a model list in the Omni API response.",
-          models: [],
-        }),
-        { headers: jsonHeaders }
-      );
-    }
+    const models = allRaw.map((item) => normalizeModel(item as Record<string, unknown>));
 
-    const models = raw.map((item) => normalizeModel(item as Record<string, unknown>));
-
-    return new Response(JSON.stringify({ models }), {
+    return new Response(JSON.stringify({ models, pageInfo: lastPageInfo, pagesFetched }), {
       headers: jsonHeaders,
     });
   } catch (error) {

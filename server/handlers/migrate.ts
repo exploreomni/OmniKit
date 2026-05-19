@@ -394,40 +394,64 @@ async function updateDashboardModelInPlace(
 ): Promise<{ data: unknown; error?: string; status?: number }> {
   try {
     const cleanUrl = baseUrl.replace(/\/+$/, "");
-    const body = JSON.stringify({ name: docName, modelId: targetModelId });
-    const response = await fetchWithRetry(
-      `${cleanUrl}/api/unstable/documents/${documentId}`,
-      {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body,
-      },
-      20000
-    );
+    const headers = {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    };
 
-    if (response.ok) {
-      const data = await response.json().catch(() => ({}));
-      return { data, status: response.status };
+    const attempts: Array<{ url: string; method: string; body: Record<string, string>; label: string }> = [
+      {
+        url: `${cleanUrl}/api/unstable/documents/${documentId}/update-model`,
+        method: "POST",
+        body: { baseModelId: targetModelId },
+        label: "document model endpoint with baseModelId",
+      },
+      {
+        url: `${cleanUrl}/api/unstable/documents/${documentId}/update-model`,
+        method: "POST",
+        body: { modelId: targetModelId },
+        label: "document model endpoint with modelId",
+      },
+      {
+        url: `${cleanUrl}/api/unstable/documents/${documentId}`,
+        method: "PATCH",
+        body: { name: docName, modelId: targetModelId },
+        label: "legacy document patch fallback",
+      },
+    ];
+
+    const failures: string[] = [];
+    for (const attempt of attempts) {
+      const response = await fetchWithRetry(
+        attempt.url,
+        {
+          method: attempt.method,
+          headers,
+          body: JSON.stringify(attempt.body),
+        },
+        20000
+      );
+
+      if (response.ok) {
+        const data = await response.json().catch(() => ({}));
+        return { data, status: response.status };
+      }
+
+      const text = (await response.text()).slice(0, 300);
+      failures.push(`${attempt.label} failed (${response.status}): ${text}`);
+
+      if (![400, 404, 405, 422].includes(response.status)) {
+        break;
+      }
     }
-    const text = (await response.text()).slice(0, 300);
-    if (response.status === 404 || response.status === 405) {
-      return {
-        data: null,
-        status: response.status,
-        error: `This Omni version does not allow changing the model on an existing dashboard (${response.status}). Use a cross-instance migration or duplicate the dashboard manually.`,
-      };
-    }
+
     return {
       data: null,
-      status: response.status,
-      error: `In-place update failed (${response.status}): ${text}`,
+      error: `Model remap failed. ${failures.join(" | ")}`,
     };
   } catch (err) {
     const msg = err instanceof Error ? err.message : "Unknown error";
-    return { data: null, error: `In-place update error: ${msg}` };
+    return { data: null, error: `Model remap error: ${msg}` };
   }
 }
 

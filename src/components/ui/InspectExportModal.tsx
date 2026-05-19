@@ -96,7 +96,7 @@ export function InspectExportModal({
   return (
     <div
       ref={backdropRef}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm animate-fadeIn"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 animate-fadeIn"
       onClick={(e) => { if (e.target === backdropRef.current) onClose(); }}
     >
       <div className="bg-surface-primary rounded-card shadow-2xl border border-border w-full max-w-2xl max-h-[85vh] flex flex-col mx-4 animate-slideUp">

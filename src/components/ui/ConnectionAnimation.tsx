@@ -1,12 +1,15 @@
 import { useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
+import { useReducedMotion } from '@/hooks/useReducedMotion';
+import { Blobby } from './Blobby';
 
 interface ConnectionAnimationProps {
   status: 'untested' | 'testing' | 'success' | 'error';
 }
 
 const confettiConfig = [
-  { color: '#D41A6E', shape: 'circle' },
-  { color: '#FF5599', shape: 'rect' },
+  { color: '#C83B70', shape: 'circle' },
+  { color: '#FF7CA4', shape: 'rect' },
   { color: '#FBBF24', shape: 'circle' },
   { color: '#34D399', shape: 'rect' },
   { color: '#60A5FA', shape: 'circle' },
@@ -24,7 +27,7 @@ function RippleRing({ delay, scale }: { delay: number; scale: number }) {
     <span
       className="absolute rounded-full border-2 border-omni-400/50"
       style={{
-        inset: 0,
+        inset: `${scale}px`,
         animation: `ripple 2.2s ${delay}s ease-out infinite`,
         transformOrigin: 'center',
       }}
@@ -64,16 +67,48 @@ function OrbitSignal({ angle, delay }: { angle: number; delay: number }) {
         height: 6,
         left: `calc(50% + ${x}px - 3px)`,
         top: `calc(50% + ${y}px - 3px)`,
-        background: 'linear-gradient(135deg, #D41A6E, #FF5599)',
-        boxShadow: '0 0 6px rgba(212,26,110,0.6)',
+        background: '#C83B70',
+        boxShadow: 'none',
         animation: `float ${1.4 + delay}s ${delay * 0.4}s ease-in-out infinite`,
       }}
     />
   );
 }
 
+function ConnectionSceneShell({
+  status,
+  children,
+  showBurst,
+}: {
+  status: ConnectionAnimationProps['status'];
+  children: ReactNode;
+  showBurst?: boolean;
+}) {
+  return (
+    <div className={`connection-scene connection-scene-${status}`}>
+      <div className="connection-node connection-node-kit">Kit</div>
+      <div className="connection-node connection-node-omni">Omni</div>
+      <div className="connection-line" aria-hidden>
+        <span className="connection-pulse-request" />
+        <span className="connection-pulse-response" />
+      </div>
+      {status === 'testing' && (
+        <div className="connection-data-stream" aria-hidden>
+          {[0, 1, 2].map((i) => (
+            <span key={i} className="connection-data-packet" style={{ animationDelay: `${i * 420}ms` }} />
+          ))}
+        </div>
+      )}
+      {status === 'success' && <span className="connection-success-check" aria-hidden>✓</span>}
+      {showBurst && <span className="connection-burst" aria-hidden />}
+      {children}
+    </div>
+  );
+}
+
 export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
   const [showBurst, setShowBurst] = useState(false);
+  const reduced = useReducedMotion();
 
   useEffect(() => {
     if (status === 'success') {
@@ -83,15 +118,22 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
     }
   }, [status]);
 
-  if (status === 'untested') return null;
+  if (status === 'untested') {
+    return (
+      <div className="flex flex-col items-center py-10 animate-fadeIn">
+        <ConnectionSceneShell status="untested">
+          <Blobby mood="connections" size={82} className={reduced ? '' : 'animate-float'} style={{ animationDuration: '3.4s' }} />
+        </ConnectionSceneShell>
+        <p className="text-base font-semibold text-content-primary mt-3">Ready to test</p>
+        <p className="text-sm text-content-secondary mt-1">Connect OmniKit to your Omni instance</p>
+      </div>
+    );
+  }
 
   if (status === 'testing') {
     return (
       <div className="flex flex-col items-center py-10 animate-fadeIn">
-        <div
-          className="relative flex items-center justify-center"
-          style={{ width: 160, height: 160 }}
-        >
+        <ConnectionSceneShell status="testing">
           {[0, 1, 2, 3].map((i) => (
             <RippleRing key={i} delay={i * 0.55} scale={1 + i * 0.5} />
           ))}
@@ -103,17 +145,12 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
           <div
             className="absolute inset-0 rounded-full"
             style={{
-              background: 'radial-gradient(circle, rgba(212,26,110,0.08) 0%, transparent 70%)',
+	              background: 'transparent',
             }}
           />
 
-          <img
-            src="/blobby-in-progress.webp"
-            alt="Blobby testing"
-            className="w-24 h-24 object-contain z-10 animate-float"
-            style={{ animationDuration: '2s' }}
-          />
-        </div>
+          <Blobby mood="in-progress" size={96} className={reduced ? 'z-10' : 'z-10 animate-float'} style={{ animationDuration: '2s' }} />
+        </ConnectionSceneShell>
         <p className="text-base font-semibold text-content-primary mt-3">Testing connection...</p>
         <p className="text-sm text-content-secondary mt-1">Checking credentials and reachability</p>
       </div>
@@ -123,20 +160,7 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
   if (status === 'success') {
     return (
       <div className="flex flex-col items-center py-10 animate-fadeIn">
-        <div
-          className="relative flex items-center justify-center"
-          style={{ width: 160, height: 160 }}
-        >
-          {showBurst && (
-            <span
-              className="absolute inset-0 rounded-full"
-              style={{
-                border: '3px solid rgba(52,211,153,0.7)',
-                animation: 'burstRing 1s ease-out forwards',
-              }}
-            />
-          )}
-
+        <ConnectionSceneShell status="success" showBurst={showBurst}>
           <span
             className="absolute rounded-full border-2 border-green-400/30"
             style={{
@@ -157,7 +181,7 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
           <div
             className="absolute inset-0 rounded-full"
             style={{
-              background: 'radial-gradient(circle, rgba(52,211,153,0.1) 0%, transparent 65%)',
+	              background: 'transparent',
             }}
           />
 
@@ -173,12 +197,8 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
             />
           ))}
 
-          <img
-            src="/blobby-success.webp"
-            alt="Blobby success"
-            className="w-28 h-28 object-contain z-10 animate-wiggle-infinite"
-          />
-        </div>
+          <Blobby mood="success" size={112} className={reduced ? 'z-10' : 'z-10 animate-wiggle-infinite'} />
+        </ConnectionSceneShell>
         <p className="text-base font-bold text-green-600 mt-3">Connection successful!</p>
         <p className="text-sm text-content-secondary mt-1">Your instance is ready to use</p>
       </div>
@@ -187,10 +207,7 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
 
   return (
     <div className="flex flex-col items-center py-10 animate-fadeIn">
-      <div
-        className="relative flex items-center justify-center"
-        style={{ width: 160, height: 160 }}
-      >
+      <ConnectionSceneShell status="error">
         <span
           className="absolute rounded-full border-2 border-red-400/30"
           style={{
@@ -202,17 +219,13 @@ export function ConnectionAnimation({ status }: ConnectionAnimationProps) {
         <div
           className="absolute inset-0 rounded-full"
           style={{
-            background: 'radial-gradient(circle, rgba(239,68,68,0.08) 0%, transparent 65%)',
+	            background: 'transparent',
           }}
         />
         <div className="animate-shake z-10">
-          <img
-            src="/blobby-error.webp"
-            alt="Blobby error"
-            className="w-28 h-28 object-contain"
-          />
+          <Blobby mood="error" size={112} />
         </div>
-      </div>
+      </ConnectionSceneShell>
       <p className="text-base font-bold text-red-600 mt-3">Connection failed</p>
       <p className="text-sm text-content-secondary mt-1">Check your URL and credentials</p>
     </div>

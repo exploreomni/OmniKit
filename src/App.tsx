@@ -9,34 +9,33 @@ import { ConnectPage } from '@/pages/ConnectPage';
 
 function PaddedLayout() {
   return (
-    <div className="flex-1 flex items-center justify-center py-6">
-      <div className="max-w-5xl w-full px-6">
+    <div className="flex-1 min-h-full flex items-start justify-center py-6">
+      <div className="w-full max-w-[1560px] 2xl:max-w-[1680px] px-4 sm:px-6 my-auto">
         <Outlet />
       </div>
     </div>
   );
 }
 import { MigratePage } from '@/pages/MigratePage';
-import { BulkDeletePage } from '@/pages/BulkDeletePage';
-import { BulkMovePage } from '@/pages/BulkMovePage';
-import { UsersPage } from '@/pages/UsersPage';
-import { GroupsPage } from '@/pages/GroupsPage';
+import { UserManagementPage } from '@/pages/UserManagementPage';
 import { ModelsPage } from '@/pages/ModelsPage';
 import { TopicsPage } from '@/pages/TopicsPage';
 import { EmbedsPage } from '@/pages/EmbedsPage';
 import { HistoryPage } from '@/pages/HistoryPage';
 import { DownloadsPage } from '@/pages/DownloadsPage';
-import { BulkCopyPage } from '@/pages/BulkCopyPage';
 import { ConnectionsPage } from '@/pages/ConnectionsPage';
 import { SchedulesPage } from '@/pages/SchedulesPage';
 import { LabelsPage } from '@/pages/LabelsPage';
 import { UploadsPage } from '@/pages/UploadsPage';
 import { DeckBuilderPage } from '@/pages/DeckBuilderPage';
 import { DataPrivacyPage } from '@/pages/DataPrivacyPage';
+import { DashboardOperationsPage } from '@/pages/DashboardOperationsPage';
+import { ContentHealthPage } from '@/pages/ContentHealthPage';
+import { AIDashboardStudioPage } from '@/pages/AIDashboardStudioPage';
 
 function AppLayout() {
   return (
-    <div className="flex min-h-screen" style={{ background: 'radial-gradient(ellipse at top left, #FFECF5 0%, #FFF2F8 40%, #FFF8FB 100%)' }}>
+    <div className="flex h-screen overflow-hidden bg-surface-secondary">
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-[100] focus:bg-omni-700 focus:text-white focus:px-4 focus:py-2 focus:rounded-button focus:shadow-dropdown"
@@ -44,23 +43,31 @@ function AppLayout() {
         Skip to main content
       </a>
       <Sidebar />
-      <main id="main-content" className="flex-1 flex flex-col overflow-y-auto" tabIndex={-1}>
+      <main id="main-content" className="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto" tabIndex={-1}>
         <Routes>
           <Route path="/" element={<Navigate to="/connect" replace />} />
           <Route path="/connect" element={<ConnectPage />} />
           <Route element={<PaddedLayout />}>
             <Route path="/dashboards/migrate" element={<MigratePage />} />
             <Route
+              path="/dashboards/ai-studio"
+              element={<RequireConnection><AIDashboardStudioPage /></RequireConnection>}
+            />
+            <Route
+              path="/dashboards/operations"
+              element={<RequireConnection><DashboardOperationsPage /></RequireConnection>}
+            />
+            <Route
               path="/dashboards/bulk-move"
-              element={<RequireConnection><BulkMovePage /></RequireConnection>}
+              element={<Navigate to="/dashboards/operations" replace />}
             />
             <Route
               path="/dashboards/bulk-copy"
-              element={<RequireConnection><BulkCopyPage /></RequireConnection>}
+              element={<Navigate to="/dashboards/operations" replace />}
             />
             <Route
               path="/dashboards/bulk-delete"
-              element={<RequireConnection><BulkDeletePage /></RequireConnection>}
+              element={<Navigate to="/dashboards/operations" replace />}
             />
             <Route
               path="/dashboards/downloads"
@@ -80,11 +87,11 @@ function AppLayout() {
             />
             <Route
               path="/users"
-              element={<RequireConnection><UsersPage /></RequireConnection>}
+              element={<RequireConnection><UserManagementPage /></RequireConnection>}
             />
             <Route
               path="/groups"
-              element={<RequireConnection><GroupsPage /></RequireConnection>}
+              element={<Navigate to="/users?tab=groups" replace />}
             />
             <Route
               path="/models"
@@ -97,6 +104,10 @@ function AppLayout() {
             <Route
               path="/labels"
               element={<RequireConnection><LabelsPage /></RequireConnection>}
+            />
+            <Route
+              path="/content-health"
+              element={<RequireConnection><ContentHealthPage /></RequireConnection>}
             />
             <Route
               path="/schedules"

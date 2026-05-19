@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 560 300" role="img" aria-label="Construction cleanup site">
+  <defs>
+    <linearGradient id="sky" x1="0" x2="0" y1="0" y2="1">
+      <stop offset="0" stop-color="#fff7ed"/>
+      <stop offset="1" stop-color="#fff1f2"/>
+    </linearGradient>
+  </defs>
+  <rect width="560" height="300" rx="24" fill="url(#sky)"/>
+  <circle cx="60" cy="50" r="24" fill="#ffd66b" opacity="0.72"/>
+  <path d="M0 221c72-20 143-21 214-2s144 19 218-2 117-22 128-18v101H0z" fill="#e3c2a2" opacity="0.64"/>
+  <path d="M0 246c72-15 143-17 214-2s144 15 218-2 117-17 128-14v72H0z" fill="#c48f67" opacity="0.35"/>
+  <g opacity="0.85">
+    <path d="M410 63h86v13h-86zM446 63h13v126h-13zM384 86h128v10H384z" fill="#ffd66b" stroke="#243044" stroke-width="4" stroke-linejoin="round"/>
+    <path d="M506 95v60" stroke="#243044" stroke-width="3"/>
+    <path d="M493 160h27l-7 20h-13z" fill="#ff8db4" stroke="#243044" stroke-width="4" stroke-linejoin="round"/>
+  </g>
+  <g opacity="0.85">
+    <rect x="42" y="183" width="54" height="42" rx="7" fill="#ffffff" stroke="#e9b8cc" stroke-width="4"/>
+    <rect x="53" y="194" width="12" height="22" rx="3" fill="#ff5789"/>
+    <rect x="73" y="201" width="12" height="15" rx="3" fill="#48cfae"/>
+    <rect x="115" y="171" width="46" height="36" rx="7" fill="#ffffff" stroke="#e9b8cc" stroke-width="4" transform="rotate(-8 138 189)"/>
+    <rect x="178" y="188" width="52" height="39" rx="7" fill="#ffffff" stroke="#e9b8cc" stroke-width="4" transform="rotate(7 204 207)"/>
+  </g>
+  <g opacity="0.72">
+    <path d="M295 192h142l28 49H267z" fill="#8b5e3c"/>
+    <path d="M312 183h74l16 27H290z" fill="#a96f45"/>
+    <path d="M390 180h44l20 33h-70z" fill="#c18452"/>
+  </g>
+  <path d="M31 250h492" stroke="#8b5e3c" stroke-width="8" stroke-linecap="round" opacity="0.28"/>
+</svg>

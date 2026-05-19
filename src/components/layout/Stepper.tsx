@@ -18,7 +18,7 @@ export function Stepper({ currentStep }: StepperProps) {
             <div className="flex items-center gap-2.5 relative">
               {isActive && (
                 <img
-                  src="/blobby-face.webp"
+                  src="/blobby-waving.png"
                   alt=""
                   className="absolute -top-9 left-1 w-6 h-6 object-contain animate-float pointer-events-none"
                   style={{ animationDuration: '2.5s' }}
@@ -34,18 +34,18 @@ export function Stepper({ currentStep }: StepperProps) {
                 }`}
                 style={
                   isCompleted
-                    ? {
-                        background: 'linear-gradient(135deg, #D41A6E 0%, #E63D82 100%)',
-                        boxShadow: '0 2px 8px rgba(212,26,110,0.3)',
-                      }
-                    : isActive
-                    ? {
-                        background: 'linear-gradient(135deg, #D41A6E 0%, #E63D82 100%)',
-                        boxShadow: '0 2px 12px rgba(212,26,110,0.4)',
-                      }
-                    : {
-                        background: 'rgba(107,16,56,0.08)',
-                        border: '1.5px solid rgba(242,206,220,0.8)',
+	                    ? {
+	                        background: '#C83B70',
+	                        boxShadow: 'none',
+	                      }
+	                    : isActive
+	                    ? {
+	                        background: '#C83B70',
+	                        boxShadow: 'none',
+	                      }
+	                    : {
+	                        background: '#F8F9FD',
+	                        border: '1.5px solid rgba(217,222,232,0.95)',
                       }
                 }
               >
@@ -67,16 +67,13 @@ export function Stepper({ currentStep }: StepperProps) {
             {index < STEP_LABELS.length - 1 && (
               <div
                 className="w-8 sm:w-16 h-0.5 mx-2 sm:mx-3 rounded-full overflow-hidden"
-                style={{ background: 'rgba(242,206,220,0.8)' }}
+	                style={{ background: '#DDE2EB' }}
               >
                 <div
                   className="h-full rounded-full transition-all duration-500"
                   style={{
                     width: index < currentStep ? '100%' : index === currentStep ? '50%' : '0%',
-                    background:
-                      index < currentStep
-                        ? 'linear-gradient(90deg, #D41A6E 0%, #E63D82 100%)'
-                        : 'linear-gradient(90deg, #FF7DB3 0%, #FFB0D0 100%)',
+	                    background: index < currentStep ? '#C83B70' : '#C7CEDB',
                   }}
                 />
               </div>

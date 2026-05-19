@@ -1,15 +1,15 @@
 import type { MigrationItemStatus } from '@/types';
 
-const variants: Record<string, string> = {
-  success: 'bg-green-100 text-green-800',
-  ready: 'bg-green-100 text-green-800',
-  error: 'bg-red-100 text-red-800',
-  failed: 'bg-red-100 text-red-800',
-  warning: 'bg-yellow-100 text-yellow-800',
-  skipped: 'bg-yellow-100 text-yellow-800',
-  info: 'bg-blue-100 text-blue-800',
-  pending: 'bg-gray-100 text-gray-600',
-  in_progress: 'bg-blue-100 text-blue-800',
+const variants: Record<string, { classes: string; dot: string }> = {
+  success: { classes: 'bg-green-50 text-green-800 border-green-200', dot: 'bg-green-500' },
+  ready: { classes: 'bg-green-50 text-green-800 border-green-200', dot: 'bg-green-500' },
+  error: { classes: 'bg-red-50 text-red-800 border-red-200', dot: 'bg-red-500' },
+  failed: { classes: 'bg-red-50 text-red-800 border-red-200', dot: 'bg-red-500' },
+  warning: { classes: 'bg-yellow-50 text-yellow-900 border-yellow-200', dot: 'bg-yellow-500' },
+  skipped: { classes: 'bg-yellow-50 text-yellow-900 border-yellow-200', dot: 'bg-yellow-500' },
+  info: { classes: 'bg-blue-50 text-blue-800 border-blue-200', dot: 'bg-blue-500' },
+  pending: { classes: 'bg-gray-50 text-gray-600 border-gray-200', dot: 'bg-gray-400' },
+  in_progress: { classes: 'bg-blue-50 text-blue-800 border-blue-200', dot: 'bg-blue-500' },
 };
 
 const labels: Record<string, string> = {
@@ -27,15 +27,21 @@ const labels: Record<string, string> = {
 interface StatusChipProps {
   status: MigrationItemStatus | string;
   label?: string;
+  className?: string;
+  title?: string;
 }
 
-export function StatusChip({ status, label }: StatusChipProps) {
-  const classes = variants[status] || variants.info;
+export function StatusChip({ status, label, className = '', title }: StatusChipProps) {
+  const variant = variants[status] || variants.info;
   const text = label || labels[status] || status;
 
   return (
-    <span className={`${classes} rounded-chip px-2.5 py-0.5 text-xs font-medium inline-flex items-center gap-1`}>
-      {text}
+    <span
+      title={title || text}
+      className={`${variant.classes} ${className} rounded-chip border px-2.5 py-0.5 text-xs font-semibold inline-flex min-w-0 max-w-full items-center gap-1.5`}
+    >
+      <span className={`h-1.5 w-1.5 flex-shrink-0 rounded-full ${variant.dot}`} />
+      <span className="min-w-0 truncate">{text}</span>
     </span>
   );
 }

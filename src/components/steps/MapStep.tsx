@@ -32,9 +32,9 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
       try {
         const targetConn = state.sameInstance ? state.source : state.target;
         const [targetRes, sourceRes] = await Promise.all([
-          listModels(targetConn.baseUrl, targetConn.apiKey),
+          listModels(targetConn.baseUrl, targetConn.apiKey, { modelKind: 'SHARED', allPages: true, pageSize: 100 }),
           state.sourceModels.length === 0
-            ? listModels(state.source.baseUrl, state.source.apiKey)
+            ? listModels(state.source.baseUrl, state.source.apiKey, { modelKind: 'SHARED', allPages: true, pageSize: 100 })
             : Promise.resolve(null),
         ]);
 

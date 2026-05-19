@@ -28,6 +28,14 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
   const [highlight, setHighlight] = useState(0);
   const containerRef = useRef<HTMLDivElement>(null);
 
+  const totalMatches = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return dashboards.length;
+    return dashboards
+      .filter((d) => d.name.toLowerCase().includes(q) || (d.folderPath || '').toLowerCase().includes(q))
+      .length;
+  }, [dashboards, query]);
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     if (!q) return dashboards.slice(0, 100);
@@ -96,7 +104,10 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
         </button>
       </div>
       <div className="text-[11px] text-content-tertiary mt-1.5 flex items-center gap-2">
-        <span>Cached locally · last synced {timeAgo(lastSyncedAt)}</span>
+        <span>
+          {dashboards.length} fetched · cached locally · last synced {timeAgo(lastSyncedAt)}
+          {totalMatches > filtered.length ? ` · showing first ${filtered.length} matches` : ''}
+        </span>
       </div>
 
       {open && filtered.length > 0 && (

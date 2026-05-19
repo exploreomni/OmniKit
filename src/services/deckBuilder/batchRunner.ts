@@ -8,6 +8,7 @@ import type {
   FilterOverride,
   LayoutKit,
   RenderStrategy,
+  SlideOverride,
   TileExportState,
   TileVisualSource,
 } from './types';
@@ -41,6 +42,7 @@ export interface BatchRunOptions {
   values: string[];
   strategy: RenderStrategy;
   perTileSource?: Record<string, TileVisualSource>;
+  slideOverrides?: Record<string, SlideOverride>;
   allowFullDashboardFallback: boolean;
   signal?: AbortSignal;
   onClientUpdate: (status: BatchClientStatus) => void;
@@ -50,6 +52,24 @@ export interface BatchRunResult {
   files: Array<{ fileName: string; blob: Blob; clientValue: string }>;
   succeeded: number;
   failed: number;
+}
+
+function resolveSource(
+  strategy: RenderStrategy,
+  perTileSource: Record<string, TileVisualSource> | undefined,
+  tileId: string,
+): TileVisualSource {
+  return perTileSource?.[tileId] || (
+    strategy === 'full-dashboard'
+      ? 'full-dashboard'
+      : strategy === 'tile-image'
+      ? 'tile-image'
+      : 'native'
+  );
+}
+
+function strategyForTileExports(strategy: RenderStrategy): RenderStrategy {
+  return strategy === 'full-dashboard' ? 'native' : strategy;
 }
 
 export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResult> {
@@ -78,9 +98,14 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
 
     const tileStates: Record<string, TileExportState> = {};
     let usedFallback = false;
+    let usedFullDashboardImage = false;
 
     try {
-      if (opts.strategy === 'full-dashboard') {
+      const sourceFor = (tile: DashboardTile) => resolveSource(opts.strategy, opts.perTileSource, tile.id);
+      const fullDashboardTiles = opts.tiles.filter((tile) => sourceFor(tile) === 'full-dashboard');
+      const exportTiles = opts.tiles.filter((tile) => sourceFor(tile) !== 'full-dashboard');
+
+      if (fullDashboardTiles.length > 0) {
         deckLog.step('batch', `[${value}] full-dashboard strategy`);
         const blob = await exportFullDashboardAsPng(
           opts.baseUrl,
@@ -90,7 +115,7 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
           (m) => deckLog.info('batch', `[${value}] ${m}`)
         );
         const dataUrl = await blobToDataUrl(blob);
-        for (const tile of opts.tiles) {
+        for (const tile of fullDashboardTiles) {
           tileStates[tile.id] = {
             tileId: tile.id,
             status: 'done',
@@ -98,15 +123,20 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
             pngSize: blob.size,
           };
         }
-        usedFallback = true;
-      } else {
+        usedFullDashboardImage = true;
+      }
+
+      if (exportTiles.length > 0) {
+        const perTileSource = Object.fromEntries(
+          exportTiles.map((tile) => [tile.id, sourceFor(tile)] as const)
+        ) as Record<string, TileVisualSource>;
         const { states } = await runTileExports({
           baseUrl: opts.baseUrl,
           apiKey: opts.apiKey,
           dashboardId: opts.dashboardId,
-          tiles: opts.tiles,
-          strategy: opts.strategy,
-          perTileSource: opts.perTileSource,
+          tiles: exportTiles,
+          strategy: strategyForTileExports(opts.strategy),
+          perTileSource,
           signal: opts.signal,
           filterOverrides: overrides,
           onUpdate: () => undefined,
@@ -114,7 +144,7 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
         Object.assign(tileStates, states);
 
         const okCount = Object.values(states).filter((s) => s.status === 'done').length;
-        if (okCount === 0 && opts.allowFullDashboardFallback) {
+        if (okCount === 0 && fullDashboardTiles.length === 0 && opts.allowFullDashboardFallback) {
           deckLog.warn('batch', `[${value}] all tiles failed, full-dashboard fallback`);
           const blob = await exportFullDashboardAsPng(
             opts.baseUrl,
@@ -155,13 +185,14 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
         template: opts.template,
         tiles: successful.map((tile) => {
           const s = tileStates[tile.id];
-          const src = opts.perTileSource?.[tile.id];
+          const resolvedSource = sourceFor(tile);
           return {
             tile,
             pngDataUrl: s.pngDataUrl,
             result: s.result,
             insight: opts.insights[tile.id],
-            forceImage: src === 'tile-image',
+            forceImage: resolvedSource === 'tile-image' || resolvedSource === 'full-dashboard',
+            slideOverride: opts.slideOverrides?.[tile.id],
           };
         }),
         includeAppendix: opts.includeAppendix,
@@ -177,7 +208,7 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
         failedTiles,
         pptxBlob,
         fileName,
-        message: usedFallback ? 'Done (fallback image)' : 'Ready',
+        message: usedFallback ? 'Done (fallback image)' : usedFullDashboardImage ? 'Done (full dashboard image)' : 'Ready',
       });
     } catch (err) {
       failed += 1;

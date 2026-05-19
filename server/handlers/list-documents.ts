@@ -13,6 +13,20 @@ function extractArray(data: unknown): unknown[] | null {
   return null;
 }
 
+interface PageInfo {
+  hasNextPage?: boolean;
+  nextCursor?: string;
+  pageSize?: number;
+  totalRecords?: number;
+}
+
+function extractPageInfo(data: unknown): PageInfo | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const pageInfo = (data as Record<string, unknown>).pageInfo;
+  if (!pageInfo || typeof pageInfo !== "object" || Array.isArray(pageInfo)) return null;
+  return pageInfo as PageInfo;
+}
+
 function firstString(...candidates: unknown[]): string | undefined {
   for (const c of candidates) {
     if (typeof c === "string" && c.length > 0) return c;
@@ -55,16 +69,17 @@ function normalizeDocument(raw: Record<string, unknown>) {
     id: docId,
     name: String(raw.name ?? ""),
     identifier: docId,
+    hasDashboard: typeof raw.hasDashboard === "boolean" ? raw.hasDashboard : undefined,
     baseModelId,
-    folderId: String(raw.folder_id ?? raw.folderId ?? "") || undefined,
-    folderPath: String(raw.folder_path ?? raw.folderPath ?? raw.path ?? "") || undefined,
+    folderId: firstString(raw.folder_id, raw.folderId, nested(raw, "folder", "id")),
+    folderPath: firstString(raw.folder_path, raw.folderPath, raw.path, nested(raw, "folder", "path")),
     type: String(raw.type ?? raw.kind ?? "") || undefined,
   };
 }
 
 export default async function handler(req: Request): Promise<Response> {
   try {
-    const { base_url, api_key, folder_id } = await req.json();
+    const { base_url, api_key, folder_id, page_size, cursor, all_pages } = await req.json();
 
     const urlError = validateBaseUrl(base_url);
     if (urlError) {
@@ -79,61 +94,70 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const cleanUrl = base_url.replace(/\/+$/, "");
-    const params = new URLSearchParams();
-    if (folder_id) {
-      params.set("folderId", folder_id);
-    }
+    const pageSize = Math.min(Math.max(Number(page_size || 100), 1), 100);
+    const allRaw: unknown[] = [];
+    let nextCursor = typeof cursor === "string" ? cursor : undefined;
+    let lastPageInfo: PageInfo | null = null;
+    let pagesFetched = 0;
 
-    const url = `${cleanUrl}/api/v1/documents${params.toString() ? `?${params.toString()}` : ""}`;
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    do {
+      const params = new URLSearchParams();
+      params.set("pageSize", String(pageSize));
+      params.set("sortField", "name");
+      params.set("sortDirection", "asc");
+      if (folder_id) params.set("folderId", folder_id);
+      if (nextCursor) params.set("cursor", nextCursor);
 
-    const response = await fetch(url, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${api_key}`,
-        "Content-Type": "application/json",
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
-
-    if (!response.ok) {
-      const text = await response.text();
-      return new Response(
-        JSON.stringify({
-          error: `Omni API returned ${response.status}.`,
-          detail: text.slice(0, 500),
-          documents: [],
-        }),
-        { status: response.status, headers: jsonHeaders }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const response = await fetch(
+        `${cleanUrl}/api/v1/documents?${params.toString()}`,
+        {
+          method: "GET",
+          headers: {
+            Authorization: `Bearer ${api_key}`,
+            "Content-Type": "application/json",
+          },
+          signal: controller.signal,
+        }
       );
-    }
+      clearTimeout(timeout);
 
-    const data = await response.json();
-    const raw = extractArray(data);
+      if (!response.ok) {
+        const text = await response.text();
+        return new Response(
+          JSON.stringify({
+            error: `Omni API returned ${response.status}.`,
+            detail: text.slice(0, 500),
+            documents: [],
+          }),
+          { status: response.status, headers: jsonHeaders }
+        );
+      }
 
-    if (raw && raw.length > 0) {
-      const sample = raw[0] as Record<string, unknown>;
-      console.log("[list-documents] Raw API sample keys:", Object.keys(sample));
-      console.log("[list-documents] Raw API sample:", JSON.stringify(sample).slice(0, 500));
-    }
+      const data = await response.json();
+      const raw = extractArray(data);
+      if (raw === null) {
+        return new Response(
+          JSON.stringify({
+            error: "Could not find a document list in the Omni API response.",
+            documents: [],
+          }),
+          { headers: jsonHeaders }
+        );
+      }
 
-    if (raw === null) {
-      return new Response(
-        JSON.stringify({
-          error: "Could not find a document list in the Omni API response.",
-          documents: [],
-        }),
-        { headers: jsonHeaders }
-      );
-    }
+      allRaw.push(...raw);
+      lastPageInfo = extractPageInfo(data);
+      pagesFetched += 1;
+      nextCursor = lastPageInfo?.hasNextPage ? lastPageInfo.nextCursor : undefined;
+    } while (all_pages === true && nextCursor && pagesFetched < 50);
 
-    const documents = raw
+    const documents = allRaw
       .map((item) => normalizeDocument(item as Record<string, unknown>))
-      .filter((d) => !d.type || d.type === "dashboard");
+      .filter((d) => d.hasDashboard !== false && (!d.type || d.type === "dashboard" || d.type === "document"));
 
-    return new Response(JSON.stringify({ documents }), {
+    return new Response(JSON.stringify({ documents, pageInfo: lastPageInfo, pagesFetched }), {
       headers: jsonHeaders,
     });
   } catch (error) {

@@ -75,7 +75,7 @@ export function ConfirmDialog({
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="confirm-title">
-      <div className="absolute inset-0 bg-black/40 backdrop-blur-sm" onClick={onCancel} />
+      <div className="absolute inset-0 bg-black/40" onClick={onCancel} />
       <div
         ref={dialogRef}
         tabIndex={-1}

@@ -52,7 +52,7 @@ Step-by-step from zero:
 
 1. **Clone the repo.**
    ```bash
-   git clone https://github.com/austin-like-texas/OmniKit.git
+   git clone https://github.com/atx-omni/OmniKit.git
    cd OmniKit
    ```
 2. **Install dependencies.**
@@ -82,7 +82,7 @@ Click **Test Connection**.
 - A green checkmark means you're good — click **Continue**.
 - A red error means one of: wrong URL, expired/invalid key, VPN not connected, or your Omni instance blocks requests from localhost. The error message tells you which.
 
-Your key lives only in a React context in memory for the session. Close the tab and it's gone. It is never written to disk.
+Your key is held in React state and same-tab `sessionStorage` so a refresh does not disconnect you. It is not exported in backups and is cleared when the tab session ends or when you use **Data Privacy → Clear all local data**.
 
 ---
 
@@ -108,7 +108,7 @@ Turn any `.pptx` template into a repeatable Omni-powered deck.
 4. Run the batch — tiles are fetched live, rendered, and dropped into place.
 5. Download the generated `.pptx` files.
 
-Templates and saved batches live in your browser's IndexedDB; they stay across restarts until you clear site data.
+Templates, saved batches, dashboard metadata caches, and filter defaults live in your browser's local storage. They stay across restarts until you clear them from the **Data Privacy** page or clear site data in DevTools.
 
 ### Admin
 
@@ -153,7 +153,8 @@ Key points:
 - **Same-origin.** Because the UI and API share `localhost:5173`, there is no CORS, no auth header, no cookies to worry about.
 - **Stateless handlers.** Each `/api/<name>` route forwards one REST call to your Omni instance using the Base URL and API key you provided. Nothing is cached server-side.
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
-- **No database.** All persistent state lives in your browser (`localStorage` + IndexedDB under the `omnikit:*` prefix).
+- **No database.** Persistent app state lives in your browser (`localStorage` + IndexedDB). The active connection is kept in same-tab `sessionStorage`, which can include your Omni API key for the current browser session and is cleared by the Data Privacy wipe action.
+- **Compatibility-first proxy guardrails.** The generic proxy only forwards HTTPS requests to Omni `/api/v1` paths. Other Omni API surfaces used by the app, such as SCIM, embeds, and dashboard import/export, go through dedicated handlers.
 
 ---
 
@@ -209,8 +210,11 @@ Open DevTools → Application → Storage → **Clear site data**. Or use the bu
 ## Security & privacy
 
 - The local API binds to `127.0.0.1` only — not reachable from other machines on your network.
-- Your Omni API key lives in React memory for the session and is never written to disk.
+- Your Omni API key lives in React state and same-tab `sessionStorage` for the current browser session. It is not included in OmniKit backups and is cleared by **Data Privacy → Clear all local data** or by clearing site data in your browser.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.
+- OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, and cached dashboard/model context. Open **Data Privacy** to inspect and clear local IndexedDB and localStorage entries.
+- Raw export inspection can display the full dashboard export payload in your browser for troubleshooting. Treat copied diagnostics and exported backups as customer data.
+- The generic proxy is intentionally limited to Omni `/api/v1` endpoints; workflows that need other Omni API surfaces use purpose-built local handlers.
 - Vite's dev server is designed for local development, not for production hosting. Don't expose this app to the public internet.
 
 ---

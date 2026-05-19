@@ -1,8 +1,8 @@
 import { useEffect, useRef } from 'react';
+import type { CSSProperties } from 'react';
 import { Copy, FolderInput, Trash2 } from 'lucide-react';
 import { useReducedMotion } from '@/hooks/useReducedMotion';
 import { useConfetti } from '@/hooks/useConfetti';
-import { Blobby } from './Blobby';
 import { Vehicle, type VehicleKind } from './Vehicle';
 
 interface BulkOperationAnimationProps {
@@ -33,34 +33,34 @@ const TONES: Record<
   }
 > = {
   move: {
-    accent: '#C8186A',
+    accent: '#C83B70',
     accentSoft: 'rgba(255,71,148,0.18)',
     border: 'rgba(255,71,148,0.28)',
     bg: 'rgba(255,71,148,0.06)',
-    fill: 'linear-gradient(90deg, #C8186A 0%, #FF4794 100%)',
+    fill: 'linear-gradient(90deg, #C83B70 0%, #FF5789 100%)',
     icon: FolderInput,
     verb: 'Moving',
     doneVerb: 'Moved',
-    vehicle: 'truck',
-    inProgressLine: (name) => `Loading ${name} onto the truck`,
-    runningTitle: "Blobby's moving truck is rolling",
-    doneTitle: (n) => `Truck's unloaded — ${n} dashboard${n === 1 ? '' : 's'} in their new home!`,
-    doneSub: 'Blobby tipped his cap and drove off into the sunset.',
+    vehicle: 'delivery-truck',
+    inProgressLine: (name) => `Delivering ${name} to the Omni warehouse`,
+    runningTitle: "Blobby's delivery truck is rolling",
+    doneTitle: (n) => `Delivered — ${n} dashboard${n === 1 ? '' : 's'} arrived at the Omni warehouse!`,
+    doneSub: 'Blobby checked the manifest and parked at the dock.',
   },
   copy: {
-    accent: '#C8186A',
+    accent: '#C83B70',
     accentSoft: 'rgba(255,71,148,0.18)',
     border: 'rgba(255,71,148,0.28)',
     bg: 'rgba(255,71,148,0.06)',
-    fill: 'linear-gradient(90deg, #C8186A 0%, #FF4794 100%)',
+    fill: 'linear-gradient(90deg, #C83B70 0%, #FF5789 100%)',
     icon: Copy,
     verb: 'Copying',
     doneVerb: 'Copied',
-    vehicle: 'copier',
-    inProgressLine: (name) => `Running ${name} through the copier`,
-    runningTitle: 'The copier is humming',
-    doneTitle: (n) => `Fresh copies off the press — ${n} done!`,
-    doneSub: 'Still warm. Handle with care.',
+    vehicle: 'conveyor',
+    inProgressLine: (name) => `Sending ${name} down the conveyor`,
+    runningTitle: 'The conveyor is humming',
+    doneTitle: (n) => `Fresh copies off the belt — ${n} done!`,
+    doneSub: 'Quality checked and ready to use.',
   },
   delete: {
     accent: '#B91C1C',
@@ -71,13 +71,65 @@ const TONES: Record<
     icon: Trash2,
     verb: 'Deleting',
     doneVerb: 'Deleted',
-    vehicle: 'crane',
-    inProgressLine: (name) => `Scooping up ${name}`,
-    runningTitle: "Blobby's sanitation crane at work",
+    vehicle: 'bulldozer',
+    inProgressLine: (name) => `Clearing ${name}`,
+    runningTitle: "Blobby's cleanup bulldozer is rolling",
     doneTitle: (n) => `All clear — ${n} dashboard${n === 1 ? '' : 's'} off the books.`,
     doneSub: 'Blobby waved goodbye on the way out.',
   },
 };
+
+function DashboardBox({ className = '', style }: { className?: string; style?: CSSProperties }) {
+  return (
+    <span className={`workflow-box ${className}`} style={style} aria-hidden>
+      <span className="workflow-box-chart" />
+      <span className="workflow-box-line" />
+    </span>
+  );
+}
+
+function BulkSceneDecor({ type, reduced }: { type: BulkOperationAnimationProps['type']; reduced: boolean }) {
+  if (type === 'move') {
+    return (
+      <>
+        <img src="/omni-warehouse.svg" alt="" className="bulk-scene-setting-image bulk-scene-warehouse-image" aria-hidden />
+        <div className="bulk-scene-route" aria-hidden />
+      </>
+    );
+  }
+
+  if (type === 'copy') {
+    return (
+      <>
+        <img src="/blobby-control-panel.png" alt="" className="bulk-control-panel-image" aria-hidden />
+        <div className="bulk-scene-shelves" aria-hidden>
+          <span />
+          <span />
+          <span />
+        </div>
+        <div className="bulk-scene-conveyor" aria-hidden />
+        {[0, 1, 2].map((i) => (
+          <DashboardBox
+            key={i}
+            className={reduced ? 'bulk-conveyor-box' : 'bulk-conveyor-box workflow-box-slide'}
+            style={{ animationDelay: `${i * 850}ms` }}
+          />
+        ))}
+      </>
+    );
+  }
+
+  return (
+    <>
+      <img src="/bulk-construction-site.svg" alt="" className="bulk-scene-setting-image bulk-scene-construction-image" aria-hidden />
+      <div className="bulk-scene-pile" aria-hidden>
+        <DashboardBox className="bulk-pile-box bulk-pile-box-a" />
+        <DashboardBox className="bulk-pile-box bulk-pile-box-b" />
+        <DashboardBox className="bulk-pile-box bulk-pile-box-c" />
+      </div>
+    </>
+  );
+}
 
 export function BulkOperationAnimation({
   current,
@@ -107,16 +159,19 @@ export function BulkOperationAnimation({
         style={{
           background:
             type === 'delete'
-              ? 'rgba(239,68,68,0.05)'
-              : 'linear-gradient(135deg, rgba(16,185,129,0.08), rgba(255,71,148,0.05))',
+              ? '#FFFFFF'
+              : '#FFFFFF',
           border: `1px solid ${type === 'delete' ? 'rgba(239,68,68,0.22)' : 'rgba(16,185,129,0.28)'}`,
         }}
       >
-        <Blobby
-          mood={type === 'delete' ? 'waving' : 'celebrating'}
-          size={64}
-          className={reduced ? '' : 'animate-wiggle-infinite'}
-        />
+        <div className="relative flex-shrink-0">
+          <Vehicle
+            kind={type === 'delete' ? 'bulldozer' : tone.vehicle}
+            width={104}
+            height={72}
+            className={reduced ? '' : 'animate-wiggle-infinite'}
+          />
+        </div>
         <div className="min-w-0">
           <div className="text-[15px] font-bold text-content-primary leading-tight">
             {tone.doneTitle(current)}
@@ -133,10 +188,10 @@ export function BulkOperationAnimation({
       style={{
         background:
           type === 'delete'
-            ? 'linear-gradient(180deg, #FFF5F5 0%, #FFF8FB 100%)'
-            : 'linear-gradient(180deg, #FFFFFF 0%, #FFF8FB 100%)',
-        border: '1px solid rgba(242,190,214,0.8)',
-        boxShadow: '0 1px 4px rgba(200,24,100,0.06), 0 4px 16px rgba(200,24,100,0.04)',
+            ? '#FFFFFF'
+            : '#FFFFFF',
+        border: '1px solid rgba(217,222,232,0.95)',
+        boxShadow: 'none',
       }}
       aria-live="polite"
       aria-atomic="true"
@@ -160,72 +215,88 @@ export function BulkOperationAnimation({
         </div>
       </div>
 
-      <div className="relative" style={{ height: 94 }}>
-        <div
-          className="absolute left-0 right-0"
-          style={{
-            bottom: 8,
-            height: 4,
-            background: 'repeating-linear-gradient(90deg, rgba(200,24,100,0.18) 0 8px, transparent 8px 14px)',
-            borderRadius: 999,
-          }}
-        />
-        <div
-          className="absolute left-0"
-          style={{
-            bottom: 8,
-            height: 4,
-            width: `${pct}%`,
-            background: tone.fill,
-            borderRadius: 999,
-            transition: reduced ? 'none' : 'width 500ms cubic-bezier(0.22, 1, 0.36, 1)',
-            boxShadow: `0 0 8px ${tone.accentSoft}`,
-          }}
-        />
-
-        <div
-          className="absolute bottom-3"
-          style={{
-            left: `calc(${Math.max(2, Math.min(pct, 94))}% - 50px)`,
-            transition: reduced ? 'none' : 'left 600ms cubic-bezier(0.22, 1, 0.36, 1)',
-          }}
-        >
-          <div className="relative">
-            <Vehicle kind={tone.vehicle} width={88} height={56} />
-            <Blobby
-              mood={type === 'delete' ? 'waving' : 'in-progress'}
-              size={28}
-              className={reduced ? 'absolute' : 'absolute animate-float'}
+      <div className={`bulk-workflow-scene bulk-workflow-scene-${type}`} style={{ height: 118 }}>
+        <BulkSceneDecor type={type} reduced={reduced} />
+        {type !== 'delete' && (
+          <>
+            <div
+              className="absolute left-4 right-4"
               style={{
-                left: tone.vehicle === 'crane' ? 18 : tone.vehicle === 'copier' ? 12 : 14,
-                top: tone.vehicle === 'copier' ? -4 : -8,
-                animationDuration: '2.4s',
+                bottom: type === 'copy' ? 30 : 20,
+                height: 4,
+                background: '#DDE2EB',
+                borderRadius: 999,
               }}
             />
-          </div>
-        </div>
+            <div
+              className="absolute left-4"
+              style={{
+                bottom: type === 'copy' ? 30 : 20,
+                height: 4,
+                width: pct > 0 ? `calc(${pct}% - 2rem)` : 0,
+                background: tone.fill,
+                borderRadius: 999,
+                transition: reduced ? 'none' : 'width 500ms cubic-bezier(0.22, 1, 0.36, 1)',
+                boxShadow: 'none',
+              }}
+            />
+          </>
+        )}
 
-        <div
-          className="absolute right-0 bottom-4 flex items-center gap-1 px-2 py-1 rounded-lg"
-          style={{
-            background: type === 'delete' ? 'rgba(239,68,68,0.08)' : 'rgba(16,185,129,0.08)',
-            border: `1px dashed ${type === 'delete' ? 'rgba(239,68,68,0.35)' : 'rgba(16,185,129,0.35)'}`,
-          }}
-        >
-          {type === 'delete' ? (
-            <Trash2 size={14} className="text-red-600" />
-          ) : type === 'copy' ? (
-            <Copy size={14} className="text-emerald-700" />
-          ) : (
-            <FolderInput size={14} className="text-emerald-700" />
-          )}
-          <span
-            className="text-[10px] font-bold uppercase tracking-wider"
-            style={{ color: type === 'delete' ? '#B91C1C' : '#047857' }}
+        {type === 'move' && (
+          <div
+            className="absolute bottom-3"
+            style={{
+              left: `calc(${Math.max(2, Math.min(pct, 94))}% - 50px)`,
+              bottom: 24,
+              transition: reduced ? 'none' : 'left 600ms cubic-bezier(0.22, 1, 0.36, 1)',
+            }}
           >
-            {type === 'delete' ? 'Trash' : 'Destination'}
-          </span>
-        </div>
+            <div className="relative bulk-delivery-truck-motion">
+              <Vehicle
+                kind={tone.vehicle}
+                width={124}
+                height={78}
+                motion="none"
+              />
+            </div>
+          </div>
+        )}
+
+        {type === 'delete' && (
+          <div
+            className="absolute bulk-bulldozer-push-group"
+            style={{
+              left: `calc(${Math.max(2, Math.min(pct, 84))}% - 42px)`,
+              transition: reduced ? 'none' : 'left 620ms cubic-bezier(0.22, 1, 0.36, 1)',
+            }}
+          >
+            <div className="relative bulk-vehicle-facing-right">
+              <Vehicle kind="bulldozer" width={126} height={80} motion="none" />
+            </div>
+            <DashboardBox className="bulk-bulldozer-pushed-tile" />
+            <span className={reduced ? 'bulk-bulldozer-dust' : 'bulk-bulldozer-dust bulk-bulldozer-dust-motion'} aria-hidden />
+          </div>
+        )}
+
+        {type !== 'delete' && (
+          <div
+            className="absolute right-3 bottom-4 flex items-center gap-1 px-2 py-1 rounded-lg"
+            style={{
+              background: 'rgba(16,185,129,0.08)',
+              border: '1px dashed rgba(16,185,129,0.35)',
+            }}
+          >
+            {type === 'copy' ? (
+              <Copy size={14} className="text-emerald-700" />
+            ) : (
+              <FolderInput size={14} className="text-emerald-700" />
+            )}
+            <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-700">
+              Destination
+            </span>
+          </div>
+        )}
       </div>
 
       {currentItem && (

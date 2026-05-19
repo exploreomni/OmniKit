@@ -70,7 +70,43 @@ export type TileExportStatus =
 
 export type RenderStrategy = 'native' | 'tile-image' | 'full-dashboard';
 
-export type TileVisualSource = 'native' | 'tile-image' | 'skip';
+export type TileVisualSource = 'native' | 'tile-image' | 'full-dashboard' | 'skip';
+
+export type SlideFitMode = 'contain' | 'cover' | 'stretch';
+
+export type InsightFormat = 'paragraph' | 'bullets';
+
+export type SlideOverlayType = 'text' | 'arrow' | 'line' | 'box' | 'symbol';
+
+export interface SlideBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+export interface SlideOverride {
+  title?: string;
+  bodyBox?: SlideBox;
+  insightBox?: SlideBox;
+  insightFormat?: InsightFormat;
+  fit?: SlideFitMode;
+  speakerNotes?: string;
+  speakerNotesFormat?: InsightFormat;
+  overlays?: SlideOverlay[];
+}
+
+export interface SlideOverlay {
+  id: string;
+  type: SlideOverlayType;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  rotation?: number;
+  text?: string;
+  color?: string;
+}
 
 export type TileRenderKind = 'kpi' | 'bar' | 'line' | 'pie' | 'table' | 'empty' | 'markdown' | 'unsupported';
 
@@ -193,6 +229,7 @@ export interface DeckRecipe {
   batch?: { filterField: string; values: string[] };
   templateId?: string;
   tileVisualSources?: Record<string, TileVisualSource>;
+  slideOverrides?: Record<string, SlideOverride>;
 }
 
 export const DEFAULT_BRAND: BrandConfig = {

@@ -46,9 +46,7 @@ function FolderNode({ folder, selectedFolderId, expandedIds, onToggle, onSelect,
         }`}
         style={{
           paddingLeft: `${depth * 16 + 8}px`,
-          background: isSelected
-            ? 'linear-gradient(135deg, rgba(255,71,148,0.15) 0%, rgba(255,71,148,0.06) 100%)'
-            : undefined,
+          background: isSelected ? '#F8F9FD' : undefined,
           borderLeft: isSelected ? '2px solid #FF4794' : '2px solid transparent',
         }}
       >
@@ -109,7 +107,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
       setLoadingFolders(true);
       setError('');
       try {
-        const res = await listFolders(state.source.baseUrl, state.source.apiKey);
+        const res = await listFolders(state.source.baseUrl, state.source.apiKey, { allPages: true, pageSize: 100 });
         if (res.error) {
           setError(`API error: ${res.error}${res.detail ? ` — ${res.detail}` : ''}`);
           return;
@@ -135,7 +133,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
     setLoadingDocs(true);
     setError('');
     try {
-      const res = await listDocuments(state.source.baseUrl, state.source.apiKey, folder.id);
+      const res = await listDocuments(state.source.baseUrl, state.source.apiKey, folder.id, { allPages: true, pageSize: 100 });
       if (res.error) {
         setError(`API error loading documents: ${res.error}`);
         return;
@@ -233,7 +231,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
           <div className="flex items-center gap-2 mb-2">
             <span className="text-[10px] font-bold uppercase tracking-[0.16em] px-2 py-0.5 rounded-full"
               style={{
-                background: 'linear-gradient(135deg, rgba(255,71,148,0.14) 0%, rgba(255,71,148,0.06) 100%)',
+                background: '#F8F9FD',
                 color: '#C8186A',
                 border: '1px solid rgba(255,71,148,0.2)',
               }}
@@ -258,7 +256,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
           <div
             className="flex items-center gap-2 px-3 py-2 rounded-xl animate-fadeIn"
             style={{
-              background: 'linear-gradient(135deg, rgba(16,185,129,0.08) 0%, rgba(16,185,129,0.04) 100%)',
+	              background: '#FFFFFF',
               border: '1px solid rgba(16,185,129,0.22)',
             }}
           >
@@ -274,7 +272,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
         <div
           className="flex items-start gap-2.5 px-4 py-3 rounded-xl text-sm"
           style={{
-            background: 'linear-gradient(135deg, rgba(239,68,68,0.06) 0%, rgba(239,68,68,0.02) 100%)',
+	            background: '#FFFFFF',
             border: '1px solid rgba(239,68,68,0.25)',
             color: '#B91C1C',
           }}
@@ -288,22 +286,22 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
         <aside
           className="md:w-72 flex-shrink-0 rounded-2xl bg-white overflow-hidden flex flex-col"
           style={{
-            border: '1px solid rgba(242, 190, 214, 0.8)',
-            boxShadow: '0 1px 4px rgba(200,24,100,0.06), 0 4px 16px rgba(200,24,100,0.04)',
+            border: '1px solid rgba(217,222,232,0.95)',
+            boxShadow: '0 1px 3px rgba(64,71,84,0.08)',
           }}
         >
           <div
             className="px-4 py-2.5 flex items-center justify-between"
             style={{
-              borderBottom: '1px solid rgba(242,206,220,0.7)',
-              background: 'linear-gradient(180deg, rgba(255,245,249,0.9) 0%, rgba(255,245,249,0.4) 100%)',
+	              borderBottom: '1px solid rgba(217,222,232,0.95)',
+	              background: '#F8F9FD',
             }}
           >
             <div className="flex items-center gap-2">
               <div
                 className="w-6 h-6 rounded-lg flex items-center justify-center"
                 style={{
-                  background: 'linear-gradient(135deg, rgba(255,71,148,0.15) 0%, rgba(255,71,148,0.05) 100%)',
+	                  background: '#FFFFFF',
                   border: '1px solid rgba(255,71,148,0.2)',
                 }}
               >
@@ -315,7 +313,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
             </div>
             {totalFolders > 0 && (
               <span className="text-[10px] font-semibold text-content-tertiary px-1.5 py-0.5 rounded"
-                style={{ background: 'rgba(255,71,148,0.08)' }}>
+	                    style={{ background: '#F8F9FD' }}>
                 {totalFolders}
               </span>
             )}
@@ -329,7 +327,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
             ) : state.folders.length === 0 ? (
               <div className="text-center py-8 px-3">
                 <img
-                  src="/blobby-empty.webp"
+                  src="/blobby-empty.png"
                   alt=""
                   className="w-12 h-12 mx-auto object-contain mb-2 opacity-80"
                   aria-hidden
@@ -354,22 +352,22 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
         <section
           className="flex-1 rounded-2xl bg-white overflow-hidden flex flex-col"
           style={{
-            border: '1px solid rgba(242, 190, 214, 0.8)',
-            boxShadow: '0 1px 4px rgba(200,24,100,0.06), 0 4px 16px rgba(200,24,100,0.04)',
+            border: '1px solid rgba(217,222,232,0.95)',
+            boxShadow: '0 1px 3px rgba(64,71,84,0.08)',
           }}
         >
           <div
             className="px-4 py-3 flex items-center justify-between gap-3"
             style={{
-              borderBottom: '1px solid rgba(242,206,220,0.7)',
-              background: 'linear-gradient(180deg, rgba(255,245,249,0.9) 0%, rgba(255,245,249,0.4) 100%)',
+	              borderBottom: '1px solid rgba(217,222,232,0.95)',
+	              background: '#F8F9FD',
             }}
           >
             <div className="flex items-center gap-2 min-w-0">
               <div
                 className="w-6 h-6 rounded-lg flex items-center justify-center flex-shrink-0"
                 style={{
-                  background: 'linear-gradient(135deg, rgba(255,71,148,0.15) 0%, rgba(255,71,148,0.05) 100%)',
+	                  background: '#FFFFFF',
                   border: '1px solid rgba(255,71,148,0.2)',
                 }}
               >
@@ -399,7 +397,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                   <button
                     type="button"
                     onClick={handleSelectAll}
-                    className="text-[11px] font-semibold text-omni-700 hover:text-omni-800 transition-colors px-2 py-1 rounded-md hover:bg-pink-50"
+	                    className="text-[11px] font-semibold text-omni-700 hover:text-omni-800 transition-colors px-2 py-1 rounded-md hover:bg-surface-secondary"
                   >
                     {allInViewSelected ? 'Deselect all' : 'Select all'}
                   </button>
@@ -420,13 +418,13 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
                   placeholder="Search dashboards in this folder…"
-                  className="w-full pl-9 pr-9 py-2 text-[13px] rounded-lg bg-surface-secondary/60 border border-transparent focus:bg-white focus:border-pink-200 focus:outline-none focus:ring-2 focus:ring-pink-200/40 transition-all placeholder:text-content-tertiary"
+	                  className="w-full pl-9 pr-9 py-2 text-[13px] rounded-lg bg-surface-secondary border border-transparent focus:bg-white focus:border-border-strong focus:outline-none focus:ring-2 focus:ring-border/70 transition-all placeholder:text-content-tertiary"
                 />
                 {search && (
                   <button
                     type="button"
                     onClick={() => setSearch('')}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded text-content-tertiary hover:text-content-primary hover:bg-pink-50"
+	                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded text-content-tertiary hover:text-content-primary hover:bg-surface-secondary"
                     aria-label="Clear search"
                   >
                     <X size={12} />
@@ -449,10 +447,10 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                   <img
                     src={
                       search
-                        ? '/blobby-no-results.webp'
+                        ? '/blobby-no-results.png'
                         : selectedFolderId
-                        ? '/blobby-empty.webp'
-                        : '/blobby-getting-started.webp'
+                        ? '/blobby-empty.png'
+                        : '/blobby-getting-started.png'
                     }
                     alt=""
                     className="w-16 h-16 object-contain animate-float"
@@ -483,13 +481,11 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                     key={doc.id || `doc-${index}`}
                     className="flex items-center px-4 py-3 border-b border-border/40 cursor-pointer transition-all duration-150 group"
                     style={{
-                      background: checked
-                        ? 'linear-gradient(90deg, rgba(255,71,148,0.08) 0%, rgba(255,71,148,0.02) 100%)'
-                        : undefined,
+	                      background: checked ? '#F8F9FD' : undefined,
                       borderLeft: checked ? '3px solid #FF4794' : '3px solid transparent',
                     }}
                     onMouseEnter={(e) => {
-                      if (!checked) e.currentTarget.style.background = 'rgba(255,245,249,0.6)';
+	                      if (!checked) e.currentTarget.style.background = '#F8F9FD';
                     }}
                     onMouseLeave={(e) => {
                       if (!checked) e.currentTarget.style.background = '';
@@ -551,7 +547,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                           e.stopPropagation();
                           setInspectDoc(doc);
                         }}
-                        className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold text-content-tertiary hover:text-omni-700 hover:bg-pink-50 transition-all opacity-0 group-hover:opacity-100"
+	                        className="flex items-center gap-1 px-2 py-1 rounded-md text-[10px] font-semibold text-content-tertiary hover:text-omni-700 hover:bg-surface-secondary transition-all opacity-0 group-hover:opacity-100"
                         title="Inspect raw export payload"
                       >
                         <Search size={10} />
@@ -569,9 +565,8 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
       <div
         className="sticky bottom-0 -mx-6 md:-mx-10 px-6 md:px-10 py-3 flex items-center justify-between gap-4 z-20"
         style={{
-          background: 'linear-gradient(180deg, rgba(255,248,251,0.5) 0%, rgba(255,248,251,0.96) 40%, #FFF8FB 100%)',
-          backdropFilter: 'blur(8px)',
-          borderTop: '1px solid rgba(242,190,214,0.6)',
+	          background: '#FFFFFF',
+	          borderTop: '1px solid rgba(217,222,232,0.95)',
         }}
       >
         <button onClick={onBack} className="btn-secondary">

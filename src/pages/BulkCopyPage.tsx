@@ -18,6 +18,7 @@ import { SkeletonRow } from '@/components/ui/SkeletonRow';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { BulkOperationAnimation } from '@/components/ui/BulkOperationAnimation';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { Blobby } from '@/components/ui/Blobby';
 import type { OmniFolder, OmniDocument, BulkOperationResult, BulkOperationSummary } from '@/types';
 
 function FolderNode({
@@ -173,7 +174,7 @@ export function BulkCopyPage() {
       setLoadingFolders(true);
       setError('');
       try {
-        const res = await listFolders(connection.baseUrl, connection.apiKey);
+        const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
         if (res.error) {
           setError(`API error: ${res.error}`);
           return;
@@ -193,7 +194,7 @@ export function BulkCopyPage() {
     setLoadingDocs(true);
     setError('');
     try {
-      const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id);
+      const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id, { allPages: true, pageSize: 100 });
       if (res.error) {
         setError(`API error: ${res.error}`);
         return;
@@ -352,7 +353,10 @@ export function BulkCopyPage() {
   if (showResults) {
     return (
       <div className="space-y-5">
-        <PageHeader title="Bulk Copy Results" />
+        <PageHeader
+          title="Bulk Copy Results"
+          icon={<Blobby mood="dashboard" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
+        />
         {summary && (
           <div className="card bg-surface-secondary">
             <div className="flex items-center gap-6 text-sm">
@@ -410,6 +414,7 @@ export function BulkCopyPage() {
       <PageHeader
         title="Bulk Copy Dashboards"
         description="Duplicate dashboards into another folder. The originals stay exactly where they are."
+        icon={<Blobby mood="dashboard" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
         actions={
           canCopy && (
             <button onClick={() => setShowConfirm(true)} disabled={copying} className="btn-primary">
@@ -483,7 +488,7 @@ export function BulkCopyPage() {
               <div className="empty-state">
                 <div className="empty-state-mascot">
                   <img
-                    src={selectedFolderId ? '/blobby-empty.webp' : '/blobby-getting-started.webp'}
+                    src={selectedFolderId ? '/blobby-empty.png' : '/blobby-getting-started.png'}
                     alt={selectedFolderId ? 'No dashboards' : 'Select a folder'}
                     className="w-14 h-14 object-contain animate-float"
                     style={{ animationDuration: '3s' }}
@@ -501,7 +506,7 @@ export function BulkCopyPage() {
                 <label
                   key={doc.id || `doc-${index}`}
                   className={`flex items-center px-4 py-2.5 border-b border-border/50 cursor-pointer hover:bg-surface-secondary transition-colors ${
-                    isSelected(doc) ? 'bg-omni-50/40' : ''
+                    isSelected(doc) ? 'bg-surface-secondary' : ''
                   }`}
                 >
                   <input

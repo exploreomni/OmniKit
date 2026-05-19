@@ -1,5 +1,7 @@
 import { validateBaseUrl, validateEndpoint, jsonHeaders } from '../security';
 
+const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+
 interface ProxyRequest {
   base_url: string;
   api_key: string;
@@ -41,6 +43,13 @@ export default async function handler(req: Request): Promise<Response> {
       );
     }
 
+    if (!ALLOWED_METHODS.has(method)) {
+      return new Response(
+        JSON.stringify({ error: `Unsupported method: ${method}` }),
+        { status: 400, headers: jsonHeaders }
+      );
+    }
+
     const cleanUrl = base_url.replace(/\/+$/, "");
     let url = `${cleanUrl}/api${endpoint}`;
 
@@ -61,7 +70,7 @@ export default async function handler(req: Request): Promise<Response> {
       Authorization: `Bearer ${api_key}`,
     };
 
-    if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
+    if (body !== undefined && (method === "POST" || method === "PUT" || method === "PATCH")) {
       headers["Content-Type"] = "application/json";
     }
 
@@ -70,7 +79,7 @@ export default async function handler(req: Request): Promise<Response> {
       headers,
     };
 
-    if (body && (method === "POST" || method === "PUT" || method === "PATCH")) {
+    if (body !== undefined && (method === "POST" || method === "PUT" || method === "PATCH")) {
       fetchOptions.body = JSON.stringify(body);
     }
 

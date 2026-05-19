@@ -8,12 +8,13 @@ import { useOperationLog } from '@/contexts/OperationLogContext';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { Blobby } from '@/components/ui/Blobby';
 import type { OperationType } from '@/types';
 
 const TYPE_CONFIG: Record<OperationType, { icon: typeof Clock; label: string; color: string }> = {
-  migration: { icon: ArrowRightLeft, label: 'Migration', color: 'text-blue-600 bg-blue-50' },
-  bulk_move: { icon: FolderInput, label: 'Bulk Move', color: 'text-sky-600 bg-sky-50' },
-  bulk_delete: { icon: Trash2, label: 'Bulk Delete', color: 'text-red-600 bg-red-50' },
+  migration: { icon: ArrowRightLeft, label: 'Model Migrator', color: 'text-blue-600 bg-blue-50' },
+  bulk_move: { icon: FolderInput, label: 'Dashboard Move', color: 'text-sky-600 bg-sky-50' },
+  bulk_delete: { icon: Trash2, label: 'Dashboard Delete', color: 'text-red-600 bg-red-50' },
   download: { icon: Download, label: 'Download', color: 'text-sky-600 bg-sky-50' },
   label_change: { icon: Tag, label: 'Label Change', color: 'text-amber-600 bg-amber-50' },
   user_import: { icon: Upload, label: 'User Import', color: 'text-green-600 bg-green-50' },
@@ -54,6 +55,7 @@ export function HistoryPage() {
       <PageHeader
         title="Operation History"
         description="All operations performed on this device. Stored locally in your browser and survives refresh."
+        icon={<Blobby mood="thinking" size={58} className="animate-float" style={{ animationDuration: '3.7s' }} />}
         actions={
           <div className="flex gap-2 items-center">
             <StatusChip status="success" label="Stored Locally" />
@@ -98,7 +100,7 @@ export function HistoryPage() {
       {filtered.length === 0 ? (
         <div className="card flex flex-col items-center justify-center py-16 animate-fadeIn">
           <img
-            src={typeFilter ? '/blobby-empty.webp' : '/blobby-thinking.webp'}
+            src={typeFilter ? '/blobby-empty.png' : '/blobby-thinking.webp'}
             alt={typeFilter ? 'Blobby investigating' : 'Blobby thinking'}
             className="w-24 h-24 object-contain animate-float mb-4"
             style={{ animationDuration: '3.5s' }}

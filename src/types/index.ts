@@ -12,6 +12,7 @@ export interface OmniFolder {
   name: string;
   identifier?: string;
   path?: string;
+  labels?: Array<string | { name?: string }>;
   children?: OmniFolder[];
 }
 
@@ -28,6 +29,7 @@ export interface OmniDocument {
   folderPath?: string;
   folderId?: string;
   type?: string;
+  labels?: Array<string | { name?: string }>;
 }
 
 export interface OmniModel {
@@ -38,6 +40,10 @@ export interface OmniModel {
   connectionName?: string;
   baseModelId?: string;
   kind?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  deletedAt?: string | null;
+  branches?: OmniModel[];
 }
 
 export interface OmniUser {

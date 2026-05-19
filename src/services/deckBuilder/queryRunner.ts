@@ -114,6 +114,7 @@ const DATE_TYPES = new Set(['date', 'timestamp', 'datetime', 'time']);
 const MAX_TABLE_ROWS = 30;
 const MAX_TABLE_COLS = 8;
 const RUN_ROW_LIMIT = 200;
+const FIELD_TRANSFORM_SUFFIX_RE = /\[[^\]]+\]$/;
 
 function isObject(v: unknown): v is Record<string, unknown> {
   return Boolean(v) && typeof v === 'object' && !Array.isArray(v);
@@ -196,6 +197,140 @@ function buildRunPayload(extracted: Record<string, unknown>): {
     out.limit = RUN_ROW_LIMIT;
   }
   return { payload: out, droppedKeys: dropped };
+}
+
+function normalizeRunFieldRef(field: string): string {
+  return field.replace(FIELD_TRANSFORM_SUFFIX_RE, '');
+}
+
+function normalizeRunFieldRefs(value: unknown, changed: Set<string>): unknown {
+  if (typeof value === 'string') {
+    const next = normalizeRunFieldRef(value);
+    if (next !== value) changed.add(value);
+    return next;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeRunFieldRefs(item, changed));
+  }
+  return value;
+}
+
+function normalizeSortRefs(value: unknown, changed: Set<string>): unknown {
+  if (!Array.isArray(value)) return value;
+  return value.map((sort) => {
+    if (!isObject(sort)) return normalizeRunFieldRefs(sort, changed);
+    const next = { ...sort };
+    for (const key of ['field', 'fieldName', 'field_name', 'column_name', 'columnName']) {
+      if (typeof next[key] === 'string') {
+        const normalized = normalizeRunFieldRef(next[key] as string);
+        if (normalized !== next[key]) changed.add(next[key] as string);
+        next[key] = normalized;
+      }
+    }
+    return next;
+  });
+}
+
+function normalizeFilterRefs(value: unknown, changed: Set<string>): unknown {
+  if (!isObject(value)) return value;
+  const next: Record<string, unknown> = {};
+  for (const [field, raw] of Object.entries(value)) {
+    const normalized = normalizeRunFieldRef(field);
+    if (normalized !== field) changed.add(field);
+    next[normalized] = raw;
+  }
+  return next;
+}
+
+function normalizeRunPayloadRefs(payload: Record<string, unknown>, scope: string): Record<string, unknown> {
+  const changed = new Set<string>();
+  const next = { ...payload };
+  for (const key of ['fields', 'pivots', 'groupBy', 'group_by']) {
+    if (key in next) next[key] = normalizeRunFieldRefs(next[key], changed);
+  }
+  for (const key of ['sorts', 'order_by', 'orderBy']) {
+    if (key in next) next[key] = normalizeSortRefs(next[key], changed);
+  }
+  if ('filters' in next) next.filters = normalizeFilterRefs(next.filters, changed);
+
+  if (changed.size > 0) {
+    deckLog.warn(scope, 'Normalized UI-decorated field reference(s) for native query replay', {
+      fields: Array.from(changed),
+    });
+  }
+  return next;
+}
+
+function extractMissingField(message: string): string | null {
+  const patterns = [
+    /No such field\s+"([^"]+)"/i,
+    /No such field\s+'([^']+)'/i,
+    /field\s+"([^"]+)"\s+does not exist/i,
+    /unknown field\s+"([^"]+)"/i,
+  ];
+  for (const pattern of patterns) {
+    const match = message.match(pattern);
+    if (match?.[1]) return match[1];
+  }
+  return null;
+}
+
+function removeFieldFromArray(value: unknown, field: string): { value: unknown; changed: boolean } {
+  if (!Array.isArray(value)) return { value, changed: false };
+  let changed = false;
+  const next = value.filter((item) => {
+    if (typeof item === 'string' && item === field) {
+      changed = true;
+      return false;
+    }
+    return true;
+  }).map((item) => {
+    if (!isObject(item)) return item;
+    let localChanged = false;
+    const nextItem = { ...item };
+    for (const key of ['field', 'fieldName', 'field_name', 'column_name', 'columnName']) {
+      if (nextItem[key] === field) {
+        localChanged = true;
+        changed = true;
+      }
+    }
+    return localChanged ? null : nextItem;
+  }).filter((item) => item !== null);
+  return { value: next, changed };
+}
+
+function removeMissingFieldFromPayload(
+  payload: Record<string, unknown>,
+  missingField: string,
+  scope: string,
+): { payload: Record<string, unknown>; changed: boolean } {
+  const candidates = Array.from(new Set([missingField, normalizeRunFieldRef(missingField)]));
+  let next = { ...payload };
+  let changed = false;
+
+  for (const field of candidates) {
+    for (const key of ['fields', 'pivots', 'groupBy', 'group_by', 'sorts', 'order_by', 'orderBy']) {
+      if (!(key in next)) continue;
+      const removed = removeFieldFromArray(next[key], field);
+      if (removed.changed) {
+        next = { ...next, [key]: removed.value };
+        changed = true;
+      }
+    }
+    if (isObject(next.filters) && field in next.filters) {
+      const filters = { ...next.filters };
+      delete filters[field];
+      next = { ...next, filters };
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    deckLog.warn(scope, 'Removed field Omni no longer recognizes before retrying native query replay', {
+      missingField,
+    });
+  }
+  return { payload: next, changed };
 }
 
 type RunShape = 'wrapped' | 'flat';
@@ -317,7 +452,7 @@ function parseQueryResponse(
         (typeof failedPart.error_message === 'string' && failedPart.error_message) ||
         (typeof failedPart.error_type === 'string' && failedPart.error_type) ||
         'Query failed';
-      deckLog.error(scope, 'Omni query job FAILED', {
+      deckLog.warn(scope, 'Omni query job FAILED; attempting repair or image fallback', {
         errorType: typeof failedPart.error_type === 'string' ? failedPart.error_type : undefined,
         errorMessage: msg,
       });
@@ -423,6 +558,7 @@ function isMarkdownTile(tile: DashboardTile): boolean {
 export function normalizeFilterType(input: string | undefined): string {
   if (!input) return 'string';
   const t = input.toLowerCase().trim();
+  if (t === 'timeframe' || t === 'date_range' || t === 'daterange') return 'date';
   if (t === 'string' || t === 'text' || t === 'varchar' || t === 'char') return 'string';
   if (t === 'number' || t === 'integer' || t === 'int' || t === 'bigint' || t === 'long' ||
       t === 'float' || t === 'double' || t === 'decimal' || t === 'numeric') return 'number';
@@ -431,6 +567,77 @@ export function normalizeFilterType(input: string | undefined): string {
   const known = new Set(['bind', 'boolean', 'composite', 'date', 'null', 'number', 'query', 'string', 'user_attribute']);
   if (known.has(t)) return t;
   return 'string';
+}
+
+function normalizeFilterKind(input: unknown): string {
+  const value = typeof input === 'string' ? input.trim() : '';
+  return value || 'EQUALS';
+}
+
+function isUnsupportedRunFilterKind(kind: string): boolean {
+  // Dashboard controls can expose UI-only timeframe filters. /v1/query/run
+  // validates filter kinds against field-type enums and rejects TIMEFRAME, so
+  // native deck export should skip those controls instead of failing the deck.
+  return kind.toUpperCase() === 'TIMEFRAME';
+}
+
+function sanitizeRunFilters(
+  filters: Record<string, unknown>,
+  scope: string,
+): Record<string, unknown> {
+  const next: Record<string, unknown> = {};
+  const removed: string[] = [];
+  for (const [field, raw] of Object.entries(filters)) {
+    if (isObject(raw) && isUnsupportedRunFilterKind(normalizeFilterKind(raw.kind))) {
+      removed.push(field);
+      continue;
+    }
+    next[field] = raw;
+  }
+  if (removed.length > 0) {
+    deckLog.warn(scope, 'Skipped unsupported dashboard timeframe filter(s) for native query export', {
+      fields: removed,
+    });
+  }
+  return next;
+}
+
+function inferFilterTypeForKind(
+  type: string | undefined,
+  kind: string,
+  field: string,
+  values: unknown[],
+): string {
+  const normalized = normalizeFilterType(type);
+  const upperKind = kind.toUpperCase();
+  const dateKind =
+    upperKind.includes('TIMEFRAME') ||
+    upperKind.includes('DATE') ||
+    upperKind === 'BETWEEN' ||
+    upperKind === 'RANGE';
+  if (dateKind) return 'date';
+
+  if (normalized !== 'string') return normalized;
+
+  const lowerField = field.toLowerCase();
+  const fieldLooksTemporal =
+    lowerField.endsWith('_at') ||
+    lowerField.endsWith('_date') ||
+    lowerField.includes('date') ||
+    lowerField.includes('time');
+  const valueLooksTemporal = values.some((value) => {
+    const raw = String(value ?? '').trim().toLowerCase();
+    return (
+      /^\d{4}-\d{2}-\d{2}/.test(raw) ||
+      raw.includes('day') ||
+      raw.includes('week') ||
+      raw.includes('month') ||
+      raw.includes('quarter') ||
+      raw.includes('year')
+    );
+  });
+
+  return fieldLooksTemporal && valueLooksTemporal ? 'date' : normalized;
 }
 
 function collectTileViewPrefixes(payload: Record<string, unknown>): Set<string> {
@@ -460,10 +667,13 @@ function applyFilterOverrides(
   scope: string
 ): Record<string, unknown> {
   if (!overrides || Object.keys(overrides).length === 0) return payload;
-  const existing = isObject(payload.filters) ? { ...payload.filters as Record<string, unknown> } : {};
+  const existing = isObject(payload.filters)
+    ? sanitizeRunFilters({ ...payload.filters as Record<string, unknown> }, scope)
+    : {};
   const viewPrefixes = collectTileViewPrefixes(payload);
   const applied: string[] = [];
   const skipped: string[] = [];
+  const unsupported: string[] = [];
   for (const [field, override] of Object.entries(overrides)) {
     const viewPrefix = field.includes('.') ? field.split('.')[0] : undefined;
     const alreadyFiltered = field in existing;
@@ -478,11 +688,18 @@ function applyFilterOverrides(
     }
     const base = isObject(existing[field]) ? (existing[field] as Record<string, unknown>) : {};
     const baseType = typeof base.type === 'string' ? base.type : undefined;
+    const kind = normalizeFilterKind(override.kind ?? base.kind);
+    if (isUnsupportedRunFilterKind(kind)) {
+      delete existing[field];
+      unsupported.push(field);
+      continue;
+    }
+    const values = override.values;
     existing[field] = {
       ...base,
-      kind: override.kind ?? base.kind ?? 'EQUALS',
-      type: normalizeFilterType(override.type ?? baseType),
-      values: override.values,
+      kind,
+      type: inferFilterTypeForKind(override.type ?? baseType, kind, field, values),
+      values,
       is_negative: override.isNegative ?? base.is_negative ?? false,
     };
     applied.push(field);
@@ -494,6 +711,11 @@ function applyFilterOverrides(
     deckLog.warn(scope, `Skipped ${skipped.length} incompatible filter override(s) (field not on tile's topic)`, {
       fields: skipped,
       tileViews: Array.from(viewPrefixes),
+    });
+  }
+  if (unsupported.length > 0) {
+    deckLog.warn(scope, 'Skipped unsupported dashboard timeframe override(s) for native query export', {
+      fields: unsupported,
     });
   }
   return { ...payload, filters: existing };
@@ -545,62 +767,90 @@ export async function runTileQuery(
   if (signal?.aborted) throw new Error('Query cancelled.');
 
   const { payload: basePayload, droppedKeys } = buildRunPayload(extracted.body);
-  const payload = applyFilterOverrides(basePayload, filterOverrides, scope);
-  deckLog.step(scope, `Running query via /v1/query/run`, {
-    bodyPath: extracted.path,
-    payloadKeys: Object.keys(payload),
-    droppedKeys,
-    modelId: payload.modelId,
-    fieldCount: Array.isArray(payload.fields) ? (payload.fields as unknown[]).length : 0,
-    sanitized: sanitizePayloadForLog(payload),
-  });
+  let payload = normalizeRunPayloadRefs(applyFilterOverrides(basePayload, filterOverrides, scope), scope);
+  let response: RawQueryResponse | null = null;
+  let parsed: { columns: TileColumn[]; rows: Array<Record<string, unknown>> } | null = null;
+  const maxMissingFieldRepairs = 2;
 
-  const wireBody = (shape: RunShape) =>
-    shape === 'wrapped' ? { query: payload } : payload;
-
-  const tryShape = async (shape: RunShape) =>
-    omniProxy<RawQueryResponse>(baseUrl, apiKey, 'POST', '/v1/query/run', {
-      body: wireBody(shape),
+  const runPayload = async (candidatePayload: Record<string, unknown>) => {
+    deckLog.step(scope, `Running query via /v1/query/run`, {
+      bodyPath: extracted.path,
+      payloadKeys: Object.keys(candidatePayload),
+      droppedKeys,
+      modelId: candidatePayload.modelId,
+      fieldCount: Array.isArray(candidatePayload.fields) ? (candidatePayload.fields as unknown[]).length : 0,
+      sanitized: sanitizePayloadForLog(candidatePayload),
     });
 
-  const order: RunShape[] = cachedRunShape
-    ? [cachedRunShape, cachedRunShape === 'wrapped' ? 'flat' : 'wrapped']
-    : ['wrapped', 'flat'];
+    const wireBody = (shape: RunShape) =>
+      shape === 'wrapped' ? { query: candidatePayload } : candidatePayload;
 
-  let response: RawQueryResponse | null = null;
-  const failures: string[] = [];
-  for (const shape of order) {
+    const tryShape = async (shape: RunShape) =>
+      omniProxy<RawQueryResponse>(baseUrl, apiKey, 'POST', '/v1/query/run', {
+        body: wireBody(shape),
+      });
+
+    const order: RunShape[] = cachedRunShape
+      ? [cachedRunShape, cachedRunShape === 'wrapped' ? 'flat' : 'wrapped']
+      : ['wrapped', 'flat'];
+
+    let runResponse: RawQueryResponse | null = null;
+    const failures: string[] = [];
+    for (const shape of order) {
+      try {
+        runResponse = await tryShape(shape);
+        cachedRunShape = shape;
+        deckLog.info(scope, `Run shape accepted`, { shape });
+        break;
+      } catch (err) {
+        const e = describeError(err);
+        failures.push(`shape=${shape}${e.status ? ` [HTTP ${e.status}]` : ''}: ${e.message}${e.detail ? ` | ${e.detail.slice(0, 200)}` : ''}`);
+        deckLog.warn(scope, `Run shape ${shape} failed`, {
+          status: e.status,
+          message: e.message,
+          detail: e.detail?.slice(0, 240),
+        });
+        if (e.status && e.status !== 400 && e.status !== 422) break;
+      }
+    }
+    if (!runResponse) {
+      throw new Error(`/v1/query/run failed for all shapes. ${failures.join(' || ')}`);
+    }
+
+    const responseRecord = runResponse as unknown as Record<string, unknown>;
+    const rawField = responseRecord.raw;
+    deckLog.info(scope, 'Run response keys', {
+      keys: Object.keys(responseRecord),
+      rawType: typeof rawField,
+      rawLen: typeof rawField === 'string' ? rawField.length : undefined,
+      rawPreview: typeof rawField === 'string' ? rawField.slice(0, 300) : undefined,
+    });
+
+    const runParsed = parseQueryResponse(runResponse, scope);
+    return { runResponse, runParsed };
+  };
+
+  for (let repairAttempt = 0; repairAttempt <= maxMissingFieldRepairs; repairAttempt += 1) {
     try {
-      response = await tryShape(shape);
-      cachedRunShape = shape;
-      deckLog.info(scope, `Run shape accepted`, { shape });
+      const result = await runPayload(payload);
+      response = result.runResponse;
+      parsed = result.runParsed;
       break;
     } catch (err) {
-      const e = describeError(err);
-      failures.push(`shape=${shape}${e.status ? ` [HTTP ${e.status}]` : ''}: ${e.message}${e.detail ? ` | ${e.detail.slice(0, 200)}` : ''}`);
-      deckLog.warn(scope, `Run shape ${shape} failed`, {
-        status: e.status,
-        message: e.message,
-        detail: e.detail?.slice(0, 240),
-      });
-      if (e.status && e.status !== 400 && e.status !== 422) break;
+      const message = err instanceof Error ? err.message : String(err);
+      const missingField = extractMissingField(message);
+      if (!missingField || repairAttempt >= maxMissingFieldRepairs) throw err;
+      const repaired = removeMissingFieldFromPayload(payload, missingField, scope);
+      if (!repaired.changed) throw err;
+      payload = normalizeRunPayloadRefs(repaired.payload, scope);
     }
   }
+
   if (!response) {
-    throw new Error(`/v1/query/run failed for all shapes. ${failures.join(' || ')}`);
+    throw new Error('/v1/query/run returned no response.');
   }
-
-  const responseRecord = response as unknown as Record<string, unknown>;
-  const rawField = responseRecord.raw;
-  deckLog.info(scope, 'Run response keys', {
-    keys: Object.keys(responseRecord),
-    rawType: typeof rawField,
-    rawLen: typeof rawField === 'string' ? rawField.length : undefined,
-    rawPreview: typeof rawField === 'string' ? rawField.slice(0, 300) : undefined,
-  });
-
-  const parsed = parseQueryResponse(response, scope);
   if (!parsed) {
+    const responseRecord = response as unknown as Record<string, unknown>;
     const dumpKeys = Object.keys(responseRecord).slice(0, 10);
     const dumpSummary: Record<string, unknown> = {};
     for (const k of dumpKeys) {

@@ -10,6 +10,7 @@ interface MigrationAnimationProps {
   total: number;
   completed: boolean;
   hasFailures: boolean;
+  mode?: 'migration' | 'remap';
   currentItem?: string;
   sourceHost?: string;
   targetHost?: string;
@@ -45,7 +46,7 @@ function useCountUp(target: number, duration = 600, reduced = false) {
 }
 
 function Terminal({ label, host, kind }: { label: string; host?: string; kind: 'source' | 'target' }) {
-  const accent = kind === 'source' ? '#C8186A' : '#047857';
+  const accent = kind === 'source' ? '#C83B70' : '#047857';
   const bg = kind === 'source' ? 'rgba(255,71,148,0.08)' : 'rgba(16,185,129,0.08)';
   const border = kind === 'source' ? 'rgba(255,71,148,0.3)' : 'rgba(16,185,129,0.3)';
   return (
@@ -68,11 +69,45 @@ function Terminal({ label, host, kind }: { label: string; host?: string; kind: '
   );
 }
 
+function MigrationSceneDecor({ mode, reduced }: { mode: 'migration' | 'remap'; reduced: boolean }) {
+  if (mode === 'remap') {
+    return (
+      <>
+        <div className="migration-scene-sky" aria-hidden />
+        <div className="migration-scene-dock migration-scene-dock-left" aria-hidden />
+        <div className="migration-scene-dock migration-scene-dock-right" aria-hidden />
+        <div className="migration-scene-water" aria-hidden>
+          {!reduced && [0, 1, 2].map((i) => <span key={i} style={{ animationDelay: `${i * 700}ms` }} />)}
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <div className="migration-scene-space" aria-hidden>
+        {[0, 1, 2, 3, 4, 5].map((i) => (
+          <span key={i} className={reduced ? '' : 'migration-star-twinkle'} style={{ animationDelay: `${i * 340}ms` }} />
+        ))}
+      </div>
+      <div className="migration-scene-earth" aria-hidden />
+      <div className="migration-scene-moon" aria-hidden />
+      {!reduced && (
+        <>
+          <span className="migration-orbit-dash migration-orbit-dash-a" aria-hidden />
+          <span className="migration-orbit-dash migration-orbit-dash-b" aria-hidden />
+        </>
+      )}
+    </>
+  );
+}
+
 export function MigrationAnimation({
   current,
   total,
   completed,
   hasFailures,
+  mode = 'migration',
   currentItem,
   sourceHost,
   targetHost,
@@ -82,6 +117,7 @@ export function MigrationAnimation({
   const pct = total > 0 ? Math.min(100, Math.round((current / total) * 100)) : 0;
   const displayPct = useCountUp(pct, 500, reduced);
   const firedRef = useRef(false);
+  const routeVehicle = mode === 'remap' ? 'sailboat' : 'rocket';
 
   useEffect(() => {
     if (completed && !hasFailures && !firedRef.current) {
@@ -95,7 +131,7 @@ export function MigrationAnimation({
       <div
         className="relative overflow-hidden rounded-2xl p-5 animate-fadeIn"
         style={{
-          background: 'linear-gradient(135deg, rgba(16,185,129,0.1) 0%, rgba(255,71,148,0.06) 100%)',
+          background: '#FFFFFF',
           border: '1px solid rgba(16,185,129,0.3)',
         }}
       >
@@ -106,7 +142,9 @@ export function MigrationAnimation({
               Wheels down! Blobby stuck the landing.
             </div>
             <div className="text-[13px] text-content-secondary mt-1">
-              All {total} dashboard{total !== 1 ? 's' : ''} are settled in at their new home.
+              {mode === 'remap'
+                ? `${total} dashboard${total !== 1 ? 's' : ''} finished remapping.`
+                : `${total} dashboard${total !== 1 ? 's are' : ' is'} settled in at ${total !== 1 ? 'their' : 'its'} new home.`}
             </div>
           </div>
         </div>
@@ -119,7 +157,7 @@ export function MigrationAnimation({
       <div
         className="rounded-2xl p-5 animate-fadeIn"
         style={{
-          background: 'linear-gradient(135deg, rgba(245,158,11,0.08) 0%, rgba(245,158,11,0.02) 100%)',
+          background: '#FFFFFF',
           border: '1px solid rgba(245,158,11,0.3)',
         }}
       >
@@ -141,38 +179,32 @@ export function MigrationAnimation({
 
   return (
     <div
-      className="relative overflow-hidden rounded-2xl p-5 animate-fadeIn"
+      className={`migration-workflow-scene migration-workflow-scene-${mode} relative overflow-hidden rounded-2xl p-5 animate-fadeIn`}
       style={{
-        background: 'linear-gradient(180deg, #EAF4FF 0%, #FFF8FB 100%)',
-        border: '1px solid rgba(242,190,214,0.8)',
-        boxShadow: '0 1px 4px rgba(200,24,100,0.06), 0 4px 16px rgba(200,24,100,0.04)',
+        background: mode === 'remap' ? '#F8F9FD' : '#404754',
+        border: '1px solid rgba(217,222,232,0.95)',
+        boxShadow: 'none',
       }}
       aria-live="polite"
       aria-atomic="true"
     >
-      {!reduced && (
-        <>
-          <div className="absolute top-3 left-8 w-8 h-3 rounded-full bg-white/80" style={{ animation: 'float 4s ease-in-out infinite' }} />
-          <div className="absolute top-6 right-24 w-10 h-3 rounded-full bg-white/70" style={{ animation: 'float 5s 0.5s ease-in-out infinite' }} />
-          <div className="absolute top-2 right-8 w-6 h-2 rounded-full bg-white/60" style={{ animation: 'float 6s 1s ease-in-out infinite' }} />
-        </>
-      )}
+      <MigrationSceneDecor mode={mode} reduced={reduced} />
 
       <div className="flex items-center justify-between mb-3 relative">
-        <span className="text-[11px] font-bold uppercase tracking-widest text-content-tertiary">
-          Flight plan
+        <span className={`text-[11px] font-bold uppercase tracking-widest ${mode === 'migration' ? 'text-white/78' : 'text-content-tertiary'}`}>
+          {mode === 'remap' ? 'Remap route' : 'Rocket route'}
         </span>
         <div className="flex items-center gap-3">
-          <span className="text-[12px] text-content-secondary tabular-nums">
-            <span className="font-bold text-content-primary">{current}</span>
-            <span className="text-content-tertiary"> / </span>
+          <span className={`text-[12px] tabular-nums ${mode === 'migration' ? 'text-white/72' : 'text-content-secondary'}`}>
+            <span className={`font-bold ${mode === 'migration' ? 'text-white' : 'text-content-primary'}`}>{current}</span>
+            <span className={mode === 'migration' ? 'text-white/45' : 'text-content-tertiary'}> / </span>
             <span className="font-semibold">{total}</span>
           </span>
           <span
             className="text-[12px] font-bold tabular-nums px-2 py-0.5 rounded-full"
             style={{
               background: 'rgba(255,71,148,0.12)',
-              color: '#C8186A',
+              color: '#C83B70',
               border: '1px solid rgba(255,71,148,0.25)',
             }}
           >
@@ -181,37 +213,37 @@ export function MigrationAnimation({
         </div>
       </div>
 
-      <div className="flex items-end gap-3 relative">
+      <div className="flex items-end gap-3 relative z-10">
         <Terminal label="Depart" kind="source" host={sourceHost} />
 
         <div className="flex-1 relative" style={{ height: 96 }}>
           <svg className="absolute inset-0 w-full h-full" preserveAspectRatio="none" viewBox="0 0 100 60">
-            <path d="M 2 48 Q 50 4 98 48" stroke="#F2BED6" strokeWidth="1" fill="none" strokeDasharray="2,3" />
+            <path
+              d="M 2 48 Q 50 4 98 48"
+              stroke={mode === 'migration' ? 'rgba(255,255,255,0.48)' : '#E8D5DE'}
+              strokeWidth="1"
+              fill="none"
+              strokeDasharray="2,3"
+            />
           </svg>
           <div
             className="absolute"
             style={{
-              left: `calc(${Math.max(2, Math.min(pct, 98))}% - 40px)`,
+              left: `calc(${Math.max(2, Math.min(pct, 98))}% - 58px)`,
               bottom: `${Math.sin((pct / 100) * Math.PI) * 42 + 16}px`,
               transition: reduced ? 'none' : 'left 600ms cubic-bezier(0.22, 1, 0.36, 1), bottom 600ms cubic-bezier(0.22, 1, 0.36, 1)',
               transform: pct < 50 ? 'rotate(-8deg)' : 'rotate(6deg)',
             }}
           >
             <div className="relative">
-              <Vehicle kind="jet" width={80} height={40} />
-              <Blobby
-                mood="migration"
-                size={30}
-                className="absolute"
-                style={{ left: 24, top: -6 }}
-              />
-              {!reduced && pct > 0 && pct < 100 && (
+              <Vehicle kind={routeVehicle} width={mode === 'remap' ? 112 : 124} height={mode === 'remap' ? 92 : 84} />
+              {mode === 'migration' && !reduced && pct > 0 && pct < 100 && (
                 <>
                   <span
                     className="absolute rounded-full"
                     style={{
-                      left: -8,
-                      top: 16,
+                      left: -6,
+                      top: 50,
                       width: 10,
                       height: 4,
                       background: 'rgba(255,71,148,0.45)',
@@ -222,7 +254,7 @@ export function MigrationAnimation({
                     className="absolute rounded-full"
                     style={{
                       left: -16,
-                      top: 18,
+                      top: 54,
                       width: 8,
                       height: 3,
                       background: 'rgba(255,71,148,0.3)',
@@ -239,10 +271,18 @@ export function MigrationAnimation({
       </div>
 
       {currentItem && (
-        <div className="mt-3 flex items-center gap-2 text-[12px] text-content-secondary relative">
+        <div className={`mt-3 flex items-center gap-2 text-[12px] relative z-10 ${mode === 'migration' ? 'text-white/80' : 'text-content-secondary'}`}>
           <span className={`w-1.5 h-1.5 rounded-full bg-omni-500 ${reduced ? '' : 'animate-pulse'}`} />
           <span className="truncate">
-            Now flying <span className="font-semibold text-content-primary">{currentItem}</span> to its new home
+            {mode === 'remap' ? (
+              <>
+                Remapping <span className="font-semibold text-content-primary">{currentItem}</span>
+              </>
+            ) : (
+              <>
+                Now flying <span className="font-semibold text-white">{currentItem}</span> to its new home
+              </>
+            )}
           </span>
         </div>
       )}

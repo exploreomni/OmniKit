@@ -217,7 +217,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         <h2 className="text-2xl font-semibold text-content-primary">Review & Confirm</h2>
         <p className="text-sm text-content-secondary mt-1">
           {state.sameInstance
-            ? 'Review your in-place model swap before executing. Dashboards will not be duplicated — only their model linkage will be updated.'
+            ? 'Review your model remap before applying it. Dashboards will not be duplicated — only their model linkage will be updated.'
             : 'Review your migration plan before executing.'}
         </p>
       </div>
@@ -388,7 +388,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
               )}
               <div>
                 <p className={`text-xs leading-relaxed ${allReady ? 'text-green-800' : 'text-amber-800'}`}>
-                  Dry run completed -- {readyCount} of {dryRunResults.length} dashboard{dryRunResults.length !== 1 ? 's' : ''} ready to migrate.
+                  Dry run completed -- {readyCount} of {dryRunResults.length} dashboard{dryRunResults.length !== 1 ? 's' : ''} ready to {state.sameInstance ? 'remap' : 'migrate'}.
                   {failedResults.length > 0 && ` ${failedResults.length} will be skipped due to errors.`}
                 </p>
                 {failedResults.length > 0 && (
@@ -410,7 +410,9 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
       <div className="flex items-start gap-2 px-4 py-3 bg-yellow-50 border border-yellow-200 rounded-card">
         <AlertTriangle size={16} className="text-yellow-600 mt-0.5 flex-shrink-0" />
         <p className="text-xs text-yellow-800 leading-relaxed">
-          Importing creates new copies in the target. Original dashboards are not modified or deleted.
+          {state.sameInstance
+            ? 'This changes the model attached to each selected dashboard in the current Omni instance. It does not create a copy.'
+            : 'Importing creates new copies in the target. Original dashboards are not modified or deleted.'}
         </p>
       </div>
 
@@ -442,20 +444,24 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
             className="btn-primary text-sm"
           >
             <Zap size={14} />
-            Execute Migration
+            {state.sameInstance ? 'Apply Model Remap' : 'Execute Migration'}
           </button>
         </div>
       </div>
 
       <ConfirmDialog
         open={showConfirm}
-        title="Confirm Migration"
+        title={state.sameInstance ? 'Confirm Model Remap' : 'Confirm Migration'}
         message={
           showDryRunWarning
-            ? `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running a dry run first. We recommend running a dry run to validate your migration plan. Continue anyway?`
-            : `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''}. This creates new copies in the target -- originals are not modified. Continue?`
+            ? state.sameInstance
+              ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running a dry run first. We recommend running a dry run to validate your model mapping. Continue anyway?`
+              : `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running a dry run first. We recommend running a dry run to validate your migration plan. Continue anyway?`
+            : state.sameInstance
+              ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''}. No dashboard copy will be created. Continue?`
+              : `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''}. This creates new copies in the target -- originals are not modified. Continue?`
         }
-        confirmLabel="Execute Migration"
+        confirmLabel={state.sameInstance ? 'Apply Model Remap' : 'Execute Migration'}
         cancelLabel="Cancel"
         variant={showDryRunWarning ? 'danger' : 'primary'}
         onConfirm={() => {

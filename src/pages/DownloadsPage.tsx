@@ -5,6 +5,7 @@ import { useLogOperation } from '@/contexts/OperationLogContext';
 import { listFolders, listDocuments, omniProxy, omniProxyDownload } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
+import { Blobby } from '@/components/ui/Blobby';
 import type { OmniFolder, OmniDocument } from '@/types';
 
 const FORMAT_OPTIONS = [
@@ -52,7 +53,7 @@ export function DownloadsPage() {
     async function load() {
       setLoadingFolders(true);
       try {
-        const res = await listFolders(connection.baseUrl, connection.apiKey);
+        const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
         setFolders(Array.isArray(res.folders) ? res.folders : []);
       } catch { /* ignore */ }
       finally { setLoadingFolders(false); }
@@ -67,7 +68,7 @@ export function DownloadsPage() {
     if (!folderId) { setDocuments([]); return; }
     setLoadingDocs(true);
     try {
-      const res = await listDocuments(connection.baseUrl, connection.apiKey, folderId);
+      const res = await listDocuments(connection.baseUrl, connection.apiKey, folderId, { allPages: true, pageSize: 100 });
       setDocuments(Array.isArray(res.documents) ? res.documents : []);
     } catch { setDocuments([]); }
     finally { setLoadingDocs(false); }
@@ -212,14 +213,7 @@ export function DownloadsPage() {
       <PageHeader
         title="Dashboard Downloads"
         description="Export dashboards in multiple formats with custom options."
-        icon={
-          <img
-            src="/blobby-download.webp"
-            alt="Blobby with graduation cap"
-            className="w-10 h-10 object-contain animate-float"
-            style={{ animationDuration: '3.5s' }}
-          />
-        }
+        icon={<Blobby mood="download" size={58} className="animate-float" style={{ animationDuration: '3.5s' }} />}
       />
 
       <div className="card space-y-5">
@@ -279,7 +273,7 @@ export function DownloadsPage() {
                   onClick={() => setFormat(opt.value)}
                   className={`flex flex-col items-center gap-1.5 p-3 rounded-card border-2 transition-all ${
                     isSelected
-                      ? 'border-omni-700 bg-omni-100/30'
+                      ? 'border-omni-700 bg-surface-secondary'
                       : 'border-border hover:border-omni-500/40'
                   }`}
                 >

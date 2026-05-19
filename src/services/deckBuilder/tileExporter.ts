@@ -25,13 +25,13 @@ interface RunResult {
 
 export async function runTileExports(opts: RunOptions): Promise<RunResult> {
   const { baseUrl, apiKey, dashboardId, tiles, strategy, onUpdate, signal, filterOverrides, perTileSource } = opts;
-  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 3, 6));
+  const concurrency = Math.max(1, Math.min(opts.concurrency ?? 2, 3));
   const results: Record<string, TileExportState> = {};
 
   const sourceFor = (tileId: string): TileVisualSource => {
     const override = perTileSource?.[tileId];
     if (override) return override;
-    return strategy === 'tile-image' ? 'tile-image' : 'native';
+    return strategy === 'full-dashboard' ? 'full-dashboard' : strategy === 'tile-image' ? 'tile-image' : 'native';
   };
 
   deckLog.step('exporter', `Starting tile run`, {
@@ -46,6 +46,8 @@ export async function runTileExports(opts: RunOptions): Promise<RunResult> {
     const src = sourceFor(tile.id);
     if (src === 'skip') {
       results[tile.id] = { tileId: tile.id, status: 'skipped', strategy, message: 'Skipped by user' };
+    } else if (src === 'full-dashboard') {
+      results[tile.id] = { tileId: tile.id, status: 'queued', strategy, message: 'Awaiting full-dashboard image' };
     } else {
       results[tile.id] = { tileId: tile.id, status: 'queued', strategy };
     }
@@ -64,6 +66,39 @@ export async function runTileExports(opts: RunOptions): Promise<RunResult> {
       const update = (patch: Partial<TileExportState>) => {
         results[tile.id] = { ...results[tile.id], ...patch };
         onUpdate(results[tile.id]);
+      };
+      const exportTileImage = async (fallbackMessage?: string) => {
+        const defaultShapes: TileExportShape[] = ['queryIdentifierMapKey'];
+        const shapesToTry: TileExportShape[] = firstSuccessfulShape
+          ? ([firstSuccessfulShape, ...defaultShapes].filter(
+              (s, i, a) => a.indexOf(s) === i
+            ) as TileExportShape[])
+          : defaultShapes;
+
+        const logRaw = !firstStatusLogged;
+        firstStatusLogged = true;
+
+        const { blob, shapeUsed } = await exportTileAsPng(baseUrl, apiKey, dashboardId, {
+          tile,
+          signal,
+          shapes: shapesToTry,
+          filterOverrides,
+          logFirstStatusPayload: logRaw,
+          onStatusChange: (msg) => update({ status: 'polling', message: fallbackMessage ? `${fallbackMessage}: ${msg}` : msg }),
+        });
+        if (!firstSuccessfulShape) {
+          firstSuccessfulShape = shapeUsed;
+          deckLog.step('exporter', `Locked successful per-tile shape: ${shapeUsed}`);
+        }
+        update({ status: 'fetching', message: 'Encoding image' });
+        const dataUrl = await blobToDataUrl(blob);
+        update({
+          status: 'done',
+          message: fallbackMessage ? `${fallbackMessage}: Ready` : 'Ready',
+          pngDataUrl: dataUrl,
+          pngSize: blob.size,
+          renderKind: undefined,
+        });
       };
 
       const resolved = sourceFor(tile.id);
@@ -84,45 +119,26 @@ export async function runTileExports(opts: RunOptions): Promise<RunResult> {
           });
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : 'Query run failed.';
-          deckLog.error('exporter', `Tile query failed: ${tile.name}`, { tileId: tile.id, error: errorMessage });
-          update({ status: 'failed', error: errorMessage });
+          deckLog.warn('exporter', `Tile native query failed; trying Omni image fallback: ${tile.name}`, { tileId: tile.id, error: errorMessage });
+          update({ status: 'polling', message: 'Native query failed; trying Omni image fallback' });
+          try {
+            await exportTileImage('Image fallback');
+          } catch (fallbackErr) {
+            const fallbackMessage = fallbackErr instanceof Error ? fallbackErr.message : 'Tile image export failed.';
+            deckLog.error('exporter', `Tile image fallback failed: ${tile.name}`, {
+              tileId: tile.id,
+              nativeError: errorMessage,
+              fallbackError: fallbackMessage,
+            });
+            update({ status: 'failed', error: `${errorMessage} Fallback image failed: ${fallbackMessage}` });
+          }
         }
         continue;
       }
 
       if (resolved === 'tile-image') {
         try {
-          const defaultShapes: TileExportShape[] = ['queryIdentifierMapKey'];
-          const shapesToTry: TileExportShape[] = firstSuccessfulShape
-            ? ([firstSuccessfulShape, ...defaultShapes].filter(
-                (s, i, a) => a.indexOf(s) === i
-              ) as TileExportShape[])
-            : defaultShapes;
-
-          const logRaw = !firstStatusLogged;
-          firstStatusLogged = true;
-
-          const { blob, shapeUsed } = await exportTileAsPng(baseUrl, apiKey, dashboardId, {
-            tile,
-            signal,
-            shapes: shapesToTry,
-            filterOverrides,
-            logFirstStatusPayload: logRaw,
-            onStatusChange: (msg) => update({ status: 'polling', message: msg }),
-          });
-          if (!firstSuccessfulShape) {
-            firstSuccessfulShape = shapeUsed;
-            deckLog.step('exporter', `Locked successful per-tile shape: ${shapeUsed}`);
-          }
-          update({ status: 'fetching', message: 'Encoding image' });
-          const dataUrl = await blobToDataUrl(blob);
-          update({
-            status: 'done',
-            message: 'Ready',
-            pngDataUrl: dataUrl,
-            pngSize: blob.size,
-            renderKind: undefined,
-          });
+          await exportTileImage();
         } catch (err) {
           const errorMessage = err instanceof Error ? err.message : 'Tile image export failed.';
           deckLog.error('exporter', `Tile failed: ${tile.name}`, { tileId: tile.id, error: errorMessage });
@@ -131,7 +147,7 @@ export async function runTileExports(opts: RunOptions): Promise<RunResult> {
         continue;
       }
 
-      // strategy === 'full-dashboard' is handled at page level (single PNG, mirrored to all tiles)
+      // Full-dashboard slides are handled at page/batch level (single PNG, mirrored to selected slides).
       update({ status: 'queued', message: 'Awaiting full-dashboard fallback' });
     }
   });

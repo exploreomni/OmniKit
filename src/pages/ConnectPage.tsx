@@ -1,8 +1,6 @@
-import { useMemo, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
-  Eye,
-  EyeOff,
   CheckCircle,
   XCircle,
   Loader2,
@@ -25,13 +23,15 @@ import {
   Shield,
   Link2,
   HelpCircle,
-  Copy,
-  Check,
   Presentation,
   ChevronRight,
+  LayoutDashboard,
+  RefreshCw,
 } from 'lucide-react';
-import { testConnection } from '@/services/omniApi';
+import { listDocuments, listFolders, listGroups, listModels, listUsers, omniProxy, testConnection } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
+import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';
 
 type CapabilityIcon = typeof Sparkles;
 
@@ -76,15 +76,19 @@ function parseHost(url: string): string | null {
   }
 }
 
+function isRecognizedOmniHost(host: string | null) {
+  if (!host) return false;
+  return /(^|\.)((explore)?omni\.dev|omni\.co|exploreomni\.dev)$/i.test(host);
+}
+
 function CapabilityCard({ cap }: { cap: Capability }) {
   return (
     <div
-      className="group relative rounded-2xl p-4 transition-all duration-200 hover:-translate-y-0.5"
+      className="group relative rounded-2xl p-6 min-h-[164px] transition-all duration-200 hover:-translate-y-0.5"
       style={{
-        background: 'linear-gradient(140deg, rgba(255,255,255,0.18) 0%, rgba(255,255,255,0.06) 100%)',
-        border: '1px solid rgba(255,255,255,0.22)',
-        backdropFilter: 'blur(10px)',
-        boxShadow: '0 4px 20px -6px rgba(0,0,0,0.12), inset 0 1px 0 rgba(255,255,255,0.15)',
+        background: '#7A2E52',
+        border: '1px solid rgba(255,255,255,0.32)',
+        boxShadow: 'none',
       }}
     >
       <div
@@ -92,27 +96,27 @@ function CapabilityCard({ cap }: { cap: Capability }) {
         className="absolute inset-0 rounded-2xl pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-300"
         style={{ border: '1px solid rgba(255,255,255,0.35)' }}
       />
-      <div className="relative flex items-start justify-between mb-3">
-        <div className="flex gap-1">
+      <div className="relative mb-5 flex items-start gap-3">
+        <div className="grid min-w-0 flex-1 grid-cols-4 gap-1.5">
           {cap.icons.slice(0, 4).map((Icon, i) => (
             <div
               key={i}
-              className="w-6 h-6 rounded-lg flex items-center justify-center transition-transform duration-300 group-hover:translate-x-0.5"
+              className="h-7 w-7 rounded-lg flex items-center justify-center transition-transform duration-300 group-hover:translate-x-0.5"
               style={{
-                background: 'linear-gradient(135deg, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0.12) 100%)',
+                background: '#8A3A60',
                 border: '1px solid rgba(255,255,255,0.35)',
                 color: '#FFFFFF',
                 transitionDelay: `${i * 40}ms`,
               }}
             >
-              <Icon size={12} />
+              <Icon size={14} />
             </div>
           ))}
         </div>
         <span
-          className="text-[10px] font-bold uppercase tracking-widest px-2 py-0.5 rounded-full"
+          className="shrink-0 whitespace-nowrap rounded-full px-2 py-1 text-[9px] font-bold uppercase tracking-[0.08em]"
           style={{
-            background: 'rgba(255,255,255,0.18)',
+            background: '#8A3A60',
             color: 'rgba(255,255,255,0.95)',
             border: '1px solid rgba(255,255,255,0.25)',
           }}
@@ -121,14 +125,14 @@ function CapabilityCard({ cap }: { cap: Capability }) {
         </span>
       </div>
       <div className="relative">
-        <h3 className="text-[15px] font-semibold text-white leading-tight mb-1 flex items-center gap-1.5">
+        <h3 className="text-[18px] font-semibold text-white leading-tight mb-2 flex items-center gap-1.5">
           {cap.title}
           <ChevronRight
             size={14}
             className="opacity-0 -translate-x-1 transition-all duration-200 group-hover:opacity-90 group-hover:translate-x-0 text-white/90"
           />
         </h3>
-        <p className="text-[12px] leading-relaxed text-white/80">{cap.blurb}</p>
+        <p className="text-[13px] leading-relaxed text-white/80">{cap.blurb}</p>
       </div>
     </div>
   );
@@ -141,18 +145,273 @@ interface QuickStartTile {
   icon: CapabilityIcon;
 }
 
+interface WorkspaceSnapshot {
+  dashboards: number | null;
+  folders: number | null;
+  models: number | null;
+  users: number | null;
+  groups: number | null;
+  schedules: number | null;
+  connections: number | null;
+  failures: string[];
+  loadedAt: Date | null;
+}
+
 const quickStartTiles: QuickStartTile[] = [
   { label: 'Migrate dashboards', description: 'Move content between instances', to: '/dashboards/migrate', icon: ArrowRightLeft },
   { label: 'Audit permissions', description: 'Review users and group access', to: '/users', icon: Shield },
   { label: 'Build a deck', description: 'Export dashboards to PowerPoint', to: '/deck-builder', icon: Presentation },
 ];
 
+const EMPTY_SNAPSHOT: WorkspaceSnapshot = {
+  dashboards: null,
+  folders: null,
+  models: null,
+  users: null,
+  groups: null,
+  schedules: null,
+  connections: null,
+  failures: [],
+  loadedAt: null,
+};
+
+function countNestedFolders(folders: Array<{ children?: unknown }>): number {
+  return folders.reduce((total, folder) => {
+    const children = Array.isArray(folder.children) ? folder.children as Array<{ children?: unknown }> : [];
+    return total + 1 + countNestedFolders(children);
+  }, 0);
+}
+
+function totalFromScim(payload: unknown): number | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+  const total = Number(record.totalResults);
+  if (Number.isFinite(total)) return total;
+  const resources = record.Resources;
+  return Array.isArray(resources) ? resources.length : null;
+}
+
+function totalFromPageInfo(payload: unknown): number | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const record = payload as Record<string, unknown>;
+  const pageInfo = record.pageInfo;
+  if (pageInfo && typeof pageInfo === 'object') {
+    const total = Number((pageInfo as Record<string, unknown>).totalRecords);
+    if (Number.isFinite(total)) return total;
+  }
+  const total = Number(record.totalRecords);
+  if (Number.isFinite(total)) return total;
+  const records = record.records;
+  return Array.isArray(records) ? records.length : null;
+}
+
+function valueFromSettled<T>(result: PromiseSettledResult<T>): T | null {
+  return result.status === 'fulfilled' ? result.value : null;
+}
+
+function failureLabel(result: PromiseSettledResult<unknown>, label: string) {
+  return result.status === 'rejected' ? label : null;
+}
+
+async function settle<T>(promise: Promise<T>): Promise<PromiseSettledResult<T>> {
+  try {
+    return { status: 'fulfilled', value: await promise };
+  } catch (reason) {
+    return { status: 'rejected', reason };
+  }
+}
+
+function formatMetric(value: number | null) {
+  if (value === null) return '—';
+  return new Intl.NumberFormat().format(value);
+}
+
+function WorkspaceSnapshotPanel({
+  snapshot,
+  loading,
+  onRefresh,
+  onNavigate,
+}: {
+  snapshot: WorkspaceSnapshot;
+  loading: boolean;
+  onRefresh: () => void;
+  onNavigate: (to: string) => void;
+}) {
+  const metrics = [
+    { label: 'Dashboards', value: snapshot.dashboards, detail: 'Content catalog', icon: LayoutDashboard, to: '/dashboards/operations' },
+    { label: 'Models', value: snapshot.models, detail: 'Semantic layer', icon: Database, to: '/models' },
+    { label: 'Users', value: snapshot.users, detail: 'SCIM directory', icon: Users, to: '/users' },
+    { label: 'Groups', value: snapshot.groups, detail: 'Access cohorts', icon: Shield, to: '/users?tab=groups' },
+    { label: 'Schedules', value: snapshot.schedules, detail: 'Deliveries', icon: Calendar, to: '/schedules' },
+    { label: 'Folders', value: snapshot.folders, detail: 'Content spaces', icon: FolderInput, to: '/labels' },
+    { label: 'Connections', value: snapshot.connections, detail: 'Data sources', icon: Cable, to: '/connections' },
+  ];
+
+  return (
+    <div
+      className="rounded-2xl p-4"
+      style={{
+        background: '#7A2E52',
+        border: '1px solid rgba(255,255,255,0.38)',
+        boxShadow: 'none',
+      }}
+    >
+      <div className="flex items-start justify-between gap-4 mb-3">
+        <div>
+          <div className="text-[12px] font-bold uppercase tracking-[0.18em] text-white/80">Workspace snapshot</div>
+          <div className="mt-1 text-[13px] text-white/90">
+            Read-only summary from your connected Omni instance.
+          </div>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={loading}
+          className="shrink-0 inline-flex items-center gap-1.5 rounded-xl px-3 py-2 text-[12px] font-semibold text-white transition-all hover:-translate-y-px disabled:opacity-60 disabled:hover:translate-y-0"
+          style={{
+	            background: '#8A3A60',
+            border: '1px solid rgba(255,255,255,0.34)',
+          }}
+        >
+          <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+          Refresh
+        </button>
+      </div>
+
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-2.5">
+        {metrics.map((metric) => {
+          const Icon = metric.icon;
+          return (
+            <button
+              key={metric.label}
+              type="button"
+              onClick={() => onNavigate(metric.to)}
+              className="group text-left rounded-xl p-3 min-h-[92px] transition-all hover:-translate-y-0.5"
+              style={{
+	                background: '#8A3A60',
+                border: '1px solid rgba(255,255,255,0.30)',
+              }}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div
+                  className="w-8 h-8 rounded-lg flex items-center justify-center text-white/95"
+                  style={{
+	                    background: '#7A2E52',
+                    border: '1px solid rgba(255,255,255,0.20)',
+                  }}
+                >
+                  <Icon size={15} />
+                </div>
+                {loading && metric.value === null && <Loader2 size={13} className="animate-spin text-white/70" />}
+              </div>
+              <div className="mt-2 text-[22px] font-bold leading-none text-white">{formatMetric(metric.value)}</div>
+              <div className="mt-1 text-[12px] font-semibold text-white/90">{metric.label}</div>
+              <div className="mt-0.5 text-[11px] text-white/78">{metric.detail}</div>
+            </button>
+          );
+        })}
+      </div>
+
+      <div className="mt-3 flex flex-col gap-1.5 text-[11px] text-white/75 sm:flex-row sm:items-center sm:justify-between">
+        <span>
+          {snapshot.loadedAt
+            ? `Last updated ${snapshot.loadedAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
+            : loading
+              ? 'Loading workspace counts...'
+              : 'Snapshot will load after connection.'}
+        </span>
+        {snapshot.failures.length > 0 && (
+          <span className="text-white/82">
+            Limited permissions for: {snapshot.failures.join(', ')}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function ConnectPage() {
   const navigate = useNavigate();
   const { connection, updateConnection, isConnected, setStatus } = useConnection();
-  const [showKey, setShowKey] = useState(false);
   const [testing, setTesting] = useState(false);
-  const [keyCopied, setKeyCopied] = useState(false);
+  const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(EMPTY_SNAPSHOT);
+  const [snapshotLoading, setSnapshotLoading] = useState(false);
+  const [snapshotLoadedFor, setSnapshotLoadedFor] = useState('');
+
+  const connectionKey = `${connection.baseUrl.trim()}|${connection.apiKey ? 'key-present' : 'no-key'}`;
+
+  const loadWorkspaceSnapshot = useCallback(async () => {
+    if (!connection.baseUrl || !connection.apiKey) return;
+    setSnapshotLoading(true);
+
+    try {
+      const documentsRes = await settle(listDocuments(connection.baseUrl, connection.apiKey, undefined, { allPages: true, pageSize: 250 }));
+      const foldersRes = await settle(listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 }));
+      const modelsRes = await settle(listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100, include: 'activeBranches' }));
+      const usersRes = await settle(listUsers(connection.baseUrl, connection.apiKey, 1, 1));
+      const groupsRes = await settle(listGroups(connection.baseUrl, connection.apiKey, 1, 1));
+      const schedulesRes = await settle(omniProxy<{ records?: unknown[]; pageInfo?: { totalRecords?: number } }>(
+        connection.baseUrl,
+        connection.apiKey,
+        'GET',
+        '/v1/schedules',
+        { queryParams: { cursor: '1', pageSize: '1' } },
+      ));
+      const connectionsRes = await settle(omniProxy<{ records?: unknown[]; connections?: unknown[] }>(
+        connection.baseUrl,
+        connection.apiKey,
+        'GET',
+        '/v1/connections',
+      ));
+
+      const documentsPayload = valueFromSettled(documentsRes) as { documents?: unknown[] } | null;
+      const foldersPayload = valueFromSettled(foldersRes) as { folders?: Array<{ children?: unknown }> } | null;
+      const modelsPayload = valueFromSettled(modelsRes) as { models?: unknown[] } | null;
+      const usersPayload = valueFromSettled(usersRes);
+      const groupsPayload = valueFromSettled(groupsRes);
+      const schedulesPayload = valueFromSettled(schedulesRes);
+      const connectionsPayload = valueFromSettled(connectionsRes);
+
+      const failures = [
+        failureLabel(documentsRes, 'dashboards'),
+        failureLabel(foldersRes, 'folders'),
+        failureLabel(modelsRes, 'models'),
+        failureLabel(usersRes, 'users'),
+        failureLabel(groupsRes, 'groups'),
+        failureLabel(schedulesRes, 'schedules'),
+        failureLabel(connectionsRes, 'connections'),
+      ].filter((label): label is string => Boolean(label));
+
+      setSnapshot({
+        dashboards: Array.isArray(documentsPayload?.documents) ? documentsPayload.documents.length : null,
+        folders: Array.isArray(foldersPayload?.folders) ? countNestedFolders(foldersPayload.folders) : null,
+        models: Array.isArray(modelsPayload?.models) ? modelsPayload.models.length : null,
+        users: totalFromScim(usersPayload),
+        groups: totalFromScim(groupsPayload),
+        schedules: totalFromPageInfo(schedulesPayload),
+        connections: Array.isArray((connectionsPayload as { records?: unknown[] } | null)?.records)
+          ? (connectionsPayload as { records?: unknown[] }).records?.length ?? null
+          : Array.isArray((connectionsPayload as { connections?: unknown[] } | null)?.connections)
+            ? (connectionsPayload as { connections?: unknown[] }).connections?.length ?? null
+            : null,
+        failures,
+        loadedAt: new Date(),
+      });
+      setSnapshotLoadedFor(connectionKey);
+    } finally {
+      setSnapshotLoading(false);
+    }
+  }, [connection.apiKey, connection.baseUrl, connectionKey]);
+
+  useEffect(() => {
+    if (!isConnected) {
+      setSnapshot(EMPTY_SNAPSHOT);
+      setSnapshotLoadedFor('');
+      return;
+    }
+    if (snapshotLoadedFor === connectionKey || snapshotLoading) return;
+    loadWorkspaceSnapshot();
+  }, [connectionKey, isConnected, loadWorkspaceSnapshot, snapshotLoadedFor, snapshotLoading]);
 
   async function handleTest() {
     if (!connection.baseUrl || !connection.apiKey) return;
@@ -182,15 +441,16 @@ export function ConnectPage() {
   }
 
   const parsedHost = useMemo(() => parseHost(connection.baseUrl), [connection.baseUrl]);
+  const hostNeedsReview = Boolean(parsedHost && !isRecognizedOmniHost(parsedHost));
   const urlValid = Boolean(parsedHost);
   const apiKeyHasValidShape = connection.apiKey.trim().length >= 12;
   const canTest = urlValid && apiKeyHasValidShape && !testing;
 
   const blobbyConfig = {
-    untested: { src: '/blobby-waving.webp', alt: 'Blobby waving hello' },
-    testing: { src: '/blobby-in-progress.webp', alt: 'Blobby connecting' },
-    success: { src: '/blobby-celebrating.webp', alt: 'Blobby celebrating connection' },
-    error: { src: '/blobby-error.webp', alt: 'Blobby connection error' },
+    untested: { src: '/blobby-waving.png', alt: 'Blobby waving hello' },
+    testing: { src: '/blobby-connection-testing.png', alt: 'Blobby testing the connection' },
+    success: { src: '/blobby-connection-success.png', alt: 'Blobby celebrating a successful connection' },
+    error: { src: '/blobby-error.png', alt: 'Blobby connection error' },
   };
   const currentBlobby = blobbyConfig[connection.status];
 
@@ -207,16 +467,38 @@ export function ConnectPage() {
     }
   })();
 
-  async function copyApiKey() {
-    if (!connection.apiKey) return;
-    try {
-      await navigator.clipboard.writeText(connection.apiKey);
-      setKeyCopied(true);
-      setTimeout(() => setKeyCopied(false), 1500);
-    } catch {
-      // ignore
+  const heroCopy = useMemo(() => {
+    switch (connection.status) {
+      case 'testing':
+        return {
+          eyebrow: 'Checking connection',
+          titleTop: 'Blobby is checking',
+          titleBottom: 'your Omni access.',
+          body: 'Validating reachability and API permissions. This usually takes just a moment.',
+        };
+      case 'success':
+        return {
+          eyebrow: "You're in",
+          titleTop: 'What would you like',
+          titleBottom: 'to do first?',
+          body: 'Pick the workflow you want to start. OmniKit will keep using this connection while the tab stays open.',
+        };
+      case 'error':
+        return {
+          eyebrow: 'Connection needs attention',
+          titleTop: "Let's get you",
+          titleBottom: 'connected.',
+          body: 'Check the URL and API key, then test again. OmniKit will keep your key masked the whole time.',
+        };
+      default:
+        return {
+          eyebrow: 'Omni Admin Toolkit',
+          titleTop: 'Your Omni',
+          titleBottom: 'command center.',
+          body: 'A unified admin toolkit for every corner of your Omni analytics instance, from AI queries to governance.',
+        };
     }
-  }
+  }, [connection.status]);
 
   return (
     <div className="flex min-h-screen max-h-screen overflow-hidden">
@@ -231,17 +513,17 @@ export function ConnectPage() {
           aria-hidden
           className="absolute inset-0 pointer-events-none"
           style={{
-            backgroundImage: `radial-gradient(circle, rgba(255,255,255,0.10) 1px, transparent 1px)`,
+	            backgroundImage: 'none',
             backgroundSize: '34px 34px',
-            maskImage: 'radial-gradient(ellipse at center, black 40%, transparent 85%)',
-            WebkitMaskImage: 'radial-gradient(ellipse at center, black 40%, transparent 85%)',
+	            maskImage: 'none',
+	            WebkitMaskImage: 'none',
           }}
         />
         <div
           aria-hidden
           className="absolute -top-24 -right-24 w-[520px] h-[520px] rounded-full pointer-events-none animate-float"
           style={{
-            background: 'radial-gradient(circle, rgba(255,200,225,0.28) 0%, transparent 65%)',
+	            background: 'transparent',
             animationDuration: '9s',
           }}
         />
@@ -249,25 +531,20 @@ export function ConnectPage() {
           aria-hidden
           className="absolute -bottom-32 -left-24 w-[460px] h-[460px] rounded-full pointer-events-none animate-float"
           style={{
-            background: 'radial-gradient(circle, rgba(255,120,170,0.22) 0%, transparent 70%)',
+	            background: 'transparent',
             animationDuration: '11s',
             animationDelay: '1.5s',
           }}
         />
 
-        <div className="relative z-10 max-w-2xl mx-auto w-full">
-          <div className="flex items-center justify-between mb-10">
-            <div className="flex items-center gap-2.5">
-              <img src="/omni-logo.webp" alt="Omni" className="h-5 w-auto object-contain brightness-0 invert" />
-              <div className="h-4 w-px bg-white/30" />
-              <span className="text-[12px] font-semibold tracking-wide text-white/90 uppercase">OmniKit · Connect</span>
-            </div>
+        <div className="relative z-10 mx-auto w-full max-w-5xl">
+          <div className="flex items-center justify-between mb-14">
+            <OmniKitLogo variant="light" size="sm" subtitle="Connect" />
             <div
-              className="flex items-center gap-2 px-3 py-1.5 rounded-full"
+              className="flex items-center gap-2 rounded-full px-4 py-2"
               style={{
                 background: 'rgba(255,255,255,0.12)',
                 border: '1px solid rgba(255,255,255,0.22)',
-                backdropFilter: 'blur(8px)',
               }}
               aria-live="polite"
             >
@@ -280,148 +557,125 @@ export function ConnectPage() {
                 )}
                 <span
                   className="relative inline-flex rounded-full h-2 w-2"
-                  style={{ background: statusPill.dot, boxShadow: `0 0 8px ${statusPill.dot}` }}
+	                  style={{ background: statusPill.dot, boxShadow: 'none' }}
                 />
               </span>
-              <span className="text-[11px] font-medium text-white/90">{statusPill.text}</span>
+              <span className="text-[12px] font-medium text-white/90">
+                {statusPill.text}
+              </span>
             </div>
           </div>
 
-          {!isConnected && (
-            <div className="mb-10">
-              <div className="flex items-end gap-5 mb-5">
-                <div className="relative flex-shrink-0">
-                  <div
-                    aria-hidden
-                    className="absolute inset-0 rounded-full"
-                    style={{
-                      background: 'radial-gradient(circle, rgba(255,255,255,0.3) 0%, transparent 65%)',
-                      transform: 'scale(2.2)',
-                    }}
-                  />
-                  <img
-                    key={currentBlobby.src}
-                    src={currentBlobby.src}
-                    alt={currentBlobby.alt}
-                    className="w-24 h-24 object-contain relative z-10 animate-float"
-                    style={{ animationDuration: '3.5s' }}
-                  />
-                </div>
-                <div className="pb-2">
-                  <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-white/70 mb-2">
-                    Omni Admin Toolkit
-                  </p>
-                  <h1 className="text-[44px] font-bold leading-[1.02] tracking-tight text-white">
-                    Your Omni
-                    <br />
-                    <span className="bg-gradient-to-r from-white to-white/75 bg-clip-text text-transparent">
-                      command center.
-                    </span>
-                  </h1>
-                </div>
+          <div className="animate-fadeIn">
+            <div className="flex items-center gap-7 mb-7">
+              <div className="relative flex-shrink-0">
+                <div
+                  aria-hidden
+                  className="absolute inset-0 rounded-full"
+                  style={{
+	                    background: 'transparent',
+                    transform: 'scale(2.4)',
+                  }}
+                />
+                <img
+                  key={currentBlobby.src}
+                  src={currentBlobby.src}
+                  alt={currentBlobby.alt}
+                  className="w-40 h-40 object-contain relative z-10 animate-float"
+                  style={{ animationDuration: connection.status === 'testing' ? '2.4s' : '3.2s' }}
+                />
               </div>
-              <p className="text-[14px] leading-relaxed text-white/85 max-w-md mb-4">
-                A unified admin toolkit for every corner of your Omni analytics instance — from AI queries to governance.
-              </p>
-              <div className="flex items-center gap-3 text-[11px] text-white/75 font-medium">
-                <span>15 tools</span>
-                <span className="w-1 h-1 rounded-full bg-white/40" />
-                <span>No data stored</span>
-                <span className="w-1 h-1 rounded-full bg-white/40" />
-                <span>Works offline-ready</span>
+              <div className="pb-1">
+                <p className="text-[12px] font-bold uppercase tracking-[0.2em] text-white/70 mb-3">
+                  {heroCopy.eyebrow}
+                </p>
+                <h1 className="text-[66px] 2xl:text-[72px] font-bold leading-[0.96] tracking-tight text-white">
+                  <span className="block">{heroCopy.titleTop}</span>
+	                  <span className="block text-white">
+                    {heroCopy.titleBottom}
+                  </span>
+                </h1>
+                <p className="mt-6 max-w-2xl text-[16px] leading-relaxed text-white/80">
+                  {heroCopy.body}
+                </p>
+                {!isConnected && (
+                  <div className="mt-4 flex items-center gap-3 text-[11px] text-white/75 font-medium">
+                    <span>15 tools</span>
+                    <span className="w-1 h-1 rounded-full bg-white" />
+                    <span>No data stored</span>
+                    <span className="w-1 h-1 rounded-full bg-white" />
+                    <span>Works offline-ready</span>
+                  </div>
+                )}
               </div>
             </div>
-          )}
-
-          {isConnected && (
-            <div className="mb-8 animate-fadeIn">
-              <div className="flex items-end gap-5 mb-5">
-                <div className="relative flex-shrink-0">
-                  <div
-                    aria-hidden
-                    className="absolute inset-0 rounded-full"
-                    style={{
-                      background: 'radial-gradient(circle, rgba(52,211,153,0.35) 0%, transparent 65%)',
-                      transform: 'scale(2.4)',
-                    }}
-                  />
-                  <img
-                    src="/blobby-celebrating.webp"
-                    alt="Blobby celebrating"
-                    className="w-24 h-24 object-contain relative z-10 animate-float"
-                    style={{ animationDuration: '3s' }}
-                  />
-                </div>
-                <div className="pb-2">
-                  <p className="text-[11px] font-bold uppercase tracking-[0.18em] text-white/70 mb-2">
-                    You're in
-                  </p>
-                  <h1 className="text-[40px] font-bold leading-[1.02] tracking-tight text-white">
-                    What would you like<br />to do first?
-                  </h1>
-                </div>
-              </div>
-              <div className="grid grid-cols-3 gap-3">
-                {quickStartTiles.map((tile) => {
-                  const Icon = tile.icon;
-                  return (
-                    <button
-                      key={tile.to}
-                      onClick={() => navigate(tile.to)}
-                      className="group text-left rounded-2xl p-4 transition-all duration-200 hover:-translate-y-0.5"
-                      style={{
-                        background: 'linear-gradient(140deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0.08) 100%)',
-                        border: '1px solid rgba(255,255,255,0.28)',
-                        backdropFilter: 'blur(10px)',
-                        boxShadow: '0 4px 20px -6px rgba(0,0,0,0.18)',
-                      }}
-                    >
-                      <div
-                        className="w-9 h-9 rounded-xl flex items-center justify-center mb-3 text-white"
+            {isConnected ? (
+              <div className="space-y-4">
+                <WorkspaceSnapshotPanel
+                  snapshot={snapshot}
+                  loading={snapshotLoading}
+                  onRefresh={loadWorkspaceSnapshot}
+                  onNavigate={navigate}
+                />
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                  {quickStartTiles.map((tile) => {
+                    const Icon = tile.icon;
+                    return (
+                      <button
+                        key={tile.to}
+                        onClick={() => navigate(tile.to)}
+                        className="group text-left rounded-2xl p-5 min-h-[132px] transition-all duration-200 hover:-translate-y-0.5"
                         style={{
-                          background: 'linear-gradient(135deg, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0.1) 100%)',
-                          border: '1px solid rgba(255,255,255,0.35)',
+	                          background: '#7A2E52',
+                          border: '1px solid rgba(255,255,255,0.32)',
+	                          boxShadow: 'none',
                         }}
                       >
-                        <Icon size={16} />
-                      </div>
-                      <div className="text-[14px] font-semibold text-white leading-tight mb-1 flex items-center gap-1.5">
-                        {tile.label}
-                        <ArrowRight
-                          size={13}
-                          className="opacity-0 -translate-x-1 transition-all duration-200 group-hover:opacity-90 group-hover:translate-x-0"
-                        />
-                      </div>
-                      <div className="text-[11px] text-white/75 leading-snug">{tile.description}</div>
-                    </button>
-                  );
-                })}
+                        <div
+                          className="w-10 h-10 rounded-xl flex items-center justify-center mb-4 text-white"
+                          style={{
+	                            background: '#8A3A60',
+                            border: '1px solid rgba(255,255,255,0.35)',
+                          }}
+                        >
+                          <Icon size={18} />
+                        </div>
+                        <div className="text-[17px] font-semibold text-white leading-tight mb-1.5 flex items-center gap-1.5">
+                          {tile.label}
+                          <ArrowRight
+                            size={14}
+                            className="opacity-0 -translate-x-1 transition-all duration-200 group-hover:opacity-90 group-hover:translate-x-0"
+                          />
+                        </div>
+                        <div className="text-[12px] text-white/80 leading-relaxed">{tile.description}</div>
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
-            </div>
-          )}
-
-          {!isConnected && (
-            <div className="grid grid-cols-3 gap-3">
+            ) : (
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {capabilities.map((cap) => (
                 <CapabilityCard key={cap.id} cap={cap} />
               ))}
-            </div>
-          )}
+              </div>
+            )}
+          </div>
         </div>
       </div>
 
       <div
         className="w-[460px] flex-shrink-0 flex flex-col overflow-y-auto relative"
-        style={{ background: 'linear-gradient(180deg, #FFFFFF 0%, #FFF7FB 100%)' }}
+        style={{ background: '#FFFFFF' }}
       >
         <div
           aria-hidden
           className="absolute inset-0 pointer-events-none"
           style={{
-            backgroundImage: `radial-gradient(circle, rgba(255,71,148,0.07) 1px, transparent 1px)`,
+	            backgroundImage: 'none',
             backgroundSize: '32px 32px',
-            maskImage: 'radial-gradient(ellipse at top, black 30%, transparent 80%)',
-            WebkitMaskImage: 'radial-gradient(ellipse at top, black 30%, transparent 80%)',
+	            maskImage: 'none',
+	            WebkitMaskImage: 'none',
           }}
         />
         <div className="relative z-10 flex-1 px-9 py-10">
@@ -431,8 +685,8 @@ export function ConnectPage() {
             </h2>
             <p className="text-[13px] leading-relaxed" style={{ color: '#6B4A60' }}>
               {isConnected
-                ? 'Your instance is connected. Credentials never leave this browser.'
-                : 'Enter your Omni instance URL and API key. Credentials are held in browser memory only.'}
+                ? 'Your instance is connected. Credentials stay masked and session-scoped.'
+                : 'Enter your Omni instance URL and API key. Credentials are held in browser memory for this session.'}
             </p>
           </div>
 
@@ -440,9 +694,8 @@ export function ConnectPage() {
             className="rounded-2xl p-5 mb-4"
             style={{
               background: '#FFFFFF',
-              border: '1px solid rgba(255,71,148,0.15)',
-              boxShadow:
-                '0 6px 24px -12px rgba(200,24,106,0.18), 0 2px 6px -2px rgba(200,24,106,0.06)',
+              border: '1px solid rgba(217,222,232,0.95)',
+              boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
             }}
           >
             <div className="space-y-4">
@@ -480,7 +733,7 @@ export function ConnectPage() {
                   {parsedHost ? (
                     <>
                       Will connect to{' '}
-                      <span className="font-mono font-medium" style={{ color: '#C8186A' }}>
+                      <span className="font-mono font-medium" style={{ color: '#C83B70' }}>
                         {parsedHost}
                       </span>
                     </>
@@ -488,6 +741,11 @@ export function ConnectPage() {
                     'Your Omni workspace URL, including https://'
                   )}
                 </p>
+                {hostNeedsReview && (
+                  <p className="mt-1.5 rounded-button border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
+                    Confirm this is a trusted Omni host before testing. OmniKit keeps the key masked, but the API call will be sent to this URL.
+                  </p>
+                )}
               </div>
 
               <div>
@@ -513,41 +771,28 @@ export function ConnectPage() {
                   </span>
                 </div>
                 <div className="relative">
-                  <input
-                    id="api-key"
-                    type={showKey ? 'text' : 'password'}
-                    value={connection.apiKey}
-                    onChange={(e) => updateConnection({ apiKey: e.target.value, status: 'untested' })}
-                    onKeyDown={handleFieldKeyDown}
-                    placeholder="Paste your API key"
-                    className="input-field pr-20 font-mono text-[13px]"
-                    autoComplete="off"
-                    spellCheck={false}
-                  />
-                  <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
-                    {connection.apiKey && (
-                      <button
-                        type="button"
-                        onClick={copyApiKey}
-                        className="p-1.5 rounded-md text-content-tertiary hover:text-omni-700 hover:bg-pink-50 transition-colors"
-                        aria-label="Copy API key"
-                      >
-                        {keyCopied ? <Check size={14} className="text-emerald-500" /> : <Copy size={14} />}
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => setShowKey(!showKey)}
-                      className="p-1.5 rounded-md text-content-tertiary hover:text-omni-700 hover:bg-pink-50 transition-colors"
-                      aria-label={showKey ? 'Hide API key' : 'Show API key'}
-                    >
-                      {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
-                    </button>
-                  </div>
-                </div>
-                <p className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
-                  Kept in browser memory only. Cleared when the tab closes.
-                </p>
+	                  <input
+	                    id="api-key"
+	                    type="password"
+	                    value={connection.apiKey}
+	                    onChange={(e) => updateConnection({ apiKey: e.target.value, status: 'untested' })}
+	                    onKeyDown={handleFieldKeyDown}
+	                    placeholder="Paste your API key"
+	                    className="input-field pr-10 font-mono text-[13px]"
+	                    autoComplete="new-password"
+	                    spellCheck={false}
+	                    autoCapitalize="off"
+	                    aria-describedby="api-key-hint"
+	                  />
+	                  <Lock
+	                    size={14}
+	                    className="absolute right-3 top-1/2 -translate-y-1/2 text-content-tertiary"
+	                    aria-hidden
+	                  />
+	                </div>
+	                <p id="api-key-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
+	                  Always masked in OmniKit. Held in browser memory and cleared when the tab closes.
+	                </p>
               </div>
             </div>
           </div>
@@ -557,14 +802,8 @@ export function ConnectPage() {
             disabled={!canTest && connection.status !== 'success'}
             className="w-full relative flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-[13px] font-semibold transition-all duration-200 text-white disabled:opacity-50 disabled:cursor-not-allowed enabled:hover:-translate-y-px enabled:hover:brightness-110 enabled:active:translate-y-0 overflow-hidden"
             style={{
-              background:
-                connection.status === 'success'
-                  ? 'linear-gradient(135deg, #10B981 0%, #059669 100%)'
-                  : 'linear-gradient(135deg, #FF4794 0%, #C8186A 100%)',
-              boxShadow:
-                connection.status === 'success'
-                  ? '0 4px 16px -4px rgba(16,185,129,0.4)'
-                  : '0 4px 16px -4px rgba(200,24,106,0.45)',
+	              background: connection.status === 'success' ? '#10B981' : '#C83B70',
+	              boxShadow: 'none',
             }}
           >
             {testing && (
@@ -572,10 +811,9 @@ export function ConnectPage() {
                 aria-hidden
                 className="absolute inset-0 opacity-40"
                 style={{
-                  background:
-                    'linear-gradient(110deg, transparent 30%, rgba(255,255,255,0.5) 50%, transparent 70%)',
-                  backgroundSize: '200% 100%',
-                  animation: 'shimmer 1.4s linear infinite',
+	                  background: 'transparent',
+	                  backgroundSize: '200% 100%',
+	                  animation: 'none',
                 }}
               />
             )}
@@ -612,8 +850,8 @@ export function ConnectPage() {
             )}
             {connection.status === 'testing' && (
               <>
-                <Loader2 size={12} className="animate-spin" style={{ color: '#E02C80' }} />
-                <span style={{ color: '#E02C80' }} className="font-medium">
+                <Loader2 size={12} className="animate-spin" style={{ color: '#E4477C' }} />
+                <span style={{ color: '#E4477C' }} className="font-medium">
                   Verifying credentials…
                 </span>
               </>
@@ -634,6 +872,18 @@ export function ConnectPage() {
             )}
           </div>
 
+          {connection.status !== 'untested' && (
+            <div
+              className="mt-4 rounded-2xl overflow-hidden"
+              style={{
+	                background: '#FFFFFF',
+	                border: '1px solid rgba(217,222,232,0.95)',
+              }}
+            >
+              <ConnectionAnimation status={connection.status} />
+            </div>
+          )}
+
           {isConnected && (
             <button
               onClick={() => navigate('/dashboards/migrate')}
@@ -641,8 +891,8 @@ export function ConnectPage() {
               style={{
                 background: '#FFFFFF',
                 border: '1px solid rgba(255,71,148,0.3)',
-                color: '#C8186A',
-                boxShadow: '0 2px 8px -4px rgba(200,24,106,0.25)',
+                color: '#C83B70',
+                boxShadow: '0 2px 6px -3px rgba(64,71,84,0.16)',
               }}
             >
               Open dashboard
@@ -654,7 +904,7 @@ export function ConnectPage() {
             <TrustRow
               icon={<ShieldCheck size={14} />}
               title="Your data stays private"
-              body="Credentials are held in browser memory only and never stored, logged, or transmitted beyond your Omni instance."
+              body="Credentials are masked, never stored, and used only by the OmniKit API proxy to reach your configured Omni instance."
             />
             <TrustRow
               icon={<Lock size={14} />}
@@ -697,8 +947,8 @@ function TrustRow({
       <div
         className="w-8 h-8 rounded-lg flex items-center justify-center flex-shrink-0 mt-0.5"
         style={{
-          background: 'linear-gradient(135deg, rgba(255,71,148,0.12) 0%, rgba(200,24,106,0.08) 100%)',
-          color: '#C8186A',
+	          background: '#F8F9FD',
+          color: '#C83B70',
           border: '1px solid rgba(255,71,148,0.18)',
         }}
       >
@@ -712,19 +962,19 @@ function TrustRow({
           {body}
         </p>
       </div>
-      {href && <ArrowRight size={12} className="flex-shrink-0 mt-1" style={{ color: '#C8186A', opacity: 0.6 }} />}
+      {href && <ArrowRight size={12} className="flex-shrink-0 mt-1" style={{ color: '#C83B70', opacity: 0.6 }} />}
     </>
   );
 
   const baseClass = 'flex items-start gap-3 px-3.5 py-3 rounded-xl transition-all duration-150';
   const baseStyle = {
-    background: 'rgba(255,255,255,0.7)',
-    border: '1px solid rgba(255,71,148,0.12)',
+	    background: '#FFFFFF',
+	    border: '1px solid rgba(217,222,232,0.95)',
   } as const;
 
   if (href) {
     return (
-      <a href={href} target="_blank" rel="noreferrer" className={`${baseClass} hover:border-pink-200`} style={baseStyle}>
+	      <a href={href} target="_blank" rel="noreferrer" className={`${baseClass} hover:border-border-strong`} style={baseStyle}>
         {content}
       </a>
     );

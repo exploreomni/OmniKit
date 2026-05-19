@@ -1,9 +1,11 @@
 import { useState, useEffect } from 'react';
-import { Loader2, Database, RefreshCw, GitBranch, Clock } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
+import { ArrowRight, AlertTriangle, CheckCircle2, Database, RefreshCw, GitBranch, Clock, Loader2 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { omniProxy } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
+import { Blobby } from '@/components/ui/Blobby';
 import type { OmniConnection } from '@/types';
 
 const DIALECT_COLORS: Record<string, string> = {
@@ -27,6 +29,7 @@ interface ConnectionDetail {
 
 export function ConnectionsPage() {
   const { connection } = useConnection();
+  const navigate = useNavigate();
   const [connections, setConnections] = useState<OmniConnection[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -88,6 +91,18 @@ export function ConnectionsPage() {
   }
 
   const dialects = [...new Set(connections.map((c) => c.dialect).filter(Boolean))].sort();
+  const activeConnections = connections.filter((c) => !c.deletedAt);
+  const dbtConfigured = Object.values(details).filter((detail) => detail.dbt && Object.keys(detail.dbt).length > 0).length;
+  const scheduleConfigured = Object.values(details).filter((detail) => (detail.schedules || []).length > 0).length;
+  const inspectedConnections = Object.values(details).filter((detail) => !detail.loadingDetail).length;
+  const missingSchemaCount = activeConnections.filter((c) => !c.defaultSchema).length;
+  const detailReviewCount = Object.values(details).filter((detail) => {
+    if (detail.loadingDetail) return false;
+    const missingDbt = !detail.dbt || Object.keys(detail.dbt).length === 0;
+    const missingSchedule = (detail.schedules || []).length === 0;
+    return missingDbt || missingSchedule;
+  }).length;
+  const reviewQueueCount = missingSchemaCount + detailReviewCount;
 
   const filtered = connections.filter((c) => {
     const matchSearch = !search || c.name?.toLowerCase().includes(search.toLowerCase()) || c.database?.toLowerCase().includes(search.toLowerCase());
@@ -103,24 +118,91 @@ export function ConnectionsPage() {
     return cron;
   }
 
+  function healthForConnection(conn: OmniConnection, detail?: ConnectionDetail) {
+    if (conn.deletedAt) {
+      return { label: 'Inactive', className: 'bg-gray-100 text-gray-600', detail: 'Deleted or inactive' };
+    }
+    if (!conn.defaultSchema) {
+      return { label: 'Needs schema', className: 'bg-yellow-100 text-yellow-800', detail: 'Default schema missing' };
+    }
+    if (!detail) {
+      return { label: 'Not inspected', className: 'bg-surface-secondary text-content-secondary', detail: 'Expand for dbt and refresh' };
+    }
+    if (detail.loadingDetail) {
+      return { label: 'Inspecting', className: 'bg-omni-50 text-omni-700', detail: 'Loading details' };
+    }
+
+    const missingDbt = !detail.dbt || Object.keys(detail.dbt).length === 0;
+    const missingSchedule = (detail.schedules || []).length === 0;
+    if (missingDbt && missingSchedule) {
+      return { label: 'Review', className: 'bg-yellow-100 text-yellow-800', detail: 'No dbt config or refresh schedule' };
+    }
+    if (missingSchedule) {
+      return { label: 'No refresh', className: 'bg-yellow-100 text-yellow-800', detail: 'No schema refresh schedule' };
+    }
+    if (missingDbt) {
+      return { label: 'No dbt', className: 'bg-blue-100 text-blue-800', detail: 'Optional, not configured' };
+    }
+    return { label: 'Ready', className: 'bg-green-100 text-green-800', detail: 'dbt and refresh metadata found' };
+  }
+
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Connections"
-        description={`${connections.length} database connections in your Omni instance.`}
-        icon={
-          <img
-            src="/blobby-connections.webp"
-            alt="Blobby with satellite"
-            className="w-10 h-10 object-contain animate-float"
-            style={{ animationDuration: '3s' }}
-          />
-        }
+        title="Connection Health"
+        description="Review connection inventory, warehouse dialects, dbt configuration, schema refresh coverage, and environment readiness."
+        icon={<Blobby mood="connections" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
       />
 
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
+
+      <div className="grid grid-cols-2 xl:grid-cols-5 gap-3">
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Active Connections</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{activeConnections.length}</div>
+          <div className="mt-1 text-xs text-content-secondary">{connections.length - activeConnections.length} deleted or inactive</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Dialects</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{dialects.length}</div>
+          <div className="mt-1 text-xs text-content-secondary">Warehouse platforms represented</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">dbt Checked</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{dbtConfigured}</div>
+          <div className="mt-1 text-xs text-content-secondary">{inspectedConnections} inspected</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Refresh Schedules</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{scheduleConfigured}</div>
+          <div className="mt-1 text-xs text-content-secondary">Expand rows to inspect cadence</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Review Queue</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">{reviewQueueCount}</div>
+          <div className="mt-1 text-xs text-content-secondary">Schema, dbt, or refresh signals</div>
+        </div>
+      </div>
+
+      <div className="card p-4">
+        <div className="grid gap-4 lg:grid-cols-[1fr_auto] lg:items-center">
+          <div>
+            <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
+              {reviewQueueCount > 0 ? <AlertTriangle size={16} className="text-yellow-600" /> : <CheckCircle2 size={16} className="text-green-600" />}
+              Connection governance pre-flight
+            </div>
+            <div className="mt-1 text-sm text-content-secondary">
+              Confirm source readiness here first, then scan model settings, relationships, views, and topics for the semantic impact of that connection.
+            </div>
+          </div>
+          <button onClick={() => navigate('/models')} className="btn-secondary text-sm inline-flex items-center gap-2 justify-center">
+            Open Model & Topic Health
+            <ArrowRight size={14} />
+          </button>
+        </div>
+      </div>
 
       <div className="flex gap-3">
         <div className="flex-1">
@@ -138,19 +220,24 @@ export function ConnectionsPage() {
         </div>
       ) : (
         <div className="card p-0 overflow-hidden">
+          <div className="px-4 py-3 border-b border-border bg-white">
+            <div className="text-sm font-semibold text-content-primary">Connection readiness inventory</div>
+            <div className="text-xs text-content-secondary mt-0.5">Use this as a pre-flight check before model, topic, upload, and content workflows.</div>
+          </div>
           <div className="bg-surface-secondary px-4 py-2.5 border-b border-border grid grid-cols-12 gap-2">
             <div className="col-span-1 text-xs font-medium text-content-secondary uppercase tracking-wider" />
             <div className="col-span-3 text-xs font-medium text-content-secondary uppercase tracking-wider">Name</div>
             <div className="col-span-2 text-xs font-medium text-content-secondary uppercase tracking-wider">Dialect</div>
-            <div className="col-span-3 text-xs font-medium text-content-secondary uppercase tracking-wider">Database</div>
-            <div className="col-span-3 text-xs font-medium text-content-secondary uppercase tracking-wider">Default Schema</div>
+            <div className="col-span-2 text-xs font-medium text-content-secondary uppercase tracking-wider">Database</div>
+            <div className="col-span-2 text-xs font-medium text-content-secondary uppercase tracking-wider">Default Schema</div>
+            <div className="col-span-2 text-xs font-medium text-content-secondary uppercase tracking-wider">Health</div>
           </div>
 
           <div className="max-h-[500px] overflow-y-auto">
             {filtered.length === 0 ? (
               <div className="flex flex-col items-center justify-center py-12 animate-fadeIn">
                 <img
-                  src="/blobby-no-results.webp"
+                  src="/blobby-no-results.png"
                   alt="No connections found"
                   className="w-16 h-16 object-contain animate-float mb-3"
                   style={{ animationDuration: '3s' }}
@@ -162,6 +249,7 @@ export function ConnectionsPage() {
                 const isExpanded = expandedId === conn.id;
                 const detail = details[conn.id];
                 const dialectClass = DIALECT_COLORS[conn.dialect?.toLowerCase()] || 'bg-gray-100 text-gray-800';
+                const health = healthForConnection(conn, detail);
 
                 return (
                   <div key={conn.id}>
@@ -178,8 +266,12 @@ export function ConnectionsPage() {
                           {conn.dialect}
                         </span>
                       </div>
-                      <div className="col-span-3 text-sm text-content-secondary truncate">{conn.database || '-'}</div>
-                      <div className="col-span-3 text-sm text-content-secondary truncate font-mono text-xs">{conn.defaultSchema || '-'}</div>
+                      <div className="col-span-2 text-sm text-content-secondary truncate">{conn.database || '-'}</div>
+                      <div className="col-span-2 text-sm text-content-secondary truncate font-mono text-xs">{conn.defaultSchema || '-'}</div>
+                      <div className="col-span-2 min-w-0">
+                        <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-chip ${health.className}`}>{health.label}</span>
+                        <div className="mt-1 text-[10px] text-content-tertiary truncate">{health.detail}</div>
+                      </div>
                     </div>
 
                     {isExpanded && (

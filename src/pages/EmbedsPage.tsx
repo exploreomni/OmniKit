@@ -3,6 +3,8 @@ import { Link2, Copy, Check, ExternalLink } from 'lucide-react';
 import { generateEmbedUrl } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { Blobby } from '@/components/ui/Blobby';
+import { friendlyApiError } from '@/utils/apiErrors';
 
 export function EmbedsPage() {
   const { connection } = useConnection();
@@ -42,28 +44,82 @@ export function EmbedsPage() {
         ...prev.slice(0, 9),
       ]);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to generate embed URL');
+      setError(friendlyApiError(err, 'Failed to generate embed URL'));
     } finally {
       setLoading(false);
     }
   }
 
-  function handleCopy() {
-    if (result) {
-      navigator.clipboard.writeText(result);
+  async function copyText(value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      setError(friendlyApiError(err, 'Unable to copy URL'));
+    }
+  }
+
+  function handleCopy() {
+    if (result) {
+      copyText(result);
     }
   }
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-5 max-w-6xl mx-auto">
       <PageHeader
         title="Embed URL Generator"
-        description="Generate signed embed URLs for embedding Omni content in external applications."
+        description="Generate signed embed URLs for governed external application access."
+        icon={<Blobby mood="embed" size={58} className="animate-float" style={{ animationDuration: '3.7s' }} />}
       />
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <div className="grid md:grid-cols-3 gap-4 items-stretch">
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Governance Use Case</div>
+          <div className="mt-2 text-sm font-semibold text-content-primary">Embedded access validation</div>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Generate a signed URL for a known content path and user identity before app handoff.</p>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Identity Context</div>
+          <div className="mt-2 text-sm font-semibold text-content-primary">External ID, email, groups</div>
+          <p className="mt-1 text-xs text-content-secondary leading-5">Pass the same identity claims your embedded app will send in production.</p>
+        </div>
+        <div className="card p-4 border-yellow-200 bg-yellow-50">
+          <div className="text-xs font-medium text-yellow-800 uppercase tracking-wider">Sensitive Output</div>
+          <div className="mt-2 text-sm font-semibold text-yellow-900">Treat URLs like credentials</div>
+          <p className="mt-1 text-xs text-yellow-800 leading-5">Signed embed URLs can grant access. Share only through the approved implementation channel.</p>
+        </div>
+      </div>
+
+      <div className="max-w-4xl mx-auto space-y-5">
+        <div className="card min-h-[220px] flex flex-col justify-center">
+          <h3 className="text-sm font-semibold text-content-primary mb-4">Embed Readiness Checklist</h3>
+          <div className="grid gap-4 md:grid-cols-3 text-sm">
+            <div className="flex items-start gap-2">
+              <Check size={14} className="text-green-600 mt-0.5 flex-shrink-0" />
+              <div>
+                <div className="font-medium text-content-primary">Confirm content path</div>
+                <p className="text-xs text-content-secondary mt-0.5 leading-5">Use the same dashboard or workbook path the application will embed.</p>
+              </div>
+            </div>
+            <div className="flex items-start gap-2">
+              <Check size={14} className="text-green-600 mt-0.5 flex-shrink-0" />
+              <div>
+                <div className="font-medium text-content-primary">Match production identity</div>
+                <p className="text-xs text-content-secondary mt-0.5 leading-5">External ID, email, and groups should mirror the claims your app will send.</p>
+              </div>
+            </div>
+            <div className="flex items-start gap-2">
+              <Check size={14} className="text-green-600 mt-0.5 flex-shrink-0" />
+              <div>
+                <div className="font-medium text-content-primary">Share securely</div>
+                <p className="text-xs text-content-secondary mt-0.5 leading-5">Copy signed URLs only into approved test or implementation channels.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+
         <div className="card">
           <h3 className="text-sm font-semibold text-content-primary mb-4">Configuration</h3>
 
@@ -133,55 +189,53 @@ export function EmbedsPage() {
           </form>
         </div>
 
-        <div className="space-y-4">
-          {result && (
-            <div className="card">
-              <h3 className="text-sm font-semibold text-content-primary mb-3">Generated URL</h3>
-              <div className="bg-gray-900 rounded p-3 mb-3">
-                <code className="text-green-400 text-xs font-mono break-all leading-relaxed">{result}</code>
-              </div>
-              <div className="flex gap-2">
-                <button onClick={handleCopy} className="btn-secondary text-sm flex-1">
-                  {copied ? <Check size={14} className="text-success" /> : <Copy size={14} />}
-                  {copied ? 'Copied' : 'Copy URL'}
-                </button>
-                <a
-                  href={result}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="btn-secondary text-sm flex-1 justify-center"
-                >
-                  <ExternalLink size={14} />
-                  Open in New Tab
-                </a>
-              </div>
+        {result && (
+          <div className="card min-h-[220px]">
+            <h3 className="text-sm font-semibold text-content-primary mb-3">Generated URL</h3>
+            <div className="bg-gray-900 rounded p-3 mb-3">
+              <code className="text-green-400 text-xs font-mono break-all leading-relaxed">{result}</code>
             </div>
-          )}
+            <div className="flex gap-2">
+              <button onClick={handleCopy} className="btn-secondary text-sm flex-1">
+                {copied ? <Check size={14} className="text-success" /> : <Copy size={14} />}
+                {copied ? 'Copied' : 'Copy URL'}
+              </button>
+              <a
+                href={result}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="btn-secondary text-sm flex-1 justify-center"
+              >
+                <ExternalLink size={14} />
+                Open in New Tab
+              </a>
+            </div>
+          </div>
+        )}
 
-          {recentUrls.length > 0 && (
-            <div className="card">
-              <h3 className="text-sm font-semibold text-content-primary mb-3">Recent URLs</h3>
-              <div className="space-y-2">
-                {recentUrls.map((item, i) => (
-                  <div key={i} className="flex items-center justify-between py-2 border-b border-border/50 last:border-0">
-                    <div className="min-w-0 flex-1">
-                      <div className="text-sm text-content-primary truncate">{item.path}</div>
-                      <div className="text-xs text-content-secondary">{item.time}</div>
-                    </div>
-                    <button
-                      onClick={() => {
-                        navigator.clipboard.writeText(item.url);
-                      }}
-                      className="p-1.5 text-content-secondary hover:text-omni-700 hover:bg-omni-100 rounded transition-colors flex-shrink-0 ml-2"
-                    >
-                      <Copy size={14} />
-                    </button>
+        {recentUrls.length > 0 && (
+          <div className="card">
+            <h3 className="text-sm font-semibold text-content-primary mb-3">Recent URLs</h3>
+            <div className="space-y-2">
+              {recentUrls.map((item, i) => (
+                <div key={i} className="flex items-center justify-between py-2 border-b border-border/50 last:border-0">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-sm text-content-primary truncate">{item.path}</div>
+                    <div className="text-xs text-content-secondary">{item.time}</div>
                   </div>
-                ))}
-              </div>
+                  <button
+                    onClick={() => {
+                      copyText(item.url);
+                    }}
+                    className="p-1.5 text-content-secondary hover:text-omni-700 hover:bg-omni-100 rounded transition-colors flex-shrink-0 ml-2"
+                  >
+                    <Copy size={14} />
+                  </button>
+                </div>
+              ))}
             </div>
-          )}
-        </div>
+          </div>
+        )}
       </div>
     </div>
   );

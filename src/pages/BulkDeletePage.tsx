@@ -18,6 +18,7 @@ import { SkeletonRow } from '@/components/ui/SkeletonRow';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { BulkOperationAnimation } from '@/components/ui/BulkOperationAnimation';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { Blobby } from '@/components/ui/Blobby';
 import type { OmniFolder, OmniDocument, BulkOperationResult, BulkOperationSummary } from '@/types';
 
 function FolderNode({
@@ -101,7 +102,7 @@ export function BulkDeletePage() {
       setLoadingFolders(true);
       setError('');
       try {
-        const res = await listFolders(connection.baseUrl, connection.apiKey);
+        const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
         if (res.error) {
           setError(`API error: ${res.error}`);
           return;
@@ -120,7 +121,7 @@ export function BulkDeletePage() {
     setLoadingDocs(true);
     setError('');
     try {
-      const res = await listDocuments(connection.baseUrl, connection.apiKey, folderId);
+      const res = await listDocuments(connection.baseUrl, connection.apiKey, folderId, { allPages: true, pageSize: 100 });
       if (res.error) {
         setError(`API error: ${res.error}`);
         return;
@@ -254,7 +255,10 @@ export function BulkDeletePage() {
   if (showResults) {
     return (
       <div className="space-y-5">
-        <PageHeader title="Bulk Delete Results" />
+        <PageHeader
+          title="Bulk Delete Results"
+          icon={<Blobby mood="warning" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
+        />
 
         {summary && (
           <div className="card bg-surface-secondary">
@@ -304,6 +308,7 @@ export function BulkDeletePage() {
       <PageHeader
         title="Bulk Delete Dashboards"
         description="Select dashboards to permanently delete from your Omni instance."
+        icon={<Blobby mood="warning" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
         actions={
           <button
             onClick={() => setShowConfirm(true)}
@@ -381,7 +386,7 @@ export function BulkDeletePage() {
               <div className="empty-state">
                 <div className="empty-state-mascot">
                   <img
-                    src={selectedFolderId ? '/blobby-empty.webp' : '/blobby-getting-started.webp'}
+                    src={selectedFolderId ? '/blobby-empty.png' : '/blobby-getting-started.png'}
                     alt={selectedFolderId ? 'No dashboards' : 'Select a folder'}
                     className="w-14 h-14 object-contain animate-float"
                     style={{ animationDuration: '3s' }}

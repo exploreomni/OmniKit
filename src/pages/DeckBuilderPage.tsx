@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Presentation,
   Loader2,
   AlertCircle,
   CheckCircle,
@@ -16,14 +15,14 @@ import {
   XCircle,
   PlayCircle,
   ChevronDown,
-  ClipboardCopy,
-  Bug,
   Eraser,
   History,
 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { Blobby } from '@/components/ui/Blobby';
+import { Vehicle } from '@/components/ui/Vehicle';
 import { parseDashboardUrl } from '@/services/deckBuilder/dashboardUrlParser';
 import {
   fetchDashboardSummary,
@@ -66,6 +65,8 @@ import type {
   DashboardTile,
   FilterOverride,
   LayoutKit,
+  RenderStrategy,
+  SlideOverride,
   TileExportState,
   TileVisualSource,
   TopicFieldRef,
@@ -85,15 +86,16 @@ import { ingestPptxTemplate } from '@/services/deckBuilder/pptxTemplateIngest';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { FilterEditor } from '@/components/deckBuilder/FilterEditor';
 import { BatchSetup } from '@/components/deckBuilder/BatchSetup';
+import { SlideLayoutPreview } from '@/components/deckBuilder/SlideLayoutPreview';
 
-type StepId = 'inspect' | 'select' | 'filters' | 'brand' | 'insights' | 'generate';
+type StepId = 'inspect' | 'select' | 'filters' | 'brand' | 'layout' | 'generate';
 
 const STEPS: Array<{ id: StepId; label: string; description: string }> = [
   { id: 'inspect', label: 'Inspect', description: 'Pick a dashboard' },
   { id: 'select', label: 'Tiles', description: 'Pick & order tiles' },
   { id: 'filters', label: 'Filters', description: 'Override values' },
   { id: 'brand', label: 'Branding', description: 'Theme & template' },
-  { id: 'insights', label: 'Insights', description: 'Optional commentary' },
+  { id: 'layout', label: 'Preview', description: 'Layout, insights & notes' },
   { id: 'generate', label: 'Generate', description: 'Export to PowerPoint' },
 ];
 
@@ -115,6 +117,24 @@ function buildDashboardUrl(baseUrl: string, dashboardId: string): string {
   } catch {
     return `${baseUrl.replace(/\/$/, '')}/dashboards/${dashboardId}`;
   }
+}
+
+function resolveTileVisualSource(
+  renderStrategy: RenderStrategy,
+  tileVisualSources: Record<string, TileVisualSource>,
+  tileId: string,
+): TileVisualSource {
+  return tileVisualSources[tileId] || (
+    renderStrategy === 'full-dashboard'
+      ? 'full-dashboard'
+      : renderStrategy === 'tile-image'
+      ? 'tile-image'
+      : 'native'
+  );
+}
+
+function strategyForTileExports(renderStrategy: RenderStrategy): RenderStrategy {
+  return renderStrategy === 'full-dashboard' ? 'native' : renderStrategy;
 }
 
 export function DeckBuilderPage() {
@@ -159,9 +179,10 @@ export function DeckBuilderPage() {
 
   useEffect(() => {
     if (currentTemplate) setBrand({ ...currentTemplate.brand });
-  }, [currentTemplate?.id]);
+  }, [currentTemplate]);
 
   const [tileVisualSources, setTileVisualSources] = useState<Record<string, TileVisualSource>>({});
+  const [slideOverrides, setSlideOverrides] = useState<Record<string, SlideOverride>>({});
   const [templateImportError, setTemplateImportError] = useState<string | null>(null);
   const [templateImportWarnings, setTemplateImportWarnings] = useState<string[]>([]);
   const [templateImporting, setTemplateImporting] = useState(false);
@@ -171,15 +192,16 @@ export function DeckBuilderPage() {
   const [includeAppendix, setIncludeAppendix] = useState(true);
 
   const [exportStates, setExportStates] = useState<Record<string, TileExportState>>({});
+  const [previewStates, setPreviewStates] = useState<Record<string, TileExportState>>({});
+  const [previewing, setPreviewing] = useState(false);
+  const [previewError, setPreviewError] = useState('');
   const [generating, setGenerating] = useState(false);
   const [generationError, setGenerationError] = useState('');
   const [generationSuccess, setGenerationSuccess] = useState('');
-  const [skipFailed, setSkipFailed] = useState(true);
-  const [allowFullDashboardFallback, setAllowFullDashboardFallback] = useState(false);
+  const skipFailed = true;
+  const allowFullDashboardFallback = false;
   const [renderStrategy, setRenderStrategy] = useState<'native' | 'tile-image' | 'full-dashboard'>('native');
-  const [verboseLogs, setVerboseLogs] = useState(false);
   const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
-  const [copiedDiag, setCopiedDiag] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const recipeFileInput = useRef<HTMLInputElement | null>(null);
@@ -188,6 +210,7 @@ export function DeckBuilderPage() {
   const pptxTemplateInput = useRef<HTMLInputElement | null>(null);
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
+  const isWorkspaceStep = step === 'layout' || step === 'generate';
 
   const selectedTiles = useMemo(() => {
     if (!dashboard) return [];
@@ -201,6 +224,80 @@ export function DeckBuilderPage() {
     if (!f) return dashboard.tiles;
     return dashboard.tiles.filter((t) => t.name.toLowerCase().includes(f));
   }, [dashboard, tileFilter]);
+
+  const exportReadiness = useMemo(() => {
+    const sourceCounts = { native: 0, image: 0, skipped: 0, fullDashboard: 0 };
+    let customizedSlides = 0;
+    let insightCount = 0;
+    let speakerNotesCount = 0;
+    let overlayCount = 0;
+    let titleOverrideCount = 0;
+    let layoutOverrideCount = 0;
+
+    for (const tile of selectedTiles) {
+      const override = slideOverrides[tile.id];
+      const insight = insights[tile.id]?.trim();
+      const notes = override?.speakerNotes?.trim();
+      const explicitSource = tileVisualSources[tile.id];
+      const source = resolveTileVisualSource(renderStrategy, tileVisualSources, tile.id);
+
+      if (source === 'full-dashboard') sourceCounts.fullDashboard += 1;
+      else if (source === 'tile-image') sourceCounts.image += 1;
+      else if (source === 'skip') sourceCounts.skipped += 1;
+      else sourceCounts.native += 1;
+
+      if (insight) insightCount += 1;
+      if (notes) speakerNotesCount += 1;
+      if (override?.overlays?.length) overlayCount += override.overlays.length;
+      if (override?.title) titleOverrideCount += 1;
+      if (override?.bodyBox || override?.insightBox || override?.fit) layoutOverrideCount += 1;
+
+      if (
+        insight ||
+        explicitSource ||
+        override?.title ||
+        override?.bodyBox ||
+        override?.insightBox ||
+        override?.insightFormat ||
+        override?.fit ||
+        override?.speakerNotes ||
+        override?.speakerNotesFormat ||
+        (override?.overlays?.length || 0) > 0
+      ) {
+        customizedSlides += 1;
+      }
+    }
+
+    return {
+      selectedCount: selectedTiles.length,
+      exportableCount: Math.max(0, selectedTiles.length - sourceCounts.skipped),
+      sourceCounts,
+      customizedSlides,
+      insightCount,
+      speakerNotesCount,
+      overlayCount,
+      titleOverrideCount,
+      layoutOverrideCount,
+      batchCount: batchEnabled && batchField && batchValues.length > 0 ? batchValues.length : 0,
+    };
+  }, [selectedTiles, slideOverrides, insights, tileVisualSources, renderStrategy, batchEnabled, batchField, batchValues.length]);
+
+  const renderModeLabel = useMemo(() => {
+    const activeSourceCount = [
+      exportReadiness.sourceCounts.native,
+      exportReadiness.sourceCounts.image,
+      exportReadiness.sourceCounts.fullDashboard,
+    ].filter((count) => count > 0).length;
+    if (activeSourceCount > 1) return 'Mixed sources';
+    if (exportReadiness.sourceCounts.fullDashboard > 0) return 'Full dashboard image';
+    if (exportReadiness.sourceCounts.image > 0) return 'Omni tile images';
+    if (exportReadiness.sourceCounts.native > 0) return 'Native data';
+    return renderStrategy === 'full-dashboard'
+      ? 'Full dashboard image'
+      : renderStrategy === 'tile-image'
+      ? 'Omni tile images'
+      : 'Native data';
+  }, [exportReadiness.sourceCounts, renderStrategy]);
 
   useEffect(() => {
     if (!connection.baseUrl) return;
@@ -400,6 +497,9 @@ export function DeckBuilderPage() {
       setBatchEnabled(false);
       setBatchField(null);
       setBatchValues([]);
+      setSlideOverrides({});
+      setPreviewStates({});
+      setPreviewError('');
       loadSavedFilterSets(dashboardId);
       setStep('select');
     } catch (err) {
@@ -524,6 +624,18 @@ export function DeckBuilderPage() {
     setTileVisualSources((prev) => ({ ...prev, [tileId]: src }));
   }, []);
 
+  const applyVisualSourceToAll = useCallback((strategy: RenderStrategy) => {
+    setRenderStrategy(strategy);
+    setTileVisualSources({});
+    setPreviewStates({});
+    setExportStates({});
+  }, []);
+
+  useEffect(() => {
+    setPreviewStates({});
+    setPreviewError('');
+  }, [renderStrategy, tileVisualSources, filterOverrides, batchEnabled, batchField, batchValues]);
+
   const handleRecipeImport = useCallback(async (file: File) => {
     try {
       const data = await readJsonFile(file);
@@ -541,6 +653,7 @@ export function DeckBuilderPage() {
       } else {
         setTileVisualSources({});
       }
+      setSlideOverrides(recipe.slideOverrides || {});
       setInspectError('');
       setInspecting(true);
       try {
@@ -609,9 +722,13 @@ export function DeckBuilderPage() {
     try {
       let workingStates: Record<string, TileExportState> = {};
       let usedFallback = false;
+      let usedFullDashboardImage = false;
+      const sourceFor = (tile: DashboardTile) => resolveTileVisualSource(renderStrategy, tileVisualSources, tile.id);
+      const fullDashboardTiles = selectedTiles.filter((tile) => sourceFor(tile) === 'full-dashboard');
+      const exportTiles = selectedTiles.filter((tile) => sourceFor(tile) !== 'full-dashboard');
 
-      if (renderStrategy === 'full-dashboard') {
-        for (const tile of selectedTiles) {
+      if (fullDashboardTiles.length > 0) {
+        for (const tile of fullDashboardTiles) {
           workingStates[tile.id] = { tileId: tile.id, status: 'exporting', message: 'Awaiting full dashboard' };
           setExportStates((prev) => ({ ...prev, [tile.id]: workingStates[tile.id] }));
         }
@@ -622,7 +739,7 @@ export function DeckBuilderPage() {
           abortRef.current.signal
         );
         const dataUrl = await blobToDataUrl(fallbackBlob);
-        for (const tile of selectedTiles) {
+        for (const tile of fullDashboardTiles) {
           workingStates[tile.id] = {
             tileId: tile.id,
             status: 'done',
@@ -632,23 +749,28 @@ export function DeckBuilderPage() {
           };
           setExportStates((prev) => ({ ...prev, [tile.id]: workingStates[tile.id] }));
         }
-        usedFallback = true;
-      } else {
+        usedFullDashboardImage = true;
+      }
+
+      if (exportTiles.length > 0) {
+        const perTileSource = Object.fromEntries(
+          exportTiles.map((tile) => [tile.id, sourceFor(tile)] as const)
+        ) as Record<string, TileVisualSource>;
         const { states } = await runTileExports({
           baseUrl: connection.baseUrl,
           apiKey: connection.apiKey,
           dashboardId: dashboard.id,
-          tiles: selectedTiles,
-          strategy: renderStrategy,
-          perTileSource: tileVisualSources,
+          tiles: exportTiles,
+          strategy: strategyForTileExports(renderStrategy),
+          perTileSource,
           signal: abortRef.current.signal,
           filterOverrides,
           onUpdate: (state) => setExportStates((prev) => ({ ...prev, [state.tileId]: state })),
         });
-        workingStates = states;
+        workingStates = { ...workingStates, ...states };
 
-        const initialSuccess = selectedTiles.filter((t) => states[t.id]?.status === 'done');
-        if (initialSuccess.length === 0 && allowFullDashboardFallback) {
+        const initialSuccess = exportTiles.filter((t) => states[t.id]?.status === 'done');
+        if (initialSuccess.length === 0 && fullDashboardTiles.length === 0 && allowFullDashboardFallback) {
           const fallbackBlob = await exportFullDashboardAsPng(
             connection.baseUrl,
             connection.apiKey,
@@ -679,7 +801,7 @@ export function DeckBuilderPage() {
       const failedCount = selectedTiles.length - successful.length - skippedCount;
 
       if (successful.length === 0) {
-        throw new Error('No tiles produced output. Open DevTools console or click "Copy diagnostics".');
+        throw new Error('No tiles produced output. Review the tile export status below, then retry with fewer tiles or a different render mode.');
       }
       if (failedCount > 0 && !skipFailed) {
         throw new Error(`${failedCount} tile(s) failed. Enable "skip failed tiles" to continue.`);
@@ -694,13 +816,14 @@ export function DeckBuilderPage() {
         template: currentTemplate,
         tiles: successful.map((tile) => {
           const s = workingStates[tile.id];
-          const src = tileVisualSources[tile.id];
+          const src = sourceFor(tile);
           return {
             tile,
             pngDataUrl: s.pngDataUrl,
             result: s.result,
             insight: insights[tile.id],
-            forceImage: src === 'tile-image',
+            forceImage: src === 'tile-image' || src === 'full-dashboard',
+            slideOverride: slideOverrides[tile.id],
           };
         }),
         includeAppendix,
@@ -719,6 +842,8 @@ export function DeckBuilderPage() {
       setGenerationSuccess(
         usedFallback
           ? `Deck downloaded as "${fileName}" using full-dashboard fallback.`
+          : usedFullDashboardImage
+          ? `Deck downloaded as "${fileName}" with full-dashboard image slide(s).`
           : failedCount > 0
           ? `Deck downloaded as "${fileName}". ${failedCount} tile(s) skipped.`
           : `Deck downloaded as "${fileName}".`
@@ -735,7 +860,7 @@ export function DeckBuilderPage() {
       setGenerating(false);
       abortRef.current = null;
     }
-  }, [dashboard, selectedTiles, connection, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, logOp]);
+  }, [dashboard, selectedTiles, connection, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, slideOverrides, logOp]);
 
   const handleBatchGenerate = useCallback(async () => {
     if (!dashboard || selectedTiles.length === 0 || !batchField || batchValues.length === 0) return;
@@ -771,6 +896,7 @@ export function DeckBuilderPage() {
         values: batchValues,
         strategy: renderStrategy,
         perTileSource: tileVisualSources,
+        slideOverrides,
         template: currentTemplate,
         allowFullDashboardFallback,
         signal: abortRef.current.signal,
@@ -830,61 +956,107 @@ export function DeckBuilderPage() {
       setGenerating(false);
       abortRef.current = null;
     }
-  }, [dashboard, selectedTiles, batchField, batchValues, connection, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, allowFullDashboardFallback, logOp]);
+  }, [dashboard, selectedTiles, batchField, batchValues, connection, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, slideOverrides, allowFullDashboardFallback, logOp]);
 
   const handleGenerate = batchEnabled && batchField && batchValues.length > 0
     ? handleBatchGenerate
     : handleSingleGenerate;
 
-  const handleCopyDiagnostics = useCallback(async () => {
-    const payload = {
-      dashboard: dashboard
-        ? { id: dashboard.id, name: dashboard.name, tileCount: dashboard.tiles.length }
-        : null,
-      selectedTileIds: selectedIds,
-      filterOverrides,
-      batch: batchEnabled ? { field: batchField, values: batchValues } : null,
-      tileResults: Object.values(exportStates).map((s) => ({
-        tileId: s.tileId,
-        status: s.status,
-        error: s.error,
-        message: s.message,
-        pngSize: s.pngSize,
-      })),
-      logs: deckLog.snapshot(),
-    };
-    try {
-      await navigator.clipboard.writeText(JSON.stringify(payload, null, 2));
-      setCopiedDiag(true);
-      setTimeout(() => setCopiedDiag(false), 2000);
-    } catch {
-      const json = JSON.stringify(payload, null, 2);
-      const blob = new Blob([json], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'deck-builder-diagnostics.json';
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 250);
-    }
-  }, [dashboard, selectedIds, exportStates, filterOverrides, batchEnabled, batchField, batchValues]);
-
-  const toggleVerbose = useCallback(() => {
-    setVerboseLogs((prev) => {
-      const next = !prev;
-      if (typeof window !== 'undefined') {
-        window.__deckBuilderDebug = next;
-      }
-      if (next) deckLog.enableVerbose();
-      return next;
-    });
-  }, []);
-
   const cancelGeneration = useCallback(() => {
     abortRef.current?.abort();
   }, []);
+
+  const previewSampleLabel = batchEnabled && batchField && batchValues.length > 0
+    ? `${batchField} = ${batchValues[0]}`
+    : undefined;
+
+  const handleRenderPreview = useCallback(async (tileId?: string) => {
+    if (!dashboard || selectedTiles.length === 0) return;
+    const previewTiles = tileId
+      ? selectedTiles.filter((tile) => tile.id === tileId)
+      : selectedTiles;
+    if (previewTiles.length === 0) return;
+    setPreviewing(true);
+    setPreviewError('');
+    setPreviewStates((prev) => {
+      const next = { ...prev };
+      for (const tile of previewTiles) delete next[tile.id];
+      return next;
+    });
+    const controller = new AbortController();
+    const previewOverrides: Record<string, FilterOverride> = { ...filterOverrides };
+    if (batchEnabled && batchField && batchValues.length > 0) {
+      const filterMeta = dashboard.filters.find((f) => f.field === batchField);
+      previewOverrides[batchField] = {
+        field: batchField,
+        kind: filterMeta?.kind ?? 'EQUALS',
+        type: filterMeta?.type ?? 'string',
+        values: [batchValues[0]],
+      };
+    }
+
+    try {
+      const sourceFor = (tile: DashboardTile) => resolveTileVisualSource(renderStrategy, tileVisualSources, tile.id);
+      const fullDashboardTiles = previewTiles.filter((tile) => sourceFor(tile) === 'full-dashboard');
+      const exportTiles = previewTiles.filter((tile) => sourceFor(tile) !== 'full-dashboard');
+
+      if (fullDashboardTiles.length > 0) {
+        const blob = await exportFullDashboardAsPng(
+          connection.baseUrl,
+          connection.apiKey,
+          dashboard.id,
+          controller.signal,
+        );
+        const dataUrl = await blobToDataUrl(blob);
+        const next = Object.fromEntries(
+          fullDashboardTiles.map((tile) => [
+            tile.id,
+            {
+              tileId: tile.id,
+              status: 'done' as const,
+              message: 'Full dashboard preview',
+              pngDataUrl: dataUrl,
+              pngSize: blob.size,
+            },
+          ]),
+        );
+        setPreviewStates((prev) => ({ ...prev, ...next }));
+      }
+
+      if (exportTiles.length > 0) {
+        const perTileSource = Object.fromEntries(
+          exportTiles.map((tile) => [tile.id, sourceFor(tile)] as const)
+        ) as Record<string, TileVisualSource>;
+        const { states } = await runTileExports({
+          baseUrl: connection.baseUrl,
+          apiKey: connection.apiKey,
+          dashboardId: dashboard.id,
+          tiles: exportTiles,
+          strategy: strategyForTileExports(renderStrategy),
+          perTileSource,
+          signal: controller.signal,
+          filterOverrides: previewOverrides,
+          onUpdate: (state) => setPreviewStates((prev) => ({ ...prev, [state.tileId]: state })),
+        });
+        setPreviewStates((prev) => ({ ...prev, ...states }));
+      }
+    } catch (err) {
+      setPreviewError(err instanceof Error ? err.message : 'Preview rendering failed.');
+    } finally {
+      setPreviewing(false);
+    }
+  }, [
+    dashboard,
+    selectedTiles,
+    filterOverrides,
+    batchEnabled,
+    batchField,
+    batchValues,
+    renderStrategy,
+    connection.baseUrl,
+    connection.apiKey,
+    tileVisualSources,
+  ]);
 
   const handleSaveRecipe = useCallback(() => {
     if (!dashboard) return;
@@ -899,10 +1071,11 @@ export function DeckBuilderPage() {
       batch: batchEnabled && batchField ? { filterField: batchField, values: batchValues } : undefined,
       templateId: currentTemplate?.id,
       tileVisualSources: Object.keys(tileVisualSources).length > 0 ? tileVisualSources : undefined,
+      slideOverrides: Object.keys(slideOverrides).length > 0 ? slideOverrides : undefined,
     });
     const filename = `${deckFileName(dashboard.name, new Date()).replace(/\.pptx$/, '')}.recipe.json`;
     downloadJson(filename, recipe);
-  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources]);
+  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, slideOverrides]);
 
   const handleSaveBrand = useCallback(() => {
     const filename = `${(brand.name || 'brand').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.brand.json`;
@@ -927,11 +1100,11 @@ export function DeckBuilderPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className={isWorkspaceStep ? 'space-y-5' : 'space-y-6'}>
       <PageHeader
         title="Deck Builder"
         description="Turn an Omni dashboard into a branded PowerPoint deck."
-        icon={<Presentation size={20} />}
+        icon={<Blobby mood="deck-package" size={58} className="animate-float" style={{ animationDuration: '3.5s' }} />}
         actions={
           <button
             onClick={handleClearLocalCache}
@@ -944,8 +1117,8 @@ export function DeckBuilderPage() {
         }
       />
 
-      <div className="card">
-        <div className="flex items-center justify-between gap-2 overflow-x-auto">
+      <div className={`card ${isWorkspaceStep ? 'p-3' : ''}`}>
+        <div className={`flex items-center justify-between overflow-x-auto ${isWorkspaceStep ? 'gap-1.5' : 'gap-2'}`}>
           {STEPS.map((s, idx) => {
             const isActive = idx === stepIndex;
             const isDone = idx < stepIndex;
@@ -955,11 +1128,11 @@ export function DeckBuilderPage() {
                 key={s.id}
                 disabled={!reachable}
                 onClick={() => gotoStep(s.id)}
-                className="flex-1 text-left disabled:cursor-not-allowed min-w-[120px]"
+                className={`${isWorkspaceStep ? 'min-w-[92px] px-2 py-1' : 'min-w-[120px]'} flex-1 text-left disabled:cursor-not-allowed rounded-button transition-colors hover:bg-surface-secondary`}
               >
                 <div className="flex items-center gap-2">
                   <span
-                    className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0"
+                    className={`${isWorkspaceStep ? 'w-6 h-6 text-[11px]' : 'w-7 h-7 text-xs'} rounded-full flex items-center justify-center font-bold flex-shrink-0`}
                     style={
                       isActive
                         ? { background: '#C8186A', color: '#fff', boxShadow: '0 0 0 4px rgba(255,71,148,0.18)' }
@@ -968,16 +1141,18 @@ export function DeckBuilderPage() {
                         : { background: 'rgba(255,71,148,0.12)', color: '#9B3065' }
                     }
                   >
-                    {isDone ? <CheckCircle size={14} /> : idx + 1}
+                    {isDone ? <CheckCircle size={isWorkspaceStep ? 12 : 14} /> : idx + 1}
                   </span>
                   <div className="min-w-0">
                     <div className="text-[12px] font-semibold tracking-tight" style={{ color: isActive ? '#C8186A' : '#1A0818' }}>
                       {s.label}
                     </div>
-                    <div className="text-[10px] text-content-tertiary">{s.description}</div>
+                    <div className={`${isWorkspaceStep ? 'hidden 2xl:block' : ''} text-[10px] text-content-tertiary`}>
+                      {s.description}
+                    </div>
                   </div>
                 </div>
-                {idx < STEPS.length - 1 && (
+                {!isWorkspaceStep && idx < STEPS.length - 1 && (
                   <div
                     className="h-px mt-2 ml-9"
                     style={{ background: idx < stepIndex ? '#FF4794' : 'rgba(255,71,148,0.18)' }}
@@ -1163,7 +1338,7 @@ export function DeckBuilderPage() {
                   className="flex items-center gap-2 p-2.5 rounded-card border border-border bg-white"
                 >
                   <span
-                    className="w-6 h-6 rounded-full bg-omni-100/40 text-[11px] flex items-center justify-center font-semibold"
+	                    className="w-6 h-6 rounded-full bg-surface-secondary text-[11px] flex items-center justify-center font-semibold"
                     style={{ color: '#C8186A' }}
                   >
                     {idx + 1}
@@ -1281,7 +1456,7 @@ export function DeckBuilderPage() {
                     type="button"
                     onClick={() => setSelectedTemplateId(kit.id)}
                     className={`w-full text-left p-2.5 rounded-card border transition ${
-                      isCurrent ? 'border-omni-500 bg-omni-100/30' : 'border-border bg-white hover:border-omni-300'
+	                      isCurrent ? 'border-omni-500 bg-surface-secondary' : 'border-border bg-white hover:border-omni-300'
                     }`}
                   >
                     <div className="flex items-center justify-between gap-2 mb-1">
@@ -1534,7 +1709,7 @@ export function DeckBuilderPage() {
               <button onClick={() => setStep('filters')} className="btn-ghost btn-sm">
                 Back
               </button>
-              <button onClick={() => setStep('insights')} className="btn-primary">
+              <button onClick={() => setStep('layout')} className="btn-primary">
                 Continue
               </button>
             </div>
@@ -1542,47 +1717,35 @@ export function DeckBuilderPage() {
         </div>
       )}
 
-      {step === 'insights' && (
+      {step === 'layout' && dashboard && currentTemplate && (
         <div className="card space-y-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <h2 className="text-sm font-semibold text-content-primary">Insights (optional)</h2>
-              <p className="text-[11px] text-content-tertiary">
-                Pre-fill the editable insight box for each slide.
-              </p>
-            </div>
-            <label className="flex items-center gap-2 text-[12px] text-content-secondary">
-              <input
-                type="checkbox"
-                checked={includeAppendix}
-                onChange={(e) => setIncludeAppendix(e.target.checked)}
-              />
-              Include source/audit appendix
-            </label>
+          <div>
+            <h2 className="text-sm font-semibold text-content-primary">Deck preview</h2>
+            <p className="text-[11px] text-content-tertiary">
+              Adjust tile placement, insight text, and speaker notes before generating. These settings are saved in deck recipes.
+            </p>
           </div>
 
-          <div className="space-y-3 max-h-[480px] overflow-y-auto">
-            {selectedTiles.map((tile, idx) => (
-              <div key={tile.id} className="border border-border rounded-card p-3 bg-white">
-                <div className="flex items-center gap-2 mb-2">
-                  <span
-                    className="w-6 h-6 rounded-full bg-omni-100/40 text-[11px] flex items-center justify-center font-semibold"
-                    style={{ color: '#C8186A' }}
-                  >
-                    {idx + 1}
-                  </span>
-                  <span className="text-[13px] font-medium text-content-primary">{tile.name}</span>
-                </div>
-                <textarea
-                  value={insights[tile.id] || ''}
-                  onChange={(e) => setInsights((prev) => ({ ...prev, [tile.id]: e.target.value }))}
-                  placeholder="Add insight here…"
-                  rows={3}
-                  className="input-field text-sm"
-                />
-              </div>
-            ))}
-          </div>
+          <SlideLayoutPreview
+            tiles={selectedTiles}
+            template={currentTemplate}
+            brand={brand}
+            overrides={slideOverrides}
+            onChange={setSlideOverrides}
+            insights={insights}
+            onInsightsChange={setInsights}
+            includeAppendix={includeAppendix}
+            onIncludeAppendixChange={setIncludeAppendix}
+            tileVisualSources={tileVisualSources}
+            renderStrategy={renderStrategy}
+            onTileVisualSourceChange={setTileVisualSource}
+            previewStates={previewStates}
+            previewing={previewing}
+            previewError={previewError}
+            previewSampleLabel={previewSampleLabel}
+            onRenderPreview={handleRenderPreview}
+            onApplyVisualSourceToAll={applyVisualSourceToAll}
+          />
 
           <div className="flex justify-between items-center pt-3 border-t border-border">
             <button onClick={() => setStep('brand')} className="btn-ghost btn-sm">
@@ -1599,105 +1762,17 @@ export function DeckBuilderPage() {
         <div className="card space-y-4">
           <div className="flex items-start justify-between gap-3">
             <div>
-              <h2 className="text-sm font-semibold text-content-primary">Generate deck</h2>
+              <h2 className="text-sm font-semibold text-content-primary">Ready to export</h2>
               <p className="text-[11px] text-content-tertiary">
                 {batchEnabled && batchField && batchValues.length > 0
-                  ? `Batch mode: ${batchValues.length} deck(s) will be generated, varying ${batchField}.`
-                  : 'Single deck generation.'}
+                  ? `Generate ${batchValues.length} deck(s), varying ${batchField}. Preview formatting will be applied to every output.`
+                  : 'Generate a PowerPoint deck using the formatting, notes, and callouts from Preview.'}
               </p>
             </div>
-            <div className="flex flex-col gap-1.5 flex-shrink-0">
-              <label className="flex items-center gap-2 text-[12px] text-content-secondary">
-                <input
-                  type="checkbox"
-                  checked={skipFailed}
-                  onChange={(e) => setSkipFailed(e.target.checked)}
-                  disabled={generating}
-                />
-                Skip failed tiles
-              </label>
-              <label className="flex items-center gap-2 text-[12px] text-content-secondary">
-                <input
-                  type="checkbox"
-                  checked={allowFullDashboardFallback}
-                  onChange={(e) => setAllowFullDashboardFallback(e.target.checked)}
-                  disabled={generating}
-                />
-                Fallback to full dashboard if per-tile fails
-              </label>
-              <label className="flex items-center gap-2 text-[12px] text-content-secondary">
-                <input type="checkbox" checked={verboseLogs} onChange={toggleVerbose} />
-                Verbose console logs
-              </label>
-            </div>
-          </div>
-
-          <div className="space-y-1.5">
-            <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
-              Render strategy
-            </div>
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-              {([
-                { id: 'native' as const, title: 'Native (recommended)', desc: 'Editable charts and tables built from query results.' },
-                { id: 'tile-image' as const, title: 'Per-tile image', desc: 'Probe Omni for tile-level PNGs.' },
-                { id: 'full-dashboard' as const, title: 'Full dashboard image', desc: 'Single dashboard PNG repeated across slides.' },
-              ]).map((opt) => {
-                const selected = renderStrategy === opt.id;
-                return (
-                  <button
-                    key={opt.id}
-                    type="button"
-                    onClick={() => setRenderStrategy(opt.id)}
-                    disabled={generating}
-                    className={`text-left p-3 rounded-card border transition ${
-                      selected ? 'border-omni-500 bg-omni-100/30' : 'border-border bg-white hover:border-omni-300'
-                    }`}
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span
-                        className={`w-3 h-3 rounded-full border ${
-                          selected ? 'bg-omni-500 border-omni-500' : 'border-border-strong'
-                        }`}
-                      />
-                      <span className="text-[12px] font-semibold text-content-primary">{opt.title}</span>
-                    </div>
-                    <div className="text-[11px] text-content-tertiary leading-snug pl-5">{opt.desc}</div>
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          {selectedTiles.length > 0 && (() => {
-            const counts = selectedTiles.reduce(
-              (acc, t) => {
-                const src = tileVisualSources[t.id] || (renderStrategy === 'tile-image' ? 'tile-image' : 'native');
-                acc[src] = (acc[src] || 0) + 1;
-                return acc;
-              },
-              {} as Record<string, number>
-            );
-            return (
-              <div className="flex flex-wrap items-center gap-2 text-[11px]">
-                <span className="text-content-tertiary uppercase tracking-wider font-medium">Per-tile sources:</span>
-                <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(16,110,62,0.12)', color: '#106E3E' }}>
-                  {counts.native || 0} native
-                </span>
-                <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,71,148,0.15)', color: '#C8186A' }}>
-                  {counts['tile-image'] || 0} image
-                </span>
-                <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(107,114,128,0.15)', color: '#4B5563' }}>
-                  {counts.skip || 0} skipped
-                </span>
-              </div>
-            );
-          })()}
-
-          <div className="flex flex-wrap items-center gap-2">
             <button
               onClick={handleGenerate}
               disabled={generating || selectedTiles.length === 0 || (batchEnabled && (!batchField || batchValues.length === 0))}
-              className="btn-primary"
+              className="btn-primary flex-shrink-0"
             >
               {generating ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
               {generating
@@ -1706,6 +1781,115 @@ export function DeckBuilderPage() {
                 ? `Generate ${batchValues.length} decks (.zip)`
                 : 'Generate & download .pptx'}
             </button>
+          </div>
+
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+            {[
+              { label: 'Slides', value: `${exportReadiness.exportableCount}/${exportReadiness.selectedCount}` },
+              { label: 'Customized', value: exportReadiness.customizedSlides },
+              { label: 'Insights', value: exportReadiness.insightCount },
+              { label: 'Callouts', value: exportReadiness.overlayCount },
+            ].map((item) => (
+              <div key={item.label} className="rounded-card border border-border bg-white px-3 py-2">
+                <div className="text-[10px] uppercase tracking-wider text-content-tertiary">{item.label}</div>
+                <div className="text-lg font-semibold text-content-primary">{item.value}</div>
+              </div>
+            ))}
+          </div>
+
+          {generating && (
+            <div
+              className="relative overflow-hidden rounded-card border p-4"
+              style={{
+                borderColor: 'rgba(255,87,137,0.22)',
+                background: 'linear-gradient(135deg, #FFFFFF 0%, #FFF6F9 52%, #F8F9FD 100%)',
+              }}
+              aria-live="polite"
+            >
+              <div className="flex items-center gap-4">
+                <div className="relative flex-shrink-0 w-28 h-20 flex items-center justify-center">
+                  <div className="absolute left-3 right-3 bottom-4 h-1 rounded-full bg-omni-100" />
+                  <Vehicle kind="f1" width={104} height={76} className="relative z-10" />
+                </div>
+                <div className="min-w-0">
+                  <div className="text-sm font-semibold text-content-primary">
+                    Blobby is building the deck package
+                  </div>
+                  <div className="text-xs text-content-secondary mt-1 leading-5">
+                    Exporting tiles, assembling slides, applying your template, and packaging the final PowerPoint.
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div className="rounded-card border border-border bg-white p-3 space-y-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 text-[12px]">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Dashboard</span>
+                  <span className="font-medium text-content-primary truncate">{dashboard.name}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Output</span>
+                  <span className="font-medium text-content-primary">
+                    {batchEnabled && batchField && batchValues.length > 0 ? `${batchValues.length} deck ZIP` : 'Single PPTX'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Render mode</span>
+                  <span className="font-medium text-content-primary">{renderModeLabel}</span>
+                </div>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Speaker notes</span>
+                  <span className="font-medium text-content-primary">{exportReadiness.speakerNotesCount}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Layout edits</span>
+                  <span className="font-medium text-content-primary">{exportReadiness.layoutOverrideCount}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Appendix</span>
+                  <span className="font-medium text-content-primary">{includeAppendix ? 'Included' : 'Off'}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 border-t border-border pt-3 text-[11px]">
+              {[
+                { label: 'Deck structure', value: `${exportReadiness.exportableCount} slide${exportReadiness.exportableCount === 1 ? '' : 's'} ready` },
+                { label: 'Narration', value: `${exportReadiness.insightCount} insight${exportReadiness.insightCount === 1 ? '' : 's'} · ${exportReadiness.speakerNotesCount} note${exportReadiness.speakerNotesCount === 1 ? '' : 's'}` },
+                { label: 'Visual strategy', value: renderModeLabel },
+              ].map((item) => (
+                <div key={item.label} className="rounded-card bg-surface-secondary px-3 py-2">
+                  <div className="font-medium text-content-primary">{item.value}</div>
+                  <div className="text-content-tertiary">{item.label}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+              <span className="text-content-tertiary uppercase tracking-wider font-medium">Slide sources:</span>
+              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(16,110,62,0.12)', color: '#106E3E' }}>
+                {exportReadiness.sourceCounts.native} native
+              </span>
+              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,71,148,0.15)', color: '#C8186A' }}>
+                {exportReadiness.sourceCounts.image} image
+              </span>
+              {exportReadiness.sourceCounts.fullDashboard > 0 && (
+                <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(255,71,148,0.15)', color: '#C8186A' }}>
+                  {exportReadiness.sourceCounts.fullDashboard} full dashboard
+                </span>
+              )}
+              <span className="px-2 py-0.5 rounded-full font-medium" style={{ background: 'rgba(107,114,128,0.15)', color: '#4B5563' }}>
+                {exportReadiness.sourceCounts.skipped} skipped
+              </span>
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
             {generating && (
               <button onClick={cancelGeneration} className="btn-ghost btn-sm" type="button">
                 <XCircle size={12} /> Cancel
@@ -1714,19 +1898,6 @@ export function DeckBuilderPage() {
             <button onClick={handleSaveRecipe} className="btn-secondary" type="button" disabled={!dashboard}>
               <Download size={13} /> Save deck recipe
             </button>
-            <button onClick={handleCopyDiagnostics} className="btn-ghost btn-sm" type="button">
-              <ClipboardCopy size={13} /> {copiedDiag ? 'Copied!' : 'Copy diagnostics'}
-            </button>
-          </div>
-
-          <div
-            className="text-[11px] flex items-start gap-2 px-3 py-2 rounded-card"
-            style={{ background: 'rgba(255,71,148,0.06)', color: '#7A2E52' }}
-          >
-            <Bug size={12} className="mt-0.5 flex-shrink-0" />
-            <span>
-              Open DevTools console and look for <code className="code-value">[DeckBuilder:*]</code> entries.
-            </span>
           </div>
 
           {generationError && (
@@ -1742,7 +1913,7 @@ export function DeckBuilderPage() {
             </div>
           )}
 
-          {batchEnabled && batchField && batchValues.length > 0 ? (
+          {batchEnabled && batchField && batchValues.length > 0 && (generating || Object.keys(batchClientStates).length > 0) ? (
             <div className="space-y-1.5">
               <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
                 Per-client status
@@ -1764,34 +1935,35 @@ export function DeckBuilderPage() {
                 );
               })}
             </div>
-          ) : (
+          ) : (generating || Object.keys(exportStates).length > 0) ? (
             <div className="space-y-1.5">
+              <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
+                Slide export status
+              </div>
               {selectedTiles.map((tile, idx) => {
                 const state = exportStates[tile.id];
                 const status = state?.status || 'pending';
                 const isFailed = status === 'failed';
                 const expanded = Boolean(expandedErrors[tile.id]);
+                const resolvedSource = resolveTileVisualSource(renderStrategy, tileVisualSources, tile.id);
+                const source = resolvedSource === 'full-dashboard'
+                  ? 'Full dashboard'
+                  : resolvedSource === 'tile-image'
+                  ? 'Omni image'
+                  : resolvedSource === 'skip'
+                  ? 'Skipped'
+                  : 'Native';
                 return (
                   <div key={tile.id} className="rounded-card border border-border bg-white">
                     <div className="flex items-center gap-2 p-2.5">
                       <span
-                        className="w-6 h-6 rounded-full bg-omni-100/40 text-[11px] flex items-center justify-center font-semibold flex-shrink-0"
+	                        className="w-6 h-6 rounded-full bg-surface-secondary text-[11px] flex items-center justify-center font-semibold flex-shrink-0"
                         style={{ color: '#C8186A' }}
                       >
                         {idx + 1}
                       </span>
                       <span className="flex-1 text-[13px] text-content-primary truncate">{tile.name}</span>
-                      <select
-                        value={tileVisualSources[tile.id] || (renderStrategy === 'tile-image' ? 'tile-image' : 'native')}
-                        onChange={(e) => setTileVisualSource(tile.id, e.target.value as TileVisualSource)}
-                        disabled={generating}
-                        className="text-[11px] rounded border border-border bg-white px-1.5 py-1 flex-shrink-0"
-                        title="Visual source for this tile"
-                      >
-                        <option value="native">Native</option>
-                        <option value="tile-image">Omni image</option>
-                        <option value="skip">Skip</option>
-                      </select>
+                      <span className="text-[11px] text-content-tertiary flex-shrink-0">{source}</span>
                       {state?.renderKind && (
                         <span
                           className="text-[10px] uppercase tracking-wider px-2 py-0.5 rounded-full font-semibold flex-shrink-0"
@@ -1824,10 +1996,10 @@ export function DeckBuilderPage() {
                 );
               })}
             </div>
-          )}
+          ) : null}
 
           <div className="flex justify-between items-center pt-3 border-t border-border">
-            <button onClick={() => setStep('insights')} className="btn-ghost btn-sm" disabled={generating}>
+            <button onClick={() => setStep('layout')} className="btn-ghost btn-sm" disabled={generating}>
               Back
             </button>
           </div>

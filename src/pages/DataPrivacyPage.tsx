@@ -1,10 +1,23 @@
 import { useEffect, useRef, useState } from 'react';
-import { Download, Upload, Trash2, ShieldCheck, HardDrive, RefreshCw } from 'lucide-react';
+import { Download, Upload, Trash2, HardDrive, RefreshCw } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { toast } from '@/components/ui/Toast';
-import { clearStore, exportAll, importAll, storageSummary, type StoreName } from '@/services/localStore';
+import { Blobby } from '@/components/ui/Blobby';
+import {
+  clearOmniKitLocalStorage,
+  clearOmniKitSessionStorage,
+  clearStore,
+  exportAll,
+  exportOmniKitLocalStorage,
+  importAll,
+  importOmniKitLocalStorage,
+  localStorageSummary,
+  sessionStorageSummary,
+  storageSummary,
+  type StoreName,
+} from '@/services/localStore';
 
 const STORE_LABELS: Record<StoreName, string> = {
   operations_log: 'Operation history',
@@ -25,13 +38,18 @@ const STORE_LABELS: Record<StoreName, string> = {
 
 export function DataPrivacyPage() {
   const [summary, setSummary] = useState<Array<{ store: StoreName; count: number }>>([]);
+  const [localSummary, setLocalSummary] = useState<Array<{ key: string; bytes: number }>>([]);
+  const [sessionSummary, setSessionSummary] = useState<Array<{ key: string; bytes: number }>>([]);
   const [loading, setLoading] = useState(true);
   const [pendingClear, setPendingClear] = useState<StoreName | 'all' | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const refresh = async () => {
     setLoading(true);
     try {
-      setSummary(await storageSummary());
+      const [indexedDbSummary] = await Promise.all([storageSummary()]);
+      setSummary(indexedDbSummary);
+      setLocalSummary(localStorageSummary());
+      setSessionSummary(sessionStorageSummary());
     } finally {
       setLoading(false);
     }
@@ -42,6 +60,8 @@ export function DataPrivacyPage() {
   }, []);
 
   const totalRecords = summary.reduce((a, b) => a + b.count, 0);
+  const totalLocalBytes = localSummary.reduce((a, b) => a + b.bytes, 0);
+  const totalSessionBytes = sessionSummary.reduce((a, b) => a + b.bytes, 0);
 
   const handleExport = async () => {
     try {
@@ -51,6 +71,7 @@ export function DataPrivacyPage() {
         exportedAt: new Date().toISOString(),
         version: 1,
         data,
+        localStorage: exportOmniKitLocalStorage(),
       };
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
       const url = URL.createObjectURL(blob);
@@ -74,6 +95,7 @@ export function DataPrivacyPage() {
       const data = parsed?.data ?? parsed;
       if (!data || typeof data !== 'object') throw new Error('Invalid backup file');
       await importAll(data, mode);
+      importOmniKitLocalStorage(parsed?.localStorage, mode);
       await refresh();
       toast({ type: 'success', title: `Backup ${mode === 'replace' ? 'restored' : 'merged'}` });
     } catch (err) {
@@ -94,6 +116,8 @@ export function DataPrivacyPage() {
         for (const row of summary) {
           await clearStore(row.store);
         }
+        clearOmniKitLocalStorage();
+        clearOmniKitSessionStorage();
         toast({ type: 'success', title: 'All local data cleared' });
       } else {
         await clearStore(pendingClear);
@@ -114,7 +138,7 @@ export function DataPrivacyPage() {
       <PageHeader
         title="Data & Privacy"
         description="Everything OmniKit stores lives in your browser. Export, import, or clear it here."
-        icon={<ShieldCheck size={18} />}
+        icon={<Blobby mood="governance" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
         actions={<StatusChip status="success" label={`${totalRecords} records stored locally`} />}
       />
 
@@ -154,6 +178,55 @@ export function DataPrivacyPage() {
         </div>
       </div>
 
+      <div className="card p-5">
+        <div className="flex items-center gap-3 mb-4">
+          <HardDrive size={16} className="text-omni-700" />
+          <h2 className="text-base font-semibold text-content-primary">Browser cache</h2>
+          <span className="text-xs text-content-secondary ml-auto">
+            {(totalLocalBytes / 1024).toFixed(1)} KB
+          </span>
+        </div>
+        {localSummary.length === 0 ? (
+          <p className="text-sm text-content-secondary">No OmniKit localStorage entries found.</p>
+        ) : (
+          <div className="divide-y divide-border">
+            {localSummary.map((row) => (
+              <div key={row.key} className="flex items-center justify-between py-2.5">
+                <div className="text-[11px] text-content-secondary font-mono truncate pr-4">{row.key}</div>
+                <span className="text-xs tabular-nums text-content-secondary">{(row.bytes / 1024).toFixed(1)} KB</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="card p-5">
+        <div className="flex items-center gap-3 mb-4">
+          <HardDrive size={16} className="text-omni-700" />
+          <h2 className="text-base font-semibold text-content-primary">Session storage</h2>
+          <span className="text-xs text-content-secondary ml-auto">
+            {(totalSessionBytes / 1024).toFixed(1)} KB
+          </span>
+        </div>
+        {sessionSummary.length === 0 ? (
+          <p className="text-sm text-content-secondary">No OmniKit sessionStorage entries found.</p>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-[13px] text-content-secondary leading-relaxed">
+              Session storage can include the active connection for this browser tab. It is excluded from backups and cleared by Clear all local data.
+            </p>
+            <div className="divide-y divide-border">
+              {sessionSummary.map((row) => (
+                <div key={row.key} className="flex items-center justify-between py-2.5">
+                  <div className="text-[11px] text-content-secondary font-mono truncate pr-4">{row.key}</div>
+                  <span className="text-xs tabular-nums text-content-secondary">{(row.bytes / 1024).toFixed(1)} KB</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <div className="card p-5">
           <div className="flex items-center gap-2 mb-2">
@@ -161,7 +234,7 @@ export function DataPrivacyPage() {
             <h3 className="text-base font-semibold text-content-primary">Export backup</h3>
           </div>
           <p className="text-[13px] text-content-secondary mb-4 leading-relaxed">
-            Download a single JSON file containing every record stored on this device. Useful for moving between machines or keeping a local snapshot.
+            Download a single JSON file containing OmniKit's IndexedDB records and browser cache entries. Useful for moving between machines or keeping a local snapshot.
           </p>
           <button onClick={handleExport} className="btn-primary text-sm">
             <Download size={14} />
@@ -202,7 +275,7 @@ export function DataPrivacyPage() {
         </p>
         <button
           onClick={() => setPendingClear('all')}
-          disabled={totalRecords === 0}
+          disabled={totalRecords === 0 && localSummary.length === 0 && sessionSummary.length === 0}
           className="px-4 py-2 rounded-button text-sm font-semibold bg-red-600 text-white hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-2"
         >
           <Trash2 size={14} />

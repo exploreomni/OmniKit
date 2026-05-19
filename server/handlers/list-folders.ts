@@ -29,10 +29,6 @@ function normalizeFolders(folders: unknown[], depth = 0): unknown[] {
     const identifier = typeof folder.identifier === "string" && folder.identifier.length > 0
       ? folder.identifier
       : slug || undefined;
-    if (depth === 0) {
-      console.log("[list-folders] Raw folder sample keys:", Object.keys(folder));
-      console.log("[list-folders] Raw folder sample:", JSON.stringify(folder).slice(0, 300));
-    }
     return { ...folder, id, identifier, children };
   });
 }
@@ -50,9 +46,23 @@ function extractArray(data: unknown): unknown[] | null {
   return null;
 }
 
+interface PageInfo {
+  hasNextPage?: boolean;
+  nextCursor?: string;
+  pageSize?: number;
+  totalRecords?: number;
+}
+
+function extractPageInfo(data: unknown): PageInfo | null {
+  if (!data || typeof data !== "object" || Array.isArray(data)) return null;
+  const pageInfo = (data as Record<string, unknown>).pageInfo;
+  if (!pageInfo || typeof pageInfo !== "object" || Array.isArray(pageInfo)) return null;
+  return pageInfo as PageInfo;
+}
+
 export default async function handler(req: Request): Promise<Response> {
   try {
-    const { base_url, api_key } = await req.json();
+    const { base_url, api_key, page_size, cursor, all_pages } = await req.json();
 
     const urlError = validateBaseUrl(base_url);
     if (urlError) {
@@ -67,48 +77,71 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     const cleanUrl = base_url.replace(/\/+$/, "");
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
+    const pageSize = Math.min(Math.max(Number(page_size || 100), 1), 100);
+    const allRaw: unknown[] = [];
+    let nextCursor = typeof cursor === "string" ? cursor : undefined;
+    let lastPageInfo: PageInfo | null = null;
+    let pagesFetched = 0;
 
-    const response = await fetch(`${cleanUrl}/api/v1/folders`, {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${api_key}`,
-        "Content-Type": "application/json",
-      },
-      signal: controller.signal,
-    });
-    clearTimeout(timeout);
+    do {
+      const params = new URLSearchParams();
+      params.set("pageSize", String(pageSize));
+      params.set("sortField", "name");
+      params.set("sortDirection", "asc");
+      params.set("include", "labels");
+      if (nextCursor) params.set("cursor", nextCursor);
 
-    if (!response.ok) {
-      const text = await response.text();
-      return new Response(
-        JSON.stringify({
-          error: `Omni API returned ${response.status}. Check your base URL and API key.`,
-          detail: text,
-          folders: [],
-        }),
-        { status: response.status, headers: jsonHeaders }
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+
+      const response = await fetch(`${cleanUrl}/api/v1/folders?${params.toString()}`, {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${api_key}`,
+          "Content-Type": "application/json",
+        },
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (!response.ok) {
+        const text = await response.text();
+        return new Response(
+          JSON.stringify({
+            error: `Omni API returned ${response.status}. Check your base URL and API key.`,
+            detail: text,
+            folders: [],
+          }),
+          { status: response.status, headers: jsonHeaders }
+        );
+      }
+
+      const data = await response.json();
+      const folders = extractArray(data);
+
+      if (folders === null) {
+        return new Response(
+          JSON.stringify({
+            error: "Could not find a folder list in the Omni API response. The response shape may have changed.",
+            rawResponse: data,
+            folders: [],
+          }),
+          { headers: jsonHeaders }
+        );
+      }
+
+      allRaw.push(...folders);
+      lastPageInfo = extractPageInfo(data);
+      pagesFetched += 1;
+      nextCursor = lastPageInfo?.hasNextPage ? lastPageInfo.nextCursor : undefined;
+    } while (all_pages === true && nextCursor && pagesFetched < 50);
+
+    return new Response(
+      JSON.stringify({ folders: normalizeFolders(allRaw), pageInfo: lastPageInfo, pagesFetched }),
+      {
+        headers: jsonHeaders,
+      }
       );
-    }
-
-    const data = await response.json();
-    const folders = extractArray(data);
-
-    if (folders === null) {
-      return new Response(
-        JSON.stringify({
-          error: "Could not find a folder list in the Omni API response. The response shape may have changed.",
-          rawResponse: data,
-          folders: [],
-        }),
-        { headers: jsonHeaders }
-      );
-    }
-
-    return new Response(JSON.stringify({ folders: normalizeFolders(folders) }), {
-      headers: jsonHeaders,
-    });
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unknown error occurred";

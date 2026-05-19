@@ -10,6 +10,7 @@ import inspectExport from './handlers/inspect-export';
 import listDocuments from './handlers/list-documents';
 import listFolders from './handlers/list-folders';
 import listModels from './handlers/list-models';
+import manageAi from './handlers/manage-ai';
 import manageGroups from './handlers/manage-groups';
 import manageModels from './handlers/manage-models';
 import manageTopics from './handlers/manage-topics';
@@ -19,6 +20,7 @@ import omniProxy from './handlers/omni-proxy';
 import testConnection from './handlers/test-connection';
 
 type Handler = (req: Request) => Promise<Response>;
+const MAX_BODY_BYTES = 25 * 1024 * 1024;
 
 const routes: Record<string, Handler> = {
   'bulk-copy-documents': bulkCopyDocuments,
@@ -30,6 +32,7 @@ const routes: Record<string, Handler> = {
   'list-documents': listDocuments,
   'list-folders': listFolders,
   'list-models': listModels,
+  'manage-ai': manageAi,
   'manage-groups': manageGroups,
   'manage-models': manageModels,
   'manage-topics': manageTopics,
@@ -42,7 +45,16 @@ const routes: Record<string, Handler> = {
 async function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on('data', (chunk: Buffer) => chunks.push(chunk));
+    let totalBytes = 0;
+    req.on('data', (chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (totalBytes > MAX_BODY_BYTES) {
+        reject(new Error('Request body is too large.'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });

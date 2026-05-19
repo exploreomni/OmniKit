@@ -1,10 +1,8 @@
 import { NavLink, useLocation } from 'react-router-dom';
 import {
   ArrowRightLeft,
-  FolderInput,
-  Trash2,
+  FolderCog,
   Users,
-  Shield,
   Database,
   BookOpen,
   Link2,
@@ -13,16 +11,18 @@ import {
   Plug,
   ChevronDown,
   ChevronRight,
-  Copy,
   Download,
   Presentation,
+  Sparkles,
   Cable,
   Calendar,
   Tag,
   FileUp,
+  FileSearch,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 
 interface NavSection {
   label: string;
@@ -35,23 +35,23 @@ interface NavSection {
 
 const sections: NavSection[] = [
   {
-    label: 'AI & Dashboards',
+    label: 'Dashboard AI & Delivery',
     items: [
-      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Migrate' },
-      { to: '/dashboards/bulk-move', icon: <FolderInput size={15} />, label: 'Bulk Move' },
-      { to: '/dashboards/bulk-copy', icon: <Copy size={15} />, label: 'Bulk Copy' },
-      { to: '/dashboards/bulk-delete', icon: <Trash2 size={15} />, label: 'Bulk Delete' },
-      { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Downloads' },
+      { to: '/dashboards/ai-studio', icon: <Sparkles size={15} />, label: 'AI Dashboard Studio' },
+      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Model Migrator' },
+      { to: '/dashboards/operations', icon: <FolderCog size={15} />, label: 'Dashboard Operations' },
+      { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Dashboard Downloads' },
       { to: '/deck-builder', icon: <Presentation size={15} />, label: 'Deck Builder' },
     ],
   },
   {
-    label: 'Data Platform',
+    label: 'Data & AI Readiness',
     items: [
-      { to: '/connections', icon: <Cable size={15} />, label: 'Connections' },
-      { to: '/uploads', icon: <FileUp size={15} />, label: 'Uploads' },
-      { to: '/models', icon: <Database size={15} />, label: 'Models' },
-      { to: '/topics', icon: <BookOpen size={15} />, label: 'Topics' },
+      { to: '/connections', icon: <Cable size={15} />, label: 'Connection Health' },
+      { to: '/uploads', icon: <FileUp size={15} />, label: 'Upload Governance' },
+      { to: '/models', icon: <Database size={15} />, label: 'Model & Topic Health' },
+      { to: '/content-health', icon: <FileSearch size={15} />, label: 'Content Health' },
+      { to: '/topics', icon: <BookOpen size={15} />, label: 'AI Semantic Studio' },
     ],
   },
   {
@@ -59,31 +59,38 @@ const sections: NavSection[] = [
     items: [
       { to: '/labels', icon: <Tag size={15} />, label: 'Labels' },
       { to: '/schedules', icon: <Calendar size={15} />, label: 'Schedules' },
-      { to: '/users', icon: <Users size={15} />, label: 'Users' },
-      { to: '/groups', icon: <Shield size={15} />, label: 'Groups' },
+      { to: '/users', icon: <Users size={15} />, label: 'User Management' },
       { to: '/embeds', icon: <Link2 size={15} />, label: 'Embed URLs' },
     ],
   },
 ];
 
-function SidebarSection({ section }: { section: NavSection }) {
+function SidebarSection({ section, expandOnConnect }: { section: NavSection; expandOnConnect: boolean }) {
   const location = useLocation();
   const isActive = section.items.some((item) => location.pathname.startsWith(item.to));
-  const [expanded, setExpanded] = useState(isActive);
+  const [expanded, setExpanded] = useState(() => expandOnConnect || isActive);
+
+  useEffect(() => {
+    if (expandOnConnect) setExpanded(true);
+  }, [expandOnConnect]);
+
+  useEffect(() => {
+    if (isActive) setExpanded(true);
+  }, [isActive]);
 
   return (
     <div className="mb-0.5">
       <button
         onClick={() => setExpanded(!expanded)}
         aria-expanded={expanded}
-        className="w-full flex items-center justify-between px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.12em] transition-all duration-150"
-        style={{ color: isActive ? '#C8186A' : 'rgba(155,48,101,0.5)' }}
+            className="w-full flex items-center justify-between px-3 py-1.5 text-[10px] font-bold uppercase tracking-[0.12em] transition-all duration-150"
+        style={{ color: isActive ? '#C83B70' : '#697080' }}
       >
         <span className="flex items-center gap-2">
           {isActive && (
             <span
               className="w-1 h-3 rounded-full flex-shrink-0"
-              style={{ background: '#E02C80' }}
+              style={{ background: '#C83B70' }}
             />
           )}
           {section.label}
@@ -102,18 +109,18 @@ function SidebarSection({ section }: { section: NavSection }) {
                 `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 group ${
                   isActive
                     ? 'font-semibold border-l-2'
-                    : 'hover:bg-pink-50'
+                    : 'hover:bg-surface-secondary'
                 }`
               }
               style={({ isActive }) =>
                 isActive
-                  ? {
-                      background: 'linear-gradient(135deg, rgba(255,71,148,0.16) 0%, rgba(200,24,106,0.10) 100%)',
-                      color: '#C8186A',
-                      boxShadow: 'inset 0 1px 0 rgba(255,71,148,0.12)',
-                      borderColor: '#E02C80',
-                    }
-                  : { color: '#7A2E52' }
+	                  ? {
+	                      background: '#F8F9FD',
+	                      color: '#C83B70',
+	                      boxShadow: 'none',
+	                      borderColor: '#C83B70',
+	                    }
+	                  : { color: '#404754' }
               }
             >
               <span className="flex-shrink-0 opacity-80">{item.icon}</span>
@@ -135,28 +142,20 @@ export function Sidebar() {
       className="w-56 flex flex-col flex-shrink-0 h-screen sticky top-0 overflow-hidden"
       aria-label="Main navigation"
       style={{
-        background: 'linear-gradient(180deg, #FFFFFF 0%, #FFF5F9 100%)',
-        borderRight: '1px solid rgba(255,71,148,0.15)',
+        background: '#FFFFFF',
+        borderRight: '1px solid rgba(217,222,232,0.95)',
       }}
     >
       <div
-        className="px-4 py-4"
-        style={{ borderBottom: '1px solid rgba(255,71,148,0.12)' }}
+        className="px-4 py-4 flex justify-center"
+        style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
       >
-        <div className="flex items-center gap-2.5">
-          <img
-            src="/omni-logo.webp"
-            alt="Omni"
-            className="h-6 w-auto object-contain"
-          />
-          <div className="h-4 w-px flex-shrink-0" style={{ background: 'rgba(200,24,106,0.2)' }} />
-          <span className="font-semibold text-sm tracking-tight" style={{ color: '#1A0818' }}>OmniKit</span>
-        </div>
+        <OmniKitLogo size="lg" />
       </div>
 
       <div
         className="px-2 py-2"
-        style={{ borderBottom: '1px solid rgba(255,71,148,0.12)' }}
+        style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
       >
         <NavLink
           to="/connect"
@@ -164,18 +163,18 @@ export function Sidebar() {
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
               isActive
                 ? 'font-semibold border-l-2'
-                : 'hover:bg-pink-50'
+	                : 'hover:bg-surface-secondary'
             }`
           }
           style={({ isActive }) =>
             isActive
-              ? {
-                  background: 'linear-gradient(135deg, rgba(255,71,148,0.16) 0%, rgba(200,24,106,0.10) 100%)',
-                  color: '#C8186A',
-                  boxShadow: 'inset 0 1px 0 rgba(255,71,148,0.12)',
-                  borderColor: '#E02C80',
-                }
-              : { color: '#9B3065' }
+	              ? {
+	                  background: '#F8F9FD',
+	                  color: '#C83B70',
+	                  boxShadow: 'none',
+	                  borderColor: '#C83B70',
+	                }
+	              : { color: '#404754' }
           }
         >
           <Plug size={15} className="flex-shrink-0 opacity-80" />
@@ -185,14 +184,14 @@ export function Sidebar() {
               {isConnected ? (
                 <span
                   className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"
-                  style={{ boxShadow: '0 0 6px rgba(52, 211, 153, 0.8)' }}
+	                  style={{ boxShadow: 'none' }}
                 />
               ) : (
-                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0" style={{ background: 'rgba(200,24,106,0.2)' }} />
+	                <span className="w-1.5 h-1.5 rounded-full flex-shrink-0 bg-border-strong" />
               )}
             </div>
             {isConnected && host && (
-              <div className="text-[10px] truncate mt-0.5 leading-none" style={{ color: '#C8186A', opacity: 0.7 }}>{host}</div>
+	              <div className="text-[10px] truncate mt-0.5 leading-none" style={{ color: '#697080' }}>{host}</div>
             )}
           </div>
         </NavLink>
@@ -200,16 +199,16 @@ export function Sidebar() {
 
       <nav className="flex-1 overflow-y-auto py-3 space-y-2" aria-label="Main sections">
         {sections.map((section) => (
-          <SidebarSection key={section.label} section={section} />
+          <SidebarSection key={section.label} section={section} expandOnConnect={isConnected} />
         ))}
       </nav>
 
       <div
         className="px-2 py-2"
-        style={{ borderTop: '1px solid rgba(255,71,148,0.12)' }}
+        style={{ borderTop: '1px solid rgba(217,222,232,0.95)' }}
       >
         <div className="px-3 mb-1.5">
-          <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: 'rgba(155,48,101,0.5)' }}>Activity</span>
+          <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: '#697080' }}>Activity</span>
         </div>
         <NavLink
           to="/history"
@@ -217,18 +216,18 @@ export function Sidebar() {
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
               isActive
                 ? 'font-semibold border-l-2'
-                : 'hover:bg-pink-50'
+	                : 'hover:bg-surface-secondary'
             }`
           }
           style={({ isActive }) =>
             isActive
-              ? {
-                  background: 'linear-gradient(135deg, rgba(255,71,148,0.16) 0%, rgba(200,24,106,0.10) 100%)',
-                  color: '#C8186A',
-                  boxShadow: 'inset 0 1px 0 rgba(255,71,148,0.12)',
-                  borderColor: '#E02C80',
-                }
-              : { color: '#7A2E52' }
+	              ? {
+	                  background: '#F8F9FD',
+	                  color: '#C83B70',
+	                  boxShadow: 'none',
+	                  borderColor: '#C83B70',
+	                }
+	              : { color: '#404754' }
           }
         >
           <Clock size={15} className="flex-shrink-0 opacity-80" />
@@ -238,18 +237,18 @@ export function Sidebar() {
           to="/data-privacy"
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
-              isActive ? 'font-semibold border-l-2' : 'hover:bg-pink-50'
+	            isActive ? 'font-semibold border-l-2' : 'hover:bg-surface-secondary'
             }`
           }
           style={({ isActive }) =>
             isActive
-              ? {
-                  background: 'linear-gradient(135deg, rgba(255,71,148,0.16) 0%, rgba(200,24,106,0.10) 100%)',
-                  color: '#C8186A',
-                  boxShadow: 'inset 0 1px 0 rgba(255,71,148,0.12)',
-                  borderColor: '#E02C80',
-                }
-              : { color: '#7A2E52' }
+	              ? {
+	                  background: '#F8F9FD',
+	                  color: '#C83B70',
+	                  boxShadow: 'none',
+	                  borderColor: '#C83B70',
+	                }
+	              : { color: '#404754' }
           }
         >
           <ShieldCheck size={15} className="flex-shrink-0 opacity-80" />
@@ -259,17 +258,17 @@ export function Sidebar() {
 
       <div
         className="px-4 py-3 flex items-center gap-2.5"
-        style={{ borderTop: '1px solid rgba(255,71,148,0.12)' }}
+        style={{ borderTop: '1px solid rgba(217,222,232,0.95)' }}
       >
         <span
           className="w-2 h-2 rounded-full flex-shrink-0 transition-all duration-300"
           style={
             isConnected
-              ? { background: '#34d399', boxShadow: '0 0 6px rgba(52,211,153,0.7)' }
-              : { background: 'rgba(200,24,106,0.3)' }
+              ? { background: '#34d399', boxShadow: 'none' }
+              : { background: '#C7CEDB' }
           }
         />
-        <span className="text-[10px] truncate font-medium" style={{ color: isConnected ? 'rgba(16,110,62,0.75)' : 'rgba(155,48,101,0.55)' }}>
+        <span className="text-[10px] truncate font-medium" style={{ color: isConnected ? '#047857' : '#697080' }}>
           {isConnected ? 'Connected & ready' : 'Not connected'}
         </span>
       </div>

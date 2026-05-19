@@ -13,15 +13,14 @@ interface DownloadAnimationProps {
 
 function Cloud({ left, top, size, delay }: { left: number; top: number; size: number; delay: number }) {
   return (
-    <div
-      className="absolute rounded-full bg-white/85"
+	    <div
+	      className="absolute rounded-full bg-white"
       style={{
         left: `${left}%`,
         top: `${top}%`,
         width: size,
         height: size * 0.45,
         animation: `float ${4 + delay}s ${delay}s ease-in-out infinite`,
-        filter: 'blur(0.5px)',
       }}
     />
   );
@@ -32,6 +31,8 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
   const fireConfetti = useConfetti();
   const firedRef = useRef(false);
   const [progress, setProgress] = useState(20);
+  const normalizedFormat = format?.toLowerCase();
+  const isPptx = normalizedFormat === 'pptx';
 
   useEffect(() => {
     if (!status || success) return;
@@ -60,22 +61,24 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
       <div
         className="rounded-2xl p-5 flex items-center gap-4 animate-fadeIn"
         style={{
-          background: 'linear-gradient(135deg, rgba(16,185,129,0.08) 0%, rgba(255,71,148,0.05) 100%)',
+          background: '#FFFFFF',
           border: '1px solid rgba(16,185,129,0.28)',
         }}
       >
         <div className="relative flex-shrink-0">
-          <Blobby mood="celebrating" size={72} className={reduced ? '' : 'animate-wiggle-infinite'} />
-          <div
-            className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full flex items-center justify-center"
-            style={{
-              background: 'linear-gradient(135deg, #047857, #10B981)',
-              boxShadow: '0 2px 8px rgba(16,185,129,0.4)',
-              animation: reduced ? undefined : 'stampIn 500ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
-            }}
-          >
-            <Check size={14} strokeWidth={3} className="text-white" />
-          </div>
+          <Blobby mood={isPptx ? 'deck-package' : 'download'} size={isPptx ? 96 : 82} className={reduced ? '' : 'animate-wiggle-infinite'} />
+          {!isPptx && (
+            <div
+              className="absolute -bottom-1 -right-1 w-7 h-7 rounded-full flex items-center justify-center"
+              style={{
+                background: '#10B981',
+                boxShadow: 'none',
+                animation: reduced ? undefined : 'stampIn 500ms cubic-bezier(0.22, 1, 0.36, 1) forwards',
+              }}
+            >
+              <Check size={14} strokeWidth={3} className="text-white" />
+            </div>
+          )}
         </div>
         <div className="min-w-0">
           <div className="text-[16px] font-bold text-content-primary leading-tight">
@@ -95,9 +98,9 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
     <div
       className="relative overflow-hidden rounded-2xl p-5 animate-fadeIn"
       style={{
-        background: 'linear-gradient(180deg, #DCEEFF 0%, #FFF8FB 85%)',
-        border: '1px solid rgba(242,190,214,0.8)',
-        boxShadow: '0 1px 4px rgba(200,24,100,0.06), 0 4px 16px rgba(200,24,100,0.04)',
+        background: '#FFFFFF',
+        border: '1px solid rgba(217,222,232,0.95)',
+        boxShadow: 'none',
       }}
       aria-live="polite"
     >
@@ -115,21 +118,15 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
             }}
           >
             <div className="relative">
-              <Vehicle kind="parachute" width={68} height={84} />
-              <Blobby
-                mood="download"
-                size={30}
-                className="absolute left-1/2 -translate-x-1/2"
-                style={{ top: 54 }}
-              />
+              <Vehicle kind={isPptx ? 'parachute' : 'airplane'} width={isPptx ? 88 : 106} height={isPptx ? 112 : 82} />
               {format && (
                 <span
-                  className="absolute -right-2 top-16 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
+                  className="absolute -right-2 top-20 text-[9px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded"
                   style={{
                     background: '#FFFFFF',
-                    color: '#C8186A',
-                    border: '1px solid #F2BED6',
-                    boxShadow: '0 1px 3px rgba(200,24,100,0.15)',
+                    color: '#C83B70',
+                    border: '1px solid #E8D5DE',
+                    boxShadow: 'none',
                   }}
                 >
                   {format}
@@ -140,10 +137,10 @@ export function DownloadAnimation({ status, success, format }: DownloadAnimation
 
           <div className="absolute bottom-0 left-0 right-0 flex justify-center">
             <svg width="80" height="24" viewBox="0 0 80 24">
-              <rect x="8" y="4" width="64" height="12" rx="2" fill="#FFFFFF" stroke="#C8186A" strokeWidth="1.2" />
+              <rect x="8" y="4" width="64" height="12" rx="2" fill="#FFFFFF" stroke="#C83B70" strokeWidth="1.2" />
               <rect x="12" y="7" width="56" height="6" rx="1" fill="#FFE8F2" />
-              <rect x="2" y="16" width="76" height="3" rx="1.5" fill="#C8186A" opacity="0.85" />
-              <circle cx="40" cy="10" r="1.5" fill="#C8186A" />
+              <rect x="2" y="16" width="76" height="3" rx="1.5" fill="#C83B70" opacity="0.85" />
+              <circle cx="40" cy="10" r="1.5" fill="#C83B70" />
             </svg>
           </div>
         </div>
