@@ -18,6 +18,13 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { SearchInput } from '@/components/ui/SearchInput';
+import {
+  selectedBadgeClass,
+  selectedRowClass,
+  selectedTreeRowClass,
+  unselectedRowClass,
+  unselectedTreeRowClass,
+} from '@/components/ui/selectionStyles';
 import { friendlyApiError } from '@/utils/apiErrors';
 import type { OmniLabel, OmniFolder, OmniDocument } from '@/types';
 
@@ -692,7 +699,7 @@ export function LabelsPage() {
                     const isActive = activeFolderId === folder.id;
                     const labelsForFolder = folderLabels[folder.id] || extractLabels(folder);
                     return (
-                      <div key={folder.id} className={`px-3 py-2.5 transition-colors ${isSelected ? 'bg-omni-50' : isActive ? 'bg-surface-secondary' : 'hover:bg-surface-secondary'}`}>
+                      <div key={folder.id} className={`px-3 py-2.5 transition-all ${isSelected ? selectedTreeRowClass : isActive ? 'border-l-4 border-l-omni-300 bg-surface-secondary' : unselectedTreeRowClass}`}>
                         <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] gap-2 items-start" style={{ paddingLeft: `${folder.depth * 14}px` }}>
                           <input
                             type="checkbox"
@@ -806,8 +813,8 @@ export function LabelsPage() {
                       return (
                         <label
                           key={doc.id}
-                          className={`block px-4 py-3 cursor-pointer transition-colors ${
-                            isSelected ? 'bg-omni-50' : 'hover:bg-surface-secondary'
+                          className={`block px-4 py-3 cursor-pointer transition-all ${
+                            isSelected ? selectedRowClass : unselectedRowClass
                           }`}
                         >
                           <div className="grid grid-cols-[auto_minmax(0,1fr)] gap-3 items-start">
@@ -821,6 +828,12 @@ export function LabelsPage() {
                               <div className="flex items-center gap-2 min-w-0">
                                 <LayoutDashboard size={14} className="text-content-secondary flex-shrink-0" />
                                 <span className="text-sm font-medium text-content-primary truncate">{doc.name}</span>
+                                {isSelected && (
+                                  <span className={selectedBadgeClass}>
+                                    <CheckCircle size={12} />
+                                    Selected
+                                  </span>
+                                )}
                               </div>
                               {doc.folderName && (
                                 <div className="mt-0.5 text-[10px] text-content-secondary truncate">

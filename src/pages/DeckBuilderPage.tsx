@@ -23,6 +23,13 @@ import { useLogOperation } from '@/contexts/OperationLogContext';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { Vehicle } from '@/components/ui/Vehicle';
+import {
+  selectedBadgeClass,
+  selectedCardClass,
+  selectedRowClass,
+  unselectedCardClass,
+  unselectedRowClass,
+} from '@/components/ui/selectionStyles';
 import { parseDashboardUrl } from '@/services/deckBuilder/dashboardUrlParser';
 import {
   fetchDashboardSummary,
@@ -1176,6 +1183,7 @@ export function DeckBuilderPage() {
               lastSyncedAt={dashboardsSyncedAt}
               onRefresh={refreshDashboardList}
               onPick={handlePickDashboard}
+              selectedDashboardId={dashboard?.id}
               disabled={inspecting}
             />
           </div>
@@ -1301,7 +1309,9 @@ export function DeckBuilderPage() {
                 return (
                   <label
                     key={tile.id}
-                    className="flex items-start gap-2.5 p-2.5 rounded-card border border-border hover:border-omni-500/40 cursor-pointer"
+                    className={`flex items-start gap-2.5 p-2.5 rounded-card border cursor-pointer transition-all ${
+                      checked ? selectedRowClass : unselectedRowClass
+                    }`}
                   >
                     <input type="checkbox" checked={checked} onChange={() => toggleTile(tile.id)} />
                     <div className="min-w-0">
@@ -1310,6 +1320,12 @@ export function DeckBuilderPage() {
                         <div className="text-[10px] text-content-tertiary truncate">{tile.section}</div>
                       )}
                     </div>
+                    {checked && (
+                      <span className={selectedBadgeClass}>
+                        <CheckCircle size={12} />
+                        Selected
+                      </span>
+                    )}
                   </label>
                 );
               })}
@@ -1455,21 +1471,30 @@ export function DeckBuilderPage() {
                     key={kit.id}
                     type="button"
                     onClick={() => setSelectedTemplateId(kit.id)}
-                    className={`w-full text-left p-2.5 rounded-card border transition ${
-	                      isCurrent ? 'border-omni-500 bg-surface-secondary' : 'border-border bg-white hover:border-omni-300'
+                    aria-pressed={isCurrent}
+                    className={`relative w-full text-left p-2.5 rounded-card border transition-all ${
+	                      isCurrent ? selectedCardClass : unselectedCardClass
                     }`}
                   >
+                    {isCurrent && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
                     <div className="flex items-center justify-between gap-2 mb-1">
                       <span className="text-[12px] font-semibold text-content-primary truncate">{kit.name}</span>
-                      <span
-                        className="text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded flex-shrink-0"
-                        style={{
-                          background: builtin ? 'rgba(107,114,128,0.12)' : 'rgba(255,71,148,0.15)',
-                          color: builtin ? '#4B5563' : '#C8186A',
-                        }}
-                      >
-                        {kit.source}
-                      </span>
+                      {isCurrent ? (
+                        <span className={selectedBadgeClass}>
+                          <CheckCircle size={12} />
+                          Selected
+                        </span>
+                      ) : (
+                        <span
+                          className="text-[9px] uppercase tracking-wider font-semibold px-1.5 py-0.5 rounded flex-shrink-0"
+                          style={{
+                            background: builtin ? 'rgba(107,114,128,0.12)' : 'rgba(255,71,148,0.15)',
+                            color: builtin ? '#4B5563' : '#C8186A',
+                          }}
+                        >
+                          {kit.source}
+                        </span>
+                      )}
                     </div>
                     <div className="flex items-center gap-1.5">
                       <span className="w-3 h-3 rounded border border-border" style={{ background: `#${kit.brand.primaryColor.replace(/^#/, '')}` }} />

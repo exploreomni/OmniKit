@@ -19,6 +19,13 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { BulkOperationAnimation } from '@/components/ui/BulkOperationAnimation';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { Blobby } from '@/components/ui/Blobby';
+import {
+  selectedBadgeClass,
+  selectedRowClass,
+  selectedTreeRowClass,
+  unselectedRowClass,
+  unselectedTreeRowClass,
+} from '@/components/ui/selectionStyles';
 import type { OmniFolder, OmniDocument, BulkOperationResult, BulkOperationSummary } from '@/types';
 
 function FolderNode({
@@ -43,12 +50,14 @@ function FolderNode({
   return (
     <div>
       <button
+        type="button"
         onClick={() => {
           onSelect(folder);
           if (hasChildren) onToggle(folder.id);
         }}
-        className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-colors ${
-          isSelected ? 'bg-omni-100 text-omni-700 font-medium' : 'text-content-primary hover:bg-surface-secondary'
+        aria-pressed={isSelected}
+        className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
+          isSelected ? selectedTreeRowClass : unselectedTreeRowClass
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >
@@ -63,6 +72,7 @@ function FolderNode({
           <Folder size={15} className="text-content-secondary flex-shrink-0" />
         )}
         <span className="truncate">{folder.name}</span>
+        {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
       </button>
       {isExpanded &&
         folder.children?.map((child) => (
@@ -108,12 +118,14 @@ function DestinationFolderPicker({
     return (
       <div>
         <button
+          type="button"
           onClick={() => {
             onSelect(folder);
             if (hasChildren) toggleExpanded(folder.id);
           }}
-          className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-colors ${
-            isSelected ? 'bg-omni-100 text-omni-700 font-medium' : 'text-content-primary hover:bg-surface-secondary'
+          aria-pressed={isSelected}
+          className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
+            isSelected ? selectedTreeRowClass : unselectedTreeRowClass
           }`}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
         >
@@ -128,6 +140,7 @@ function DestinationFolderPicker({
             <Folder size={15} className="text-content-secondary flex-shrink-0" />
           )}
           <span className="truncate">{folder.name}</span>
+          {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
         </button>
         {isExpanded &&
           folder.children?.map((child) => (
@@ -505,8 +518,8 @@ export function BulkCopyPage() {
               filteredDocs.map((doc, index) => (
                 <label
                   key={doc.id || `doc-${index}`}
-                  className={`flex items-center px-4 py-2.5 border-b border-border/50 cursor-pointer hover:bg-surface-secondary transition-colors ${
-                    isSelected(doc) ? 'bg-surface-secondary' : ''
+                  className={`flex items-center px-4 py-2.5 border-b border-border/50 cursor-pointer transition-all ${
+                    isSelected(doc) ? selectedRowClass : unselectedRowClass
                   }`}
                 >
                   <input
@@ -518,6 +531,12 @@ export function BulkCopyPage() {
                   <div className="ml-3 flex-1 min-w-0">
                     <div className="text-sm text-content-primary truncate">{doc.name}</div>
                   </div>
+                  {isSelected(doc) && (
+                    <span className={selectedBadgeClass}>
+                      <CheckCircle size={12} />
+                      Selected
+                    </span>
+                  )}
                   <div className="ml-3 flex-shrink-0">
                     {!doc.baseModelId && enriching ? (
                       <Loader2 size={14} className="text-content-secondary animate-spin" />

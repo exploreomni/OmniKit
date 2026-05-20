@@ -142,6 +142,18 @@ export function DataPrivacyPage() {
         actions={<StatusChip status="success" label={`${totalRecords} records stored locally`} />}
       />
 
+      <div className="card p-5 border-omni-100 bg-omni-50">
+        <div className="flex items-start gap-3">
+          <HardDrive size={16} className="mt-0.5 text-omni-700" />
+          <div>
+            <h2 className="text-base font-semibold text-content-primary">Semantic migration source handling</h2>
+            <p className="mt-1 text-[13px] leading-relaxed text-omni-700">
+              AI Semantic Studio can parse dbt, Looker, Power BI, Tableau, and Domo source artifacts in the browser for migration planning. Raw uploaded files and pasted source text stay in page memory by default and are not written to IndexedDB or localStorage. Generated YAML, branch validation results, and normal operation metadata follow the storage rules listed below.
+            </p>
+          </div>
+        </div>
+      </div>
+
       <div className="card p-5">
         <div className="flex items-center gap-3 mb-4">
           <HardDrive size={16} className="text-omni-700" />

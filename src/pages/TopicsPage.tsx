@@ -37,6 +37,15 @@ import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { SemanticMigrationImportPanel } from '@/components/semanticStudio/SemanticMigrationImportPanel';
+import {
+  selectedBadgeClass,
+  selectedCardClass,
+  selectedRowClass,
+  unselectedBadgeClass,
+  unselectedCardClass,
+  unselectedRowClass,
+} from '@/components/ui/selectionStyles';
 import type { OmniModel } from '@/types';
 
 function TopicFormModal({
@@ -4823,6 +4832,7 @@ function ManualCopyFallback({
 
 export function TopicsPage() {
   const { connection } = useConnection();
+  const [studioMode, setStudioMode] = useState<'builders' | 'migration'>('builders');
   const [models, setModels] = useState<OmniModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
   const [selectedTopicName, setSelectedTopicName] = useState('');
@@ -6219,6 +6229,51 @@ export function TopicsPage() {
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
 
+      <div className="card p-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2" aria-label="AI Semantic Studio mode">
+          <button
+            type="button"
+            onClick={() => setStudioMode('builders')}
+            aria-pressed={studioMode === 'builders'}
+            className={`relative rounded-button border px-3 py-2 text-left transition-all ${
+              studioMode === 'builders' ? selectedCardClass : unselectedCardClass
+            }`}
+          >
+            {studioMode === 'builders' && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
+            <div className="text-sm font-semibold">Guided Builders</div>
+            <div className="mt-0.5 text-[11px]">Topic Builder, Model / View Builder, and Permission Builder.</div>
+            {studioMode === 'builders' && (
+              <span className={`${selectedBadgeClass} mt-2`}>
+                <CheckCircle2 size={12} />
+                Selected
+              </span>
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => setStudioMode('migration')}
+            aria-pressed={studioMode === 'migration'}
+            className={`relative rounded-button border px-3 py-2 text-left transition-all ${
+              studioMode === 'migration' ? selectedCardClass : unselectedCardClass
+            }`}
+          >
+            {studioMode === 'migration' && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
+            <div className="text-sm font-semibold">Semantic Migration Import</div>
+            <div className="mt-0.5 text-[11px]">Convert external semantic artifacts into Omni YAML.</div>
+            {studioMode === 'migration' && (
+              <span className={`${selectedBadgeClass} mt-2`}>
+                <CheckCircle2 size={12} />
+                Selected
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {studioMode === 'migration' ? (
+        <SemanticMigrationImportPanel />
+      ) : (
+      <>
       <div className="card p-3">
         <div className="flex items-center justify-between overflow-x-auto gap-2" aria-label="AI Semantic Studio progress">
           {STUDIO_STEPS.map((step, index) => {
@@ -6368,21 +6423,28 @@ export function TopicsPage() {
                       key={path.id}
                       type="button"
                       onClick={() => handleStudioPathSelect(path.id)}
-                      className={`text-left rounded-card border p-3 transition-colors ${
-                        selected ? 'border-omni-400 bg-omni-50 shadow-soft' : 'border-border bg-white hover:bg-surface-secondary'
+                      aria-pressed={selected}
+                      className={`relative text-left rounded-card border p-3 transition-all ${
+                        selected ? selectedCardClass : unselectedCardClass
                       }`}
                     >
-                      <div className="flex items-start justify-between gap-3">
+                      {selected && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
+                      <div className="flex items-start justify-between gap-3 pl-1">
                         <div>
                           <div className="text-sm font-semibold text-content-primary">{path.label}</div>
                           <div className="mt-1 text-[11px] leading-relaxed text-content-secondary">{path.output}</div>
                         </div>
-                        <span className={`shrink-0 rounded-chip px-2 py-1 text-[10px] font-semibold ${
-                          selected ? 'bg-white text-omni-700' : 'bg-surface-secondary text-content-secondary'
-                        }`}>
-	                          {path.id === 'topic' ? '.topic' : path.id === 'permissions' ? 'permissions' : 'model/relationships/.view'}
+                        <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
+                          {selected && <CheckCircle2 size={12} />}
+                          {selected ? 'Selected' : path.id === 'topic' ? '.topic' : path.id === 'permissions' ? 'permissions' : 'model/relationships/.view'}
                         </span>
                       </div>
+                      {selected && (
+                        <div className="mt-2 inline-flex items-center gap-1 pl-1 text-[11px] font-semibold text-omni-700">
+                          <CheckCircle2 size={13} />
+                          Active workflow lane
+                        </div>
+                      )}
                     </button>
                   );
                 })}
@@ -6412,8 +6474,9 @@ export function TopicsPage() {
                       key={model.id}
                       type="button"
                       onClick={() => handleModelSelect(model.id)}
-                      className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-colors last:border-b-0 ${
-                        selected ? 'bg-omni-50 text-omni-800' : 'hover:bg-surface-secondary text-content-primary'
+                      aria-pressed={selected}
+                      className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${
+                        selected ? selectedRowClass : unselectedRowClass
                       }`}
                     >
                       <div className="flex items-start justify-between gap-3">
@@ -6426,8 +6489,9 @@ export function TopicsPage() {
                             </div>
                           )}
                         </div>
-                        <span className={`shrink-0 rounded-chip px-2 py-1 text-[10px] font-semibold ${selected ? 'bg-white text-omni-700' : 'bg-surface-secondary text-content-secondary'}`}>
-                          {model.kind || 'Model'}
+                        <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
+                          {selected && <CheckCircle2 size={12} />}
+                          {selected ? 'Selected' : model.kind || 'Model'}
                         </span>
                       </div>
                     </button>
@@ -6485,16 +6549,28 @@ export function TopicsPage() {
 	                    setAiPickedTopic('');
 	                    resetAiConversation();
 	                  }}
-	                  className={`w-full rounded-card border px-3 py-2 text-left transition-colors ${
+                    aria-pressed={topicCreationMode}
+	                  className={`relative w-full rounded-card border px-3 py-2 text-left transition-all ${
 	                    topicCreationMode
-	                      ? 'border-omni-300 bg-omni-50 text-omni-800 shadow-soft'
-	                      : 'border-border bg-white text-content-primary hover:bg-surface-secondary'
+	                      ? selectedCardClass
+	                      : unselectedCardClass
 	                  }`}
 	                >
-	                  <div className="text-xs font-semibold">Create new topic candidate</div>
+                    {topicCreationMode && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
+                    <div className="flex items-start justify-between gap-3 pl-1">
+                      <div className="min-w-0">
+	                      <div className="text-xs font-semibold">Create new topic candidate</div>
 	                  <div className="mt-0.5 text-[11px] text-content-secondary">
 	                    No existing topic selected. Omni AI will propose a new .topic file.
 	                  </div>
+                      </div>
+                      {topicCreationMode && (
+                        <span className={selectedBadgeClass}>
+                          <CheckCircle2 size={12} />
+                          Selected
+                        </span>
+                      )}
+                    </div>
 	                </button>
 	              </div>
 	            )}
@@ -6519,8 +6595,9 @@ export function TopicsPage() {
                       resetAiConversation();
                       fetchTopicDetail(topic.name, selectedModelId);
                     }}
-                    className={`w-full text-left px-4 py-3 border-b border-border/50 transition-colors ${
-                      selectedTopicName === topic.name ? 'bg-omni-50 text-omni-700' : 'hover:bg-surface-secondary text-content-primary'
+                    aria-pressed={selectedTopicName === topic.name}
+                    className={`w-full text-left px-4 py-3 border-b border-border/50 transition-all ${
+                      selectedTopicName === topic.name ? selectedRowClass : unselectedRowClass
                     }`}
                   >
                     <div className="flex items-center justify-between gap-3">
@@ -6528,7 +6605,14 @@ export function TopicsPage() {
                         <div className="text-sm font-semibold truncate">{topic.label || topic.name}</div>
                         <div className="text-[10px] font-mono text-content-tertiary truncate">{topic.name}</div>
                       </div>
-                      <div className={`w-2 h-2 rounded-full flex-shrink-0 ${topic.description ? 'bg-green-500' : 'bg-amber-400'}`} />
+                      {selectedTopicName === topic.name ? (
+                        <span className={selectedBadgeClass}>
+                          <CheckCircle2 size={12} />
+                          Selected
+                        </span>
+                      ) : (
+                        <div className={`w-2 h-2 rounded-full flex-shrink-0 ${topic.description ? 'bg-green-500' : 'bg-amber-400'}`} />
+                      )}
                     </div>
                   </button>
                 ))
@@ -6763,14 +6847,16 @@ export function TopicsPage() {
 	                                    setTargetBaseViewName(fileName);
 	                                    if (aiConversationId) resetAiConversation();
 	                                  }}
-	                                  className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-colors last:border-b-0 ${
-	                                    selected ? 'bg-omni-50 text-omni-800' : 'hover:bg-surface-secondary text-content-primary'
+                                    aria-pressed={selected}
+	                                  className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${
+	                                    selected ? selectedRowClass : unselectedRowClass
 	                                  }`}
 	                                >
 	                                  <div className="flex items-center justify-between gap-3">
 	                                    <span className="min-w-0 truncate font-mono text-xs">{fileName}</span>
-	                                    <span className={`shrink-0 rounded-chip px-2 py-1 text-[10px] font-semibold ${selected ? 'bg-white text-omni-700' : 'bg-surface-secondary text-content-secondary'}`}>
-	                                      {fileType}
+	                                    <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
+                                        {selected && <CheckCircle2 size={12} />}
+	                                      {selected ? 'Selected' : fileType}
 	                                    </span>
 	                                  </div>
 	                                </button>
@@ -6837,18 +6923,21 @@ export function TopicsPage() {
                           key={workstream.id}
                           type="button"
                           onClick={() => toggleWorkstream(workstream.id)}
-	                          className={`text-left rounded-card border p-3 transition-colors h-full min-h-[84px] ${
-                            selected ? 'border-omni-300 bg-omni-50' : 'border-border bg-white hover:bg-surface-secondary'
+                          aria-pressed={selected}
+	                          className={`relative text-left rounded-card border p-3 transition-all h-full min-h-[84px] ${
+                            selected ? selectedCardClass : unselectedCardClass
                           }`}
                         >
-                          <div className="flex items-start justify-between gap-3">
+                          {selected && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
+                          <div className="flex items-start justify-between gap-3 pl-1">
                             <div>
                               <div className="text-sm font-semibold text-content-primary">{workstream.label}</div>
                               <div className="mt-1 text-xs text-content-secondary leading-relaxed">{workstream.description}</div>
                             </div>
                             <div className="flex shrink-0 flex-col items-end gap-2">
-                              <span className={`text-[10px] px-2 py-1 rounded-chip ${selected ? 'bg-white text-omni-700' : 'bg-surface-secondary text-content-secondary'}`}>
-                                {workstream.layer}
+                              <span className={selected ? selectedBadgeClass : unselectedBadgeClass}>
+                                {selected && <CheckCircle2 size={12} />}
+                                {selected ? 'Selected' : workstream.layer}
                               </span>
                               <CheckCircle2 className={`h-4 w-4 ${selected ? 'text-omni-600' : 'text-content-tertiary'}`} />
                             </div>
@@ -8121,6 +8210,8 @@ export function TopicsPage() {
         onCancel={() => setDeleteTarget(null)}
       />
 
+      </>
+      )}
     </div>
   );
 }

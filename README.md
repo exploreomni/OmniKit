@@ -30,6 +30,7 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 - Download dashboards and build PowerPoint decks from live Omni tiles
 - Manage connections, uploads, users, groups, models, topics, labels, schedules, and embeds
 - Generate reviewable AI Semantic Studio packages for topics, views, models, and permissions
+- Import dbt, Looker, Power BI, Tableau, or Domo semantic artifacts into AI Semantic Studio to generate reviewed Omni semantic YAML
 - Inspect local history and review exactly what OmniKit stores on the Data Privacy page
 
 ---
@@ -117,7 +118,7 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 - **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
 - **Model & Topic Health** — validate models and inspect topic coverage.
 - **Content Health** — scan dashboard and workbook dependency health.
-- **AI Semantic Studio** — review and generate governed semantic-layer packages for Topic Builder, Model / View Builder, and Permission Builder workflows. OmniKit saves generated YAML to a dev branch for validation; final promotion remains in Omni's model editor.
+- **AI Semantic Studio** — review and generate governed semantic-layer packages for Topic Builder, Model / View Builder, and Permission Builder workflows. The Semantic Migration Import mode accepts dbt, Looker, Power BI, Tableau, and Domo source artifacts, parses them locally, and asks Blobby to generate Omni semantic YAML only. OmniKit saves generated YAML to a dev branch for validation; final promotion remains in Omni's model editor.
 
 ### Governance
 
@@ -132,7 +133,7 @@ Every batch run, migration, and bulk operation is appended here with timestamps,
 
 ### Data Privacy
 
-Exactly what is stored locally, where it's stored (localStorage, IndexedDB, or same-tab sessionStorage), and a single button to wipe everything.
+Exactly what is stored locally, where it's stored (localStorage, IndexedDB, or same-tab sessionStorage), and a single button to wipe everything. Semantic Migration Import source files and pasted source text stay in page memory by default; generated semantic YAML and operation metadata are stored only if you save or export them through normal OmniKit workflows.
 
 ---
 
@@ -162,6 +163,7 @@ Key points:
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
 - **No database.** Persistent app state lives in your browser (`localStorage` + IndexedDB). The active connection is kept in same-tab `sessionStorage`, which can include your Omni API key for the current browser session and is cleared by the Data Privacy wipe action.
 - **Compatibility-first proxy guardrails.** The generic proxy only forwards HTTPS requests to Omni `/api/v1` paths. Other Omni API surfaces used by the app, such as SCIM, embeds, and dashboard import/export, go through dedicated handlers.
+- **Semantic migration intake is local-first.** Uploaded dbt, Looker, Power BI, Tableau, and Domo artifacts are parsed in the browser and held in memory for the active page session. OmniKit does not write raw external BI source files to IndexedDB or localStorage by default.
 
 ---
 

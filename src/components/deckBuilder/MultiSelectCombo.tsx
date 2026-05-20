@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, X, Search, Loader2, RefreshCcw, AlertTriangle, Plus } from 'lucide-react';
+import { CheckCircle2, ChevronDown, X, Search, Loader2, RefreshCcw, AlertTriangle, Plus } from 'lucide-react';
+import { selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 
 interface Props {
   selected: string[];
@@ -280,8 +281,9 @@ export function MultiSelectCombo({
                     e.stopPropagation();
                     toggleValue(v);
                   }}
-                  className={`w-full flex items-center gap-2 px-3 py-2 text-left text-[13px] border-b border-border/40 last:border-0 ${
-                    active ? 'bg-omni-50' : 'hover:bg-surface-secondary'
+                  aria-pressed={checked}
+                  className={`w-full flex items-center gap-2 px-3 py-2 text-left text-[13px] border-b border-border/40 last:border-0 transition-all ${
+                    checked ? selectedRowClass : active ? 'border-l-4 border-l-omni-300 bg-omni-50' : unselectedRowClass
                   }`}
                 >
                   <span
@@ -296,6 +298,7 @@ export function MultiSelectCombo({
                     )}
                   </span>
                   <span className="truncate text-content-primary">{v}</span>
+                  {checked && <CheckCircle2 size={13} className="ml-auto shrink-0 text-omni-700" />}
                 </button>
               );
             })}
