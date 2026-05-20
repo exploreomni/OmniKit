@@ -13,11 +13,12 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 5. [Feature guide](#feature-guide)
 6. [How it works under the hood](#how-it-works-under-the-hood)
 7. [Scripts reference](#scripts-reference)
-8. [Configuration](#configuration)
-9. [Troubleshooting](#troubleshooting)
-10. [Security & privacy](#security--privacy)
-11. [Uninstalling](#uninstalling)
-12. [FAQ](#faq)
+8. [Release & package information](#release--package-information)
+9. [Configuration](#configuration)
+10. [Troubleshooting](#troubleshooting)
+11. [Security & privacy](#security--privacy)
+12. [Uninstalling](#uninstalling)
+13. [FAQ](#faq)
 
 ---
 
@@ -175,6 +176,14 @@ Key points:
 | `npm run preview` | Vite's built-in static preview (UI only, no API). |
 | `npm run typecheck` | Run `tsc --noEmit` across app and server. |
 | `npm run lint` | Run ESLint. |
+
+---
+
+## Release & package information
+
+- Release notes live in [RELEASES.md](./RELEASES.md).
+- Package and distribution guidance lives in [PACKAGES.md](./PACKAGES.md).
+- OmniKit is currently distributed as a source repository. It does not publish a GitHub Package, npm package, Docker image, or hosted service in the initial release.
 
 ---
 
