@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
-import { ChevronDown, ChevronRight, Download, Loader2, UserPlus, UserMinus, Upload, X } from 'lucide-react';
+import { CheckCircle2, ChevronDown, ChevronRight, Download, Loader2, UserPlus, UserMinus, Upload, X } from 'lucide-react';
 import { listGroups, getGroup, updateGroup, findUserByEmail, listAllUsers } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -7,6 +7,13 @@ import { SearchInput } from '@/components/ui/SearchInput';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Blobby } from '@/components/ui/Blobby';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import {
+  selectedBadgeClass,
+  selectedCardClass,
+  selectedRowClass,
+  unselectedCardClass,
+  unselectedRowClass,
+} from '@/components/ui/selectionStyles';
 import { friendlyApiError } from '@/utils/apiErrors';
 import type { OmniGroup, OmniUser } from '@/types';
 
@@ -701,20 +708,29 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
               {filteredAssignUsers.length === 0 ? (
                 <div className="px-4 py-8 text-center text-sm text-content-secondary">No users match this filter.</div>
               ) : (
-                filteredAssignUsers.map((user) => (
-                  <label key={user.id} className="flex items-center gap-3 px-4 py-2.5 hover:bg-surface-secondary cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={selectedAssignUserIds.has(user.id)}
-                      onChange={() => toggleAssignmentUser(user.id)}
-                      className="accent-omni-700"
-                    />
-                    <div className="min-w-0">
-                      <div className="text-sm font-medium text-content-primary truncate">{user.userName}</div>
-                      <div className="text-xs text-content-secondary truncate">{user.displayName || 'No display name'}</div>
-                    </div>
-                  </label>
-                ))
+                filteredAssignUsers.map((user) => {
+                  const selected = selectedAssignUserIds.has(user.id);
+                  return (
+                    <label key={user.id} className={`flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-all ${selected ? selectedRowClass : unselectedRowClass}`}>
+                      <input
+                        type="checkbox"
+                        checked={selected}
+                        onChange={() => toggleAssignmentUser(user.id)}
+                        className="accent-omni-700"
+                      />
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium text-content-primary truncate">{user.userName}</div>
+                        <div className="text-xs text-content-secondary truncate">{user.displayName || 'No display name'}</div>
+                      </div>
+                      {selected && (
+                        <span className={selectedBadgeClass}>
+                          <CheckCircle2 size={12} />
+                          Selected
+                        </span>
+                      )}
+                    </label>
+                  );
+                })
               )}
             </div>
           </div>
@@ -769,9 +785,12 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
             const members = detail?.members || group.members || [];
 
             return (
-              <div key={group.id} className={`card p-0 overflow-hidden transition-colors ${bulkAssignGroupId === group.id ? 'border-omni-300 bg-surface-secondary' : ''}`}>
+              <div key={group.id} className={`relative card p-0 overflow-hidden transition-all ${bulkAssignGroupId === group.id ? selectedCardClass : unselectedCardClass}`}>
+                {bulkAssignGroupId === group.id && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
                 <button
+                  type="button"
                   onClick={() => toggleExpand(group.id)}
+                  aria-pressed={bulkAssignGroupId === group.id}
                   className="w-full flex items-center justify-between px-4 py-3 hover:bg-surface-secondary transition-colors"
                 >
                   <div className="flex items-center gap-3">
@@ -781,8 +800,9 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
                       {group.members?.length || 0} members
                     </span>
                     {bulkAssignGroupId === group.id && (
-                      <span className="text-xs text-omni-800 bg-omni-100 px-2 py-0.5 rounded-chip">
-                        selected
+                      <span className={selectedBadgeClass}>
+                        <CheckCircle2 size={12} />
+                        Selected
                       </span>
                     )}
                   </div>

@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
-import { ChevronDown, Search } from 'lucide-react';
+import { CheckCircle2, ChevronDown, Search } from 'lucide-react';
+import { selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 
 interface ComboBoxOption {
   value: string;
@@ -165,15 +166,16 @@ export function ComboBox({
                 onMouseEnter={() => setHighlightedIndex(index)}
                 role="option"
                 aria-selected={option.value === value}
-                className={`w-full text-left px-3 py-2 text-sm transition-colors ${
-                  index === highlightedIndex
-                    ? 'bg-omni-100 text-omni-700'
-                    : option.value === value
-                      ? 'bg-omni-50 text-omni-700 font-medium'
-                      : 'text-content-primary hover:bg-surface-secondary'
+                className={`w-full text-left px-3 py-2 text-sm transition-all ${
+                  option.value === value
+                    ? selectedRowClass
+                    : index === highlightedIndex
+                      ? 'border-l-4 border-l-omni-300 bg-omni-100 text-omni-700'
+                      : unselectedRowClass
                 }`}
               >
                 <div className="flex items-center gap-2">
+                  {option.value === value && <CheckCircle2 size={13} className="shrink-0 text-omni-700" />}
                   <span className="truncate">{option.label}</span>
                   {option.subtitle && (
                     <span className="flex-shrink-0 text-[10px] font-medium uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">

@@ -6,6 +6,7 @@ import { listFolders, listDocuments, omniProxy, omniProxyDownload } from '@/serv
 import { PageHeader } from '@/components/layout/PageHeader';
 import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
 import { Blobby } from '@/components/ui/Blobby';
+import { selectedBadgeClass, selectedCardClass, unselectedCardClass } from '@/components/ui/selectionStyles';
 import type { OmniFolder, OmniDocument } from '@/types';
 
 const FORMAT_OPTIONS = [
@@ -270,18 +271,25 @@ export function DownloadsPage() {
               return (
                 <button
                   key={opt.value}
+                  type="button"
                   onClick={() => setFormat(opt.value)}
-                  className={`flex flex-col items-center gap-1.5 p-3 rounded-card border-2 transition-all ${
-                    isSelected
-                      ? 'border-omni-700 bg-surface-secondary'
-                      : 'border-border hover:border-omni-500/40'
+                  aria-pressed={isSelected}
+                  className={`relative flex flex-col items-center gap-1.5 p-3 rounded-card border-2 transition-all ${
+                    isSelected ? selectedCardClass : unselectedCardClass
                   }`}
                 >
+                  {isSelected && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
                   <div className={`p-2 rounded-button ${opt.color}`}>
                     <Icon size={18} />
                   </div>
                   <span className="text-xs font-medium text-content-primary">{opt.label}</span>
                   <span className="text-[10px] text-content-secondary leading-tight text-center">{opt.description}</span>
+                  {isSelected && (
+                    <span className={selectedBadgeClass}>
+                      <CheckCircle size={12} />
+                      Selected
+                    </span>
+                  )}
                 </button>
               );
             })}

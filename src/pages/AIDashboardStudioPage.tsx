@@ -506,6 +506,7 @@ export function AIDashboardStudioPage() {
               lastSyncedAt={dashboardsSyncedAt}
               onRefresh={refreshDashboardList}
               onPick={inspectDashboard}
+              selectedDashboardId={selectedDashboard?.id}
               disabled={inspecting || reviewing}
             />
           </div>

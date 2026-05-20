@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import {
   AlertTriangle,
+  CheckCircle2,
   Cloud,
   Edit3,
   HardDrive,
@@ -24,6 +25,7 @@ import { StatusChip } from '@/components/ui/StatusChip';
 import { Blobby } from '@/components/ui/Blobby';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { selectedBadgeClass, selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 import { friendlyApiError } from '@/utils/apiErrors';
 import type { OmniDocument, OmniSchedule, PageInfo } from '@/types';
 
@@ -412,13 +414,20 @@ function ScheduleFormModal({
                         key={dashboard.scheduleIdentifier}
                         type="button"
                         onClick={() => selectDashboard(dashboard)}
-                        className={`block w-full px-3 py-2 text-left transition-colors ${
-                          isSelected ? 'bg-omni-50' : 'hover:bg-surface-secondary'
+                        aria-pressed={isSelected}
+                        className={`block w-full px-3 py-2 text-left transition-all ${
+                          isSelected ? selectedRowClass : unselectedRowClass
                         }`}
                       >
                         <div className="flex min-w-0 items-center gap-2">
                           <LayoutDashboard size={14} className={isSelected ? 'text-omni-700 flex-shrink-0' : 'text-content-secondary flex-shrink-0'} />
                           <span className="truncate text-sm font-medium text-content-primary">{dashboard.displayName}</span>
+                          {isSelected && (
+                            <span className={selectedBadgeClass}>
+                              <CheckCircle2 size={12} />
+                              Selected
+                            </span>
+                          )}
                         </div>
                         <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-1 text-[10px] text-content-secondary">
                           <span className="capitalize">{dashboard.documentKind}</span>

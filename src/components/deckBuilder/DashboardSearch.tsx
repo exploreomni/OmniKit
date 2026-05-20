@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Search, RefreshCcw, Loader2, Folder } from 'lucide-react';
+import { CheckCircle2, Search, RefreshCcw, Loader2, Folder } from 'lucide-react';
+import { selectedBadgeClass, selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 import type { CachedDashboard } from '@/services/deckBuilder/localCache';
 
 interface Props {
@@ -8,6 +9,7 @@ interface Props {
   lastSyncedAt: number | null;
   onRefresh: () => void;
   onPick: (d: CachedDashboard) => void;
+  selectedDashboardId?: string;
   disabled?: boolean;
 }
 
@@ -22,7 +24,7 @@ function timeAgo(ts: number | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, onPick, disabled }: Props) {
+export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, onPick, selectedDashboardId, disabled }: Props) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
@@ -112,28 +114,42 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
 
       {open && filtered.length > 0 && (
         <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-border rounded-card shadow-dropdown max-h-80 overflow-y-auto">
-          {filtered.map((d, idx) => (
-            <button
-              key={d.id}
-              type="button"
-              onMouseEnter={() => setHighlight(idx)}
-              onClick={() => {
-                onPick(d);
-                setOpen(false);
-              }}
-              className={`w-full text-left px-3 py-2.5 border-b border-border/40 last:border-0 ${
-                idx === highlight ? 'bg-omni-50' : 'hover:bg-surface-secondary'
-              }`}
-            >
-              <div className="text-[13px] font-medium text-content-primary truncate">{d.name}</div>
-              {d.folderPath && (
-                <div className="text-[11px] text-content-tertiary truncate flex items-center gap-1 mt-0.5">
-                  <Folder size={10} />
-                  {d.folderPath}
+          {filtered.map((d, idx) => {
+            const selected = selectedDashboardId === d.id;
+            return (
+              <button
+                key={d.id}
+                type="button"
+                onMouseEnter={() => setHighlight(idx)}
+                onClick={() => {
+                  onPick(d);
+                  setOpen(false);
+                }}
+                aria-pressed={selected}
+                className={`w-full text-left px-3 py-2.5 border-b border-border/40 last:border-0 transition-all ${
+                  selected ? selectedRowClass : idx === highlight ? 'border-l-4 border-l-omni-300 bg-omni-50' : unselectedRowClass
+                }`}
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[13px] font-medium text-content-primary truncate">{d.name}</div>
+                    {d.folderPath && (
+                      <div className="text-[11px] text-content-tertiary truncate flex items-center gap-1 mt-0.5">
+                        <Folder size={10} />
+                        {d.folderPath}
+                      </div>
+                    )}
+                  </div>
+                  {selected && (
+                    <span className={selectedBadgeClass}>
+                      <CheckCircle2 size={12} />
+                      Selected
+                    </span>
+                  )}
                 </div>
-              )}
-            </button>
-          ))}
+              </button>
+            );
+          })}
         </div>
       )}
       {open && !loading && filtered.length === 0 && dashboards.length > 0 && (

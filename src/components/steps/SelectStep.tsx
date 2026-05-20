@@ -35,10 +35,12 @@ function FolderNode({ folder, selectedFolderId, expandedIds, onToggle, onSelect,
   return (
     <div>
       <button
+        type="button"
         onClick={() => {
           onSelect(folder);
           if (hasChildren) onToggle(folder.id);
         }}
+        aria-pressed={isSelected}
         className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all duration-150 ${
           isSelected
             ? 'text-omni-700 font-semibold'
@@ -61,6 +63,7 @@ function FolderNode({ folder, selectedFolderId, expandedIds, onToggle, onSelect,
           <Folder size={15} className={isSelected ? 'text-omni-600 flex-shrink-0' : 'text-content-secondary flex-shrink-0'} />
         )}
         <span className="truncate">{folder.name}</span>
+        {isSelected && <CheckCircle2 size={13} className="ml-auto shrink-0 text-omni-700" />}
       </button>
       {isExpanded && folder.children?.map((child) => (
         <FolderNode
@@ -505,6 +508,12 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                         <div className="text-xs text-content-tertiary truncate mt-0.5">{doc.folderPath}</div>
                       )}
                     </div>
+                    {checked && (
+                      <span className="inline-flex shrink-0 items-center gap-1 rounded-chip bg-omni-600 px-2 py-1 text-[10px] font-semibold text-white">
+                        <CheckCircle2 size={12} />
+                        Selected
+                      </span>
+                    )}
                     <div className="ml-3 flex-shrink-0 flex items-center gap-2">
                       {!doc.baseModelId && enriching ? (
                         <div className="flex items-center gap-1.5 text-[11px] text-content-tertiary">

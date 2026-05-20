@@ -30,6 +30,16 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { BulkOperationAnimation } from '@/components/ui/BulkOperationAnimation';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { Blobby } from '@/components/ui/Blobby';
+import {
+  selectedBadgeClass,
+  selectedCardClass,
+  selectedDangerRowClass,
+  selectedRowClass,
+  selectedTreeRowClass,
+  unselectedCardClass,
+  unselectedRowClass,
+  unselectedTreeRowClass,
+} from '@/components/ui/selectionStyles';
 import type { BulkOperationResult, BulkOperationSummary, OmniDocument, OmniFolder } from '@/types';
 
 type DashboardAction = 'move' | 'copy' | 'delete';
@@ -147,8 +157,9 @@ function FolderNode({
           onSelect(folder);
           if (hasChildren) onToggle(folder.id);
         }}
-          className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-colors ${
-          isSelected ? 'bg-surface-tertiary text-content-primary font-medium' : 'text-content-primary hover:bg-surface-secondary'
+        aria-pressed={isSelected}
+          className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
+          isSelected ? selectedTreeRowClass : unselectedTreeRowClass
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >
@@ -163,6 +174,7 @@ function FolderNode({
           <Folder size={15} className="text-content-secondary flex-shrink-0" />
         )}
         <span className="truncate">{folder.name}</span>
+        {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
       </button>
       {isExpanded &&
         folder.children?.map((child) => (
@@ -213,8 +225,9 @@ function DestinationFolderPicker({
             onSelect(folder);
             if (hasChildren) toggleExpanded(folder.id);
           }}
-            className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-colors ${
-            isSelected ? 'bg-surface-tertiary text-content-primary font-medium' : 'text-content-primary hover:bg-surface-secondary'
+          aria-pressed={isSelected}
+            className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
+            isSelected ? selectedTreeRowClass : unselectedTreeRowClass
           }`}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
         >
@@ -229,6 +242,7 @@ function DestinationFolderPicker({
             <Folder size={15} className="text-content-secondary flex-shrink-0" />
           )}
           <span className="truncate">{folder.name}</span>
+          {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
         </button>
         {isExpanded && folder.children?.map((child) => <PickerNode key={child.id} folder={child} depth={depth + 1} />)}
       </div>
@@ -764,17 +778,23 @@ export function DashboardOperationsPage() {
               key={option}
               type="button"
               onClick={() => chooseAction(option)}
-              className={`text-left rounded-card border p-4 transition-all ${
-                active
-                  ? config.tone
-                  : 'bg-white border-border text-content-primary hover:border-border-strong hover:bg-surface-secondary'
+              aria-pressed={active}
+              className={`relative text-left rounded-card border p-4 transition-all ${
+                active ? selectedCardClass : unselectedCardClass
               }`}
             >
+              {active && <div className="absolute left-0 top-0 h-full w-1 rounded-l-[8px] bg-omni-500" />}
               <div className="flex items-center gap-2.5">
                 <span className="w-8 h-8 rounded-lg flex items-center justify-center bg-surface-secondary">
                   <Icon size={16} />
                 </span>
                 <span className="text-sm font-semibold">{config.label}</span>
+                {active && (
+                  <span className={option === 'delete' ? 'ml-auto inline-flex shrink-0 items-center gap-1 rounded-chip bg-red-600 px-2 py-1 text-[10px] font-semibold text-white' : `${selectedBadgeClass} ml-auto`}>
+                    <CheckCircle size={12} />
+                    Selected
+                  </span>
+                )}
               </div>
               <p className="text-xs leading-relaxed mt-2 text-content-secondary">{config.description}</p>
             </button>
@@ -863,8 +883,8 @@ export function DashboardOperationsPage() {
               filteredDocs.map((doc, index) => (
                 <label
                   key={doc.id || `doc-${index}`}
-                  className={`flex items-center px-4 py-2.5 border-b border-border/50 cursor-pointer hover:bg-surface-secondary transition-colors ${
-                    isSelected(doc) ? (action === 'delete' ? 'bg-red-50' : 'bg-surface-secondary') : ''
+                  className={`flex items-center px-4 py-2.5 border-b border-border/50 cursor-pointer transition-all ${
+                    isSelected(doc) ? (action === 'delete' ? selectedDangerRowClass : selectedRowClass) : unselectedRowClass
                   }`}
                 >
                   <input type="checkbox" checked={isSelected(doc)} onChange={() => toggleDashboard(doc)} className="flex-shrink-0" />
@@ -872,6 +892,12 @@ export function DashboardOperationsPage() {
                     <div className="text-sm text-content-primary truncate">{doc.name}</div>
                     <div className="text-[11px] text-content-tertiary truncate">{doc.identifier || doc.id}</div>
                   </div>
+                  {isSelected(doc) && (
+                    <span className={action === 'delete' ? 'inline-flex shrink-0 items-center gap-1 rounded-chip bg-red-600 px-2 py-1 text-[10px] font-semibold text-white' : selectedBadgeClass}>
+                      <CheckCircle size={12} />
+                      Selected
+                    </span>
+                  )}
                   <div className="ml-3 flex-shrink-0">
                     {!doc.baseModelId && enriching ? (
                       <Loader2 size={14} className="text-content-secondary animate-spin" />
