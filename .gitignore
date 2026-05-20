@@ -16,7 +16,10 @@ tmp/
 Thumbs.db
 
 # editor
-.vscode/settings.json
+.claude/
+.codex/
+.cursor/
+.vscode/
 .idea/
 
 # logs
