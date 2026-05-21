@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
-import { Download, Upload, Trash2, HardDrive, RefreshCw } from 'lucide-react';
+import { Download, Upload, Trash2, HardDrive, RefreshCw, GraduationCap, RotateCcw } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { toast } from '@/components/ui/Toast';
 import { Blobby } from '@/components/ui/Blobby';
+import { useWalkthrough } from '@/hooks/useWalkthrough';
+import { WALKTHROUGH_STORAGE_KEY } from '@/services/walkthrough';
 import {
   clearOmniKitLocalStorage,
   clearOmniKitSessionStorage,
@@ -37,6 +39,7 @@ const STORE_LABELS: Record<StoreName, string> = {
 };
 
 export function DataPrivacyPage() {
+  const { openWalkthrough, resetWalkthrough, currentVersion } = useWalkthrough();
   const [summary, setSummary] = useState<Array<{ store: StoreName; count: number }>>([]);
   const [localSummary, setLocalSummary] = useState<Array<{ key: string; bytes: number }>>([]);
   const [sessionSummary, setSessionSummary] = useState<Array<{ key: string; bytes: number }>>([]);
@@ -62,6 +65,7 @@ export function DataPrivacyPage() {
   const totalRecords = summary.reduce((a, b) => a + b.count, 0);
   const totalLocalBytes = localSummary.reduce((a, b) => a + b.bytes, 0);
   const totalSessionBytes = sessionSummary.reduce((a, b) => a + b.bytes, 0);
+  const walkthroughEntry = localSummary.find((row) => row.key === WALKTHROUGH_STORAGE_KEY);
 
   const handleExport = async () => {
     try {
@@ -146,10 +150,44 @@ export function DataPrivacyPage() {
         <div className="flex items-start gap-3">
           <HardDrive size={16} className="mt-0.5 text-omni-700" />
           <div>
-            <h2 className="text-base font-semibold text-content-primary">Semantic migration source handling</h2>
+            <h2 className="text-base font-semibold text-content-primary">AI source handling</h2>
             <p className="mt-1 text-[13px] leading-relaxed text-omni-700">
-              AI Semantic Studio can parse dbt, Looker, Power BI, Tableau, and Domo source artifacts in the browser for migration planning. Raw uploaded files and pasted source text stay in page memory by default and are not written to IndexedDB or localStorage. Generated YAML, branch validation results, and normal operation metadata follow the storage rules listed below.
+              AI Semantic Studio can parse dbt, Looker, Power BI, Tableau, and Domo source artifacts in the browser for migration planning. AI Dashboard Studio can parse Excel workbooks for guarded dashboard draft planning and model follow-up discovery. Raw uploaded files and pasted source text stay in page memory by default and are not written to IndexedDB or localStorage. Generated YAML, Blobby responses, dashboard handoffs, branch validation results, and normal operation metadata follow the storage rules listed below.
             </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="card p-5 border-omni-100 bg-white">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex items-start gap-3">
+            <GraduationCap size={17} className="mt-0.5 text-omni-700" />
+            <div>
+              <h2 className="text-base font-semibold text-content-primary">Learning walkthrough</h2>
+              <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
+                OmniKit stores a small walkthrough progress flag so returning users are not interrupted repeatedly. When the local app is updated and the guide version changes, the walkthrough can appear again for the new version.
+              </p>
+              <div className="mt-2 font-mono text-[11px] text-content-tertiary">
+                {WALKTHROUGH_STORAGE_KEY} · {walkthroughEntry ? `${(walkthroughEntry.bytes / 1024).toFixed(1)} KB stored` : 'not stored yet'} · version {currentVersion}
+              </div>
+            </div>
+          </div>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            <button type="button" onClick={() => openWalkthrough('manual')} className="btn-secondary text-sm">
+              <GraduationCap size={14} />
+              Replay guide
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                resetWalkthrough();
+                refresh();
+              }}
+              className="btn-secondary text-sm"
+            >
+              <RotateCcw size={14} />
+              Reset prompt
+            </button>
           </div>
         </div>
       </div>
