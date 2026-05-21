@@ -72,6 +72,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
               name: (e.dashboard_name as string) || '',
               status: e.status === 'success' ? 'ready' : (e.status as MigrationResult['status']),
               error: e.error as string | undefined,
+              warnings: Array.isArray(e.warnings) ? (e.warnings as string[]) : undefined,
             };
             if (existingIdx >= 0) {
               results[existingIdx] = entry;
@@ -92,12 +93,12 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
       );
       setDryRunResults(results);
       setDiagnostics(diagMap);
-      const allReady = results.length > 0 && results.every((r) => r.status === 'ready');
-      if (allReady) {
+      const allMigratable = results.length > 0 && results.every((r) => r.status === 'ready' || r.status === 'warning');
+      if (allMigratable) {
         dispatch({ type: 'SET_DRY_RUN_COMPLETED', value: true });
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Dry run failed. Check your credentials and try again.';
+      const msg = err instanceof Error ? err.message : 'Compatibility preflight failed. Check your credentials and try again.';
       setDryRunError(msg);
     }
 
@@ -133,6 +134,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
               name: (e.dashboard_name as string) || '',
               status: e.status as MigrationResult['status'],
               error: e.error as string | undefined,
+              warnings: Array.isArray(e.warnings) ? (e.warnings as string[]) : undefined,
             },
           });
         }
@@ -143,6 +145,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
             name: r.name as string,
             status: r.status as MigrationResult['status'],
             error: r.error as string | undefined,
+            warnings: Array.isArray(r.warnings) ? (r.warnings as string[]) : undefined,
             sourceModel: r.source_model as string,
             targetModel: r.target_model as string,
           }));
@@ -209,7 +212,8 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
     return match?.name || null;
   }, [state.sourceModels, enrichedNameMap]);
 
-  const showDryRunWarning = !state.dryRunCompleted && !dryRunAttempted;
+  const showPreflightWarning = !state.dryRunCompleted && !dryRunAttempted;
+  const hasPreflightWarnings = dryRunResults?.some((r) => r.status === 'warning') ?? false;
 
   return (
     <div className="space-y-5">
@@ -218,7 +222,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         <p className="text-sm text-content-secondary mt-1">
           {state.sameInstance
             ? 'Review your model remap before applying it. Dashboards will not be duplicated — only their model linkage will be updated.'
-            : 'Review your migration plan before executing.'}
+            : 'Review your migration plan and run compatibility preflight before executing.'}
         </p>
       </div>
 
@@ -252,7 +256,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
           <div className="col-span-3 text-xs font-medium text-content-secondary uppercase tracking-wider">Source Model</div>
           <div className="col-span-1 text-xs font-medium text-content-secondary uppercase tracking-wider text-center" />
           <div className="col-span-3 text-xs font-medium text-content-secondary uppercase tracking-wider">Target Model</div>
-          <div className="col-span-1 text-xs font-medium text-content-secondary uppercase tracking-wider text-right">Status</div>
+          <div className="col-span-1 text-xs font-medium text-content-secondary uppercase tracking-wider text-right">Preflight</div>
         </div>
 
         <div className="max-h-[300px] overflow-y-auto">
@@ -328,7 +332,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
                     {diagnostics[doc.id].map((d, idx) => (
                       <div key={idx} className="mb-2 last:mb-0">
                         <div className="text-[10px] font-semibold text-content-secondary uppercase tracking-wider mb-1">
-                          {d.phase === 'post_export' ? 'After Export' : d.phase === 'post_transform' ? 'After Transform' : d.phase}
+                          {d.phase === 'post_export' ? 'After Export' : d.phase === 'post_transform' ? 'After Transform' : d.phase === 'compatibility_preflight' ? 'Compatibility Preflight' : d.phase}
                         </div>
                         <div className="font-mono text-[11px] text-content-primary bg-white rounded border border-border/50 p-2 overflow-x-auto">
                           {Object.entries(d.detail).map(([key, val]) => (
@@ -354,7 +358,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-card">
           <XCircle size={16} className="text-red-600 mt-0.5 flex-shrink-0" />
           <div>
-            <p className="text-xs font-medium text-red-800">Dry run failed</p>
+            <p className="text-xs font-medium text-red-800">Compatibility preflight failed</p>
             <p className="text-xs text-red-700 mt-0.5 leading-relaxed">{dryRunError}</p>
           </div>
         </div>
@@ -364,33 +368,45 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         <div className="flex items-start gap-2 px-4 py-3 bg-slate-50 border border-slate-200 rounded-card">
           <AlertTriangle size={16} className="text-slate-500 mt-0.5 flex-shrink-0" />
           <p className="text-xs text-slate-700 leading-relaxed">
-            Dry run returned no results. The migration service may be unavailable or no dashboards were processed.
+            Compatibility preflight returned no results. The migration service may be unavailable or no dashboards were processed.
           </p>
         </div>
       )}
 
       {dryRunAttempted && !dryRunError && dryRunResults !== null && dryRunResults.length > 0 && (() => {
         const readyCount = dryRunResults.filter(r => r.status === 'ready').length;
+        const warningResults = dryRunResults.filter(r => r.status === 'warning');
         const failedResults = dryRunResults.filter(r => r.status === 'failed' || r.status === 'skipped');
-        const allReady = failedResults.length === 0;
+        const allMigratable = failedResults.length === 0;
 
         return (
           <>
             <div className={`flex items-start gap-2 px-4 py-3 rounded-card ${
-              allReady
+              allMigratable && warningResults.length === 0
                 ? 'bg-green-50 border border-green-200'
                 : 'bg-amber-50 border border-amber-200'
             }`}>
-              {allReady ? (
+              {allMigratable && warningResults.length === 0 ? (
                 <CheckCircle2 size={16} className="text-green-600 mt-0.5 flex-shrink-0" />
               ) : (
                 <AlertTriangle size={16} className="text-amber-600 mt-0.5 flex-shrink-0" />
               )}
               <div>
-                <p className={`text-xs leading-relaxed ${allReady ? 'text-green-800' : 'text-amber-800'}`}>
-                  Dry run completed -- {readyCount} of {dryRunResults.length} dashboard{dryRunResults.length !== 1 ? 's' : ''} ready to {state.sameInstance ? 'remap' : 'migrate'}.
-                  {failedResults.length > 0 && ` ${failedResults.length} will be skipped due to errors.`}
+                <p className={`text-xs leading-relaxed ${allMigratable && warningResults.length === 0 ? 'text-green-800' : 'text-amber-800'}`}>
+                  Compatibility preflight completed -- {readyCount} ready, {warningResults.length} with warning{warningResults.length !== 1 ? 's' : ''}, {failedResults.length} blocked.
+                  {allMigratable && warningResults.length > 0 && ` You can continue after reviewing the warning details.`}
+                  {failedResults.length > 0 && ` Blocked dashboards will be skipped due to errors.`}
                 </p>
+                {warningResults.length > 0 && (
+                  <ul className="mt-2 space-y-1">
+                    {warningResults.map((r) => (
+                      <li key={r.id} className="text-xs text-amber-700 flex items-start gap-1.5">
+                        <AlertTriangle size={12} className="text-amber-500 mt-0.5 flex-shrink-0" />
+                        <span><span className="font-medium">{r.name}</span>: {r.error || r.warnings?.join(' ') || 'Semantic compatibility warning.'}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
                 {failedResults.length > 0 && (
                   <ul className="mt-2 space-y-1">
                     {failedResults.map((r) => (
@@ -411,8 +427,8 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         <AlertTriangle size={16} className="text-yellow-600 mt-0.5 flex-shrink-0" />
         <p className="text-xs text-yellow-800 leading-relaxed">
           {state.sameInstance
-            ? 'This changes the model attached to each selected dashboard in the current Omni instance. It does not create a copy.'
-            : 'Importing creates new copies in the target. Original dashboards are not modified or deleted.'}
+            ? 'This changes the model attached to each selected dashboard in the current Omni instance. Compatibility preflight checks payload shape and target field presence, but it cannot prove that same-named metrics have identical business definitions.'
+            : 'Importing creates new copies in the target; originals are not modified or deleted. Compatibility preflight checks payload shape and target field presence, but it cannot prove that same-named metrics have identical business definitions.'}
         </p>
       </div>
 
@@ -429,12 +445,12 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
             {runningDryRun ? (
               <>
                 <span className="w-4 h-4 border-2 border-omni-700 border-t-transparent rounded-full animate-spin" />
-                Running...
+                Checking...
               </>
             ) : (
               <>
                 <Play size={14} />
-                Dry Run
+                Run Compatibility Preflight
               </>
             )}
           </button>
@@ -453,17 +469,19 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         open={showConfirm}
         title={state.sameInstance ? 'Confirm Model Remap' : 'Confirm Migration'}
         message={
-          showDryRunWarning
+          showPreflightWarning
             ? state.sameInstance
-              ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running a dry run first. We recommend running a dry run to validate your model mapping. Continue anyway?`
-              : `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running a dry run first. We recommend running a dry run to validate your migration plan. Continue anyway?`
+              ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running compatibility preflight first. We recommend running preflight to check payload and field compatibility. Continue anyway?`
+              : `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running compatibility preflight first. We recommend running preflight to check payload and field compatibility. Continue anyway?`
+            : hasPreflightWarnings
+              ? `Compatibility preflight found warnings. You can continue, but review the impacted dashboards in Omni after migration and expect possible tile or filter cleanup. Continue?`
             : state.sameInstance
               ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''}. No dashboard copy will be created. Continue?`
               : `You are about to migrate ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''}. This creates new copies in the target -- originals are not modified. Continue?`
         }
         confirmLabel={state.sameInstance ? 'Apply Model Remap' : 'Execute Migration'}
         cancelLabel="Cancel"
-        variant={showDryRunWarning ? 'danger' : 'primary'}
+        variant={showPreflightWarning ? 'danger' : 'primary'}
         onConfirm={() => {
           setShowConfirm(false);
           handleExecute();

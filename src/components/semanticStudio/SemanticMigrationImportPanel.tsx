@@ -156,22 +156,39 @@ function basenameWithoutExtension(fileName: string) {
   return base.replace(/\.(view|topic)$/, '');
 }
 
+function normalizedSemanticName(value: string) {
+  return value
+    .split('/').pop()!
+    .replace(/\.(view|topic)$/i, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
+}
+
 function likelyTargetFiles(inventory: ReturnType<typeof buildMigrationInventory>, files?: Record<string, string>) {
   const allFiles = files || {};
   const sourceNames = new Set<string>();
-  inventory.views.forEach((view) => sourceNames.add(view.name));
+
+  function addSourceName(value?: string) {
+    const trimmed = (value || '').trim();
+    if (!trimmed) return;
+    sourceNames.add(trimmed);
+    sourceNames.add(normalizedSemanticName(trimmed));
+  }
+
+  inventory.views.forEach((view) => addSourceName(view.name));
   inventory.explores.forEach((explore) => {
-    sourceNames.add(explore.name);
-    if (explore.baseView) sourceNames.add(explore.baseView);
+    addSourceName(explore.name);
+    addSourceName(explore.baseView);
   });
   inventory.relationships.forEach((relationship) => {
-    sourceNames.add(relationship.from);
-    sourceNames.add(relationship.to);
+    addSourceName(relationship.from);
+    addSourceName(relationship.to);
   });
   inventory.dashboards.forEach((dashboard) => {
     dashboard.fields.forEach((field) => {
-      const [viewName] = field.split('.');
-      if (viewName) sourceNames.add(viewName);
+      const viewName = field.split(/[.[]/)[0];
+      addSourceName(viewName);
     });
   });
 
@@ -179,7 +196,7 @@ function likelyTargetFiles(inventory: ReturnType<typeof buildMigrationInventory>
   Object.entries(allFiles).forEach(([fileName, yaml]) => {
     if (fileName === 'model' || fileName === 'relationships') return;
     const baseName = basenameWithoutExtension(fileName);
-    if (sourceNames.has(baseName)) selected[fileName] = yaml;
+    if (sourceNames.has(baseName) || sourceNames.has(normalizedSemanticName(baseName))) selected[fileName] = yaml;
   });
 
   Object.entries(allFiles).forEach(([fileName, yaml]) => {

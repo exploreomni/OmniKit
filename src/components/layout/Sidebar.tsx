@@ -19,9 +19,11 @@ import {
   Tag,
   FileUp,
   FileSearch,
+  GraduationCap,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 
 interface NavSection {
@@ -135,6 +137,7 @@ function SidebarSection({ section, expandOnConnect }: { section: NavSection; exp
 
 export function Sidebar() {
   const { connection, isConnected } = useConnection();
+  const { openWalkthrough, hasUpdate } = useWalkthrough();
   const host = connection.baseUrl ? connection.baseUrl.replace(/https?:\/\//, '').replace(/\/$/, '') : '';
 
   return (
@@ -210,6 +213,20 @@ export function Sidebar() {
         <div className="px-3 mb-1.5">
           <span className="text-[10px] font-bold uppercase tracking-[0.12em]" style={{ color: '#697080' }}>Activity</span>
         </div>
+        <button
+          type="button"
+          onClick={() => openWalkthrough('manual')}
+          className="mb-1 flex w-full items-center gap-2.5 rounded-[6px] px-3 py-2 text-left text-[13px] transition-all duration-150 hover:bg-surface-secondary"
+          style={{ color: '#404754' }}
+        >
+          <GraduationCap size={15} className="flex-shrink-0 opacity-80" />
+          <span className="flex-1">Guide</span>
+          {hasUpdate && (
+            <span className="rounded-chip bg-omni-600 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-white">
+              New
+            </span>
+          )}
+        </button>
         <NavLink
           to="/history"
           className={({ isActive }) =>

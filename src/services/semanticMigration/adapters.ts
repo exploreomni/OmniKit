@@ -445,7 +445,7 @@ function extractLookmlExplores(artifact: MigrationArtifact): MigrationExplore[] 
 function extractLookmlDashboards(artifact: MigrationArtifact): MigrationDashboardEvidence[] {
   const dashboards = extractNamedBlocks(artifact.content, 'dashboard').map(({ name, block }) => ({
     name,
-    fields: unique(Array.from(block.matchAll(/\b(?:field|dimension|measure)\s*:\s*"?([^"\n]+)"?/g)).map((match) => match[1]), 80),
+    fields: extractLookmlDashboardFields(block),
     filters: unique(Array.from(block.matchAll(/\bfilter(?:s)?\s*:\s*([^\n{]+)/g)).map((match) => match[1]), 40),
     sourceArtifact: artifact.name,
   }));
@@ -454,12 +454,23 @@ function extractLookmlDashboards(artifact: MigrationArtifact): MigrationDashboar
   if (/dashboard|element|tile|vis_config|listen:/i.test(artifact.content)) {
     return [{
       name: artifact.name.replace(/\.(dashboard\.)?lookml$/i, ''),
-      fields: unique(Array.from(artifact.content.matchAll(/\b(?:field|dimension|measure)\s*:\s*"?([^"\n]+)"?/g)).map((match) => match[1]), 80),
+      fields: extractLookmlDashboardFields(artifact.content),
       filters: unique(Array.from(artifact.content.matchAll(/\bfilter(?:s)?\s*:\s*([^\n{]+)/g)).map((match) => match[1]), 40),
       sourceArtifact: artifact.name,
     }];
   }
   return [];
+}
+
+function extractLookmlDashboardFields(content: string) {
+  const scalarFields = Array.from(content.matchAll(/\b(?:field|dimension|measure)\s*:\s*"?([^"\n\]]+)"?/g))
+    .map((match) => match[1]);
+  const inlineFieldLists = Array.from(content.matchAll(/\bfields\s*:\s*\[([^\]]+)\]/g))
+    .flatMap((match) => splitInlineList(match[1]));
+  const multilineFieldItems = Array.from(content.matchAll(/^\s*-\s*["']?([A-Za-z0-9_.$]+(?:\.[A-Za-z0-9_.$]+)+)["']?\s*$/gm))
+    .map((match) => match[1]);
+
+  return unique([...scalarFields, ...inlineFieldLists, ...multilineFieldItems], 80);
 }
 
 function parseLookmlField(name: string, block: string, sourceArtifact: string): MigrationField {

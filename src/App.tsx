@@ -4,7 +4,9 @@ import { OperationLogProvider } from '@/contexts/OperationLogContext';
 import { Sidebar } from '@/components/layout/Sidebar';
 import { RequireConnection } from '@/components/layout/RequireConnection';
 import { ToastContainer } from '@/components/ui/Toast';
+import { OmniKitWalkthrough } from '@/components/walkthrough/OmniKitWalkthrough';
 import { usePreloadBlobby } from '@/components/ui/Blobby';
+import { WalkthroughProvider } from '@/contexts/WalkthroughContext';
 import { ConnectPage } from '@/pages/ConnectPage';
 
 function PaddedLayout() {
@@ -122,6 +124,7 @@ function AppLayout() {
           </Route>
         </Routes>
       </main>
+      <OmniKitWalkthrough />
       <ToastContainer />
     </div>
   );
@@ -133,7 +136,9 @@ function App() {
     <BrowserRouter>
       <ConnectionProvider>
         <OperationLogProvider>
-          <AppLayout />
+          <WalkthroughProvider>
+            <AppLayout />
+          </WalkthroughProvider>
         </OperationLogProvider>
       </ConnectionProvider>
     </BrowserRouter>

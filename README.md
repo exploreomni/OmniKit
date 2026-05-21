@@ -24,13 +24,16 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 
 ## What you can do with it
 
-- Review dashboards with AI-assisted readiness checks and admin-friendly recommendations
-- Migrate dashboards between Omni connections with base-model mapping
+- Build first-pass dashboards with Blobby, then finish review and iteration in Omni chat
+- Convert Excel workbooks into guarded dashboard drafts and semantic follow-up plans
+- Review existing dashboards with AI-assisted readiness checks and admin-friendly recommendations
+- Migrate dashboards between Omni connections with base-model mapping and compatibility preflight
 - Bulk copy, move, and delete dashboards across folders
 - Download dashboards and build PowerPoint decks from live Omni tiles
 - Manage connections, uploads, users, groups, models, topics, labels, schedules, and embeds
 - Generate reviewable AI Semantic Studio packages for topics, views, models, and permissions
 - Import dbt, Looker, Power BI, Tableau, or Domo semantic artifacts into AI Semantic Studio to generate reviewed Omni semantic YAML
+- Guide non-technical users with a versioned in-app walkthrough that can be dismissed, replayed, or refreshed after a local app update
 - Inspect local history and review exactly what OmniKit stores on the Data Privacy page
 
 ---
@@ -92,10 +95,15 @@ Your key is held in React state and same-tab `sessionStorage` so a refresh does 
 
 The sidebar groups features by category. Each page is a single workflow with its own wizard or table view.
 
+New users see a click-through walkthrough the first time they open OmniKit. The guide explains how to connect, where each workflow lives, how review steps work, and where local data controls live. Users can dismiss it for the current app version, replay it from the sidebar **Guide** button, or reset it from **Data & Privacy**. When the walkthrough content is updated in a future local clone/pull, OmniKit can show it again for that new version.
+
 ### Dashboard AI & Delivery
 
-- **AI Dashboard Studio** — review dashboard structure, filters, topic usage, and readiness with AI-assisted admin recommendations.
-- **Model Migrator** — copy dashboards from one connection to another. Pick source, pick target, select dashboards, map the base models, preview the dry-run diff, then commit. Results are logged to **History**.
+- **AI Dashboard Studio** — build new dashboard drafts, convert Excel formulas/visuals into guarded dashboard drafts plus model follow-up lists, and review existing dashboards.
+  - **Build New Dashboard** starts a first-pass dashboard developer chat from a selected model/topic, audience, KPI list, filters, layout, and color guidance. It routes missing or unsafe metrics back to AI Semantic Studio instead of inventing model fields.
+  - **Excel to Dashboard** parses `.xlsx` workbooks in page memory, inventories sheets/formulas/charts, drafts safe dashboard tiles from existing Omni fields, and lists formula/lookup work as AI Semantic Studio follow-ups instead of updating topics or views directly.
+  - **Review Existing Dashboard** inspects a live Omni dashboard and returns a review checklist for purpose, UX risks, semantic risks, and Omni UI handoff.
+- **Model Migrator** — copy dashboards from one connection to another, or remap dashboards inside one instance. Pick source, pick target, select dashboards, map the base models, run Compatibility Preflight for payload and field-presence warnings, then commit. Warnings can be accepted intentionally; blocked dashboards are skipped. Results are logged to **History**.
 - **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
 - **Dashboard Downloads** — export one or more dashboards to local files.
 - **Deck Builder** — build repeatable PowerPoint decks from live Omni dashboard tiles.
@@ -118,7 +126,7 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 - **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
 - **Model & Topic Health** — validate models and inspect topic coverage.
 - **Content Health** — scan dashboard and workbook dependency health.
-- **AI Semantic Studio** — review and generate governed semantic-layer packages for Topic Builder, Model / View Builder, and Permission Builder workflows. The Semantic Migration Import mode accepts dbt, Looker, Power BI, Tableau, and Domo source artifacts, parses them locally, and asks Blobby to generate Omni semantic YAML only. OmniKit saves generated YAML to a dev branch for validation; final promotion remains in Omni's model editor.
+- **AI Semantic Studio** — review and generate governed semantic-layer packages for Topic Builder, Model / View Builder, and Permission Builder workflows. The Semantic Migration Import mode accepts dbt, Looker, Power BI, Tableau, and Domo source artifacts, parses them locally, and asks Blobby to generate Omni semantic YAML only. OmniKit saves generated YAML to a dev branch for validation, shows lint/content checks, and leaves final promotion in Omni's model editor.
 
 ### Governance
 
@@ -133,7 +141,7 @@ Every batch run, migration, and bulk operation is appended here with timestamps,
 
 ### Data Privacy
 
-Exactly what is stored locally, where it's stored (localStorage, IndexedDB, or same-tab sessionStorage), and a single button to wipe everything. Semantic Migration Import source files and pasted source text stay in page memory by default; generated semantic YAML and operation metadata are stored only if you save or export them through normal OmniKit workflows.
+Exactly what is stored locally, where it's stored (localStorage, IndexedDB, or same-tab sessionStorage), and a single button to wipe everything. Semantic Migration Import source files, pasted source text, and Excel to Dashboard workbooks stay in page memory by default; generated semantic YAML, Blobby responses, dashboard draft handoffs, and operation metadata are stored only if you save or export them through normal OmniKit workflows. Walkthrough progress is stored as a small localStorage flag so returning users are not interrupted repeatedly.
 
 ---
 
@@ -163,7 +171,8 @@ Key points:
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
 - **No database.** Persistent app state lives in your browser (`localStorage` + IndexedDB). The active connection is kept in same-tab `sessionStorage`, which can include your Omni API key for the current browser session and is cleared by the Data Privacy wipe action.
 - **Compatibility-first proxy guardrails.** The generic proxy only forwards HTTPS requests to Omni `/api/v1` paths. Other Omni API surfaces used by the app, such as SCIM, embeds, and dashboard import/export, go through dedicated handlers.
-- **Semantic migration intake is local-first.** Uploaded dbt, Looker, Power BI, Tableau, and Domo artifacts are parsed in the browser and held in memory for the active page session. OmniKit does not write raw external BI source files to IndexedDB or localStorage by default.
+- **AI intake is local-first.** Uploaded dbt, Looker, Power BI, Tableau, and Domo artifacts, plus Excel workbooks used by AI Dashboard Studio, are parsed in the browser and held in memory for the active page session. OmniKit does not write raw external BI source files or raw Excel workbooks to IndexedDB or localStorage by default.
+- **No external app runtime services.** The app uses bundled public assets and system fonts; it does not require a hosted OmniKit backend, package registry service, database, telemetry endpoint, or external font CDN at runtime.
 
 ---
 
@@ -176,7 +185,7 @@ Key points:
 | `npm run start` | Build, then serve `dist/` plus the API proxy on a single port. |
 | `npm run serve` | Serve an existing `dist/` plus the API proxy (skips rebuild). |
 | `npm run preview` | Vite's built-in static preview (UI only, no API). |
-| `npm run typecheck` | Run `tsc --noEmit` across app and server. |
+| `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
 | `npm run lint` | Run ESLint. |
 
 ---
@@ -229,6 +238,7 @@ Open DevTools → Application → Storage → **Clear site data**. Or use the bu
 - The local API binds to `127.0.0.1` only — not reachable from other machines on your network.
 - Your Omni API key lives in React state and same-tab `sessionStorage` for the current browser session. It is not included in OmniKit backups and is cleared by **Data Privacy → Clear all local data** or by clearing site data in your browser.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.
+- No external font or tracking scripts are loaded by the app shell.
 - OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, and cached dashboard/model context. Open **Data Privacy** to inspect and clear local IndexedDB and localStorage entries.
 - Raw export inspection can display the full dashboard export payload in your browser for troubleshooting. Treat copied diagnostics and exported backups as customer data.
 - The generic proxy is intentionally limited to Omni `/api/v1` endpoints; workflows that need other Omni API surfaces use purpose-built local handlers.

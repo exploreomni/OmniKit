@@ -98,6 +98,7 @@ export interface MigrationResult {
   name: string;
   status: MigrationItemStatus;
   error?: string;
+  warnings?: string[];
   sourceModel?: string;
   targetModel?: string;
 }
