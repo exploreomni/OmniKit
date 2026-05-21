@@ -57,7 +57,7 @@ Step-by-step from zero:
 
 1. **Clone the repo.**
    ```bash
-   git clone https://github.com/atx-omni/OmniKit.git
+   git clone https://github.com/exploreomni/OmniKit.git
    cd OmniKit
    ```
 2. **Install dependencies.**

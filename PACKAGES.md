@@ -4,7 +4,7 @@ OmniKit is currently distributed as a source repository, not as a published pack
 
 ## Current Distribution
 
-- Clone from GitHub: `https://github.com/atx-omni/OmniKit.git`
+- Clone from GitHub: `https://github.com/exploreomni/OmniKit.git`
 - Install dependencies with `npm install`.
 - Run locally with `npm run dev`.
 - Build locally with `npm run build`.
@@ -62,7 +62,7 @@ No binary release assets are required for v1.0.0. The recommended package is the
 Recommended install path:
 
 ```bash
-git clone https://github.com/atx-omni/OmniKit.git
+git clone https://github.com/exploreomni/OmniKit.git
 cd OmniKit
 npm install
 npm run dev
