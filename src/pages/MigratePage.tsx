@@ -122,7 +122,7 @@ export function MigratePage() {
     <div className="space-y-5">
       <PageHeader
         title="Model Migrator"
-        description="Map dashboards from one model to another with a guided review step before changes are applied."
+        description="Map dashboards from one model to another with compatibility preflight before changes are applied."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
       <Stepper currentStep={state.currentStep} />

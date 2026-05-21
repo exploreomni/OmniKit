@@ -1,13 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
   CheckCircle2,
+  ClipboardCheck,
+  ExternalLink,
+  FileSpreadsheet,
   Filter,
   LayoutDashboard,
   Loader2,
   MessageSquareText,
+  Send,
   Sparkles,
+  Trash2,
+  Upload,
+  Wand2,
 } from 'lucide-react';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -15,10 +22,12 @@ import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
 import { Vehicle } from '@/components/ui/Vehicle';
 import { useConnection } from '@/contexts/ConnectionContext';
-import { ApiError, createAiJob, enrichDocuments, getAiJob, getAiJobResult, listTopics, type EnrichmentResult, type OmniAiJob, type OmniAiJobResult } from '@/services/omniApi';
+import { ApiError, createAiJob, enrichDocuments, getAiJob, getAiJobResult, listModels, listTopics, type EnrichmentResult, type OmniAiJob, type OmniAiJobResult } from '@/services/omniApi';
 import { fetchDashboardList, fetchDashboardSummary } from '@/services/deckBuilder/omniDeckApi';
 import { dashboardCache, type CachedDashboard } from '@/services/deckBuilder/localCache';
 import type { DashboardFilter, DashboardTile } from '@/services/deckBuilder/types';
+import { parseExcelWorkbook, type ExcelWorkbookInventory } from '@/services/dashboardStudio/excelWorkbook';
+import type { OmniModel, OmniTopic } from '@/types';
 
 interface InspectedDashboard {
   id: string;
@@ -31,6 +40,8 @@ interface InspectedDashboard {
 }
 
 type WorkflowStepState = 'active' | 'done' | 'pending';
+type DashboardStudioLane = 'review' | 'builder' | 'excel';
+type ExcelConversionIntent = 'dashboard_only' | 'semantic_and_dashboard' | 'semantic_only';
 
 function normalizeAiState(state: string | undefined) {
   return (state || '').trim().toUpperCase().replace(/[-\s]/g, '_');
@@ -55,47 +66,146 @@ function readFirstString(value: unknown, keys: string[]) {
   return '';
 }
 
+function buildOmniChatUrl(baseUrl: string, conversationId: string) {
+  const cleanBase = baseUrl.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
+  if (!cleanBase || !conversationId) return '';
+  return `${cleanBase}/chat/${encodeURIComponent(conversationId)}`;
+}
+
 function shortenId(value?: string) {
   if (!value) return 'Not detected';
   return value.length > 20 ? `${value.slice(0, 8)}...${value.slice(-6)}` : value;
+}
+
+function modelIsBase(model: OmniModel) {
+  return !model.deletedAt && (!model.kind || ['SHARED', 'SHARED_EXTENSION'].includes(model.kind));
+}
+
+function formatSize(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function dashboardColorGuidance(colorScheme: string) {
+  return colorScheme.trim()
+    ? colorScheme.trim()
+    : 'No brand palette provided. Choose a restrained Omni-friendly palette with neutral dashboard chrome, clear chart contrast, and consistent semantic colors.';
+}
+
+function excelIntentLabel(intent: ExcelConversionIntent) {
+  if (intent === 'dashboard_only') return 'Dashboard draft only';
+  if (intent === 'semantic_only') return 'Model follow-up plan only';
+  return 'Dashboard draft with model follow-ups';
+}
+
+function compactPromptTitlePart(value: string | undefined, fallback: string, maxLength = 80) {
+  const clean = (value || '').replace(/\s+/g, ' ').trim() || fallback;
+  return clean.length > maxLength ? `${clean.slice(0, maxLength - 1).trim()}…` : clean;
 }
 
 function cleanReviewText(value: string) {
   return value.replace(/\*\*/g, '').replace(/`/g, '').trim();
 }
 
+function parseMarkdownTableCells(value: string) {
+  return value
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cleanReviewText(cell));
+}
+
+function isMarkdownTableRow(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith('|')) return false;
+  return parseMarkdownTableCells(trimmed).length >= 2;
+}
+
+function isMarkdownTableDivider(value: string) {
+  const cells = parseMarkdownTableCells(value);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell.trim()));
+}
+
 function AiReviewContent({ message }: { message: string }) {
   const lines = message.split('\n');
+  const blocks: ReactNode[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const trimmed = lines[index].trim();
+    if (!trimmed) continue;
+    if (/^Here is the full AI Dashboard Studio review/i.test(trimmed)) continue;
+
+    if (isMarkdownTableRow(trimmed)) {
+      const tableLines: string[] = [];
+      let cursor = index;
+      while (cursor < lines.length && isMarkdownTableRow(lines[cursor])) {
+        tableLines.push(lines[cursor].trim());
+        cursor += 1;
+      }
+
+      const rows = tableLines
+        .filter((line) => !isMarkdownTableDivider(line))
+        .map((line) => parseMarkdownTableCells(line));
+
+      if (rows.length > 1) {
+        blocks.push(
+          <div key={`table-${index}`} className="overflow-x-auto rounded-card border border-border bg-white">
+            <table className="min-w-full text-left text-xs">
+              <tbody>
+                {rows.map((row, rowIndex) => (
+                  <tr key={`table-${index}-${rowIndex}`} className={rowIndex === 0 ? 'bg-surface-secondary text-content-primary' : 'border-t border-border text-content-secondary'}>
+                    {row.map((cell, cellIndex) => {
+                      const Cell = rowIndex === 0 ? 'th' : 'td';
+                      return (
+                        <Cell key={`table-${index}-${rowIndex}-${cellIndex}`} className="px-3 py-2 align-top leading-5">
+                          {cell}
+                        </Cell>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        );
+        index = cursor - 1;
+        continue;
+      }
+    }
+
+    if (/^-{3,}$/.test(trimmed)) {
+      blocks.push(<div key={`${index}-${trimmed}`} className="h-px bg-border my-4" />);
+      continue;
+    }
+    if (/^#{1,4}\s+/.test(trimmed)) {
+      blocks.push(
+        <div key={`${index}-${trimmed}`} className="pt-2 text-sm font-semibold text-content-primary">
+          {cleanReviewText(trimmed.replace(/^#{1,4}\s+/, ''))}
+        </div>
+      );
+      continue;
+    }
+    if (/^[-*]\s+/.test(trimmed)) {
+      blocks.push(
+        <div key={`${index}-${trimmed}`} className="flex gap-2 text-sm leading-6 text-content-secondary">
+          <span className="mt-2 h-1.5 w-1.5 rounded-full bg-omni-500 flex-shrink-0" />
+          <span>{cleanReviewText(trimmed.replace(/^[-*]\s+/, ''))}</span>
+        </div>
+      );
+      continue;
+    }
+    blocks.push(
+      <p key={`${index}-${trimmed}`} className="text-sm leading-6 text-content-secondary">
+        {cleanReviewText(trimmed)}
+      </p>
+    );
+  }
+
   return (
     <div className="space-y-3">
-      {lines.map((line, index) => {
-        const trimmed = line.trim();
-        if (!trimmed) return null;
-        if (/^Here is the full AI Dashboard Studio review/i.test(trimmed)) return null;
-        if (/^-{3,}$/.test(trimmed)) {
-          return <div key={`${index}-${trimmed}`} className="h-px bg-border my-4" />;
-        }
-        if (/^#{1,4}\s+/.test(trimmed)) {
-          return (
-            <div key={`${index}-${trimmed}`} className="pt-2 text-sm font-semibold text-content-primary">
-              {cleanReviewText(trimmed.replace(/^#{1,4}\s+/, ''))}
-            </div>
-          );
-        }
-        if (/^[-*]\s+/.test(trimmed)) {
-          return (
-            <div key={`${index}-${trimmed}`} className="flex gap-2 text-sm leading-6 text-content-secondary">
-              <span className="mt-2 h-1.5 w-1.5 rounded-full bg-omni-500 flex-shrink-0" />
-              <span>{cleanReviewText(trimmed.replace(/^[-*]\s+/, ''))}</span>
-            </div>
-          );
-        }
-        return (
-          <p key={`${index}-${trimmed}`} className="text-sm leading-6 text-content-secondary">
-            {cleanReviewText(trimmed)}
-          </p>
-        );
-      })}
+      {blocks}
     </div>
   );
 }
@@ -134,6 +244,24 @@ function extractAiMessage(result?: OmniAiJobResult | null, job?: OmniAiJob | nul
     extractMessageFromActions(job?.actions) ||
     ''
   );
+}
+
+function jobToResult(job: OmniAiJob | null | undefined): OmniAiJobResult | null {
+  if (!job) return null;
+  const message = extractAiMessage(undefined, job);
+  const topic = readFirstString(job, ['topicName', 'topic_name', 'topic']);
+  if (!message && !topic && !job.actions?.length) return null;
+  return {
+    actions: job.actions,
+    message,
+    resultSummary: readFirstString(job, ['resultSummary', 'result_summary']),
+    topic,
+    omniChatUrl: readFirstString(job, ['omniChatUrl', 'omni_chat_url']),
+  };
+}
+
+function hasAiResultContent(result?: OmniAiJobResult | null, job?: OmniAiJob | null) {
+  return Boolean(extractAiMessage(result, job));
 }
 
 function buildDashboardReviewPrompt(dashboard: InspectedDashboard) {
@@ -189,8 +317,208 @@ Return exactly these sections:
 8. Omni UI handoff checklist`;
 }
 
+function buildDashboardDeveloperPrompt(params: {
+  modelName: string;
+  modelId: string;
+  topicName?: string;
+  audience: string;
+  goal: string;
+  kpis: string;
+  filters: string;
+  layout: string;
+  colorScheme: string;
+  notes: string;
+}) {
+  const { modelName, modelId, topicName, audience, goal, kpis, filters, layout, colorScheme, notes } = params;
+  const titleTarget = topicName ? `${modelName} / ${topicName}` : modelName;
+  return `${compactPromptTitlePart(titleTarget, 'Selected model')} - AI Dashboard Studio Build New Dashboard
+
+Act as a senior Omni dashboard developer and analytics product designer.
+
+Goal:
+Start a first-pass Omni dashboard build from this prompt, then keep the conversation open so the user can finish dashboard iteration in Omni chat.
+
+Rules:
+- Use only the selected Omni model/topic context. Do not invent unavailable fields.
+- If dashboard creation is available in this Omni Agent surface, create a draft/first-pass dashboard from the requirements.
+- If dashboard creation is not available from this API job, return a dashboard build brief that the user can continue in Omni chat.
+- Do not mark a tile as validated unless the created dashboard preview renders it without an error. If preview verification is not available, call the dashboard a draft that still needs Omni UI review.
+- Treat chart type fidelity as part of validation. If a requested line, bar, KPI, or table tile renders as a different visualization type, list it as visual review required and tell the user exactly what to adjust in Omni UI.
+- Treat blank or axes-only charts as fix-required even if the query succeeds. A chart is not validated unless visible marks, values, or rows render in the preview.
+- For trend requests, prefer a true line or bar trend chart. Do not duplicate the same table as both the revenue trend and margin trend unless chart creation is unavailable; if that fallback happens, say so clearly.
+- For ratio metrics, use an existing ratio measure only when its definition matches the requested KPI. Do not substitute a row-level average for an order-level ratio unless the field definition confirms that grain.
+- Do not generate semantic YAML in this lane. Route semantic gaps to AI Semantic Studio.
+- Do not ask for external BI credentials, screenshots, or unsupported imports.
+- Do not use markdown tables; use short bullets for tile and filter lists.
+- Apply the requested color scheme when Omni dashboard creation supports styling. Do not use color as the only way to communicate status; labels, titles, and values must remain clear without color.
+- Use accessible contrast and consistent semantic colors: green for healthy/positive, red for risk/negative, amber for warning, and neutral colors for context.
+- Keep the response admin-friendly and action-oriented.
+
+Target:
+- Model: ${modelName}
+- Model ID: ${modelId}
+- Topic: ${topicName || 'Use the best available topic in this model'}
+
+Dashboard request:
+- Audience: ${audience || 'Not specified'}
+- Business goal: ${goal || 'Not specified'}
+- KPI / metric ideas: ${kpis || 'Not specified'}
+- Filters / controls: ${filters || 'Not specified'}
+- Layout / visual style: ${layout || 'Not specified'}
+- Color / brand style: ${dashboardColorGuidance(colorScheme)}
+- Additional notes: ${notes || 'None'}
+
+Return exactly these sections:
+1. First-pass dashboard build status
+2. Proposed dashboard title and audience
+3. Tiles to create
+4. Filters and interactions
+5. Semantic gaps to route elsewhere
+6. Questions for the user in Omni chat
+7. Next step in Omni`;
+}
+
+function excelInventoryPromptBlock(inventory: ExcelWorkbookInventory) {
+  const sheetLines = inventory.sheets.slice(0, 20).map((sheet) =>
+    `- ${sheet.name}: ${sheet.rowCount} rows, ${sheet.formulaCount} formulas, ${sheet.chartCount} charts${sheet.columnHeaders.length ? `, headers: ${sheet.columnHeaders.slice(0, 12).join(', ')}` : ''}`
+  );
+  const formulaLines = inventory.formulas.slice(0, 40).map((formula) =>
+    `- ${formula.sheetName}!${formula.cell}: =${formula.formula} | ${formula.classification} | ${formula.guidance}`
+  );
+  const chartLines = inventory.charts.slice(0, 30).map((chart) =>
+    `- ${chart.sheetName}/${chart.chartName}: ${chart.chartType}${chart.title ? `, title: ${chart.title}` : ''}${chart.sourceRanges.length ? `, ranges: ${chart.sourceRanges.slice(0, 4).join('; ')}` : ''}`
+  );
+  const warningLines = inventory.warnings.slice(0, 12).map((warning) => `- ${warning}`);
+
+  return `Workbook:
+- File: ${inventory.fileName}
+- Size: ${formatSize(inventory.sizeBytes)}
+- Summary: ${inventory.summary}
+
+Sheets:
+${sheetLines.length ? sheetLines.join('\n') : '- None detected'}
+
+Formula candidates:
+${formulaLines.length ? formulaLines.join('\n') : '- No formulas detected'}
+
+Chart / visual evidence:
+${chartLines.length ? chartLines.join('\n') : '- No embedded chart metadata detected'}
+
+Parser warnings:
+${warningLines.length ? warningLines.join('\n') : '- None'}`;
+}
+
+function buildExcelConversionPrompt(params: {
+  inventory: ExcelWorkbookInventory;
+  intent: ExcelConversionIntent;
+  modelName: string;
+  modelId: string;
+  topicName?: string;
+  adminGoal: string;
+  colorScheme: string;
+}) {
+  const { inventory, intent, modelName, modelId, topicName, adminGoal, colorScheme } = params;
+  return `${compactPromptTitlePart(inventory.fileName, 'Excel workbook')} - AI Dashboard Studio Excel Conversion
+
+Act as a senior analytics engineer and Omni dashboard developer.
+
+Goal:
+Convert an Excel workbook into a reviewed Omni dashboard migration plan. Focus on what Blobby can safely draft now from existing Omni fields, and what formula or lookup logic should become model follow-up work.
+
+Rules:
+- This is a planning/conversion analysis step, not a production write.
+- This lane does not update Omni semantic files, topics, views, relationships, or model YAML.
+- Do not return deployable YAML in this response.
+- Do not claim a formula is safe to deploy until grain, source fields, filters, and null behavior are validated.
+- Formula candidates that should become Omni measures must be listed as model follow-ups for AI Semantic Studio, reviewed YAML, and dev-branch validation.
+- Dashboard requirements can be used to start a guarded Blobby dashboard chat using existing Omni fields only.
+- When dashboard intent is selected, separate safe draft tiles that can use existing Omni fields from blocked tiles that require semantic work first.
+- Make the sequencing explicit: Blobby can draft safe dashboard tiles now, while blocked measures, lookup dimensions, and ratio metrics remain follow-up work in AI Semantic Studio before they are added.
+- If the workbook appears to contain raw source data, note that the user may need Omni upload/data input table steps before dashboard creation.
+- Do not use markdown tables; use short bullets grouped under the required sections.
+- Capture dashboard color and brand requirements as visual requirements. Do not use color as the only status signal; require labels or values alongside color.
+- Use accessible contrast and consistent semantic colors: green for healthy/positive, red for risk/negative, amber for warning, and neutral colors for context.
+
+Target:
+- Model: ${modelName}
+- Model ID: ${modelId}
+- Topic: ${topicName || 'Not selected'}
+- User intent: ${excelIntentLabel(intent)}
+- Admin goal: ${adminGoal || 'Create a guarded dashboard draft from Excel evidence and list model follow-up requirements.'}
+- Color / brand style: ${dashboardColorGuidance(colorScheme)}
+
+${excelInventoryPromptBlock(inventory)}
+
+Return exactly these sections:
+1. Workbook readout
+2. Safe dashboard candidates from existing fields
+3. Formulas that should not become measures yet
+4. Model follow-ups and blocked work
+5. Dashboard visual requirements
+6. Human validation questions
+7. Recommended next step`;
+}
+
+function buildExcelDashboardPrompt(params: {
+  inventory: ExcelWorkbookInventory;
+  analysis: string;
+  modelName: string;
+  modelId: string;
+  topicName?: string;
+  adminGoal: string;
+  colorScheme: string;
+}) {
+  const { inventory, analysis, modelName, modelId, topicName, adminGoal, colorScheme } = params;
+  return `${compactPromptTitlePart(inventory.fileName, 'Excel workbook')} - AI Dashboard Studio Excel Dashboard Build
+
+Act as Blobby, an Omni dashboard developer.
+
+Goal:
+Use the prior Excel conversion analysis to start a guarded first-pass dashboard draft in Omni chat, or return the exact dashboard build brief if creation is not available in this AI job surface.
+
+Rules:
+- Use only validated Omni model/topic fields. Do not invent fields from Excel formulas.
+- If the prior conversion analysis says a formula needs validation, treat that tile as blocked unless an exact existing Omni field is confirmed.
+- If formulas require new measures that do not exist yet, pause that tile and list it as a model follow-up for AI Semantic Studio.
+- For Average Order Value or other ratio formulas, do not use a generic average field unless it is explicitly defined as the same numerator and denominator. If the matching ratio measure is not confirmed, block the tile and route it to AI Semantic Studio.
+- If dashboard creation is available, create a draft/first-pass dashboard from only the validated visual requirements that map to existing Omni fields.
+- If dashboard creation is not available, return a build brief and ask the user to continue in Omni chat.
+- If the prior conversion analysis recommends semantic work first, still create only the safe draft tiles when possible and list every blocked tile clearly. Do not create placeholders that imply blocked metrics are live.
+- Do not claim a created tile is validated unless the dashboard preview renders it without an error. If any tile errors, list it under blocked/fix-required tiles with the likely field or grain issue.
+- Treat chart type fidelity as part of validation. If a requested chart renders as a table, or a scorecard renders as a chart, list it as visual review required and tell the user exactly what to adjust in Omni UI.
+- Treat blank or axes-only charts as fix-required even if the query succeeds. A chart is not validated unless visible marks, values, or rows render in the preview.
+- For workbook charts and trend requirements, prefer the closest matching Omni chart type. Do not silently convert an embedded Excel chart into a table unless chart creation is unavailable.
+- Do not generate semantic YAML here.
+- Do not use markdown tables; use short bullets for tile, filter, and blocker lists.
+- Apply the requested color scheme when Omni dashboard creation supports styling. Do not use color as the only way to communicate status; labels, titles, and values must remain clear without color.
+- Use accessible contrast and consistent semantic colors: green for healthy/positive, red for risk/negative, amber for warning, and neutral colors for context.
+
+Target:
+- Model: ${modelName}
+- Model ID: ${modelId}
+- Topic: ${topicName || 'Use the best available topic in this model'}
+- Admin goal: ${adminGoal || 'Create a guarded Omni dashboard draft from safe existing fields and list model follow-ups.'}
+- Color / brand style: ${dashboardColorGuidance(colorScheme)}
+
+Excel inventory:
+${excelInventoryPromptBlock(inventory)}
+
+Prior conversion analysis:
+${analysis}
+
+Return exactly these sections:
+1. Dashboard build status
+2. Draft dashboard title
+3. Tiles to create now
+4. Tiles blocked by semantic prerequisites
+5. Filters and interactions
+6. Omni chat next step`;
+}
+
 export function AIDashboardStudioPage() {
   const { connection } = useConnection();
+  const excelFileInputRef = useRef<HTMLInputElement>(null);
+  const [studioLane, setStudioLane] = useState<DashboardStudioLane>('builder');
   const [dashboards, setDashboards] = useState<CachedDashboard[]>([]);
   const [dashboardsSyncedAt, setDashboardsSyncedAt] = useState<number | null>(null);
   const [loadingDashboards, setLoadingDashboards] = useState(false);
@@ -204,6 +532,37 @@ export function AIDashboardStudioPage() {
   const [aiConversationId, setAiConversationId] = useState('');
   const [reviewStatus, setReviewStatus] = useState('');
   const [error, setError] = useState('');
+  const [studioModels, setStudioModels] = useState<OmniModel[]>([]);
+  const [loadingStudioModels, setLoadingStudioModels] = useState(false);
+  const [studioModelSearch, setStudioModelSearch] = useState('');
+  const [studioModelId, setStudioModelId] = useState('');
+  const [studioTopics, setStudioTopics] = useState<OmniTopic[]>([]);
+  const [studioTopicName, setStudioTopicName] = useState('');
+  const [loadingStudioTopics, setLoadingStudioTopics] = useState(false);
+  const [builderAudience, setBuilderAudience] = useState('');
+  const [builderGoal, setBuilderGoal] = useState('');
+  const [builderKpis, setBuilderKpis] = useState('');
+  const [builderFilters, setBuilderFilters] = useState('');
+  const [builderLayout, setBuilderLayout] = useState('');
+  const [builderColorScheme, setBuilderColorScheme] = useState('');
+  const [builderNotes, setBuilderNotes] = useState('');
+  const [builderMessage, setBuilderMessage] = useState('');
+  const [builderStatus, setBuilderStatus] = useState('');
+  const [builderChatUrl, setBuilderChatUrl] = useState('');
+  const [builderConversationId, setBuilderConversationId] = useState('');
+  const [builderRunning, setBuilderRunning] = useState(false);
+  const [excelIntent, setExcelIntent] = useState<ExcelConversionIntent>('semantic_and_dashboard');
+  const [excelGoal, setExcelGoal] = useState('');
+  const [excelColorScheme, setExcelColorScheme] = useState('');
+  const [excelInventory, setExcelInventory] = useState<ExcelWorkbookInventory | null>(null);
+  const [excelParsing, setExcelParsing] = useState(false);
+  const [excelRunning, setExcelRunning] = useState(false);
+  const [excelDashboardRunning, setExcelDashboardRunning] = useState(false);
+  const [excelMessage, setExcelMessage] = useState('');
+  const [excelDashboardMessage, setExcelDashboardMessage] = useState('');
+  const [excelStatus, setExcelStatus] = useState('');
+  const [excelChatUrl, setExcelChatUrl] = useState('');
+  const [excelConversationId, setExcelConversationId] = useState('');
 
   useEffect(() => {
     const cached = dashboardCache.load(connection.baseUrl);
@@ -212,6 +571,52 @@ export function AIDashboardStudioPage() {
       setDashboardsSyncedAt(cached.savedAt);
     }
   }, [connection.baseUrl]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadStudioModels() {
+      setLoadingStudioModels(true);
+      try {
+        const response = await listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
+        if (!cancelled) setStudioModels(Array.isArray(response.models) ? response.models : []);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load Omni models.');
+      } finally {
+        if (!cancelled) setLoadingStudioModels(false);
+      }
+    }
+    loadStudioModels();
+    return () => {
+      cancelled = true;
+    };
+  }, [connection.baseUrl, connection.apiKey]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadTopicsForModel() {
+      if (!studioModelId) {
+        setStudioTopics([]);
+        setStudioTopicName('');
+        return;
+      }
+      setLoadingStudioTopics(true);
+      try {
+        const topics = await listTopics(connection.baseUrl, connection.apiKey, studioModelId);
+        if (!cancelled) {
+          setStudioTopics(Array.isArray(topics) ? topics : []);
+          setStudioTopicName((current) => current && topics.some((topic) => topic.name === current) ? current : '');
+        }
+      } catch {
+        if (!cancelled) setStudioTopics([]);
+      } finally {
+        if (!cancelled) setLoadingStudioTopics(false);
+      }
+    }
+    loadTopicsForModel();
+    return () => {
+      cancelled = true;
+    };
+  }, [connection.baseUrl, connection.apiKey, studioModelId]);
 
   async function refreshDashboardList() {
     setLoadingDashboards(true);
@@ -288,18 +693,99 @@ export function AIDashboardStudioPage() {
   }
 
   async function getAiResult(jobId: string, finalJob: OmniAiJob | null) {
+    const fallbackFromFinalJob = jobToResult(finalJob);
     let lastError: unknown = null;
     for (let i = 0; i < 8; i += 1) {
       try {
         const result = await getAiJobResult(connection.baseUrl, connection.apiKey, jobId);
-        if (extractAiMessage(result, finalJob)) return result;
+        if (hasAiResultContent(result, finalJob)) return result;
       } catch (err) {
         lastError = err;
       }
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
-    if (extractAiMessage(undefined, finalJob)) return null;
+
+    const latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId).catch(() => null);
+    const fallback = jobToResult(latest) || fallbackFromFinalJob;
+    if (fallback) return fallback;
+
+    if (lastError instanceof ApiError && lastError.status === 404) {
+      throw new Error('Omni has not exposed the AI result through the API yet. Try again in a moment, or continue from the Omni chat if it is available.');
+    }
     throw lastError instanceof Error ? lastError : new Error('AI result was not available yet.');
+  }
+
+  async function runModelAiPrompt(params: {
+    modelId: string;
+    topicName?: string;
+    prompt: string;
+    conversationId?: string;
+    status: (value: string) => void;
+  }) {
+    let lastError: unknown = null;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        params.status(attempt > 0 ? 'Retrying Omni AI job...' : 'Creating Omni AI job...');
+        const created = await createAiJob(connection.baseUrl, connection.apiKey, {
+          modelId: params.modelId,
+          topicName: params.topicName || undefined,
+          prompt: params.prompt,
+          conversationId: params.conversationId || undefined,
+        });
+        setAiJob(created);
+        const jobId = created.jobId || created.id;
+        if (!jobId) throw new Error('Omni did not return an AI job ID.');
+        const createdConversationId = readFirstString(created, ['conversationId', 'conversation_id']) || params.conversationId || '';
+        const createdChatUrl =
+          readFirstString(created, ['omniChatUrl', 'omni_chat_url']) ||
+          buildOmniChatUrl(connection.baseUrl, createdConversationId);
+        params.status('Waiting for Blobby to finish...');
+        const finalJob = await waitForAiJob(jobId);
+        const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
+        if (['FAILED', 'CANCELLED', 'CANCELED'].includes(finalState)) throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
+        params.status('Retrieving Blobby output...');
+        const finalConversationId =
+          readFirstString(finalJob, ['conversationId', 'conversation_id']) ||
+          createdConversationId;
+        const finalChatUrl =
+          readFirstString(finalJob, ['omniChatUrl', 'omni_chat_url']) ||
+          createdChatUrl ||
+          buildOmniChatUrl(connection.baseUrl, finalConversationId);
+        let result: OmniAiJobResult | null = null;
+        try {
+          result = await getAiResult(jobId, finalJob);
+        } catch (err) {
+          if (finalChatUrl) {
+            return {
+              message:
+                'Blobby started the Omni dashboard conversation, but Omni did not expose the full AI result stream back to OmniKit yet. Continue the dashboard build in Omni chat using the handoff link below.',
+              conversationId: finalConversationId,
+              chatUrl: finalChatUrl,
+            };
+          }
+          throw err;
+        }
+        const conversationId =
+          readFirstString(result, ['conversationId', 'conversation_id']) ||
+          finalConversationId;
+        const chatUrl =
+          readFirstString(result, ['omniChatUrl', 'omni_chat_url']) ||
+          finalChatUrl ||
+          buildOmniChatUrl(connection.baseUrl, conversationId);
+        const aiMessage = extractAiMessage(result, finalJob);
+        const message = aiMessage || (chatUrl
+          ? 'Blobby completed the Omni dashboard conversation, but Omni did not expose the full narrative result back to OmniKit. Continue in Omni chat using the handoff link below, then review any draft dashboard tiles for errors before saving or sharing.'
+          : 'Blobby completed, but no narrative result was returned.');
+        return { message, conversationId, chatUrl };
+      } catch (err) {
+        lastError = err;
+        const retryable = err instanceof ApiError && [429, 500, 502, 503].includes(err.status);
+        if (!retryable || attempt === 2) break;
+        params.status('Omni is busy, waiting a moment before retrying...');
+        await new Promise((resolve) => setTimeout(resolve, 8000));
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Omni AI job failed to start.');
   }
 
   async function createDashboardAiJobWithRetry(prompt: string) {
@@ -368,8 +854,168 @@ export function AIDashboardStudioPage() {
     }
   }
 
+  async function runDashboardDeveloper() {
+    const selectedModel = studioModels.find((model) => model.id === studioModelId);
+    if (!selectedModel) {
+      setError('Choose an Omni model before starting the dashboard developer lane.');
+      return;
+    }
+    if (!builderGoal.trim()) {
+      setError('Describe the dashboard goal before asking Blobby to build the first pass.');
+      return;
+    }
+    setBuilderRunning(true);
+    setBuilderMessage('');
+    setError('');
+    setBuilderStatus(builderConversationId ? 'Continuing dashboard developer chat...' : 'Starting dashboard developer chat...');
+    try {
+      const outcome = await runModelAiPrompt({
+        modelId: selectedModel.id,
+        topicName: studioTopicName || undefined,
+        conversationId: builderConversationId || undefined,
+        status: setBuilderStatus,
+        prompt: buildDashboardDeveloperPrompt({
+          modelName: selectedModel.name,
+          modelId: selectedModel.id,
+          topicName: studioTopicName || undefined,
+          audience: builderAudience,
+          goal: builderGoal,
+          kpis: builderKpis,
+          filters: builderFilters,
+          layout: builderLayout,
+          colorScheme: builderColorScheme,
+          notes: builderNotes,
+        }),
+      });
+      setBuilderMessage(outcome.message);
+      setBuilderConversationId(outcome.conversationId);
+      setBuilderChatUrl(outcome.chatUrl || builderChatUrl);
+      setBuilderStatus('Dashboard developer handoff ready.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to start Blobby dashboard developer.';
+      setError(message);
+      setBuilderStatus(`Dashboard developer failed: ${message}`);
+    } finally {
+      setBuilderRunning(false);
+    }
+  }
+
+  async function handleExcelUpload(file: File | undefined) {
+    if (!file) return;
+    setExcelParsing(true);
+    setError('');
+    setExcelInventory(null);
+    setExcelMessage('');
+    setExcelDashboardMessage('');
+    setExcelConversationId('');
+    setExcelChatUrl('');
+    try {
+      const inventory = await parseExcelWorkbook(file);
+      setExcelInventory(inventory);
+      setExcelStatus(`Parsed ${inventory.summary}.`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to parse Excel workbook.';
+      setError(message);
+      setExcelStatus(`Excel parsing failed: ${message}`);
+    } finally {
+      setExcelParsing(false);
+      if (excelFileInputRef.current) excelFileInputRef.current.value = '';
+    }
+  }
+
+  async function runExcelConversion() {
+    const selectedModel = studioModels.find((model) => model.id === studioModelId);
+    if (!selectedModel) {
+      setError('Choose an Omni model before asking Blobby to convert Excel formulas.');
+      return;
+    }
+    if (!excelInventory) {
+      setError('Upload an .xlsx workbook before running Excel conversion.');
+      return;
+    }
+    setExcelRunning(true);
+    setError('');
+    setExcelMessage('');
+    setExcelDashboardMessage('');
+    setExcelStatus('Starting Excel conversion analysis...');
+    try {
+      const outcome = await runModelAiPrompt({
+        modelId: selectedModel.id,
+        topicName: studioTopicName || undefined,
+        conversationId: excelConversationId || undefined,
+        status: setExcelStatus,
+        prompt: buildExcelConversionPrompt({
+          inventory: excelInventory,
+          intent: excelIntent,
+          modelName: selectedModel.name,
+          modelId: selectedModel.id,
+          topicName: studioTopicName || undefined,
+          adminGoal: excelGoal,
+          colorScheme: excelColorScheme,
+        }),
+      });
+      setExcelMessage(outcome.message);
+      setExcelConversationId(outcome.conversationId);
+      setExcelChatUrl(outcome.chatUrl || excelChatUrl);
+      setExcelStatus('Excel formula and dashboard conversion analysis ready.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to convert Excel workbook with Blobby.';
+      setError(message);
+      setExcelStatus(`Excel conversion failed: ${message}`);
+    } finally {
+      setExcelRunning(false);
+    }
+  }
+
+  async function runExcelDashboardDeveloper() {
+    const selectedModel = studioModels.find((model) => model.id === studioModelId);
+    if (!selectedModel || !excelInventory || !excelMessage) {
+      setError('Run Excel conversion analysis before starting a dashboard build chat.');
+      return;
+    }
+    setExcelDashboardRunning(true);
+    setError('');
+    setExcelStatus('Starting Excel dashboard build chat...');
+    try {
+      const outcome = await runModelAiPrompt({
+        modelId: selectedModel.id,
+        topicName: studioTopicName || undefined,
+        conversationId: excelConversationId || undefined,
+        status: setExcelStatus,
+        prompt: buildExcelDashboardPrompt({
+          inventory: excelInventory,
+          analysis: excelMessage,
+          modelName: selectedModel.name,
+          modelId: selectedModel.id,
+          topicName: studioTopicName || undefined,
+          adminGoal: excelGoal,
+          colorScheme: excelColorScheme,
+        }),
+      });
+      setExcelDashboardMessage(outcome.message);
+      setExcelConversationId(outcome.conversationId);
+      setExcelChatUrl(outcome.chatUrl || excelChatUrl);
+      setExcelStatus('Excel dashboard handoff ready.');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to start Excel dashboard build chat.';
+      setError(message);
+      setExcelStatus(`Excel dashboard build failed: ${message}`);
+    } finally {
+      setExcelDashboardRunning(false);
+    }
+  }
+
   const aiStatus = normalizeAiState(aiJob?.state || aiJob?.status);
   const canRunAi = Boolean(dashboard?.modelId && !reviewing && !inspecting);
+  const selectedStudioModel = studioModels.find((model) => model.id === studioModelId) || null;
+  const filteredStudioModels = studioModels.filter((model) => {
+    const needle = studioModelSearch.toLowerCase().trim();
+    const matches = !needle ||
+      model.name.toLowerCase().includes(needle) ||
+      model.id.toLowerCase().includes(needle) ||
+      (model.connectionName || '').toLowerCase().includes(needle);
+    return modelIsBase(model) && matches;
+  });
   const semanticScope = useMemo(() => {
     if (!dashboard) {
       return {
@@ -450,6 +1096,10 @@ export function AIDashboardStudioPage() {
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
 
+      <StudioLaneSelector activeLane={studioLane} onChange={setStudioLane} />
+
+      {studioLane === 'review' && (
+        <>
       <div className="rounded-card border border-border bg-white overflow-hidden">
         <div className="grid md:grid-cols-4 divide-y md:divide-y-0 md:divide-x divide-border">
           {workflowSteps.map((step, index) => (
@@ -659,7 +1309,7 @@ export function AIDashboardStudioPage() {
                   </div>
                   <div className="flex flex-wrap items-center gap-2">
                     {chatUrl && (
-                      <a href={chatUrl} target="_blank" rel="noreferrer" className="btn-secondary text-sm inline-flex items-center gap-2">
+                      <a href={chatUrl} className="btn-secondary text-sm inline-flex items-center gap-2">
                         Open Omni chat
                         <ArrowRight size={14} />
                       </a>
@@ -702,7 +1352,7 @@ export function AIDashboardStudioPage() {
                   </div>
                 </div>
                 {chatUrl && (
-                  <a href={chatUrl} target="_blank" rel="noreferrer" className="btn-secondary text-sm inline-flex items-center justify-center gap-2 flex-shrink-0">
+                  <a href={chatUrl} className="btn-secondary text-sm inline-flex items-center justify-center gap-2 flex-shrink-0">
                     Ask follow-up in Omni
                     <ArrowRight size={14} />
                   </a>
@@ -723,6 +1373,646 @@ export function AIDashboardStudioPage() {
             </div>
           )}
       </div>
+        </>
+      )}
+
+      {studioLane === 'builder' && (
+        <DashboardDeveloperLane
+          models={filteredStudioModels}
+          loadingModels={loadingStudioModels}
+          modelSearch={studioModelSearch}
+          selectedModel={selectedStudioModel}
+          selectedModelId={studioModelId}
+          topics={studioTopics}
+          selectedTopicName={studioTopicName}
+          loadingTopics={loadingStudioTopics}
+          audience={builderAudience}
+          goal={builderGoal}
+          kpis={builderKpis}
+          filters={builderFilters}
+          layout={builderLayout}
+          colorScheme={builderColorScheme}
+          notes={builderNotes}
+          running={builderRunning}
+          status={builderStatus}
+          message={builderMessage}
+          chatUrl={builderChatUrl}
+          onModelSearch={setStudioModelSearch}
+          onModelSelect={(modelId) => {
+            setStudioModelId(modelId);
+            setBuilderMessage('');
+            setBuilderChatUrl('');
+            setBuilderConversationId('');
+          }}
+          onTopicSelect={setStudioTopicName}
+          onAudience={setBuilderAudience}
+          onGoal={setBuilderGoal}
+          onKpis={setBuilderKpis}
+          onFilters={setBuilderFilters}
+          onLayout={setBuilderLayout}
+          onColorScheme={setBuilderColorScheme}
+          onNotes={setBuilderNotes}
+          onRun={runDashboardDeveloper}
+        />
+      )}
+
+      {studioLane === 'excel' && (
+        <ExcelDashboardLane
+          fileInputRef={excelFileInputRef}
+          models={filteredStudioModels}
+          loadingModels={loadingStudioModels}
+          modelSearch={studioModelSearch}
+          selectedModel={selectedStudioModel}
+          selectedModelId={studioModelId}
+          topics={studioTopics}
+          selectedTopicName={studioTopicName}
+          loadingTopics={loadingStudioTopics}
+          intent={excelIntent}
+          goal={excelGoal}
+          colorScheme={excelColorScheme}
+          inventory={excelInventory}
+          parsing={excelParsing}
+          running={excelRunning}
+          dashboardRunning={excelDashboardRunning}
+          status={excelStatus}
+          message={excelMessage}
+          dashboardMessage={excelDashboardMessage}
+          chatUrl={excelChatUrl}
+          onModelSearch={setStudioModelSearch}
+          onModelSelect={(modelId) => {
+            setStudioModelId(modelId);
+            setExcelMessage('');
+            setExcelDashboardMessage('');
+            setExcelConversationId('');
+            setExcelChatUrl('');
+          }}
+          onTopicSelect={setStudioTopicName}
+          onIntent={setExcelIntent}
+          onGoal={setExcelGoal}
+          onColorScheme={setExcelColorScheme}
+          onUpload={handleExcelUpload}
+          onClear={() => {
+            setExcelInventory(null);
+            setExcelMessage('');
+            setExcelDashboardMessage('');
+            setExcelStatus('');
+          }}
+          onAnalyze={runExcelConversion}
+          onBuildDashboard={runExcelDashboardDeveloper}
+        />
+      )}
+    </div>
+  );
+}
+
+function StudioLaneSelector({ activeLane, onChange }: { activeLane: DashboardStudioLane; onChange: (lane: DashboardStudioLane) => void }) {
+  const lanes: Array<{ id: DashboardStudioLane; label: string; description: string; icon: ReactNode }> = [
+    { id: 'builder', label: 'Build New Dashboard', description: 'Start a first-pass dashboard developer chat, then finish in Omni.', icon: <Wand2 size={16} /> },
+    { id: 'excel', label: 'Excel to Dashboard', description: 'Draft safe tiles from workbook evidence and list model follow-ups.', icon: <FileSpreadsheet size={16} /> },
+    { id: 'review', label: 'Review Existing Dashboard', description: 'Inspect a live Omni dashboard and generate a focused review.', icon: <LayoutDashboard size={16} /> },
+  ];
+
+  return (
+    <div className="grid gap-3 lg:grid-cols-3" aria-label="AI Dashboard Studio lanes">
+      {lanes.map((lane) => {
+        const selected = activeLane === lane.id;
+        return (
+          <button
+            key={lane.id}
+            type="button"
+            onClick={() => onChange(lane.id)}
+            aria-pressed={selected}
+            className={`rounded-card border p-4 text-left transition-all ${
+              selected
+                ? 'border-omni-500 bg-omni-50 shadow-soft ring-2 ring-omni-100'
+                : 'border-border bg-white hover:border-omni-200 hover:bg-surface-secondary'
+            }`}
+          >
+            <div className="flex items-start gap-3">
+              <div className={`rounded-button p-2 ${selected ? 'bg-omni-600 text-white' : 'bg-surface-secondary text-content-secondary'}`}>
+                {lane.icon}
+              </div>
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
+                  {lane.label}
+                  {selected && <span className="rounded-chip bg-omni-600 px-2 py-0.5 text-[10px] font-semibold text-white">Selected</span>}
+                </div>
+                <div className="mt-1 text-xs leading-5 text-content-secondary">{lane.description}</div>
+              </div>
+            </div>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function TargetModelSelector({
+  models,
+  loadingModels,
+  modelSearch,
+  selectedModel,
+  selectedModelId,
+  topics,
+  selectedTopicName,
+  loadingTopics,
+  onModelSearch,
+  onModelSelect,
+  onTopicSelect,
+}: {
+  models: OmniModel[];
+  loadingModels: boolean;
+  modelSearch: string;
+  selectedModel: OmniModel | null;
+  selectedModelId: string;
+  topics: OmniTopic[];
+  selectedTopicName: string;
+  loadingTopics: boolean;
+  onModelSearch: (value: string) => void;
+  onModelSelect: (value: string) => void;
+  onTopicSelect: (value: string) => void;
+}) {
+  return (
+    <div className="card p-4 space-y-3">
+      <div>
+        <div className="text-sm font-semibold text-content-primary">Target Omni context</div>
+        <div className="mt-0.5 text-xs text-content-secondary">Choose the model and optional topic Blobby should use.</div>
+      </div>
+      {selectedModel && (
+        <div className="rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+          <div className="flex items-center gap-2 font-semibold">
+            <CheckCircle2 size={14} />
+            {selectedModel.name}
+          </div>
+          <div className="mt-0.5 break-all font-mono text-[11px] text-green-700">{selectedModel.id}</div>
+        </div>
+      )}
+      <input
+        value={modelSearch}
+        onChange={(event) => onModelSearch(event.target.value)}
+        className="input-field text-sm"
+        placeholder="Search models..."
+      />
+      <div className="max-h-[260px] overflow-y-auto rounded-card border border-border bg-white">
+        {loadingModels ? (
+          <div className="px-3 py-3 text-sm text-content-secondary">Loading models...</div>
+        ) : models.length === 0 ? (
+          <div className="px-3 py-3 text-sm text-content-secondary">No base models match that search.</div>
+        ) : models.slice(0, 60).map((model) => {
+          const selected = selectedModelId === model.id;
+          return (
+            <button
+              key={model.id}
+              type="button"
+              onClick={() => onModelSelect(model.id)}
+              aria-pressed={selected}
+              className={`w-full border-b border-border/60 px-3 py-2.5 text-left transition-all last:border-b-0 ${
+                selected ? 'border-l-4 border-l-omni-500 bg-omni-50 text-omni-800' : 'border-l-4 border-l-transparent hover:bg-surface-secondary text-content-primary'
+              }`}
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="truncate text-sm font-semibold">{model.name}</div>
+                  <div className="mt-0.5 truncate font-mono text-[10px] text-content-tertiary">{model.id}</div>
+                </div>
+                {selected && <span className="rounded-chip bg-omni-600 px-2 py-1 text-[10px] font-semibold text-white">Selected</span>}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <div>
+        <label className="text-xs font-semibold text-content-primary">Optional topic</label>
+        <select
+          value={selectedTopicName}
+          onChange={(event) => onTopicSelect(event.target.value)}
+          disabled={!selectedModel || loadingTopics}
+          className="input-field mt-1 text-sm disabled:opacity-60"
+        >
+          <option value="">{loadingTopics ? 'Loading topics...' : 'Let Blobby choose best topic'}</option>
+          {topics.map((topic) => (
+            <option key={topic.name} value={topic.name}>{topic.label || topic.name}</option>
+          ))}
+        </select>
+      </div>
+    </div>
+  );
+}
+
+function AiOutputPanel({ title, subtitle, message, chatUrl }: { title: string; subtitle: string; message: string; chatUrl?: string }) {
+  if (!message) return null;
+  return (
+    <div className="rounded-card border border-border bg-white overflow-hidden">
+      <div className="border-b border-border bg-surface-secondary px-4 py-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <div className="text-sm font-semibold text-content-primary">{title}</div>
+          <div className="mt-0.5 text-xs text-content-secondary">{subtitle}</div>
+        </div>
+        {chatUrl && (
+          <a href={chatUrl} className="btn-secondary text-sm justify-center">
+            <ExternalLink size={14} />
+            Open Omni chat
+          </a>
+        )}
+      </div>
+      <div className="max-h-[620px] overflow-y-auto p-5">
+        <AiReviewContent message={message} />
+      </div>
+    </div>
+  );
+}
+
+function DashboardDeveloperLane({
+  models,
+  loadingModels,
+  modelSearch,
+  selectedModel,
+  selectedModelId,
+  topics,
+  selectedTopicName,
+  loadingTopics,
+  audience,
+  goal,
+  kpis,
+  filters,
+  layout,
+  colorScheme,
+  notes,
+  running,
+  status,
+  message,
+  chatUrl,
+  onModelSearch,
+  onModelSelect,
+  onTopicSelect,
+  onAudience,
+  onGoal,
+  onKpis,
+  onFilters,
+  onLayout,
+  onColorScheme,
+  onNotes,
+  onRun,
+}: {
+  models: OmniModel[];
+  loadingModels: boolean;
+  modelSearch: string;
+  selectedModel: OmniModel | null;
+  selectedModelId: string;
+  topics: OmniTopic[];
+  selectedTopicName: string;
+  loadingTopics: boolean;
+  audience: string;
+  goal: string;
+  kpis: string;
+  filters: string;
+  layout: string;
+  colorScheme: string;
+  notes: string;
+  running: boolean;
+  status: string;
+  message: string;
+  chatUrl: string;
+  onModelSearch: (value: string) => void;
+  onModelSelect: (value: string) => void;
+  onTopicSelect: (value: string) => void;
+  onAudience: (value: string) => void;
+  onGoal: (value: string) => void;
+  onKpis: (value: string) => void;
+  onFilters: (value: string) => void;
+  onLayout: (value: string) => void;
+  onColorScheme: (value: string) => void;
+  onNotes: (value: string) => void;
+  onRun: () => void;
+}) {
+  return (
+    <div className="grid gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
+      <div className="space-y-4">
+        <TargetModelSelector
+          models={models}
+          loadingModels={loadingModels}
+          modelSearch={modelSearch}
+          selectedModel={selectedModel}
+          selectedModelId={selectedModelId}
+          topics={topics}
+          selectedTopicName={selectedTopicName}
+          loadingTopics={loadingTopics}
+          onModelSearch={onModelSearch}
+          onModelSelect={onModelSelect}
+          onTopicSelect={onTopicSelect}
+        />
+        <div className="rounded-card border border-omni-100 bg-omni-50 p-4 text-sm leading-6 text-omni-800">
+          <div className="font-semibold text-omni-900">How this lane works</div>
+          Blobby starts a draft dashboard developer conversation using the selected model/topic. Final review stays in Omni chat so users can fix errored tiles, refine, save, and share through the normal Omni UI.
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        <div className="card p-4 space-y-4">
+          <div>
+            <div className="text-sm font-semibold text-content-primary">Dashboard request</div>
+            <div className="mt-0.5 text-xs text-content-secondary">Give Blobby enough product direction to create a useful first pass.</div>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            <LabeledTextarea label="Audience" value={audience} onChange={onAudience} placeholder="e.g. Revenue leadership, Sales Ops, regional managers" />
+            <LabeledTextarea label="Business goal" value={goal} onChange={onGoal} placeholder="e.g. Track order volume, revenue, and fulfillment health by region" />
+            <LabeledTextarea label="KPIs / metrics" value={kpis} onChange={onKpis} placeholder="Revenue, order count, average order value, delivery time..." />
+            <LabeledTextarea label="Filters / controls" value={filters} onChange={onFilters} placeholder="Date range, status, region, category..." />
+            <LabeledTextarea label="Layout" value={layout} onChange={onLayout} placeholder="Executive summary, KPI row, trends, breakdowns, detail table..." />
+            <LabeledTextarea label="Color / brand style" value={colorScheme} onChange={onColorScheme} placeholder="e.g. Neutral canvas, blue revenue charts, green positive variance, red risk states, accessible contrast" />
+            <LabeledTextarea label="Additional notes" value={notes} onChange={onNotes} placeholder="Known constraints, fields to avoid, owner questions..." />
+          </div>
+          <button
+            type="button"
+            onClick={onRun}
+            disabled={!selectedModel || !goal.trim() || running}
+            className="btn-primary text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {running ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+            Start New Dashboard Build
+          </button>
+          {status && <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs text-content-secondary">{status}</div>}
+        </div>
+
+        <AiOutputPanel
+          title="Dashboard developer output"
+          subtitle="Use this as the Omni chat handoff. If Blobby created a first pass, review tile errors and continue from the linked chat."
+          message={message}
+          chatUrl={chatUrl}
+        />
+      </div>
+    </div>
+  );
+}
+
+function ExcelDashboardLane({
+  fileInputRef,
+  models,
+  loadingModels,
+  modelSearch,
+  selectedModel,
+  selectedModelId,
+  topics,
+  selectedTopicName,
+  loadingTopics,
+  intent,
+  goal,
+  colorScheme,
+  inventory,
+  parsing,
+  running,
+  dashboardRunning,
+  status,
+  message,
+  dashboardMessage,
+  chatUrl,
+  onModelSearch,
+  onModelSelect,
+  onTopicSelect,
+  onIntent,
+  onGoal,
+  onColorScheme,
+  onUpload,
+  onClear,
+  onAnalyze,
+  onBuildDashboard,
+}: {
+  fileInputRef: RefObject<HTMLInputElement>;
+  models: OmniModel[];
+  loadingModels: boolean;
+  modelSearch: string;
+  selectedModel: OmniModel | null;
+  selectedModelId: string;
+  topics: OmniTopic[];
+  selectedTopicName: string;
+  loadingTopics: boolean;
+  intent: ExcelConversionIntent;
+  goal: string;
+  colorScheme: string;
+  inventory: ExcelWorkbookInventory | null;
+  parsing: boolean;
+  running: boolean;
+  dashboardRunning: boolean;
+  status: string;
+  message: string;
+  dashboardMessage: string;
+  chatUrl: string;
+  onModelSearch: (value: string) => void;
+  onModelSelect: (value: string) => void;
+  onTopicSelect: (value: string) => void;
+  onIntent: (value: ExcelConversionIntent) => void;
+  onGoal: (value: string) => void;
+  onColorScheme: (value: string) => void;
+  onUpload: (file: File | undefined) => void;
+  onClear: () => void;
+  onAnalyze: () => void;
+  onBuildDashboard: () => void;
+}) {
+  return (
+    <div className="grid gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
+      <div className="space-y-4">
+        <TargetModelSelector
+          models={models}
+          loadingModels={loadingModels}
+          modelSearch={modelSearch}
+          selectedModel={selectedModel}
+          selectedModelId={selectedModelId}
+          topics={topics}
+          selectedTopicName={selectedTopicName}
+          loadingTopics={loadingTopics}
+          onModelSearch={onModelSearch}
+          onModelSelect={onModelSelect}
+          onTopicSelect={onTopicSelect}
+        />
+        <div className="card p-4 space-y-3">
+          <div>
+            <div className="text-sm font-semibold text-content-primary">Excel workbook</div>
+            <div className="mt-0.5 text-xs text-content-secondary">Upload an .xlsx workbook. Raw file contents stay in page memory for this session.</div>
+          </div>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx"
+            className="hidden"
+            onChange={(event) => onUpload(event.target.files?.[0])}
+          />
+          <button type="button" onClick={() => fileInputRef.current?.click()} className="btn-secondary w-full justify-center text-sm">
+            {parsing ? <Loader2 size={14} className="animate-spin" /> : <Upload size={14} />}
+            Upload Excel workbook
+          </button>
+          {inventory && (
+            <button type="button" onClick={onClear} className="btn-secondary w-full justify-center text-sm">
+              <Trash2 size={14} />
+              Clear workbook
+            </button>
+          )}
+        </div>
+        <div className="card p-4 space-y-3">
+          <div className="text-sm font-semibold text-content-primary">Conversion intent</div>
+          {[
+            { id: 'semantic_and_dashboard', label: 'Dashboard draft + model follow-ups', description: 'Draft safe tiles from existing fields, then list model updates as follow-up work.' },
+            { id: 'dashboard_only', label: 'Dashboard draft only', description: 'Use formulas as context, but keep model-change recommendations out of the handoff.' },
+            { id: 'semantic_only', label: 'Model follow-up plan only', description: 'Stop after formula, lookup, and measure recommendations for AI Semantic Studio.' },
+          ].map((option) => (
+            <label key={option.id} className="flex cursor-pointer items-start gap-2 rounded-card border border-border bg-white px-3 py-2 text-sm">
+              <input
+                type="radio"
+                checked={intent === option.id}
+                onChange={() => onIntent(option.id as ExcelConversionIntent)}
+                className="mt-1 text-omni-700 focus:ring-omni-500"
+              />
+              <span>
+                <span className="block font-semibold text-content-primary">{option.label}</span>
+                <span className="block text-xs leading-5 text-content-secondary">{option.description}</span>
+              </span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="space-y-4">
+        <div className="card p-4 space-y-4">
+          <div>
+            <div className="text-sm font-semibold text-content-primary">Excel conversion brief</div>
+            <div className="mt-0.5 text-xs text-content-secondary">Blobby will draft safe dashboard needs from existing fields and list formula or lookup gaps as follow-ups.</div>
+          </div>
+          <textarea
+            value={goal}
+            onChange={(event) => onGoal(event.target.value)}
+            className="input-field min-h-[86px] resize-y text-sm"
+            placeholder="e.g. Convert this sales workbook into governed revenue measures and an executive dashboard."
+          />
+          <label className="block">
+            <span className="text-xs font-semibold text-content-primary">Color / brand style</span>
+            <textarea
+              value={colorScheme}
+              onChange={(event) => onColorScheme(event.target.value)}
+              className="input-field mt-1 min-h-[74px] resize-y text-sm"
+              placeholder="e.g. Preserve workbook chart colors where readable; use blue for revenue, green for healthy, red for risk, amber for warnings"
+            />
+          </label>
+          {inventory ? (
+            <ExcelInventoryPreview inventory={inventory} />
+          ) : (
+            <div className="rounded-card border border-amber-100 bg-amber-50 px-3 py-3 text-sm text-amber-800">
+              Upload an .xlsx workbook to inspect sheets, formulas, and chart metadata.
+            </div>
+          )}
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              onClick={onAnalyze}
+              disabled={!selectedModel || !inventory || running}
+              className="btn-primary text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {running ? <Loader2 size={14} className="animate-spin" /> : <ClipboardCheck size={14} />}
+              Convert Formulas & Visuals
+            </button>
+            <button
+              type="button"
+              onClick={onBuildDashboard}
+              disabled={!selectedModel || !inventory || !message || dashboardRunning || intent === 'semantic_only'}
+              className="btn-secondary text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {dashboardRunning ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              Start Guarded Draft Chat
+            </button>
+          </div>
+          {status && <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs text-content-secondary">{status}</div>}
+        </div>
+
+        <AiOutputPanel
+          title="Excel conversion analysis"
+          subtitle="Review what can be drafted now and what should route to AI Semantic Studio later."
+          message={message}
+          chatUrl={chatUrl}
+        />
+        <AiOutputPanel
+          title="Excel dashboard developer output"
+          subtitle="Continue in Omni chat to review tile errors, finish iteration, and save the dashboard."
+          message={dashboardMessage}
+          chatUrl={chatUrl}
+        />
+      </div>
+    </div>
+  );
+}
+
+function LabeledTextarea({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (value: string) => void; placeholder: string }) {
+  return (
+    <label className="block">
+      <span className="text-xs font-semibold text-content-primary">{label}</span>
+      <textarea
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="input-field mt-1 min-h-[92px] resize-y text-sm"
+        placeholder={placeholder}
+      />
+    </label>
+  );
+}
+
+function ExcelInventoryPreview({ inventory }: { inventory: ExcelWorkbookInventory }) {
+  const measureCandidates = inventory.formulas.filter((formula) => formula.classification === 'candidate_measure').length;
+  return (
+    <div className="space-y-3">
+      <div className="grid gap-3 sm:grid-cols-4">
+        <MiniMetric label="Sheets" value={String(inventory.sheetCount)} />
+        <MiniMetric label="Formulas" value={String(inventory.formulas.length)} />
+        <MiniMetric label="Measure candidates" value={String(measureCandidates)} />
+        <MiniMetric label="Charts" value={String(inventory.charts.length)} />
+      </div>
+      <details className="rounded-card border border-border bg-white overflow-hidden" open>
+        <summary className="cursor-pointer bg-surface-secondary px-3 py-2 text-xs font-semibold text-content-primary">
+          Workbook inventory
+        </summary>
+        <div className="space-y-3 p-3">
+          <div className="text-xs text-content-secondary">{inventory.fileName} · {formatSize(inventory.sizeBytes)} · {inventory.summary}</div>
+          <InventoryList
+            title="Sheets"
+            items={inventory.sheets.map((sheet) => `${sheet.name}: ${sheet.rowCount} rows, ${sheet.formulaCount} formulas, ${sheet.chartCount} charts`)}
+          />
+          <InventoryList
+            title="Formula candidates"
+            items={inventory.formulas.slice(0, 12).map((formula) => `${formula.sheetName}!${formula.cell}: =${formula.formula} (${formula.classification})`)}
+            empty="No formulas detected."
+          />
+          <InventoryList
+            title="Chart evidence"
+            items={inventory.charts.slice(0, 12).map((chart) => `${chart.sheetName}/${chart.chartName}: ${chart.chartType}${chart.title ? ` - ${chart.title}` : ''}`)}
+            empty="No embedded chart metadata detected."
+          />
+          {inventory.warnings.length > 0 && (
+            <div className="rounded-card border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              {inventory.warnings.join(' ')}
+            </div>
+          )}
+        </div>
+      </details>
+    </div>
+  );
+}
+
+function MiniMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-card border border-border bg-white p-3">
+      <div className="text-[10px] font-semibold uppercase tracking-wider text-content-secondary">{label}</div>
+      <div className="mt-1 text-xl font-semibold text-content-primary">{value}</div>
+    </div>
+  );
+}
+
+function InventoryList({ title, items, empty = 'None detected.' }: { title: string; items: string[]; empty?: string }) {
+  return (
+    <div>
+      <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-content-secondary">{title}</div>
+      {items.length === 0 ? (
+        <div className="text-xs text-content-secondary">{empty}</div>
+      ) : (
+        <ul className="list-disc space-y-1 pl-4 text-xs leading-5 text-content-secondary">
+          {items.map((item) => <li key={item}>{item}</li>)}
+        </ul>
+      )}
     </div>
   );
 }

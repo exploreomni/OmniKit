@@ -48,8 +48,8 @@ export default {
         },
       },
       fontFamily: {
-        sans: ['Inter', 'system-ui', 'sans-serif'],
-        mono: ['JetBrains Mono', 'SF Mono', 'monospace'],
+        sans: ['system-ui', '-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'sans-serif'],
+        mono: ['"SF Mono"', 'Menlo', 'Monaco', 'Consolas', 'monospace'],
       },
       borderRadius: {
         card: '10px',

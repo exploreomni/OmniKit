@@ -14,8 +14,9 @@ interface SSEEvent {
   type: "progress" | "complete" | "heartbeat" | "diagnostic";
   dashboard_id?: string;
   dashboard_name?: string;
-  status?: "pending" | "in_progress" | "success" | "failed" | "skipped";
+  status?: "pending" | "in_progress" | "success" | "warning" | "failed" | "skipped";
   error?: string;
+  warnings?: string[];
   index?: number;
   total?: number;
   replacements?: number;
@@ -27,6 +28,7 @@ interface SSEEvent {
     error?: string;
     source_model?: string;
     target_model?: string;
+    warnings?: string[];
   }>;
   phase?: string;
   detail?: Record<string, unknown>;
@@ -193,6 +195,227 @@ function replaceAllModelIds(
     }
   }
   return replaced;
+}
+
+interface CompatibilityPreflightResult {
+  status: "success" | "warning";
+  referencedFields: string[];
+  missingFields: string[];
+  matchedFieldCount: number;
+  targetFieldCount: number | null;
+  warnings: string[];
+}
+
+const FIELD_REF_KEYS = new Set([
+  "field", "fieldName", "field_name", "column_name", "columnName",
+  "fields", "pivots", "sorts", "filters", "filter", "measures",
+  "dimensions", "x", "y", "series",
+]);
+
+const FIELD_REF_PATTERN = /\b([A-Za-z_][\w/]*\.[A-Za-z_][\w]*(?:\[[A-Za-z_][\w]*\])?)\b/g;
+
+function normalizeFieldRef(value: string): string {
+  return value.trim().replace(/\[[^\]]+\]$/, "");
+}
+
+function isLikelyFieldRef(value: string): boolean {
+  const normalized = normalizeFieldRef(value);
+  return /^[A-Za-z_][\w/]*\.[A-Za-z_][\w]*$/.test(normalized);
+}
+
+function extractFieldRefsFromString(value: string, onlyIfFieldLike = false): string[] {
+  const refs = new Set<string>();
+  const candidates = onlyIfFieldLike ? [value] : Array.from(value.matchAll(FIELD_REF_PATTERN)).map((m) => m[1]);
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const normalized = normalizeFieldRef(candidate);
+    if (isLikelyFieldRef(normalized)) refs.add(normalized);
+  }
+  return [...refs];
+}
+
+function extractDashboardFieldRefs(obj: unknown, maxDepth = 14): string[] {
+  const refs = new Set<string>();
+
+  function walk(node: unknown, keyHint = "", depth = maxDepth): void {
+    if (node === null || node === undefined || depth <= 0) return;
+
+    if (typeof node === "string") {
+      const keyLooksFieldLike = FIELD_REF_KEYS.has(keyHint) || /field|column|sort|pivot|filter|measure|dimension/i.test(keyHint);
+      for (const ref of extractFieldRefsFromString(node, !keyLooksFieldLike)) {
+        refs.add(ref);
+      }
+      return;
+    }
+
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, keyHint, depth - 1);
+      return;
+    }
+
+    if (typeof node === "object") {
+      for (const [key, val] of Object.entries(node as Record<string, unknown>)) {
+        walk(val, key, depth - 1);
+      }
+    }
+  }
+
+  walk(obj);
+  return [...refs].sort();
+}
+
+function viewNameVariants(fileName: string): string[] {
+  const withoutSuffix = fileName.replace(/\.view$/, "");
+  const leaf = withoutSuffix.includes("/") ? withoutSuffix.split("/").pop() || withoutSuffix : withoutSuffix;
+  const withoutQuerySuffix = leaf.replace(/\.query$/, "");
+  return [...new Set([withoutSuffix, leaf, withoutQuerySuffix].filter(Boolean))];
+}
+
+function extractFieldsFromViewYaml(fileName: string, yaml: string): string[] {
+  const refs = new Set<string>();
+  if (!fileName.endsWith(".view")) return [];
+
+  const viewNames = viewNameVariants(fileName);
+  let activeSection = false;
+  let sectionIndent = -1;
+
+  for (const line of yaml.split(/\r?\n/)) {
+    if (!line.trim() || line.trimStart().startsWith("#")) continue;
+
+    const indent = line.match(/^\s*/)?.[0].length ?? 0;
+    const sectionMatch = line.match(/^(\s*)(dimensions|measures):\s*$/);
+    if (sectionMatch) {
+      activeSection = true;
+      sectionIndent = sectionMatch[1].length;
+      continue;
+    }
+
+    if (!activeSection) continue;
+
+    if (indent <= sectionIndent) {
+      activeSection = false;
+      continue;
+    }
+
+    if (indent === sectionIndent + 2) {
+      const fieldMatch = line.trim().match(/^([A-Za-z_][\w]*):/);
+      if (fieldMatch) {
+        for (const viewName of viewNames) {
+          refs.add(`${viewName}.${fieldMatch[1]}`);
+        }
+      }
+    }
+  }
+
+  return [...refs];
+}
+
+async function loadTargetFieldUniverse(
+  baseUrl: string,
+  apiKey: string,
+  modelId: string
+): Promise<{ fields: Set<string>; error?: string }> {
+  try {
+    const cleanUrl = baseUrl.replace(/\/+$/, "");
+    const url = `${cleanUrl}/api/v1/models/${encodeURIComponent(modelId)}/yaml?fullyResolved=true`;
+    const response = await fetchWithRetry(
+      url,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+      },
+      30000
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      return {
+        fields: new Set(),
+        error: `Target model YAML inspection failed (${response.status}): ${text.slice(0, 200)}`,
+      };
+    }
+
+    const data = await response.json();
+    const files = data && typeof data === "object" && !Array.isArray(data)
+      ? (data as Record<string, unknown>).files
+      : null;
+
+    if (!files || typeof files !== "object" || Array.isArray(files)) {
+      return { fields: new Set(), error: "Target model YAML inspection returned no file map." };
+    }
+
+    const fields = new Set<string>();
+    for (const [fileName, yaml] of Object.entries(files as Record<string, unknown>)) {
+      if (typeof yaml !== "string") continue;
+      for (const fieldRef of extractFieldsFromViewYaml(fileName, yaml)) {
+        fields.add(fieldRef);
+      }
+    }
+
+    return { fields };
+  } catch (err) {
+    return {
+      fields: new Set(),
+      error: err instanceof Error ? err.message : "Target model YAML inspection failed.",
+    };
+  }
+}
+
+function formatFieldList(fields: string[], limit = 8): string {
+  const shown = fields.slice(0, limit).join(", ");
+  const remaining = fields.length - limit;
+  return remaining > 0 ? `${shown}, +${remaining} more` : shown;
+}
+
+async function runCompatibilityPreflight(params: {
+  dashboardPayload: unknown;
+  targetBaseUrl: string;
+  targetApiKey: string;
+  targetModelId: string;
+}): Promise<CompatibilityPreflightResult> {
+  const referencedFields = extractDashboardFieldRefs(params.dashboardPayload);
+  const warnings: string[] = [];
+
+  const { fields: targetFields, error } = await loadTargetFieldUniverse(
+    params.targetBaseUrl,
+    params.targetApiKey,
+    params.targetModelId
+  );
+
+  if (referencedFields.length === 0) {
+    warnings.push("No dashboard field references were detected in the export payload. Review the migrated dashboard in Omni before publishing.");
+  }
+
+  if (error) {
+    warnings.push(`${error} Payload structure was checked, but semantic field compatibility could not be fully verified.`);
+    return {
+      status: "warning",
+      referencedFields,
+      missingFields: [],
+      matchedFieldCount: 0,
+      targetFieldCount: null,
+      warnings,
+    };
+  }
+
+  const missingFields = referencedFields.filter((field) => !targetFields.has(field));
+  if (missingFields.length > 0) {
+    warnings.push(
+      `${missingFields.length} referenced field${missingFields.length === 1 ? "" : "s"} were not found in the target model: ${formatFieldList(missingFields)}.`
+    );
+  }
+
+  return {
+    status: warnings.length > 0 ? "warning" : "success",
+    referencedFields,
+    missingFields,
+    matchedFieldCount: referencedFields.length - missingFields.length,
+    targetFieldCount: targetFields.size,
+    warnings,
+  };
 }
 
 function deepTransform(
@@ -611,14 +834,62 @@ export default async function handler(req: Request): Promise<Response> {
               const noChange = resolvedSourceModel && resolvedSourceModel === targetModelId;
 
               if (dry_run) {
+                let compatibility: CompatibilityPreflightResult | null = null;
+                if (!noChange) {
+                  const { data: preflightExportData, error: preflightExportError } = await exportDashboard(
+                    source.base_url,
+                    source.api_key,
+                    dashboard.id
+                  );
+                  if (preflightExportError || !preflightExportData) {
+                    compatibility = {
+                      status: "warning",
+                      referencedFields: [],
+                      missingFields: [],
+                      matchedFieldCount: 0,
+                      targetFieldCount: null,
+                      warnings: [
+                        `${preflightExportError || "Export returned no data."} Payload structure could not be inspected before model remap.`,
+                      ],
+                    };
+                  } else {
+                    const { payload: preflightPayload } = normalizeExportPayload(preflightExportData);
+                    compatibility = await runCompatibilityPreflight({
+                      dashboardPayload: preflightPayload,
+                      targetBaseUrl: target.base_url,
+                      targetApiKey: target.api_key,
+                      targetModelId,
+                    });
+                  }
+
+                  sendEvent({
+                    type: "diagnostic",
+                    dashboard_id: dashboard.id,
+                    dashboard_name: dashboard.name,
+                    phase: "compatibility_preflight",
+                    detail: {
+                      referencedFieldCount: compatibility.referencedFields.length,
+                      matchedFieldCount: compatibility.matchedFieldCount,
+                      missingFields: compatibility.missingFields.slice(0, 25),
+                      targetFieldCount: compatibility.targetFieldCount,
+                      warnings: compatibility.warnings,
+                      semanticCheckAvailable: compatibility.targetFieldCount !== null,
+                    },
+                  });
+                }
+
+                const compatibilityWarnings = compatibility?.warnings ?? [];
                 succeeded++;
                 const result = {
                   id: dashboard.id,
                   name: dashboard.name,
-                  status: "success",
+                  status: compatibilityWarnings.length > 0 ? "warning" : "success",
                   source_model: resolvedSourceModel,
                   target_model: targetModelId,
-                  error: noChange ? "Model already correct -- no change needed." : undefined,
+                  error: compatibilityWarnings.length > 0
+                    ? compatibilityWarnings.join(" ")
+                    : noChange ? "Model already correct -- no change needed." : undefined,
+                  warnings: compatibilityWarnings,
                 };
                 results.push(result);
                 sendEvent({
@@ -637,7 +908,9 @@ export default async function handler(req: Request): Promise<Response> {
                   type: "progress",
                   dashboard_id: dashboard.id,
                   dashboard_name: dashboard.name,
-                  status: "success",
+                  status: compatibilityWarnings.length > 0 ? "warning" : "success",
+                  error: result.error,
+                  warnings: compatibilityWarnings,
                   index: i,
                   total: dashboards.length,
                 });
@@ -941,20 +1214,46 @@ export default async function handler(req: Request): Promise<Response> {
             }
 
             if (dry_run) {
+              const compatibility = await runCompatibilityPreflight({
+                dashboardPayload: transformed,
+                targetBaseUrl: target.base_url,
+                targetApiKey: target.api_key,
+                targetModelId: effectiveTarget,
+              });
+
+              sendEvent({
+                type: "diagnostic",
+                dashboard_id: dashboard.id,
+                dashboard_name: dashboard.name,
+                phase: "compatibility_preflight",
+                detail: {
+                  referencedFieldCount: compatibility.referencedFields.length,
+                  matchedFieldCount: compatibility.matchedFieldCount,
+                  missingFields: compatibility.missingFields.slice(0, 25),
+                  targetFieldCount: compatibility.targetFieldCount,
+                  warnings: compatibility.warnings,
+                  semanticCheckAvailable: compatibility.targetFieldCount !== null,
+                },
+              });
+
               succeeded++;
               const result = {
                 id: dashboard.id,
                 name: dashboard.name,
-                status: "success",
+                status: compatibility.status,
+                error: compatibility.warnings.length > 0 ? compatibility.warnings.join(" ") : undefined,
                 source_model: sourceModel,
                 target_model: effectiveTarget,
+                warnings: compatibility.warnings,
               };
               results.push(result);
               sendEvent({
                 type: "progress",
                 dashboard_id: dashboard.id,
                 dashboard_name: dashboard.name,
-                status: "success",
+                status: compatibility.status,
+                error: result.error,
+                warnings: compatibility.warnings,
                 replacements,
                 index: i,
                 total: dashboards.length,
