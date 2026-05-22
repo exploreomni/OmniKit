@@ -146,6 +146,24 @@ function normalizeInsightLines(text: string): string[] {
     .filter(Boolean);
 }
 
+function estimateWrappedLineCount(text: string, widthIn: number, fontSize: number): number {
+  const charsPerLine = Math.max(10, Math.floor((Math.max(0.4, widthIn) * 144) / Math.max(1, fontSize)));
+  return text
+    .split('\n')
+    .map((line) => Math.max(1, Math.ceil(Math.max(1, line.trim().length) / charsPerLine)))
+    .reduce((sum, lines) => sum + lines, 0);
+}
+
+function fitInsightFontSize(text: string, widthIn: number, heightIn: number): number {
+  if (!text.trim()) return 9;
+  for (let fontSize = 10; fontSize >= 7; fontSize -= 0.5) {
+    const lines = estimateWrappedLineCount(text, widthIn, fontSize);
+    const neededPoints = lines * fontSize * 1.18;
+    if (neededPoints <= Math.max(0.2, heightIn) * 72) return fontSize;
+  }
+  return 7;
+}
+
 function overlayDefaults(type: SlideOverlayType, brand: BrandConfig): SlideOverlay {
   const id = `overlay_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
   if (type === 'arrow') {
@@ -169,6 +187,13 @@ function visualSourceFor(
   renderStrategy: Props['renderStrategy'],
 ): TileVisualSource {
   return tileVisualSources[tile.id] || (renderStrategy === 'full-dashboard' ? 'full-dashboard' : renderStrategy === 'tile-image' ? 'tile-image' : 'native');
+}
+
+function sourceLabel(source: TileVisualSource): string {
+  if (source === 'tile-image') return 'Omni image';
+  if (source === 'full-dashboard') return 'Dashboard';
+  if (source === 'skip') return 'Skipped';
+  return 'Native';
 }
 
 function tileKindLabel(tile: DashboardTile): string {
@@ -409,9 +434,27 @@ export function SlideLayoutPreview({
   const activeNotes = activeOverride.speakerNotes || '';
   const activeNotesFormat = activeOverride.speakerNotesFormat || 'paragraph';
   const activeInsight = activeTile ? insights[activeTile.id] || '' : '';
+  const activeInsightDisplayText =
+    activeInsightFormat === 'bullets'
+      ? normalizeInsightLines(activeInsight).map((line) => `• ${line}`).join('\n')
+      : activeInsight;
+  const activeInsightFontSize = fitInsightFontSize(
+    activeInsightDisplayText || 'Add insight here...',
+    Math.max(0.3, activeInsightBox.w - 0.4),
+    Math.max(0.3, activeInsightBox.h - 0.7),
+  );
   const activeSource = activeTile ? visualSourceFor(activeTile, tileVisualSources, renderStrategy) : 'native';
   const activePreview = activeTile ? previewStates[activeTile.id] : undefined;
   const activeOverlays = activeOverride.overlays || [];
+  const selectedSourceCounts = useMemo(() => {
+    return tiles.reduce<Record<TileVisualSource, number>>(
+      (acc, tile) => {
+        acc[visualSourceFor(tile, tileVisualSources, renderStrategy)] += 1;
+        return acc;
+      },
+      { native: 0, 'tile-image': 0, 'full-dashboard': 0, skip: 0 },
+    );
+  }, [tiles, tileVisualSources, renderStrategy]);
   const previewStatus =
     activePreview?.status === 'done'
       ? 'Rendered preview'
@@ -591,6 +634,7 @@ export function SlideLayoutPreview({
           <div className="space-y-1.5 h-full overflow-y-auto pr-0.5">
             {tiles.map((tile, idx) => {
               const active = tile.id === activeTile.id;
+              const source = visualSourceFor(tile, tileVisualSources, renderStrategy);
               const customized = Boolean(
                 overrides[tile.id]?.title ||
                 overrides[tile.id]?.bodyBox ||
@@ -617,7 +661,12 @@ export function SlideLayoutPreview({
                     >
                       {idx + 1}
                     </span>
-                    <span className="text-[12px] font-medium text-content-primary truncate">{tile.name}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-[12px] font-medium text-content-primary truncate">{tile.name}</span>
+                      <span className="block text-[9px] uppercase tracking-wider text-content-tertiary truncate">
+                        {sourceLabel(source)}
+                      </span>
+                    </span>
                     {customized && (
                       <span className="ml-auto h-2 w-2 rounded-full bg-omni-500 flex-shrink-0" title="Customized" />
                     )}
@@ -737,7 +786,10 @@ export function SlideLayoutPreview({
               <div className="h-[20%] min-h-[18px] bg-omni-50 px-2 flex items-center text-[10px] font-semibold text-omni-700 pointer-events-none">
                 Insights
               </div>
-              <div className="p-2 text-[10px] text-slate-700 leading-snug pointer-events-none">
+              <div
+                className="p-2 text-slate-700 leading-tight pointer-events-none overflow-hidden"
+                style={{ fontSize: `${activeInsightFontSize}px` }}
+              >
                 {activeInsight ? (
                   activeInsightFormat === 'bullets' ? (
                     <ul className="list-disc pl-4 space-y-1">
@@ -797,7 +849,7 @@ export function SlideLayoutPreview({
                 </svg>
               ) : overlay.type === 'box' ? (
                 <div
-                  className="w-full h-full rounded-[4px] border-2 bg-white"
+                  className="w-full h-full rounded-[4px] border-2 bg-transparent"
                   style={{
                     borderColor: hex(overlay.color || brand.accentColor),
                     transform: `rotate(${overlayRotation(overlay)}deg)`,
@@ -870,7 +922,8 @@ export function SlideLayoutPreview({
                     key={source}
                     type="button"
                     onClick={() => onApplyVisualSourceToAll(source)}
-                    className={`btn-sm justify-center ${renderStrategy === source ? 'btn-secondary' : 'btn-ghost'}`}
+                    className={`btn-sm justify-center ${tiles.length > 0 && selectedSourceCounts[source] === tiles.length ? 'btn-secondary' : 'btn-ghost'}`}
+                    title={`Apply ${label} to every selected slide`}
                   >
                     {label}
                   </button>
