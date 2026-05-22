@@ -22,7 +22,7 @@ import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
-import { Vehicle } from '@/components/ui/Vehicle';
+import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
 import {
   selectedBadgeClass,
   selectedCardClass,
@@ -633,10 +633,16 @@ export function DeckBuilderPage() {
 
   const applyVisualSourceToAll = useCallback((strategy: RenderStrategy) => {
     setRenderStrategy(strategy);
-    setTileVisualSources({});
+    setTileVisualSources((prev) => {
+      const next = { ...prev };
+      for (const tile of selectedTiles) {
+        next[tile.id] = strategy;
+      }
+      return next;
+    });
     setPreviewStates({});
     setExportStates({});
-  }, []);
+  }, [selectedTiles]);
 
   useEffect(() => {
     setPreviewStates({});
@@ -1823,29 +1829,15 @@ export function DeckBuilderPage() {
           </div>
 
           {generating && (
-            <div
-              className="relative overflow-hidden rounded-card border p-4"
-              style={{
-                borderColor: 'rgba(255,87,137,0.22)',
-                background: 'linear-gradient(135deg, #FFFFFF 0%, #FFF6F9 52%, #F8F9FD 100%)',
-              }}
-              aria-live="polite"
-            >
-              <div className="flex items-center gap-4">
-                <div className="relative flex-shrink-0 w-28 h-20 flex items-center justify-center">
-                  <div className="absolute left-3 right-3 bottom-4 h-1 rounded-full bg-omni-100" />
-                  <Vehicle kind="f1" width={104} height={76} className="relative z-10" />
-                </div>
-                <div className="min-w-0">
-                  <div className="text-sm font-semibold text-content-primary">
-                    Blobby is building the deck package
-                  </div>
-                  <div className="text-xs text-content-secondary mt-1 leading-5">
-                    Exporting tiles, assembling slides, applying your template, and packaging the final PowerPoint.
-                  </div>
-                </div>
-              </div>
-            </div>
+            <DownloadAnimation
+              format={batchEnabled && batchField && batchValues.length > 0 ? 'zip' : 'pptx'}
+              success={false}
+              status={
+                batchEnabled && batchField && batchValues.length > 0
+                  ? 'Blobby is packing your deck bundle'
+                  : 'Blobby is parachuting your PowerPoint package'
+              }
+            />
           )}
 
           <div className="rounded-card border border-border bg-white p-3 space-y-3">
@@ -1932,9 +1924,16 @@ export function DeckBuilderPage() {
             </div>
           )}
           {generationSuccess && (
-            <div className="flex items-center gap-2 bg-green-50 border border-green-200 text-green-700 text-sm px-4 py-3 rounded-card">
-              <CheckCircle size={16} />
-              {generationSuccess}
+            <div className="space-y-2">
+              <DownloadAnimation
+                format={batchEnabled && batchField && batchValues.length > 0 ? 'zip' : 'pptx'}
+                success
+                status={generationSuccess}
+              />
+              <div className="flex items-center gap-2 bg-green-50 border border-green-200 text-green-700 text-sm px-4 py-3 rounded-card">
+                <CheckCircle size={16} />
+                {generationSuccess}
+              </div>
             </div>
           )}
 
