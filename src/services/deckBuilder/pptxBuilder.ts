@@ -196,6 +196,24 @@ function insightTextFor(text: string | undefined, format: InsightFormat = 'parag
     .join('\n');
 }
 
+function estimateWrappedLineCount(text: string, widthIn: number, fontSize: number): number {
+  const charsPerLine = Math.max(10, Math.floor((Math.max(0.4, widthIn) * 144) / Math.max(1, fontSize)));
+  return text
+    .split('\n')
+    .map((line) => Math.max(1, Math.ceil(Math.max(1, line.trim().length) / charsPerLine)))
+    .reduce((sum, lines) => sum + lines, 0);
+}
+
+function fitInsightFontSize(text: string, widthIn: number, heightIn: number): number {
+  if (!text.trim()) return 9;
+  for (let fontSize = 10; fontSize >= 7; fontSize -= 0.5) {
+    const lines = estimateWrappedLineCount(text, widthIn, fontSize);
+    const neededPoints = lines * fontSize * 1.18;
+    if (neededPoints <= Math.max(0.2, heightIn) * 72) return fontSize;
+  }
+  return 7;
+}
+
 function addInsightPanel(
   ctx: RenderCtx,
   insight: string | undefined,
@@ -219,11 +237,23 @@ function addInsightPanel(
   });
   slide.addText('Insights', {
     x: panel.x + 0.2, y: panel.y + 0.15, w: panel.w - 0.4, h: 0.35,
-    fontFace: brand.fontFamily, fontSize: 12, bold: true, color: hex(brand.primaryColor),
+    fontFace: brand.fontFamily, fontSize: 12, bold: true, color: hex(brand.primaryColor), margin: 0,
   });
-  slide.addText(insightTextFor(insight, format), {
-    x: panel.x + 0.2, y: panel.y + 0.55, w: panel.w - 0.4, h: Math.max(0.3, panel.h - 0.7),
-    fontFace: brand.fontFamily, fontSize: 12, color: hex(brand.bodyTextColor || '333333'), valign: 'top',
+  const insightText = insightTextFor(insight, format);
+  const textBox = {
+    x: panel.x + 0.2,
+    y: panel.y + 0.55,
+    w: Math.max(0.3, panel.w - 0.4),
+    h: Math.max(0.3, panel.h - 0.7),
+  };
+  slide.addText(insightText, {
+    ...textBox,
+    fontFace: brand.fontFamily,
+    fontSize: fitInsightFontSize(insightText, textBox.w, textBox.h),
+    color: hex(brand.bodyTextColor || '333333'),
+    valign: 'top',
+    fit: 'shrink',
+    margin: 0,
   });
 }
 
@@ -247,7 +277,7 @@ function addOverlays(slide: PptxGenJS.Slide, brand: BrandConfig, overlays: Slide
         w: overlay.w,
         h: overlay.h,
         rotate: overlay.rotation,
-        fill: { color: 'FFFFFF', transparency: 100 },
+        fill: { type: 'none' },
         line: { color, width: 1.75 },
       });
     } else if (overlay.type === 'symbol') {
@@ -468,9 +498,8 @@ function renderUnsupported(ctx: RenderCtx, tileName: string) {
 }
 
 function renderImage(ctx: RenderCtx, pngDataUrl: string, fit: SlideFitMode = 'contain') {
-  const { slide, body, layout } = ctx;
-  const gutter = layout.insightPanel ? 0.1 : 0;
-  const maxW = Math.max(0.5, body.w - gutter);
+  const { slide, body } = ctx;
+  const maxW = Math.max(0.5, body.w);
   const maxH = body.h;
 
   if (fit === 'stretch') {
