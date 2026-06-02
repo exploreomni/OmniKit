@@ -21,6 +21,18 @@ const initialState: WizardState = {
   currentMigrationIndex: -1,
 };
 
+function resetPlanState(state: WizardState): WizardState {
+  return {
+    ...state,
+    targetModels: [],
+    modelMappings: {},
+    dryRunCompleted: false,
+    migrationResults: [],
+    migrationSummary: null,
+    currentMigrationIndex: -1,
+  };
+}
+
 function wizardReducer(state: WizardState, action: WizardAction): WizardState {
   switch (action.type) {
     case 'SET_STEP':
@@ -29,19 +41,24 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
     case 'UPDATE_SOURCE': {
       const source = { ...state.source, ...action.payload };
       if (state.sameInstance) {
-        return { ...state, source, target: { ...source } };
+        return resetPlanState({ ...state, source, target: { ...source } });
       }
-      return { ...state, source };
+      return resetPlanState({ ...state, source });
     }
 
     case 'UPDATE_TARGET':
-      return { ...state, target: { ...state.target, ...action.payload } };
+      return resetPlanState({ ...state, target: { ...state.target, ...action.payload } });
 
     case 'SET_SAME_INSTANCE':
       if (action.value) {
-        return { ...state, sameInstance: true, target: { ...state.source } };
+        return resetPlanState({ ...state, sameInstance: true, target: { ...state.source }, targetFolder: '' });
       }
-      return { ...state, sameInstance: false, target: { baseUrl: '', apiKey: '', status: 'untested', errorMessage: '' } };
+      return resetPlanState({
+        ...state,
+        sameInstance: false,
+        target: { baseUrl: '', apiKey: '', status: 'untested', errorMessage: '' },
+        targetFolder: '',
+      });
 
     case 'SET_FOLDERS':
       return { ...state, folders: action.folders };
@@ -50,7 +67,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
       return { ...state, documents: action.documents };
 
     case 'SET_SELECTED_DASHBOARDS':
-      return { ...state, selectedDashboards: action.dashboards };
+      return resetPlanState({ ...state, selectedDashboards: action.dashboards });
 
     case 'SET_SOURCE_MODELS':
       return { ...state, sourceModels: action.models };
@@ -62,13 +79,16 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
       return {
         ...state,
         modelMappings: { ...state.modelMappings, [action.sourceId]: action.targetId },
+        dryRunCompleted: false,
+        migrationResults: [],
+        migrationSummary: null,
       };
 
     case 'SET_ALL_MODEL_MAPPINGS':
-      return { ...state, modelMappings: action.mappings };
+      return { ...state, modelMappings: action.mappings, dryRunCompleted: false, migrationResults: [], migrationSummary: null };
 
     case 'SET_TARGET_FOLDER':
-      return { ...state, targetFolder: action.folder };
+      return { ...state, targetFolder: action.folder, dryRunCompleted: false, migrationResults: [], migrationSummary: null };
 
     case 'SET_DRY_RUN':
       return { ...state, dryRun: action.value };

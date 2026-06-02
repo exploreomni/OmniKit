@@ -125,13 +125,14 @@ export const walkthroughSteps: WalkthroughStep[] = [
     route: '/dashboards/migrate',
     label: 'Migrate',
     title: 'Use Model Migrator for Omni-to-Omni dashboard moves',
-    purpose: 'Model Migrator is for moving dashboards between Omni connections while reviewing model mappings before committing.',
+    purpose: 'Model Migrator starts with same-instance model remaps, and can optionally copy dashboards to another Omni instance after the target URL and API key are tested.',
     directions: [
-      'Pick the source and target Omni connections.',
+      'Choose same-instance remap or turn on Copy to another instance.',
+      'For another instance, enter and test the target Omni URL and API key before continuing.',
       'Select dashboards, map base models, and run Compatibility Preflight.',
       'Review payload and field-compatibility warnings before committing; results are logged to History.',
     ],
-    outcome: 'Dashboard migration work becomes a reviewed checklist with clear warnings for missing fields or risky model swaps.',
+    outcome: 'Dashboard migration work becomes a reviewed checklist with clear warnings for missing fields, risky model swaps, or target-instance cleanup.',
     caution: 'Preflight checks field presence, not business-definition equivalence. External BI semantic imports belong in AI Semantic Studio.',
   },
   {
@@ -168,7 +169,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     title: 'Check connection, upload, model, and content health',
     purpose: 'The readiness pages help admins understand whether the Omni environment is healthy before they ask Blobby or bulk workflows to act on it.',
     directions: [
-      'Use Connection Health to confirm Omni access and account readiness.',
+      'Use Connection Health to confirm schema model coverage, refresh signals, and account readiness.',
       'Use Upload Governance, Model & Topic Health, and Content Health to identify stale content or semantic gaps.',
       'Treat these scans as triage: they tell you where to repair, not just what is broken.',
     ],

@@ -13,7 +13,7 @@ import {
   Layers,
   X,
 } from 'lucide-react';
-import { listFolders, listDocuments, enrichDocuments } from '@/services/omniApi';
+import { listFolders, listDocuments, enrichDocuments, testConnection } from '@/services/omniApi';
 import { SkeletonRow } from '@/components/ui/SkeletonRow';
 import { InspectExportModal } from '@/components/ui/InspectExportModal';
 import type { WizardState, WizardAction, OmniFolder, OmniDocument } from '@/types';
@@ -87,6 +87,16 @@ interface SelectStepProps {
   onBack: () => void;
 }
 
+function hostFromUrl(value: string): string {
+  if (!value.trim()) return '';
+  try {
+    const parsed = new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`);
+    return parsed.host;
+  } catch {
+    return '';
+  }
+}
+
 export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps) {
   const [loadingFolders, setLoadingFolders] = useState(false);
   const [loadingDocs, setLoadingDocs] = useState(false);
@@ -97,6 +107,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
   const [inspectDoc, setInspectDoc] = useState<OmniDocument | null>(null);
+  const [testingTarget, setTestingTarget] = useState(false);
 
   const selectedIds = useMemo(
     () => new Set(state.selectedDashboards.map((d) => d.id)),
@@ -227,6 +238,35 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
     return count;
   }, [state.folders]);
 
+  const targetHost = hostFromUrl(state.target.baseUrl);
+  const sourceHost = hostFromUrl(state.source.baseUrl);
+  const targetCanTest = Boolean(state.target.baseUrl.trim() && state.target.apiKey.trim() && !testingTarget);
+  const targetReady = state.sameInstance || state.target.status === 'success';
+
+  async function handleTargetTest() {
+    if (!state.target.baseUrl.trim() || !state.target.apiKey.trim()) return;
+    setTestingTarget(true);
+    dispatch({ type: 'UPDATE_TARGET', payload: { status: 'testing', errorMessage: '' } });
+    try {
+      const result = await testConnection(state.target.baseUrl, state.target.apiKey) as { status?: string; message?: string };
+      if (result.status === 'ok') {
+        dispatch({ type: 'UPDATE_TARGET', payload: { status: 'success', errorMessage: '' } });
+      } else {
+        dispatch({ type: 'UPDATE_TARGET', payload: { status: 'error', errorMessage: result.message || 'Target connection failed.' } });
+      }
+    } catch (err) {
+      dispatch({
+        type: 'UPDATE_TARGET',
+        payload: {
+          status: 'error',
+          errorMessage: err instanceof Error ? err.message : 'Target connection failed.',
+        },
+      });
+    } finally {
+      setTestingTarget(false);
+    }
+  }
+
   return (
     <div className="space-y-6 pb-24">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -284,6 +324,154 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
           <span className="leading-relaxed">{error}</span>
         </div>
       )}
+
+      <div
+        className="rounded-2xl bg-white p-4"
+        style={{
+          border: '1px solid rgba(217,222,232,0.95)',
+          boxShadow: '0 1px 3px rgba(64,71,84,0.08)',
+        }}
+      >
+        <div className="flex flex-wrap items-start justify-between gap-4">
+          <div>
+            <h3 className="text-sm font-semibold text-content-primary">Migration mode</h3>
+            <p className="mt-1 text-xs text-content-secondary leading-relaxed">
+              Same-instance model remap is the default. Turn on cross-instance migration only when you want OmniKit to copy dashboards into another Omni instance.
+            </p>
+          </div>
+          <div className="inline-flex rounded-xl border border-border bg-surface-secondary p-1">
+            <button
+              type="button"
+              onClick={() => dispatch({ type: 'SET_SAME_INSTANCE', value: true })}
+              className={`rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${
+                state.sameInstance
+                  ? 'bg-white text-omni-700 shadow-sm'
+                  : 'text-content-secondary hover:text-content-primary'
+              }`}
+            >
+              Same instance
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: 'SET_SAME_INSTANCE', value: false })}
+              className={`rounded-lg px-3 py-2 text-xs font-semibold transition-colors ${
+                !state.sameInstance
+                  ? 'bg-white text-omni-700 shadow-sm'
+                  : 'text-content-secondary hover:text-content-primary'
+              }`}
+            >
+              Copy to another instance
+            </button>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-xl border border-border/70 bg-surface-secondary px-3 py-2.5 text-xs text-content-secondary">
+          <span className="font-semibold text-content-primary">Source (active connection):</span>{' '}
+          <span className="font-mono">{sourceHost || 'Connected instance'}</span>
+          <span className="mx-2 text-content-tertiary">→</span>
+          <span className="font-semibold text-content-primary">Target:</span>{' '}
+          <span className="font-mono">{state.sameInstance ? sourceHost || 'Same instance' : targetHost || 'Target instance required'}</span>
+          {!state.sameInstance && (
+            <div className="mt-1 text-[11px] leading-relaxed text-content-tertiary">
+              To copy dashboards into the current instance, connect OmniKit to the other instance first, then enter the current instance as the target.
+            </div>
+          )}
+        </div>
+
+        {!state.sameInstance && (
+          <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
+            <div>
+              <label htmlFor="target-base-url" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                Target Base URL
+              </label>
+              <input
+                id="target-base-url"
+                type="url"
+                value={state.target.baseUrl}
+                onChange={(e) => dispatch({ type: 'UPDATE_TARGET', payload: { baseUrl: e.target.value, status: 'untested', errorMessage: '' } })}
+                placeholder="https://target-org.omni.co"
+                className="input-field"
+              />
+            </div>
+            <div>
+              <label htmlFor="target-api-key" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                Target API Key
+              </label>
+              <input
+                id="target-api-key"
+                type="password"
+                value={state.target.apiKey}
+                onChange={(e) => dispatch({ type: 'UPDATE_TARGET', payload: { apiKey: e.target.value, status: 'untested', errorMessage: '' } })}
+                placeholder="Paste target API key"
+                className="input-field font-mono text-[13px]"
+                autoComplete="new-password"
+                spellCheck={false}
+                autoCapitalize="off"
+              />
+            </div>
+            <button
+              type="button"
+              onClick={handleTargetTest}
+              disabled={!targetCanTest}
+              className={`h-10 justify-center text-sm ${
+                state.target.status === 'success'
+                  ? 'btn-primary shadow-[0_0_0_4px_rgba(255,71,148,0.18)]'
+                  : 'btn-secondary'
+              }`}
+            >
+              {testingTarget ? (
+                <>
+                  <Loader2 size={14} className="animate-spin" />
+                  Testing
+                </>
+              ) : state.target.status === 'success' ? (
+                <>
+                  <CheckCircle2 size={14} />
+                  Connected
+                </>
+              ) : (
+                'Test Target'
+              )}
+            </button>
+            <div className="lg:col-span-3">
+              <label htmlFor="target-folder" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                Target folder path <span className="font-normal text-content-tertiary">(optional)</span>
+              </label>
+              <input
+                id="target-folder"
+                type="text"
+                value={state.targetFolder}
+                onChange={(e) => dispatch({ type: 'SET_TARGET_FOLDER', folder: e.target.value })}
+                placeholder="e.g. Executive Dashboards/Migrated"
+                className="input-field"
+              />
+              <p className="mt-1.5 text-[11px] leading-relaxed text-content-tertiary">
+                Leave blank to let Omni import into the target instance default location. Credentials stay in this browser session and are not added to a persistent vault.
+              </p>
+            </div>
+            {state.target.status === 'success' && (
+              <div className="lg:col-span-3 flex items-start gap-2 rounded-xl border border-omni-200 bg-omni-50 px-3 py-2 text-xs text-omni-800">
+                <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-omni-500 animate-pulse" />
+                <span>
+                  <span className="font-semibold">Target instance verified.</span> Model mapping and compatibility preflight will use this tested target connection.
+                </span>
+              </div>
+            )}
+            {state.target.status === 'error' && state.target.errorMessage && (
+              <div className="lg:col-span-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                {state.target.errorMessage}
+              </div>
+            )}
+          </div>
+        )}
+
+        {!targetReady && (
+          <div className="mt-4 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
+            <span>Test the target instance before continuing so model mapping and compatibility preflight run against the correct Omni instance.</span>
+          </div>
+        )}
+      </div>
 
       <div className="flex flex-col md:flex-row gap-4 min-h-[440px]">
         <aside
@@ -595,7 +783,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
           )}
           <button
             onClick={onNext}
-            disabled={state.selectedDashboards.length === 0}
+            disabled={state.selectedDashboards.length === 0 || !targetReady}
             className="btn-primary"
           >
             Next
