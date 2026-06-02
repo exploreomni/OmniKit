@@ -48,8 +48,8 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
   const total = state.migrationResults.length;
   const hasFailures = (state.migrationSummary?.failed ?? 0) > 0;
   const currentItemName = state.migrationResults.find((r) => r.status === 'in_progress')?.name;
-  const operationLabel = state.sameInstance ? 'Model Remap' : 'Migration';
-  const operationLabelLower = state.sameInstance ? 'model remap' : 'migration';
+  const operationLabel = state.sameInstance ? 'Model Remap' : 'Dashboard Copy';
+  const operationLabelLower = state.sameInstance ? 'model remap' : 'dashboard copy';
 
   function hostnameFromUrl(url: string | undefined): string | undefined {
     if (!url) return undefined;
@@ -102,7 +102,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `${state.sameInstance ? 'model-remap' : 'migration'}-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
+    a.download = `${state.sameInstance ? 'model-remap' : 'dashboard-copy'}-log-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.json`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -115,7 +115,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
             {operationLabel} In Progress
           </h2>
           <p className="text-sm text-content-secondary mt-1">
-            Your dashboards are being {state.sameInstance ? 'remapped' : 'migrated'}. Do not close this tab.
+            Your dashboards are being {state.sameInstance ? 'remapped' : 'copied into the target instance'}. Do not close this tab.
           </p>
         </div>
       )}

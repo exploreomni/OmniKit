@@ -2,11 +2,11 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowRight, AlertTriangle, CheckCircle2, Database, RefreshCw, GitBranch, Clock, Loader2 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
-import { omniProxy } from '@/services/omniApi';
+import { listModels, omniProxy } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
-import type { OmniConnection } from '@/types';
+import type { OmniConnection, OmniModel } from '@/types';
 
 const DIALECT_COLORS: Record<string, string> = {
   bigquery: 'bg-blue-100 text-blue-800',
@@ -38,17 +38,44 @@ export function ConnectionsPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'dbt' | 'schedules'>('dbt');
   const [details, setDetails] = useState<Record<string, ConnectionDetail>>({});
+  const [schemaModels, setSchemaModels] = useState<OmniModel[]>([]);
+  const [schemaModelError, setSchemaModelError] = useState('');
 
   useEffect(() => {
     async function load() {
       setLoading(true);
       setError('');
+      setSchemaModelError('');
       try {
-        const res = await omniProxy<{ records?: OmniConnection[]; connections?: OmniConnection[] }>(
-          connection.baseUrl, connection.apiKey, 'GET', '/v1/connections'
-        );
-        const data = res.records || res.connections || [];
+        const [connectionRes, schemaRes] = await Promise.allSettled([
+          omniProxy<{ records?: OmniConnection[]; connections?: OmniConnection[] }>(
+            connection.baseUrl, connection.apiKey, 'GET', '/v1/connections'
+          ),
+          listModels(connection.baseUrl, connection.apiKey, {
+            modelKind: 'SCHEMA',
+            allPages: true,
+            pageSize: 100,
+            sortField: 'updatedAt',
+            sortDirection: 'desc',
+          }),
+        ]);
+
+        if (connectionRes.status === 'rejected') {
+          throw connectionRes.reason;
+        }
+
+        const data = connectionRes.value.records || connectionRes.value.connections || [];
         setConnections(Array.isArray(data) ? data : []);
+
+        if (schemaRes.status === 'fulfilled' && !schemaRes.value.error) {
+          setSchemaModels(Array.isArray(schemaRes.value.models) ? schemaRes.value.models : []);
+        } else {
+          const message = schemaRes.status === 'rejected'
+            ? schemaRes.reason instanceof Error ? schemaRes.reason.message : 'Failed to load schema models'
+            : schemaRes.value.error || 'Failed to load schema models';
+          setSchemaModels([]);
+          setSchemaModelError(message);
+        }
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Failed to load connections');
       } finally {
@@ -92,10 +119,21 @@ export function ConnectionsPage() {
 
   const dialects = [...new Set(connections.map((c) => c.dialect).filter(Boolean))].sort();
   const activeConnections = connections.filter((c) => !c.deletedAt);
+  const schemaModelByConnectionId = new Map(
+    schemaModels
+      .filter((model) => !model.deletedAt && model.connectionId)
+      .map((model) => [model.connectionId!, model])
+  );
+  const schemaModelCoverageCount = activeConnections.filter((c) => schemaModelByConnectionId.has(c.id)).length;
+  const latestSchemaModelUpdate = schemaModels
+    .filter((model) => !model.deletedAt && model.updatedAt)
+    .map((model) => Date.parse(model.updatedAt!))
+    .filter((value) => Number.isFinite(value))
+    .sort((a, b) => b - a)[0];
   const dbtConfigured = Object.values(details).filter((detail) => detail.dbt && Object.keys(detail.dbt).length > 0).length;
   const scheduleConfigured = Object.values(details).filter((detail) => (detail.schedules || []).length > 0).length;
   const inspectedConnections = Object.values(details).filter((detail) => !detail.loadingDetail).length;
-  const missingSchemaCount = activeConnections.filter((c) => !c.defaultSchema).length;
+  const missingSchemaCount = schemaModelError ? 0 : activeConnections.length - schemaModelCoverageCount;
   const detailReviewCount = Object.values(details).filter((detail) => {
     if (detail.loadingDetail) return false;
     const missingDbt = !detail.dbt || Object.keys(detail.dbt).length === 0;
@@ -118,12 +156,24 @@ export function ConnectionsPage() {
     return cron;
   }
 
-  function healthForConnection(conn: OmniConnection, detail?: ConnectionDetail) {
+  function connectionValue(conn: OmniConnection, ...keys: string[]): string {
+    const record = conn as unknown as Record<string, unknown>;
+    for (const key of keys) {
+      const value = record[key];
+      if (typeof value === 'string' && value.trim()) return value;
+    }
+    return '';
+  }
+
+  function healthForConnection(conn: OmniConnection, detail?: ConnectionDetail, schemaModel?: OmniModel) {
     if (conn.deletedAt) {
       return { label: 'Inactive', className: 'bg-gray-100 text-gray-600', detail: 'Deleted or inactive' };
     }
-    if (!conn.defaultSchema) {
-      return { label: 'Needs schema', className: 'bg-yellow-100 text-yellow-800', detail: 'Default schema missing' };
+    if (schemaModelError) {
+      return { label: 'Schema check unavailable', className: 'bg-surface-secondary text-content-secondary', detail: 'Could not load schema models' };
+    }
+    if (!schemaModel) {
+      return { label: 'Needs schema model', className: 'bg-yellow-100 text-yellow-800', detail: 'No schema model found for this connection' };
     }
     if (!detail) {
       return { label: 'Not inspected', className: 'bg-surface-secondary text-content-secondary', detail: 'Expand for dbt and refresh' };
@@ -150,7 +200,7 @@ export function ConnectionsPage() {
     <div className="space-y-5">
       <PageHeader
         title="Connection Health"
-        description="Review connection inventory, warehouse dialects, dbt configuration, schema refresh coverage, and environment readiness."
+        description="Review connection inventory, warehouse dialects, dbt configuration, schema model coverage, refresh schedules, and environment readiness."
         icon={<Blobby mood="connections" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
       />
 
@@ -158,7 +208,7 @@ export function ConnectionsPage() {
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
 
-      <div className="grid grid-cols-2 xl:grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 xl:grid-cols-6 gap-3">
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Active Connections</div>
           <div className="mt-2 text-2xl font-semibold text-content-primary">{activeConnections.length}</div>
@@ -168,6 +218,19 @@ export function ConnectionsPage() {
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Dialects</div>
           <div className="mt-2 text-2xl font-semibold text-content-primary">{dialects.length}</div>
           <div className="mt-1 text-xs text-content-secondary">Warehouse platforms represented</div>
+        </div>
+        <div className="card p-4">
+          <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Schema Models</div>
+          <div className="mt-2 text-2xl font-semibold text-content-primary">
+            {schemaModelError ? '-' : `${schemaModelCoverageCount}/${activeConnections.length}`}
+          </div>
+          <div className="mt-1 text-xs text-content-secondary">
+            {schemaModelError
+              ? 'Coverage check unavailable'
+              : latestSchemaModelUpdate
+                ? `Latest update ${new Date(latestSchemaModelUpdate).toLocaleDateString()}`
+                : 'Connection coverage'}
+          </div>
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">dbt Checked</div>
@@ -182,7 +245,7 @@ export function ConnectionsPage() {
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Review Queue</div>
           <div className="mt-2 text-2xl font-semibold text-content-primary">{reviewQueueCount}</div>
-          <div className="mt-1 text-xs text-content-secondary">Schema, dbt, or refresh signals</div>
+          <div className="mt-1 text-xs text-content-secondary">Schema model, dbt, or refresh signals</div>
         </div>
       </div>
 
@@ -249,7 +312,9 @@ export function ConnectionsPage() {
                 const isExpanded = expandedId === conn.id;
                 const detail = details[conn.id];
                 const dialectClass = DIALECT_COLORS[conn.dialect?.toLowerCase()] || 'bg-gray-100 text-gray-800';
-                const health = healthForConnection(conn, detail);
+                const schemaModel = schemaModelByConnectionId.get(conn.id);
+                const defaultSchema = connectionValue(conn, 'defaultSchema', 'default_schema', 'default_schema_name', 'schema');
+                const health = healthForConnection(conn, detail, schemaModel);
 
                 return (
                   <div key={conn.id}>
@@ -267,7 +332,7 @@ export function ConnectionsPage() {
                         </span>
                       </div>
                       <div className="col-span-2 text-sm text-content-secondary truncate">{conn.database || '-'}</div>
-                      <div className="col-span-2 text-sm text-content-secondary truncate font-mono text-xs">{conn.defaultSchema || '-'}</div>
+                      <div className="col-span-2 text-sm text-content-secondary truncate font-mono text-xs">{defaultSchema || '-'}</div>
                       <div className="col-span-2 min-w-0">
                         <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-chip ${health.className}`}>{health.label}</span>
                         <div className="mt-1 text-[10px] text-content-tertiary truncate">{health.detail}</div>
@@ -285,6 +350,19 @@ export function ConnectionsPage() {
                             <span className="font-medium text-content-primary">Base Role:</span> {conn.baseRole}
                           </div>
                         )}
+                        <div className="text-xs text-content-secondary mb-3">
+                          <span className="font-medium text-content-primary">Schema model:</span>{' '}
+                          {schemaModel ? (
+                            <>
+                              <span className="font-mono">{schemaModel.id}</span>
+                              {schemaModel.updatedAt && <span> · updated {new Date(schemaModel.updatedAt).toLocaleString()}</span>}
+                            </>
+                          ) : schemaModelError ? (
+                            <span title={schemaModelError}>Check unavailable</span>
+                          ) : (
+                            <span className="text-yellow-700">None found for this connection</span>
+                          )}
+                        </div>
 
                         <div className="flex gap-1 mb-3">
                           <button
