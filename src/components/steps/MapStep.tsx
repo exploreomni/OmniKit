@@ -1,7 +1,9 @@
 import { useState, useEffect, useMemo, useCallback } from 'react';
-import { ArrowRight, AlertTriangle, Loader2 } from 'lucide-react';
+import { ArrowRight, AlertTriangle, Loader2, ShieldCheck } from 'lucide-react';
 import { listModels } from '@/services/omniApi';
 import { ComboBox } from '@/components/ui/ComboBox';
+import { StatusChip } from '@/components/ui/StatusChip';
+import type { OmniModel } from '@/types';
 import type { WizardState, WizardAction } from '@/types';
 
 interface MapStepProps {
@@ -9,6 +11,34 @@ interface MapStepProps {
   dispatch: React.Dispatch<WizardAction>;
   onNext: () => void;
   onBack: () => void;
+}
+
+type CompatibilityLevel = 'likely' | 'partial' | 'weak';
+
+interface CompatibilityHint {
+  level: CompatibilityLevel;
+  score: number;
+  reasons: string[];
+}
+
+const compatibilityStyles: Record<CompatibilityLevel, { label: string; status: string; tone: string }> = {
+  likely: { label: 'Likely match', status: 'ready', tone: 'text-green-700' },
+  partial: { label: 'Partial match', status: 'warning', tone: 'text-amber-700' },
+  weak: { label: 'Poor match', status: 'failed', tone: 'text-red-700' },
+};
+
+function normalizeTokens(value: string | undefined): string[] {
+  if (!value) return [];
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 2 && !['model', 'demo', 'shared', 'new'].includes(token));
+}
+
+function modelDisplayName(model: OmniModel): string {
+  const hasName = model.name && model.name !== model.id && model.name !== model.identifier;
+  return hasName ? model.name : model.identifier || model.id;
 }
 
 export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
@@ -97,6 +127,9 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
     return !!target && target.length > 0;
   });
 
+  const sourceHost = state.source.baseUrl.replace(/^https?:\/\//, '').replace(/\/+$/, '');
+  const targetHost = (state.sameInstance ? state.source.baseUrl : state.target.baseUrl).replace(/^https?:\/\//, '').replace(/\/+$/, '');
+
   const resolveSourceName = useCallback((modelId: string): string | null => {
     if (!modelId) return null;
     if (enrichedNameMap[modelId]?.name) return enrichedNameMap[modelId].name;
@@ -105,6 +138,56 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
     );
     return match?.name || null;
   }, [state.sourceModels, enrichedNameMap]);
+
+  const scoreCompatibility = useCallback((sourceModelId: string, targetModel: OmniModel): CompatibilityHint => {
+    const sourceName = resolveSourceName(sourceModelId) || sourceModelId;
+    const topics = enrichedNameMap[sourceModelId]?.topicNames || [];
+    const targetName = modelDisplayName(targetModel);
+    const sourceTokens = new Set([
+      ...normalizeTokens(sourceName),
+      ...topics.flatMap((topic) => normalizeTokens(topic)),
+    ]);
+    const targetTokens = new Set([
+      ...normalizeTokens(targetName),
+      ...normalizeTokens(targetModel.identifier),
+      ...normalizeTokens(targetModel.connectionName),
+    ]);
+    const overlap = [...sourceTokens].filter((token) => targetTokens.has(token));
+    const exactName = sourceName.toLowerCase() === targetName.toLowerCase();
+    const sameId = Boolean(sourceModelId && (targetModel.id === sourceModelId || targetModel.identifier === sourceModelId));
+    const score = Math.min(100, (sameId ? 100 : 0) + (exactName ? 75 : 0) + overlap.length * 25);
+    const reasons = [
+      sameId ? 'same model id' : '',
+      exactName ? 'same model name' : '',
+      overlap.length > 0 ? `name/topic overlap: ${overlap.slice(0, 3).join(', ')}` : '',
+    ].filter(Boolean);
+
+    if (score >= 75) return { level: 'likely', score, reasons: reasons.length ? reasons : ['strong metadata match'] };
+    if (score >= 25) return { level: 'partial', score, reasons: reasons.length ? reasons : ['some metadata overlap'] };
+    return { level: 'weak', score, reasons: ['no obvious model or topic-name overlap'] };
+  }, [enrichedNameMap, resolveSourceName]);
+
+  const bestHintsBySource = useMemo(() => {
+    const out: Record<string, Array<{ model: OmniModel; hint: CompatibilityHint }>> = {};
+    for (const { key } of mappingGroups) {
+      if (key === '__unresolved__') continue;
+      out[key] = state.targetModels
+        .map((model) => ({ model, hint: scoreCompatibility(key, model) }))
+        .sort((a, b) => b.hint.score - a.hint.score)
+        .slice(0, 3);
+    }
+    return out;
+  }, [mappingGroups, scoreCompatibility, state.targetModels]);
+
+  const selectedHintFor = useCallback((sourceModelId: string, targetModelId: string): CompatibilityHint | null => {
+    const targetModel = state.targetModels.find((model) => model.id === targetModelId || model.identifier === targetModelId);
+    if (!targetModel || sourceModelId === '__unresolved__') return null;
+    return scoreCompatibility(sourceModelId, targetModel);
+  }, [scoreCompatibility, state.targetModels]);
+
+  const weakOnlyTarget = !loadingModels && state.targetModels.length > 0 && mappingGroups
+    .filter(({ key }) => key !== '__unresolved__')
+    .every(({ key }) => (bestHintsBySource[key]?.[0]?.hint.level || 'weak') === 'weak');
 
   return (
     <div className="space-y-5">
@@ -115,9 +198,52 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
         </p>
       </div>
 
+      <div className="rounded-card border border-omni-100 bg-omni-50 px-4 py-3">
+        <div className="flex items-start gap-2">
+          <ShieldCheck size={16} className="mt-0.5 flex-shrink-0 text-omni-700" />
+          <div>
+            <p className="text-sm font-semibold text-omni-800">
+              {state.sameInstance ? 'Same-instance model remap' : 'Cross-instance dashboard copy'}
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-omni-700">
+              Active connection is the source: <span className="font-mono">{sourceHost || 'current instance'}</span>.
+              {' '}Target is <span className="font-mono">{state.sameInstance ? sourceHost || 'current instance' : targetHost || 'tested instance'}</span>.
+              {' '}Compatibility hints below are metadata-based; Compatibility Preflight is the field-level check before any write.
+            </p>
+          </div>
+        </div>
+      </div>
+
       {error && (
         <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">
           {error}
+        </div>
+      )}
+
+      {!loadingModels && !error && state.targetModels.length === 0 && (
+        <div className="rounded-card border border-amber-200 bg-amber-50 px-4 py-3">
+          <div className="flex items-start gap-2">
+            <AlertTriangle size={16} className="mt-0.5 flex-shrink-0 text-amber-700" />
+            <div>
+              <p className="text-sm font-semibold text-amber-900">No target shared models found</p>
+              <p className="mt-1 text-xs leading-relaxed text-amber-800">
+                This target instance can be reached, but OmniKit did not find a shared model to map these dashboards to.
+                Create or import a compatible model first, then return here and rerun the mapping step.
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {weakOnlyTarget && (
+        <div className="rounded-card border border-amber-200 bg-amber-50 px-4 py-3">
+          <div className="flex items-start gap-2">
+            <AlertTriangle size={16} className="mt-0.5 flex-shrink-0 text-amber-700" />
+            <p className="text-xs leading-relaxed text-amber-800">
+              Target models loaded, but none look like a close metadata match for the selected dashboard model.
+              You can still map one manually, but expect Compatibility Preflight to flag missing fields or filters if the semantic layer is not aligned.
+            </p>
+          </div>
         </div>
       )}
 
@@ -145,6 +271,8 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
             const targetValue = state.modelMappings[key] || '';
             const isMapped = !!targetValue;
             const isUnresolved = key === '__unresolved__';
+            const selectedHint = selectedHintFor(key, targetValue);
+            const bestHints = bestHintsBySource[key] || [];
 
             return (
               <div
@@ -197,6 +325,39 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
                       placeholder="Select target model..."
                       allowFreeText={false}
                     />
+                    {!isUnresolved && bestHints.length > 0 && (
+                      <div className="mt-2 space-y-1">
+                        <div className="text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">
+                          Compatibility hint
+                        </div>
+                        {selectedHint ? (
+                          <div className="flex flex-wrap items-center gap-2">
+                            <StatusChip
+                              status={compatibilityStyles[selectedHint.level].status}
+                              label={compatibilityStyles[selectedHint.level].label}
+                            />
+                            <span className={`text-[11px] ${compatibilityStyles[selectedHint.level].tone}`}>
+                              {selectedHint.reasons.join('; ')}
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="flex flex-wrap gap-1.5">
+                            {bestHints.map(({ model, hint }) => (
+                              <span
+                                key={model.id}
+                                className="inline-flex max-w-full items-center gap-1 rounded-chip border border-border bg-white px-2 py-1 text-[10px] text-content-secondary"
+                                title={hint.reasons.join('; ')}
+                              >
+                                <span className={`h-1.5 w-1.5 rounded-full ${
+                                  hint.level === 'likely' ? 'bg-green-500' : hint.level === 'partial' ? 'bg-amber-500' : 'bg-red-500'
+                                }`} />
+                                <span className="truncate">{modelDisplayName(model)}</span>
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                   {!isMapped && (
                     <AlertTriangle size={16} className="text-warning flex-shrink-0 mt-2.5" />
