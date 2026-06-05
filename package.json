@@ -11,7 +11,11 @@
     "serve": "tsx server/start.ts",
     "lint": "eslint .",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.app.json"
+    "typecheck": "tsc --noEmit -p tsconfig.app.json",
+    "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "test:security": "tsx --test tests/security-regression.test.ts",
+    "security:audit": "npm audit --audit-level=moderate",
+    "security:check": "npm run security:audit && npm run test:security && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
     "apache-arrow": "^21.1.0",
@@ -20,7 +24,7 @@
     "pptxgenjs": "^4.0.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "react-router-dom": "^6.30.3"
+    "react-router-dom": "^6.30.4"
   },
   "devDependencies": {
     "@eslint/js": "^9.9.1",

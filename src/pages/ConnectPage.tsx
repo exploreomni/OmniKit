@@ -7,6 +7,7 @@ import {
   Wifi,
   ShieldCheck,
   Lock,
+  KeyRound,
   ArrowRight,
   Sparkles,
   PlayCircle,
@@ -27,11 +28,24 @@ import {
   ChevronRight,
   LayoutDashboard,
   RefreshCw,
+  Save,
+  Server,
+  UnlockKeyhole,
 } from 'lucide-react';
 import { listDocuments, listFolders, listGroups, listModels, listUsers, omniProxy, testConnection } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';
+import {
+  connectSavedInstance,
+  getVaultStatus,
+  listSavedInstances,
+  saveSavedInstance,
+  unlockNativeVault,
+  type InstanceRole,
+  type SavedInstancePublic,
+  type VaultStatus,
+} from '@/services/opsConsole';
 
 type CapabilityIcon = typeof Sparkles;
 
@@ -173,6 +187,20 @@ const EMPTY_SNAPSHOT: WorkspaceSnapshot = {
   connections: null,
   failures: [],
   loadedAt: null,
+};
+
+interface NewVaultInstanceForm {
+  label: string;
+  role: InstanceRole;
+  baseUrl: string;
+  apiKey: string;
+}
+
+const EMPTY_VAULT_INSTANCE_FORM: NewVaultInstanceForm = {
+  label: '',
+  role: 'both',
+  baseUrl: '',
+  apiKey: '',
 };
 
 function countNestedFolders(folders: Array<{ children?: unknown }>): number {
@@ -332,13 +360,115 @@ function WorkspaceSnapshotPanel({
 
 export function ConnectPage() {
   const navigate = useNavigate();
-  const { connection, updateConnection, isConnected, setStatus } = useConnection();
+  const { connection, updateConnection, resetConnection, isConnected, setStatus } = useConnection();
   const [testing, setTesting] = useState(false);
   const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(EMPTY_SNAPSHOT);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [snapshotLoadedFor, setSnapshotLoadedFor] = useState('');
+  const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
+  const [savedInstances, setSavedInstances] = useState<SavedInstancePublic[]>([]);
+  const [selectedInstanceId, setSelectedInstanceId] = useState('');
+  const [vaultPassphrase, setVaultPassphrase] = useState('');
+  const [vaultBusy, setVaultBusy] = useState(false);
+  const [vaultMessage, setVaultMessage] = useState('');
+  const [vaultError, setVaultError] = useState('');
+  const [newVaultInstance, setNewVaultInstance] = useState<NewVaultInstanceForm>(EMPTY_VAULT_INSTANCE_FORM);
+  const [showAddVaultInstance, setShowAddVaultInstance] = useState(false);
+  const [showManualConnection, setShowManualConnection] = useState(false);
 
-  const connectionKey = `${connection.baseUrl.trim()}|${connection.apiKey ? 'key-present' : 'no-key'}`;
+  const connectionKey = `${connection.baseUrl.trim()}|${connection.instanceId || (connection.apiKey ? 'manual-key-present' : 'no-key')}`;
+  const selectedInstance = savedInstances.find((instance) => instance.id === selectedInstanceId) || savedInstances[0] || null;
+
+  const loadVaultState = useCallback(async () => {
+    const status = await getVaultStatus();
+    setVaultStatus(status);
+    if (!status.unlocked) {
+      setSavedInstances([]);
+      setSelectedInstanceId('');
+      return;
+    }
+    const res = await listSavedInstances();
+    setSavedInstances(res.instances);
+    setSelectedInstanceId((current) => {
+      if (current && res.instances.some((instance) => instance.id === current)) return current;
+      return res.instances[0]?.id || '';
+    });
+  }, []);
+
+  useEffect(() => {
+    void loadVaultState().catch(() => {
+      setVaultStatus(null);
+    });
+  }, [loadVaultState]);
+
+  async function handleVaultUnlock() {
+    setVaultBusy(true);
+    setVaultError('');
+    setVaultMessage('');
+    const hadExistingVault = Boolean(vaultStatus?.exists);
+    try {
+      const res = await unlockNativeVault(vaultPassphrase);
+      setVaultStatus(res.status);
+      setVaultPassphrase('');
+      await loadVaultState();
+      setVaultMessage(hadExistingVault ? 'Vault unlocked. Choose a saved instance to connect.' : 'Vault created. Add your first Omni instance to continue.');
+      setShowAddVaultInstance(res.status.instanceCount === 0);
+    } catch (err) {
+      setVaultError(err instanceof Error ? err.message : 'Could not unlock the vault.');
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handleUseSavedInstance(instanceId = selectedInstance?.id || '') {
+    if (!instanceId) return;
+    setVaultBusy(true);
+    setVaultError('');
+    setVaultMessage('');
+    try {
+      const res = await connectSavedInstance(instanceId);
+      updateConnection({
+        ...res.connection,
+        errorMessage: '',
+      });
+      await loadVaultState();
+      setVaultMessage(`Connected to ${res.instance.label}.`);
+    } catch (err) {
+      setVaultError(err instanceof Error ? err.message : 'Could not connect to the saved instance.');
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handleSaveAndUseVaultInstance() {
+    setVaultBusy(true);
+    setVaultError('');
+    setVaultMessage('');
+    try {
+      const saved = await saveSavedInstance({
+        label: newVaultInstance.label,
+        role: newVaultInstance.role,
+        baseUrl: newVaultInstance.baseUrl,
+        apiKey: newVaultInstance.apiKey,
+        metricFilter: {
+          connectionDatabaseContains: [],
+          connectionDatabaseExact: [],
+          embedExternalIdContains: [],
+          embedExternalIdExact: [],
+        },
+        postMigrationActions: [],
+      });
+      setNewVaultInstance(EMPTY_VAULT_INSTANCE_FORM);
+      setShowAddVaultInstance(false);
+      await loadVaultState();
+      setSelectedInstanceId(saved.instance.id);
+      await handleUseSavedInstance(saved.instance.id);
+    } catch (err) {
+      setVaultError(err instanceof Error ? err.message : 'Could not save and test this instance.');
+    } finally {
+      setVaultBusy(false);
+    }
+  }
 
   const loadWorkspaceSnapshot = useCallback(async () => {
     if (!connection.baseUrl || !connection.apiKey) return;
@@ -421,7 +551,14 @@ export function ConnectPage() {
     try {
       const result = await testConnection(connection.baseUrl, connection.apiKey);
       if (result.status === 'ok') {
-        setStatus('success');
+        updateConnection({
+          status: 'success',
+          errorMessage: '',
+          connectionMode: 'manual',
+          instanceId: undefined,
+          instanceLabel: undefined,
+          apiKeyMasked: undefined,
+        });
       } else {
         setStatus('error', result.message || 'Connection failed.');
       }
@@ -445,6 +582,11 @@ export function ConnectPage() {
   const urlValid = Boolean(parsedHost);
   const apiKeyHasValidShape = connection.apiKey.trim().length >= 12;
   const canTest = urlValid && apiKeyHasValidShape && !testing;
+  const vaultUnlocked = Boolean(vaultStatus?.unlocked);
+  const canUnlockVault = Boolean(vaultPassphrase.trim()) && (vaultStatus?.exists || vaultPassphrase.trim().length >= 8) && !vaultBusy;
+  const newInstanceHost = parseHost(newVaultInstance.baseUrl);
+  const canSaveVaultInstance = Boolean(newInstanceHost && newVaultInstance.apiKey.trim().length >= 12 && !vaultBusy);
+  const isVaultConnected = connection.connectionMode === 'vault' && Boolean(connection.instanceId);
 
   const blobbyConfig = {
     untested: { src: '/blobby-waving.png', alt: 'Blobby waving hello' },
@@ -681,223 +823,422 @@ export function ConnectPage() {
         <div className="relative z-10 flex-1 px-9 py-10">
           <div className="mb-7">
             <h2 className="text-[22px] font-bold tracking-tight mb-1.5" style={{ color: '#1A0818' }}>
-              {isConnected ? 'Signed in' : 'Get connected'}
+              {isConnected ? 'Connected workspace' : 'Start with your vault'}
             </h2>
             <p className="text-[13px] leading-relaxed" style={{ color: '#6B4A60' }}>
               {isConnected
-                ? 'Your instance is connected. Credentials stay masked and session-scoped.'
-                : 'Enter your Omni instance URL and API key. Credentials are held in browser memory for this session.'}
+                ? isVaultConnected
+                  ? 'This session is using a saved vault profile. The browser only keeps a non-secret reference.'
+                  : 'This session is using a one-time connection. Save it to the vault if you want to reuse it later.'
+                : 'Create or unlock your local encrypted vault, then choose the Omni instance you want to use.'}
             </p>
           </div>
 
-          <div
-            className="rounded-2xl p-5 mb-4"
-            style={{
-              background: '#FFFFFF',
-              border: '1px solid rgba(217,222,232,0.95)',
-              boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
-            }}
-          >
+          {isConnected ? (
             <div className="space-y-4">
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label htmlFor="base-url" className="text-[12px] font-semibold" style={{ color: '#1A0818' }}>
-                    Base URL
-                  </label>
-                  {connection.baseUrl && (
-                    <span className={`text-[10px] font-medium ${urlValid ? 'text-emerald-600' : 'text-amber-600'}`}>
-                      {urlValid ? 'Valid' : 'Check format'}
-                    </span>
-                  )}
+              <div
+                className="rounded-2xl p-5"
+                style={{
+                  background: '#FFFFFF',
+                  border: '1px solid rgba(217,222,232,0.95)',
+                  boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
+                }}
+              >
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 flex h-10 w-10 items-center justify-center rounded-xl bg-emerald-50 text-emerald-600">
+                    <CheckCircle size={18} />
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="text-[13px] font-semibold" style={{ color: '#1A0818' }}>
+                      {connection.instanceLabel || parsedHost || 'Omni instance'}
+                    </div>
+                    <div className="mt-1 truncate text-[12px]" style={{ color: '#6B4A60' }}>
+                      {connection.baseUrl}
+                    </div>
+                    <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-omni-50 px-2.5 py-1 text-[11px] font-semibold text-omni-700">
+                      <ShieldCheck size={12} />
+                      {isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Session-only key'}
+                    </div>
+                  </div>
                 </div>
-                <div className="relative">
-                  <input
-                    id="base-url"
-                    type="url"
-                    value={connection.baseUrl}
-                    onChange={(e) => updateConnection({ baseUrl: e.target.value, status: 'untested' })}
-                    onKeyDown={handleFieldKeyDown}
-                    placeholder="https://your-org.omni.co"
-                    className="input-field pr-9"
-                    aria-describedby="base-url-hint"
-                  />
-                  {connection.baseUrl && urlValid && (
-                    <CheckCircle
-                      size={15}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-500"
-                      aria-hidden
+                <div
+                  className="mt-4 rounded-2xl overflow-hidden"
+                  style={{
+                    background: '#FFFFFF',
+                    border: '1px solid rgba(217,222,232,0.95)',
+                  }}
+                >
+                  <ConnectionAnimation status={connection.status} />
+                </div>
+                <div className="mt-4 grid grid-cols-2 gap-2">
+                  <button
+                    onClick={() => navigate('/dashboards/migrate')}
+                    className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px"
+                    style={{
+                      background: '#C83B70',
+                      color: '#FFFFFF',
+                      boxShadow: '0 2px 6px -3px rgba(64,71,84,0.16)',
+                    }}
+                  >
+                    Open dashboard
+                    <ArrowRight size={13} />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={resetConnection}
+                    className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px"
+                    style={{
+                      background: '#FFFFFF',
+                      border: '1px solid rgba(217,222,232,0.95)',
+                      color: '#6B4A60',
+                    }}
+                  >
+                    Change
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              <div
+                className="rounded-2xl p-5"
+                style={{
+                  background: '#FFFFFF',
+                  border: '1px solid rgba(217,222,232,0.95)',
+                  boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
+                }}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2 text-[14px] font-semibold" style={{ color: '#1A0818' }}>
+                      <ShieldCheck size={16} className="text-omni-600" />
+                      Local encrypted vault
+                    </div>
+                    <p className="mt-1 text-[12px] leading-relaxed" style={{ color: '#6B4A60' }}>
+                      Save Omni URLs and API keys locally so users can pick from dropdowns instead of re-entering credentials.
+                    </p>
+                  </div>
+                  <span className={`shrink-0 rounded-full px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.08em] ${vaultUnlocked ? 'bg-emerald-50 text-emerald-700' : 'bg-amber-50 text-amber-800'}`}>
+                    {vaultUnlocked ? 'Unlocked' : vaultStatus?.exists ? 'Locked' : 'New'}
+                  </span>
+                </div>
+
+                {vaultError && <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">{vaultError}</div>}
+                {vaultMessage && <div className="mt-4 rounded-xl border border-green-200 bg-green-50 px-3 py-2 text-[12px] text-green-700">{vaultMessage}</div>}
+
+                {!vaultUnlocked ? (
+                  <div className="mt-4 space-y-3">
+                    <input
+                      type="password"
+                      value={vaultPassphrase}
+                      onChange={(event) => setVaultPassphrase(event.target.value)}
+                      onKeyDown={(event) => {
+                        if (event.key === 'Enter' && canUnlockVault) void handleVaultUnlock();
+                      }}
+                      className="input-field"
+                      placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'Create vault passphrase'}
+                      autoComplete="new-password"
                     />
-                  )}
-                </div>
-                <p id="base-url-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
-                  {parsedHost ? (
-                    <>
-                      Will connect to{' '}
-                      <span className="font-mono font-medium" style={{ color: '#C83B70' }}>
-                        {parsedHost}
-                      </span>
-                    </>
-                  ) : (
-                    'Your Omni workspace URL, including https://'
-                  )}
-                </p>
-                {hostNeedsReview && (
-                  <p className="mt-1.5 rounded-button border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
-                    Confirm this is a trusted Omni host before testing. OmniKit keeps the key masked, but the API call will be sent to this URL.
-                  </p>
+                    <button
+                      type="button"
+                      onClick={handleVaultUnlock}
+                      disabled={!canUnlockVault}
+                      className="w-full btn-primary inline-flex items-center justify-center gap-2"
+                    >
+                      {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <UnlockKeyhole size={15} />}
+                      {vaultStatus?.exists ? 'Unlock vault' : 'Create vault'}
+                    </button>
+                    <p className="text-[11px] leading-relaxed" style={{ color: '#8A6078' }}>
+                      The passphrase never leaves your machine. The vault file lives under OmniKit's local data folder.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="mt-4 space-y-4">
+                    {savedInstances.length > 0 && (
+                      <div className="space-y-2">
+                        <label className="text-[12px] font-semibold" style={{ color: '#1A0818' }}>
+                          Choose saved instance
+                        </label>
+                        <select
+                          value={selectedInstance?.id || ''}
+                          onChange={(event) => setSelectedInstanceId(event.target.value)}
+                          className="input-field"
+                        >
+                          {savedInstances.map((instance) => (
+                            <option key={instance.id} value={instance.id}>
+                              {instance.label} — {instance.baseUrl}
+                            </option>
+                          ))}
+                        </select>
+                        {selectedInstance && (
+                          <div className="rounded-xl border border-border-subtle bg-surface-subtle px-3 py-2 text-[11px]" style={{ color: '#6B4A60' }}>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="truncate">{selectedInstance.apiKeyMasked}</span>
+                              <span className="rounded-full bg-white px-2 py-0.5 font-semibold text-content-secondary">
+                                {selectedInstance.role === 'both' ? 'Source + destination' : selectedInstance.role}
+                              </span>
+                            </div>
+                          </div>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => void handleUseSavedInstance()}
+                          disabled={vaultBusy || !selectedInstance}
+                          className="w-full btn-primary inline-flex items-center justify-center gap-2"
+                        >
+                          {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <Server size={15} />}
+                          Use & test selected instance
+                        </button>
+                      </div>
+                    )}
+
+                    {(showAddVaultInstance || savedInstances.length === 0) ? (
+                      <div className="rounded-xl border border-border-subtle p-3">
+                        <div className="text-[13px] font-semibold" style={{ color: '#1A0818' }}>
+                          {savedInstances.length === 0 ? 'Add your first connection' : 'Add another connection'}
+                        </div>
+                        <p className="mt-1 text-[11px] leading-relaxed" style={{ color: '#8A6078' }}>
+                          Only URL and API key are required. Model, folder, filters, and actions can be selected later.
+                        </p>
+                        <div className="mt-3 space-y-3">
+                          <input
+                            value={newVaultInstance.label}
+                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, label: event.target.value }))}
+                            className="input-field"
+                            placeholder="Label, optional"
+                          />
+                          <select
+                            value={newVaultInstance.role}
+                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, role: event.target.value as InstanceRole }))}
+                            className="input-field"
+                          >
+                            <option value="both">Use as source + destination</option>
+                            <option value="source">Use as source only</option>
+                            <option value="destination">Use as destination only</option>
+                          </select>
+                          <input
+                            type="url"
+                            value={newVaultInstance.baseUrl}
+                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, baseUrl: event.target.value }))}
+                            className="input-field"
+                            placeholder="https://your-org.omni.co"
+                          />
+                          <input
+                            type="password"
+                            value={newVaultInstance.apiKey}
+                            onChange={(event) => setNewVaultInstance((prev) => ({ ...prev, apiKey: event.target.value }))}
+                            className="input-field font-mono text-[13px]"
+                            placeholder="API key"
+                            autoComplete="new-password"
+                            spellCheck={false}
+                            autoCapitalize="off"
+                          />
+                          <button
+                            type="button"
+                            onClick={handleSaveAndUseVaultInstance}
+                            disabled={!canSaveVaultInstance}
+                            className="w-full btn-primary inline-flex items-center justify-center gap-2"
+                          >
+                            {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <Save size={15} />}
+                            Save, test, and connect
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setShowAddVaultInstance(true)}
+                        className="w-full btn-secondary inline-flex items-center justify-center gap-2"
+                      >
+                        <KeyRound size={15} />
+                        Add another saved instance
+                      </button>
+                    )}
+                  </div>
                 )}
               </div>
 
-              <div>
-                <div className="flex items-center justify-between mb-1.5">
-                  <label
-                    htmlFor="api-key"
-                    className="text-[12px] font-semibold flex items-center gap-1"
-                    style={{ color: '#1A0818' }}
-                  >
-                    API Key
-                    <a
-                      href="https://docs.omni.co/docs/API/authentication"
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex text-content-tertiary hover:text-omni-700 transition-colors"
-                      aria-label="Where do I find my API key?"
-                    >
-                      <HelpCircle size={12} />
-                    </a>
-                  </label>
-                  <span className="text-[10px] font-medium" style={{ color: '#8A6078' }}>
-                    Settings → API
-                  </span>
-                </div>
-                <div className="relative">
-	                  <input
-	                    id="api-key"
-	                    type="password"
-	                    value={connection.apiKey}
-	                    onChange={(e) => updateConnection({ apiKey: e.target.value, status: 'untested' })}
-	                    onKeyDown={handleFieldKeyDown}
-	                    placeholder="Paste your API key"
-	                    className="input-field pr-10 font-mono text-[13px]"
-	                    autoComplete="new-password"
-	                    spellCheck={false}
-	                    autoCapitalize="off"
-	                    aria-describedby="api-key-hint"
-	                  />
-	                  <Lock
-	                    size={14}
-	                    className="absolute right-3 top-1/2 -translate-y-1/2 text-content-tertiary"
-	                    aria-hidden
-	                  />
-	                </div>
-	                <p id="api-key-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
-	                  Always masked in OmniKit. Held in browser memory and cleared when the tab closes.
-	                </p>
-              </div>
-            </div>
-          </div>
-
-          <button
-            onClick={handleTest}
-            disabled={!canTest && connection.status !== 'success'}
-            className="w-full relative flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-[13px] font-semibold transition-all duration-200 text-white disabled:opacity-50 disabled:cursor-not-allowed enabled:hover:-translate-y-px enabled:hover:brightness-110 enabled:active:translate-y-0 overflow-hidden"
-            style={{
-	              background: connection.status === 'success' ? '#10B981' : '#C83B70',
-	              boxShadow: 'none',
-            }}
-          >
-            {testing && (
-              <span
-                aria-hidden
-                className="absolute inset-0 opacity-40"
-                style={{
-	                  background: 'transparent',
-	                  backgroundSize: '200% 100%',
-	                  animation: 'none',
-                }}
-              />
-            )}
-            <span className="relative flex items-center gap-2">
-              {testing ? (
-                <Loader2 size={14} className="animate-spin" />
-              ) : connection.status === 'success' ? (
-                <CheckCircle size={14} />
-              ) : (
-                <Wifi size={14} />
-              )}
-              {testing
-                ? 'Testing connection…'
-                : connection.status === 'success'
-                ? 'Connected'
-                : 'Test Connection'}
-            </span>
-            {!testing && connection.status !== 'success' && canTest && (
-              <span
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-[10px] font-medium px-1.5 py-0.5 rounded border border-white/30 text-white/80"
-                aria-hidden
+              <button
+                type="button"
+                onClick={() => setShowManualConnection((prev) => !prev)}
+                className="w-full rounded-xl border border-border-subtle bg-white px-4 py-2.5 text-[12px] font-semibold text-content-secondary transition-colors hover:text-omni-700"
               >
-                Enter
-              </span>
-            )}
-          </button>
+                {showManualConnection ? 'Hide one-time connection' : 'Use one-time connection instead'}
+              </button>
 
-          <div className="mt-3 flex items-center justify-center gap-2 text-[12px]" aria-live="polite">
-            {connection.status === 'untested' && (
-              <>
-                <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'rgba(155,48,101,0.3)' }} />
-                <span style={{ color: 'rgba(155,48,101,0.6)' }}>Not tested yet</span>
-              </>
-            )}
-            {connection.status === 'testing' && (
-              <>
-                <Loader2 size={12} className="animate-spin" style={{ color: '#E4477C' }} />
-                <span style={{ color: '#E4477C' }} className="font-medium">
-                  Verifying credentials…
-                </span>
-              </>
-            )}
-            {connection.status === 'success' && (
-              <>
-                <CheckCircle size={12} className="text-emerald-500" />
-                <span className="text-emerald-600 font-medium">Successfully connected</span>
-              </>
-            )}
-            {connection.status === 'error' && (
-              <>
-                <XCircle size={12} className="text-red-500" />
-                <span className="text-red-600 font-medium truncate max-w-[320px]">
-                  {connection.errorMessage || 'Connection failed'}
-                </span>
-              </>
-            )}
-          </div>
+              {showManualConnection && (
+                <div
+                  className="rounded-2xl p-5"
+                  style={{
+                    background: '#FFFFFF',
+                    border: '1px solid rgba(217,222,232,0.95)',
+                    boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
+                  }}
+                >
+                  <div className="space-y-4">
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label htmlFor="base-url" className="text-[12px] font-semibold" style={{ color: '#1A0818' }}>
+                          Base URL
+                        </label>
+                        {connection.baseUrl && (
+                          <span className={`text-[10px] font-medium ${urlValid ? 'text-emerald-600' : 'text-amber-600'}`}>
+                            {urlValid ? 'Valid' : 'Check format'}
+                          </span>
+                        )}
+                      </div>
+                      <div className="relative">
+                        <input
+                          id="base-url"
+                          type="url"
+                          value={connection.connectionMode === 'vault' ? '' : connection.baseUrl}
+                          onChange={(e) => updateConnection({
+                            baseUrl: e.target.value,
+                            status: 'untested',
+                            connectionMode: 'manual',
+                            instanceId: undefined,
+                            instanceLabel: undefined,
+                            apiKeyMasked: undefined,
+                          })}
+                          onKeyDown={handleFieldKeyDown}
+                          placeholder="https://your-org.omni.co"
+                          className="input-field pr-9"
+                          aria-describedby="base-url-hint"
+                        />
+                        {connection.baseUrl && urlValid && connection.connectionMode !== 'vault' && (
+                          <CheckCircle
+                            size={15}
+                            className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-500"
+                            aria-hidden
+                          />
+                        )}
+                      </div>
+                      <p id="base-url-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
+                        {parsedHost && connection.connectionMode !== 'vault' ? (
+                          <>
+                            Will connect to{' '}
+                            <span className="font-mono font-medium" style={{ color: '#C83B70' }}>
+                              {parsedHost}
+                            </span>
+                          </>
+                        ) : (
+                          'Your Omni workspace URL, including https://'
+                        )}
+                      </p>
+                      {hostNeedsReview && connection.connectionMode !== 'vault' && (
+                        <p className="mt-1.5 rounded-button border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
+                          Confirm this is a trusted Omni host before testing. OmniKit keeps the key masked, but the API call will be sent to this URL.
+                        </p>
+                      )}
+                    </div>
 
-          {connection.status !== 'untested' && (
-            <div
-              className="mt-4 rounded-2xl overflow-hidden"
-              style={{
-	                background: '#FFFFFF',
-	                border: '1px solid rgba(217,222,232,0.95)',
-              }}
-            >
-              <ConnectionAnimation status={connection.status} />
+                    <div>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <label
+                          htmlFor="api-key"
+                          className="text-[12px] font-semibold flex items-center gap-1"
+                          style={{ color: '#1A0818' }}
+                        >
+                          API Key
+                          <a
+                            href="https://docs.omni.co/docs/API/authentication"
+                            target="_blank"
+                            rel="noreferrer"
+                            className="inline-flex text-content-tertiary hover:text-omni-700 transition-colors"
+                            aria-label="Where do I find my API key?"
+                          >
+                            <HelpCircle size={12} />
+                          </a>
+                        </label>
+                        <span className="text-[10px] font-medium" style={{ color: '#8A6078' }}>
+                          Settings → API
+                        </span>
+                      </div>
+                      <div className="relative">
+                        <input
+                          id="api-key"
+                          type="password"
+                          value={connection.connectionMode === 'vault' ? '' : connection.apiKey}
+                          onChange={(e) => updateConnection({
+                            apiKey: e.target.value,
+                            status: 'untested',
+                            connectionMode: 'manual',
+                            instanceId: undefined,
+                            instanceLabel: undefined,
+                            apiKeyMasked: undefined,
+                          })}
+                          onKeyDown={handleFieldKeyDown}
+                          placeholder="Paste your API key"
+                          className="input-field pr-10 font-mono text-[13px]"
+                          autoComplete="new-password"
+                          spellCheck={false}
+                          autoCapitalize="off"
+                          aria-describedby="api-key-hint"
+                        />
+                        <Lock
+                          size={14}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-content-tertiary"
+                          aria-hidden
+                        />
+                      </div>
+                      <p id="api-key-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
+                        Session-only fallback. Use the vault above when you want reusable saved instances.
+                      </p>
+                    </div>
+                  </div>
+
+                  <button
+                    onClick={handleTest}
+                    disabled={!canTest}
+                    className="mt-4 w-full relative flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-[13px] font-semibold transition-all duration-200 text-white disabled:opacity-50 disabled:cursor-not-allowed enabled:hover:-translate-y-px enabled:hover:brightness-110 enabled:active:translate-y-0 overflow-hidden"
+                    style={{
+                      background: connection.status === 'success' ? '#10B981' : '#C83B70',
+                      boxShadow: 'none',
+                    }}
+                  >
+                    <span className="relative flex items-center gap-2">
+                      {testing ? (
+                        <Loader2 size={14} className="animate-spin" />
+                      ) : connection.status === 'success' ? (
+                        <CheckCircle size={14} />
+                      ) : (
+                        <Wifi size={14} />
+                      )}
+                      {testing
+                        ? 'Testing connection…'
+                        : connection.status === 'success'
+                          ? 'Connected'
+                          : 'Test one-time connection'}
+                    </span>
+                  </button>
+
+                  <div className="mt-3 flex items-center justify-center gap-2 text-[12px]" aria-live="polite">
+                    {connection.status === 'untested' && (
+                      <>
+                        <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'rgba(155,48,101,0.3)' }} />
+                        <span style={{ color: 'rgba(155,48,101,0.6)' }}>Not tested yet</span>
+                      </>
+                    )}
+                    {connection.status === 'testing' && (
+                      <>
+                        <Loader2 size={12} className="animate-spin" style={{ color: '#E4477C' }} />
+                        <span style={{ color: '#E4477C' }} className="font-medium">
+                          Verifying credentials…
+                        </span>
+                      </>
+                    )}
+                    {connection.status === 'error' && (
+                      <>
+                        <XCircle size={12} className="text-red-500" />
+                        <span className="text-red-600 font-medium truncate max-w-[320px]">
+                          {connection.errorMessage || 'Connection failed'}
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
-          )}
-
-          {isConnected && (
-            <button
-              onClick={() => navigate('/dashboards/migrate')}
-              className="w-full mt-4 flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px"
-              style={{
-                background: '#FFFFFF',
-                border: '1px solid rgba(255,71,148,0.3)',
-                color: '#C83B70',
-                boxShadow: '0 2px 6px -3px rgba(64,71,84,0.16)',
-              }}
-            >
-              Open dashboard
-              <ArrowRight size={13} />
-            </button>
           )}
 
           <div className="mt-7 space-y-2">

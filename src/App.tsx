@@ -34,6 +34,7 @@ import { DataPrivacyPage } from '@/pages/DataPrivacyPage';
 import { DashboardOperationsPage } from '@/pages/DashboardOperationsPage';
 import { ContentHealthPage } from '@/pages/ContentHealthPage';
 import { AIDashboardStudioPage } from '@/pages/AIDashboardStudioPage';
+import { InstancesPage } from '@/pages/InstancesPage';
 
 function AppLayout() {
   return (
@@ -83,6 +84,7 @@ function AppLayout() {
               path="/connections"
               element={<RequireConnection><ConnectionsPage /></RequireConnection>}
             />
+            <Route path="/instances" element={<InstancesPage />} />
             <Route
               path="/uploads"
               element={<RequireConnection><UploadsPage /></RequireConnection>}
