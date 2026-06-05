@@ -1,19 +1,23 @@
 import { useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { Stepper } from '@/components/layout/Stepper';
 import { SelectStep } from '@/components/steps/SelectStep';
 import { MapStep } from '@/components/steps/MapStep';
 import { ReviewStep } from '@/components/steps/ReviewStep';
 import { ResultsStep } from '@/components/steps/ResultsStep';
+import { MultiInstanceMigratePanel } from '@/components/steps/MultiInstanceMigratePanel';
 import { useWizard } from '@/hooks/useWizard';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
+import { RequireConnection } from '@/components/layout/RequireConnection';
 
 export function MigratePage() {
   const { state, dispatch, nextStep, prevStep, resetAll } = useWizard();
   const { connection, isConnected } = useConnection();
   const navigate = useNavigate();
+  const location = useLocation();
+  const mode = new URLSearchParams(location.search).get('mode') === 'copy' ? 'copy' : 'remap';
 
   useEffect(() => {
     if (!isConnected) return;
@@ -53,56 +57,6 @@ export function MigratePage() {
     return () => window.removeEventListener('beforeunload', handleBeforeUnload);
   }, [state.migrationInProgress, state.selectedDashboards.length]);
 
-  if (!isConnected) {
-    return (
-      <div
-        className="relative flex flex-col items-center justify-center animate-fadeIn"
-        style={{ minHeight: 'calc(100vh - 3rem)' }}
-      >
-        <div
-          className="absolute inset-0 pointer-events-none"
-          style={{
-            backgroundImage: 'none',
-            backgroundSize: '28px 28px',
-          }}
-        />
-        <div
-          className="absolute top-0 left-0 right-0 h-1 pointer-events-none"
-          style={{
-            background: '#DDE2EB',
-            opacity: 1,
-          }}
-        />
-        <div
-          className="relative z-10 flex flex-col items-center text-center px-8 py-10 rounded-2xl max-w-sm w-full mx-auto"
-          style={{
-            background: '#FFFFFF',
-            border: '1px solid rgba(217,222,232,0.95)',
-            boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
-          }}
-        >
-          <div className="empty-state-mascot mb-2">
-            <img
-              src="/blobby-migration.webp"
-              alt="Blobby ready to migrate"
-              className="w-24 h-24 object-contain animate-float"
-              style={{ animationDuration: '3s' }}
-            />
-          </div>
-          <h2 className="text-lg font-bold text-content-primary mb-2 tracking-tight">
-            Connect first to start model migration
-          </h2>
-          <p className="text-sm text-content-secondary mb-7 leading-relaxed">
-            You need to connect to your Omni instance before using Model Migrator.
-          </p>
-          <button onClick={() => navigate('/connect')} className="btn-primary">
-            Go to Connect
-          </button>
-        </div>
-      </div>
-    );
-  }
-
   function renderStep() {
     switch (state.currentStep) {
       case 0:
@@ -118,17 +72,57 @@ export function MigratePage() {
     }
   }
 
+  if (mode === 'remap' && !isConnected) {
+    return (
+      <RequireConnection>
+        <div />
+      </RequireConnection>
+    );
+  }
+
   return (
     <div className="space-y-5">
       <PageHeader
         title="Model Migrator"
-        description="Remap dashboards within the current instance by default, or copy them into another Omni instance after testing target credentials."
+        description="Remap dashboards within the current instance by default, or copy/import dashboards into explicit models and folders across saved Omni instances."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
-      <Stepper currentStep={state.currentStep} />
-      <div className="pb-12">
-        {renderStep()}
+      <div className="card p-2">
+        <div className="grid gap-2 md:grid-cols-2">
+          <a
+            href="/dashboards/migrate"
+            className={`rounded-button px-4 py-3 text-left transition ${
+              mode === 'remap' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+            }`}
+          >
+            <div className="text-sm font-semibold">Same-instance model remap</div>
+            <div className={`mt-1 text-xs ${mode === 'remap' ? 'text-white/80' : 'text-content-secondary'}`}>
+              Default path. Move dashboards between models inside the connected Omni instance.
+            </div>
+          </a>
+          <a
+            href="/dashboards/migrate?mode=copy"
+            className={`rounded-button px-4 py-3 text-left transition ${
+              mode === 'copy' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+            }`}
+          >
+            <div className="text-sm font-semibold">Saved-instance dashboard copy/import</div>
+            <div className={`mt-1 text-xs ${mode === 'copy' ? 'text-white/80' : 'text-content-secondary'}`}>
+              Use encrypted saved profiles to choose exact destination models and folders.
+            </div>
+          </a>
+        </div>
       </div>
+      {mode === 'copy' ? (
+        <MultiInstanceMigratePanel />
+      ) : isConnected ? (
+        <>
+          <Stepper currentStep={state.currentStep} />
+          <div className="pb-12">
+            {renderStep()}
+          </div>
+        </>
+      ) : null}
     </div>
   );
 }

@@ -682,20 +682,19 @@ async function moveDocumentToFolder(
   baseUrl: string,
   apiKey: string,
   documentId: string,
-  docName: string,
   folder: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const cleanUrl = baseUrl.replace(/\/+$/, "");
     const response = await fetchWithRetry(
-      `${cleanUrl}/api/unstable/documents/${documentId}`,
+      `${cleanUrl}/api/v1/documents/${documentId}/move`,
       {
-        method: "PATCH",
+        method: "PUT",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ name: docName, filePath: folder }),
+        body: JSON.stringify({ folderPath: folder }),
       },
       15000
     );
@@ -1300,7 +1299,6 @@ export default async function handler(req: Request): Promise<Response> {
                     target.base_url,
                     target.api_key,
                     importedId,
-                    dashboard.name,
                     target_folder!
                   );
                   if (!moveResult.success) {
@@ -1348,10 +1346,11 @@ export default async function handler(req: Request): Promise<Response> {
               }
 
               succeeded++;
+              const resultStatus = folderMoveWarning ? "warning" as const : "success" as const;
               const result = {
                 id: dashboard.id,
                 name: dashboard.name,
-                status: "success" as const,
+                status: resultStatus,
                 error: folderMoveWarning,
                 source_model: sourceModel,
                 target_model: effectiveTarget,
@@ -1361,10 +1360,11 @@ export default async function handler(req: Request): Promise<Response> {
                 type: "progress",
                 dashboard_id: dashboard.id,
                 dashboard_name: dashboard.name,
-                status: "success",
+                status: resultStatus,
                 replacements,
                 index: i,
                 total: dashboards.length,
+                warnings: folderMoveWarning ? [folderMoveWarning] : undefined,
               });
             }
           }

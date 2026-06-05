@@ -12,14 +12,31 @@ import {
   CheckCircle2,
   Layers,
   X,
+  KeyRound,
+  Lock,
+  Save,
+  ShieldCheck,
+  Trash2,
 } from 'lucide-react';
 import { listFolders, listDocuments, enrichDocuments, testConnection } from '@/services/omniApi';
 import { SkeletonRow } from '@/components/ui/SkeletonRow';
 import { InspectExportModal } from '@/components/ui/InspectExportModal';
 import type { WizardState, WizardAction, OmniFolder, OmniDocument } from '@/types';
+import {
+  createInstanceVault,
+  deleteInstanceFromVault,
+  getUnlockedInstanceVault,
+  hasInstanceVault,
+  isInstanceVaultUnlocked,
+  lockInstanceVault,
+  saveInstanceToVault,
+  unlockInstanceVault,
+  type SavedOmniInstance,
+} from '@/services/instanceVault';
 
 interface FolderNodeProps {
   folder: OmniFolder;
+  nodeKey: string;
   selectedFolderId: string | null;
   expandedIds: Set<string>;
   onToggle: (id: string) => void;
@@ -27,7 +44,7 @@ interface FolderNodeProps {
   depth?: number;
 }
 
-function FolderNode({ folder, selectedFolderId, expandedIds, onToggle, onSelect, depth = 0 }: FolderNodeProps) {
+function FolderNode({ folder, nodeKey, selectedFolderId, expandedIds, onToggle, onSelect, depth = 0 }: FolderNodeProps) {
   const isExpanded = expandedIds.has(folder.id);
   const isSelected = selectedFolderId === folder.id;
   const hasChildren = folder.children && folder.children.length > 0;
@@ -65,10 +82,11 @@ function FolderNode({ folder, selectedFolderId, expandedIds, onToggle, onSelect,
         <span className="truncate">{folder.name}</span>
         {isSelected && <CheckCircle2 size={13} className="ml-auto shrink-0 text-omni-700" />}
       </button>
-      {isExpanded && folder.children?.map((child) => (
+      {isExpanded && folder.children?.map((child, index) => (
         <FolderNode
-          key={child.id}
+          key={`${nodeKey}/${child.id || child.name}/${index}`}
           folder={child}
+          nodeKey={`${nodeKey}/${child.id || child.name}/${index}`}
           selectedFolderId={selectedFolderId}
           expandedIds={expandedIds}
           onToggle={onToggle}
@@ -108,6 +126,14 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
   const [search, setSearch] = useState('');
   const [inspectDoc, setInspectDoc] = useState<OmniDocument | null>(null);
   const [testingTarget, setTestingTarget] = useState(false);
+  const [vaultPassword, setVaultPassword] = useState('');
+  const [vaultBusy, setVaultBusy] = useState(false);
+  const [vaultName, setVaultName] = useState('');
+  const [vaultNotice, setVaultNotice] = useState('');
+  const [vaultError, setVaultError] = useState('');
+  const [vaultExists, setVaultExists] = useState(() => hasInstanceVault());
+  const [vaultUnlocked, setVaultUnlocked] = useState(() => isInstanceVaultUnlocked());
+  const [savedInstances, setSavedInstances] = useState<SavedOmniInstance[]>(() => getUnlockedInstanceVault()?.instances ?? []);
 
   const selectedIds = useMemo(
     () => new Set(state.selectedDashboards.map((d) => d.id)),
@@ -243,6 +269,22 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
   const targetCanTest = Boolean(state.target.baseUrl.trim() && state.target.apiKey.trim() && !testingTarget);
   const targetReady = state.sameInstance || state.target.status === 'success';
 
+  const refreshVaultState = useCallback(() => {
+    setVaultExists(hasInstanceVault());
+    const vault = getUnlockedInstanceVault();
+    setVaultUnlocked(Boolean(vault));
+    setSavedInstances(vault?.instances ?? []);
+  }, []);
+
+  useEffect(() => {
+    refreshVaultState();
+  }, [refreshVaultState]);
+
+  const selectedVaultInstance = useMemo(
+    () => savedInstances.find((instance) => instance.baseUrl.trim().toLowerCase() === state.target.baseUrl.trim().toLowerCase()),
+    [savedInstances, state.target.baseUrl],
+  );
+
   async function handleTargetTest() {
     if (!state.target.baseUrl.trim() || !state.target.apiKey.trim()) return;
     setTestingTarget(true);
@@ -265,6 +307,89 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
     } finally {
       setTestingTarget(false);
     }
+  }
+
+  async function handleUnlockVault() {
+    setVaultBusy(true);
+    setVaultError('');
+    setVaultNotice('');
+    try {
+      const payload = vaultExists
+        ? await unlockInstanceVault(vaultPassword)
+        : await createInstanceVault(vaultPassword);
+      setSavedInstances(payload.instances);
+      setVaultUnlocked(true);
+      setVaultExists(true);
+      setVaultPassword('');
+      setVaultNotice(vaultExists ? 'Legacy browser vault unlocked for this app session.' : 'Legacy browser vault created.');
+    } catch (err) {
+      setVaultError(err instanceof Error ? err.message : 'Could not unlock the instance vault.');
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  async function handleSaveTargetInstance() {
+    setVaultBusy(true);
+    setVaultError('');
+    setVaultNotice('');
+    try {
+      const saved = await saveInstanceToVault({
+        id: selectedVaultInstance?.id,
+        name: vaultName || targetHost || state.target.baseUrl,
+        connection: state.target,
+        defaultTargetFolder: state.targetFolder,
+      });
+      refreshVaultState();
+      setVaultName(saved.name);
+      setVaultNotice(`Saved ${saved.name} to the legacy browser vault. Import it into the native vault from Instance Manager when ready.`);
+    } catch (err) {
+      setVaultError(err instanceof Error ? err.message : 'Could not save the target instance.');
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  function handleUseSavedInstance(instance: SavedOmniInstance) {
+    dispatch({
+      type: 'UPDATE_TARGET',
+      payload: {
+        baseUrl: instance.baseUrl,
+        apiKey: instance.apiKey,
+        status: instance.lastValidatedAt ? 'success' : 'untested',
+        errorMessage: '',
+      },
+    });
+    if (instance.defaultTargetFolder) {
+      dispatch({ type: 'SET_TARGET_FOLDER', folder: instance.defaultTargetFolder });
+    }
+    setVaultName(instance.name);
+    setVaultNotice(`Loaded ${instance.name} as the target instance.`);
+    setVaultError('');
+  }
+
+  async function handleDeleteSavedInstance(instance: SavedOmniInstance) {
+    setVaultBusy(true);
+    setVaultError('');
+    setVaultNotice('');
+    try {
+      await deleteInstanceFromVault(instance.id);
+      refreshVaultState();
+      setVaultNotice(`Removed ${instance.name} from the instance vault.`);
+    } catch (err) {
+      setVaultError(err instanceof Error ? err.message : 'Could not remove the saved instance.');
+    } finally {
+      setVaultBusy(false);
+    }
+  }
+
+  function handleLockVault() {
+    lockInstanceVault();
+    refreshVaultState();
+    setVaultPassword('');
+    setVaultName('');
+    setVaultNotice('Legacy browser vault locked.');
+    setVaultError('');
   }
 
   return (
@@ -379,89 +504,221 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
         </div>
 
         {!state.sameInstance && (
-          <div className="mt-4 grid gap-4 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
-            <div>
-              <label htmlFor="target-base-url" className="mb-1.5 block text-xs font-semibold text-content-primary">
-                Target Base URL
-              </label>
-              <input
-                id="target-base-url"
-                type="url"
-                value={state.target.baseUrl}
-                onChange={(e) => dispatch({ type: 'UPDATE_TARGET', payload: { baseUrl: e.target.value, status: 'untested', errorMessage: '' } })}
-                placeholder="https://target-org.omni.co"
-                className="input-field"
-              />
-            </div>
-            <div>
-              <label htmlFor="target-api-key" className="mb-1.5 block text-xs font-semibold text-content-primary">
-                Target API Key
-              </label>
-              <input
-                id="target-api-key"
-                type="password"
-                value={state.target.apiKey}
-                onChange={(e) => dispatch({ type: 'UPDATE_TARGET', payload: { apiKey: e.target.value, status: 'untested', errorMessage: '' } })}
-                placeholder="Paste target API key"
-                className="input-field font-mono text-[13px]"
-                autoComplete="new-password"
-                spellCheck={false}
-                autoCapitalize="off"
-              />
-            </div>
-            <button
-              type="button"
-              onClick={handleTargetTest}
-              disabled={!targetCanTest}
-              className={`h-10 justify-center text-sm ${
-                state.target.status === 'success'
-                  ? 'btn-primary shadow-[0_0_0_4px_rgba(255,71,148,0.18)]'
-                  : 'btn-secondary'
-              }`}
-            >
-              {testingTarget ? (
-                <>
-                  <Loader2 size={14} className="animate-spin" />
-                  Testing
-                </>
-              ) : state.target.status === 'success' ? (
-                <>
-                  <CheckCircle2 size={14} />
-                  Connected
-                </>
+          <div className="mt-4 space-y-4">
+            <div className="rounded-xl border border-omni-100 bg-omni-50/50 p-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="flex items-start gap-2">
+                  <ShieldCheck size={15} className="mt-0.5 text-omni-700" />
+                  <div>
+                    <h4 className="text-xs font-semibold text-content-primary">Legacy browser vault</h4>
+                    <p className="mt-1 text-[11px] leading-relaxed text-content-secondary">
+                      This older browser-encrypted vault is kept only for existing saved targets. For reusable multi-instance credentials, use Instance Manager and the native encrypted vault.
+                    </p>
+                  </div>
+                </div>
+                {vaultUnlocked && (
+                  <button type="button" onClick={handleLockVault} className="btn-secondary text-xs">
+                    <Lock size={12} />
+                    Lock
+                  </button>
+                )}
+              </div>
+
+              {!vaultUnlocked ? (
+                <div className="mt-3 grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+                  <div>
+                    <label htmlFor="instance-vault-password" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                      Legacy vault password
+                    </label>
+                    <input
+                      id="instance-vault-password"
+                      type="password"
+                      value={vaultPassword}
+                      onChange={(e) => setVaultPassword(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void handleUnlockVault();
+                      }}
+                      placeholder={vaultExists ? 'Unlock legacy saved targets' : 'Create legacy vault password'}
+                      className="input-field"
+                      autoComplete="new-password"
+                    />
+                  </div>
+                  <button type="button" onClick={handleUnlockVault} disabled={vaultBusy || !vaultPassword.trim()} className="btn-primary h-10 justify-center text-sm">
+                    {vaultBusy ? <Loader2 size={14} className="animate-spin" /> : <KeyRound size={14} />}
+                    {vaultExists ? 'Unlock legacy vault' : 'Create legacy vault'}
+                  </button>
+                  <p className="md:col-span-2 text-[11px] leading-relaxed text-content-tertiary">
+                    Prefer Instance Manager for new saved instances. This compatibility vault lives in browser storage and can be imported into the native vault from Instance Manager.
+                  </p>
+                </div>
               ) : (
-                'Test Target'
+                <div className="mt-3 space-y-3">
+                  {savedInstances.length === 0 ? (
+                    <div className="rounded-lg border border-dashed border-omni-200 bg-white px-3 py-2 text-[11px] text-content-secondary">
+                      No legacy target instances saved. For new reusable targets, use Instance Manager and the native vault.
+                    </div>
+                  ) : (
+                    <div className="grid gap-2">
+                      {savedInstances.map((instance) => (
+                        <div key={instance.id} className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-white px-3 py-2">
+                          <button
+                            type="button"
+                            onClick={() => handleUseSavedInstance(instance)}
+                            className="min-w-0 flex-1 text-left"
+                          >
+                            <div className="truncate text-xs font-semibold text-content-primary">{instance.name}</div>
+                            <div className="truncate font-mono text-[10px] text-content-tertiary">{hostFromUrl(instance.baseUrl) || instance.baseUrl}</div>
+                            {instance.defaultTargetFolder && (
+                              <div className="truncate text-[10px] text-content-tertiary">Default folder: {instance.defaultTargetFolder}</div>
+                            )}
+                          </button>
+                          <div className="flex items-center gap-2">
+                            {instance.lastValidatedAt && (
+                              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[10px] font-semibold text-emerald-700">
+                                Tested
+                              </span>
+                            )}
+                            <button type="button" onClick={() => handleUseSavedInstance(instance)} className="btn-secondary text-xs">
+                              Use
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => void handleDeleteSavedInstance(instance)}
+                              className="rounded-lg border border-border p-2 text-content-tertiary hover:border-red-200 hover:text-red-600"
+                              aria-label={`Delete ${instance.name}`}
+                              disabled={vaultBusy}
+                            >
+                              <Trash2 size={13} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+                    <div>
+                      <label htmlFor="target-instance-name" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                        Legacy saved target name
+                      </label>
+                      <input
+                        id="target-instance-name"
+                        type="text"
+                        value={vaultName}
+                        onChange={(e) => setVaultName(e.target.value)}
+                        placeholder={targetHost || 'Production target'}
+                        className="input-field"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => void handleSaveTargetInstance()}
+                      disabled={vaultBusy || !state.target.baseUrl.trim() || !state.target.apiKey.trim()}
+                      className="btn-secondary h-10 justify-center text-sm"
+                    >
+                      {vaultBusy ? <Loader2 size={14} className="animate-spin" /> : <Save size={14} />}
+                      {selectedVaultInstance ? 'Update legacy target' : 'Save legacy target'}
+                    </button>
+                  </div>
+                </div>
               )}
-            </button>
-            <div className="lg:col-span-3">
-              <label htmlFor="target-folder" className="mb-1.5 block text-xs font-semibold text-content-primary">
-                Target folder path <span className="font-normal text-content-tertiary">(optional)</span>
-              </label>
-              <input
-                id="target-folder"
-                type="text"
-                value={state.targetFolder}
-                onChange={(e) => dispatch({ type: 'SET_TARGET_FOLDER', folder: e.target.value })}
-                placeholder="e.g. Executive Dashboards/Migrated"
-                className="input-field"
-              />
-              <p className="mt-1.5 text-[11px] leading-relaxed text-content-tertiary">
-                Leave blank to let Omni import into the target instance default location. Credentials stay in this browser session and are not added to a persistent vault.
-              </p>
+
+              {vaultNotice && (
+                <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-700">
+                  {vaultNotice}
+                </div>
+              )}
+              {vaultError && (
+                <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  {vaultError}
+                </div>
+              )}
             </div>
-            {state.target.status === 'success' && (
-              <div className="lg:col-span-3 flex items-start gap-2 rounded-xl border border-omni-200 bg-omni-50 px-3 py-2 text-xs text-omni-800">
-                <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-omni-500 animate-pulse" />
-                <span>
-                  <span className="font-semibold">Target instance verified.</span> Model mapping and compatibility preflight will use this tested target connection.
-                </span>
+
+            <div className="grid gap-4 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
+              <div>
+                <label htmlFor="target-base-url" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                  Target Base URL
+                </label>
+                <input
+                  id="target-base-url"
+                  type="url"
+                  value={state.target.baseUrl}
+                  onChange={(e) => dispatch({ type: 'UPDATE_TARGET', payload: { baseUrl: e.target.value, status: 'untested', errorMessage: '' } })}
+                  placeholder="https://target-org.omni.co"
+                  className="input-field"
+                />
               </div>
-            )}
-            {state.target.status === 'error' && state.target.errorMessage && (
-              <div className="lg:col-span-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                {state.target.errorMessage}
+              <div>
+                <label htmlFor="target-api-key" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                  Target API Key
+                </label>
+                <input
+                  id="target-api-key"
+                  type="password"
+                  value={state.target.apiKey}
+                  onChange={(e) => dispatch({ type: 'UPDATE_TARGET', payload: { apiKey: e.target.value, status: 'untested', errorMessage: '' } })}
+                  placeholder="Paste target API key"
+                  className="input-field font-mono text-[13px]"
+                  autoComplete="new-password"
+                  spellCheck={false}
+                  autoCapitalize="off"
+                />
               </div>
-            )}
+              <button
+                type="button"
+                onClick={handleTargetTest}
+                disabled={!targetCanTest}
+                className={`h-10 justify-center text-sm ${
+                  state.target.status === 'success'
+                    ? 'btn-primary shadow-[0_0_0_4px_rgba(255,71,148,0.18)]'
+                    : 'btn-secondary'
+                }`}
+              >
+                {testingTarget ? (
+                  <>
+                    <Loader2 size={14} className="animate-spin" />
+                    Testing
+                  </>
+                ) : state.target.status === 'success' ? (
+                  <>
+                    <CheckCircle2 size={14} />
+                    Connected
+                  </>
+                ) : (
+                  'Test Target'
+                )}
+              </button>
+              <div className="lg:col-span-3">
+                <label htmlFor="target-folder" className="mb-1.5 block text-xs font-semibold text-content-primary">
+                  Target folder path <span className="font-normal text-content-tertiary">(optional)</span>
+                </label>
+                <input
+                  id="target-folder"
+                  type="text"
+                  value={state.targetFolder}
+                  onChange={(e) => dispatch({ type: 'SET_TARGET_FOLDER', folder: e.target.value })}
+                  placeholder="e.g. Executive Dashboards/Migrated"
+                  className="input-field"
+                />
+                <p className="mt-1.5 text-[11px] leading-relaxed text-content-tertiary">
+                  Leave blank to let Omni import into the target instance default location. When provided, OmniKit moves the imported dashboard to this folder after creation.
+                </p>
+              </div>
+              {state.target.status === 'success' && (
+                <div className="lg:col-span-3 flex items-start gap-2 rounded-xl border border-omni-200 bg-omni-50 px-3 py-2 text-xs text-omni-800">
+                  <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-omni-500 animate-pulse" />
+                  <span>
+                    <span className="font-semibold">Target instance verified.</span> Model mapping and compatibility preflight will use this tested target connection.
+                  </span>
+                </div>
+              )}
+              {state.target.status === 'error' && state.target.errorMessage && (
+                <div className="lg:col-span-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                  {state.target.errorMessage}
+                </div>
+              )}
+            </div>
           </div>
         )}
 
@@ -526,10 +783,11 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                 <p className="text-xs text-content-secondary">No folders found.</p>
               </div>
             ) : (
-              state.folders.map((folder) => (
+              state.folders.map((folder, index) => (
                 <FolderNode
-                  key={folder.id}
+                  key={`${folder.id || folder.name}/${index}`}
                   folder={folder}
+                  nodeKey={`${folder.id || folder.name}/${index}`}
                   selectedFolderId={selectedFolderId}
                   expandedIds={expandedIds}
                   onToggle={toggleExpanded}

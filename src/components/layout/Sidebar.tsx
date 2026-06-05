@@ -20,6 +20,7 @@ import {
   FileUp,
   FileSearch,
   GraduationCap,
+  Server,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useConnection } from '@/contexts/ConnectionContext';
@@ -49,6 +50,7 @@ const sections: NavSection[] = [
   {
     label: 'Data & AI Readiness',
     items: [
+      { to: '/instances', icon: <Server size={15} />, label: 'Instance Manager' },
       { to: '/connections', icon: <Cable size={15} />, label: 'Connection Health' },
       { to: '/uploads', icon: <FileUp size={15} />, label: 'Upload Governance' },
       { to: '/models', icon: <Database size={15} />, label: 'Model & Topic Health' },

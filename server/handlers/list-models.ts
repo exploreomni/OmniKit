@@ -29,6 +29,20 @@ function extractPageInfo(data: unknown): PageInfo | null {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+interface NormalizedModel {
+  id: string;
+  name: string;
+  identifier: string;
+  connectionId?: string;
+  connectionName?: string;
+  baseModelId?: string;
+  kind?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  deletedAt: string | null;
+  branches?: NormalizedModel[];
+}
+
 function extractString(
   raw: Record<string, unknown>,
   ...keys: string[]
@@ -50,7 +64,7 @@ function extractNestedString(
   return extractString(nested as Record<string, unknown>, ...fields);
 }
 
-function normalizeModel(raw: Record<string, unknown>) {
+function normalizeModel(raw: Record<string, unknown>): NormalizedModel {
   const id = String(raw.id ?? "");
   const identifier = extractString(raw, "identifier", "slug", "key");
   const rawName = extractString(
@@ -80,7 +94,7 @@ function normalizeModel(raw: Record<string, unknown>) {
     extractNestedString(raw, "baseModel", "id") ||
     undefined;
 
-  const branches = Array.isArray(raw.branches)
+  const branches: NormalizedModel[] | undefined = Array.isArray(raw.branches)
     ? raw.branches
         .filter((branch): branch is Record<string, unknown> => Boolean(branch) && typeof branch === "object" && !Array.isArray(branch))
         .map((branch) => normalizeModel(branch))

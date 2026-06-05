@@ -4,6 +4,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 
 const protectedToolNames: Record<string, string> = {
   '/dashboards/ai-studio': 'AI Dashboard Studio',
+  '/dashboards/migrate': 'Model Migrator',
   '/dashboards/operations': 'Dashboard Operations',
   '/dashboards/downloads': 'Dashboard Downloads',
   '/deck-builder': 'Deck Builder',

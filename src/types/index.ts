@@ -5,6 +5,10 @@ export interface ConnectionConfig {
   apiKey: string;
   status: ConnectionStatus;
   errorMessage: string;
+  connectionMode?: 'manual' | 'vault';
+  instanceId?: string;
+  instanceLabel?: string;
+  apiKeyMasked?: string;
 }
 
 export interface OmniFolder {
