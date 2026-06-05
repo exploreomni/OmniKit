@@ -10,6 +10,8 @@ function statusIcon(status: MigrationResult['status']) {
       return <CheckCircle size={16} className="text-success" />;
     case 'failed':
       return <XCircle size={16} className="text-error" />;
+    case 'warning':
+      return <AlertTriangle size={16} className="text-warning" />;
     case 'in_progress':
       return <Loader2 size={16} className="text-omni-500 animate-spin" />;
     case 'skipped':
@@ -63,7 +65,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
   useEffect(() => {
     if (!completed) return;
     const failedIds = state.migrationResults
-      .filter((r) => r.status === 'failed' && r.error)
+      .filter((r) => r.error)
       .map((r) => r.id);
     if (failedIds.length > 0) {
       setExpandedIds(new Set(failedIds));
@@ -168,7 +170,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
         <div className="max-h-[360px] overflow-y-auto">
           {state.migrationResults.map((result) => {
             const isExpanded = expandedIds.has(result.id);
-            const hasError = result.status === 'failed' && result.error;
+            const hasDetail = Boolean(result.error);
 
             return (
               <div key={result.id} className="animate-fadeIn">
@@ -176,6 +178,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
                   className={`px-4 py-2.5 border-b border-border/50 grid grid-cols-12 gap-2 items-center transition-colors duration-300 ${
                     result.status === 'success' ? 'bg-green-50/30' :
                     result.status === 'failed' ? 'bg-red-50/30' :
+                    result.status === 'warning' ? 'bg-amber-50/30' :
                     result.status === 'in_progress' ? 'bg-blue-50/30' :
                     ''
                   }`}
@@ -204,7 +207,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
                     <StatusChip status={result.status} />
                   </div>
                   <div className="col-span-2 flex justify-end">
-                    {hasError && (
+                    {hasDetail && (
                       <button
                         onClick={() => toggleExpand(result.id)}
                         className="text-content-secondary hover:text-content-primary transition-colors flex items-center gap-1 text-xs"
@@ -216,9 +219,9 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
                   </div>
                 </div>
 
-                {isExpanded && hasError && (
-                  <div className="px-4 py-3 bg-red-50 border-b border-border/50">
-                    <p className="text-xs text-red-700 font-mono whitespace-pre-wrap">{result.error}</p>
+                {isExpanded && hasDetail && (
+                  <div className={`px-4 py-3 border-b border-border/50 ${result.status === 'failed' ? 'bg-red-50' : 'bg-amber-50'}`}>
+                    <p className={`text-xs font-mono whitespace-pre-wrap ${result.status === 'failed' ? 'text-red-700' : 'text-amber-800'}`}>{result.error}</p>
                   </div>
                 )}
               </div>

@@ -1,11 +1,12 @@
-export const WALKTHROUGH_VERSION = '2026-05-20-dashboard-excel-final';
-export const WALKTHROUGH_DISPLAY_VERSION = 'Updated May 20, 2026';
+export const WALKTHROUGH_VERSION = '2026-06-04-multi-instance-ops-console';
+export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 4, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
 export type WalkthroughStepId =
   | 'start'
   | 'connect'
   | 'workflow-map'
+  | 'instance-manager'
   | 'dashboard-ai'
   | 'dashboard-builder'
   | 'excel-dashboard'
@@ -73,10 +74,24 @@ export const walkthroughSteps: WalkthroughStep[] = [
     purpose: 'Each page is built around one admin job. Users do not need to understand the underlying APIs before starting.',
     directions: [
       'Dashboard AI & Delivery is for dashboard reviews, migration, downloads, deck creation, and bulk dashboard operations.',
-      'Data & AI Readiness is for model health, content health, uploads, connections, and AI Semantic Studio.',
+      'Data & AI Readiness is for Instance Manager, connection health, model health, content health, uploads, and AI Semantic Studio.',
       'Governance is for labels, schedules, users, groups, and embeds.',
     ],
     outcome: 'The user can pick the right page without guessing which technical object matters first.',
+  },
+  {
+    id: 'instance-manager',
+    route: '/instances',
+    label: 'Instances',
+    title: 'Set up saved Omni instances once',
+    purpose: 'Instance Manager is the new multi-instance operations home. It uses a native encrypted local vault so technical admins can save source and destination Omni profiles without re-entering API keys for every migration.',
+    directions: [
+      'Unlock or create the native vault, then add source, destination, or source + destination instance profiles.',
+      'Save default model IDs, folder IDs or folder paths, metric filters, and optional post-migration action templates.',
+      'Use the Connections and Embed Users tabs to scan saved instances, filter internal/test records, and find schema model coverage issues without relying on default schema fields.',
+    ],
+    outcome: 'Admins can manage reusable multi-instance credentials and metrics while keeping secrets encrypted locally.',
+    caution: 'Native vault secrets are not included in browser backups. Resetting the native vault removes saved instance profiles and local migration job history.',
   },
   {
     id: 'dashboard-ai',
@@ -125,15 +140,15 @@ export const walkthroughSteps: WalkthroughStep[] = [
     route: '/dashboards/migrate',
     label: 'Migrate',
     title: 'Use Model Migrator for Omni-to-Omni dashboard moves',
-    purpose: 'Model Migrator starts with same-instance model remaps, and can optionally copy dashboards to another Omni instance after the target URL and API key are tested.',
+    purpose: 'Model Migrator starts with same-instance model remaps, and now has a separate saved-instance dashboard copy/import mode for one source to one or more explicit migration targets.',
     directions: [
-      'Choose same-instance remap or turn on Copy to another instance.',
-      'For another instance, enter and test the target Omni URL and API key before continuing.',
-      'Select dashboards, map base models, and run Compatibility Preflight.',
-      'Review payload and field-compatibility warnings before committing; results are logged to History.',
+      'Use Same-instance model remap when the active Omni connection is both source and destination and only the dashboard base model is changing.',
+      'Use Saved-instance dashboard copy/import when dashboards need to move across instances or fan out to multiple target models/folders.',
+      'In saved-instance mode, choose the source, add one or more migration targets, select dashboards, review optional target-folder cleanup, and enable any post-migration actions.',
+      'Run Compatibility Preflight before starting the job, then monitor per-target export, import, metadata, folder move, and post-action status.',
     ],
-    outcome: 'Dashboard migration work becomes a reviewed checklist with clear warnings for missing fields, risky model swaps, or target-instance cleanup.',
-    caution: 'Preflight checks field presence, not business-definition equivalence. External BI semantic imports belong in AI Semantic Studio.',
+    outcome: 'Dashboard migration work becomes a reviewed, retryable job with clear warnings for missing fields, folder placement, metadata preservation, and destination failures.',
+    caution: 'Preflight checks field presence and job shape, not business-definition equivalence. Destructive cleanup should be enabled only when the destination folder contents are understood.',
   },
   {
     id: 'dashboard-operations',
@@ -169,7 +184,8 @@ export const walkthroughSteps: WalkthroughStep[] = [
     title: 'Check connection, upload, model, and content health',
     purpose: 'The readiness pages help admins understand whether the Omni environment is healthy before they ask Blobby or bulk workflows to act on it.',
     directions: [
-      'Use Connection Health to confirm schema model coverage, refresh signals, and account readiness.',
+      'Use Instance Manager for multi-instance totals, filtered internal/test counts, embed-user rollups, and saved instance configuration.',
+      'Use Connection Health to inspect the active Omni connection in detail.',
       'Use Upload Governance, Model & Topic Health, and Content Health to identify stale content or semantic gaps.',
       'Treat these scans as triage: they tell you where to repair, not just what is broken.',
     ],
@@ -210,8 +226,9 @@ export const walkthroughSteps: WalkthroughStep[] = [
     purpose: 'OmniKit is local-first. The Data & Privacy page explains what is stored in the browser and gives users controls to export, import, or clear it.',
     directions: [
       'Review IndexedDB records for operation history and saved app metadata.',
-      'Review localStorage and sessionStorage entries.',
-      'Use Clear all local data when handing off or resetting a machine.',
+      'Review localStorage and sessionStorage entries for browser-based state.',
+      'Review the native vault path and reset controls for encrypted instance profiles and local migration job history.',
+      'Use Clear all local data for browser data, and Reset native vault only when saved instance profiles should be removed.',
     ],
     outcome: 'Users can trust what the local app keeps and can cleanly reset it.',
   },

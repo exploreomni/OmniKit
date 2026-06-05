@@ -27,7 +27,9 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 - Build first-pass dashboards with Blobby, then finish review and iteration in Omni chat
 - Convert Excel workbooks into guarded dashboard drafts and semantic follow-up plans
 - Review existing dashboards with AI-assisted readiness checks and admin-friendly recommendations
-- Migrate dashboards between Omni connections with base-model mapping and compatibility preflight
+- Manage saved Omni instance profiles in a native encrypted local vault
+- Track multi-instance connection and embed-user metrics with internal/test filters
+- Migrate dashboards through same-instance model remap or saved-instance copy/import with multi-destination fan-out
 - Bulk copy, move, and delete dashboards across folders
 - Download dashboards and build PowerPoint decks from live Omni tiles
 - Manage connections, uploads, users, groups, models, topics, labels, schedules, and embeds
@@ -103,7 +105,7 @@ New users see a click-through walkthrough the first time they open OmniKit. The 
   - **Build New Dashboard** starts a first-pass dashboard developer chat from a selected model/topic, audience, KPI list, filters, layout, and color guidance. It routes missing or unsafe metrics back to AI Semantic Studio instead of inventing model fields.
   - **Excel to Dashboard** parses `.xlsx` workbooks in page memory, inventories sheets/formulas/charts, drafts safe dashboard tiles from existing Omni fields, and lists formula/lookup work as AI Semantic Studio follow-ups instead of updating topics or views directly.
   - **Review Existing Dashboard** inspects a live Omni dashboard and returns a review checklist for purpose, UX risks, semantic risks, and Omni UI handoff.
-- **Model Migrator** — remap dashboards inside the active Omni instance by default, or turn on **Copy to another instance** to import dashboard copies into a separately tested target instance. The active connection is always the source for the current run; enter target Base URL/API key only for cross-instance copies. Select dashboards, map base models, run Compatibility Preflight for payload and field-presence warnings, then commit intentionally. Warnings can be accepted intentionally; blocked dashboards are skipped. Results are logged to **History**.
+- **Model Migrator** — use **Same-instance model remap** by default when dashboards stay inside the connected Omni instance and only need base-model remapping. Use **Saved-instance dashboard copy/import** when dashboards need to copy from one saved source instance into one or more explicit migration targets. Each target chooses a destination instance, target model, and target folder, so admins can fan out to multiple models in the same Omni instance or across several instances. Saved-instance mode uses the native encrypted vault, runs per-target compatibility preflight, preserves descriptions and labels where Omni supports it, records per-step job status, and lets failed import/export items be retried without rerunning successful work.
 - **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
 - **Dashboard Downloads** — export one or more dashboards to local files.
 - **Deck Builder** — build repeatable PowerPoint decks from live Omni dashboard tiles.
@@ -122,6 +124,7 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 
 ### Data & AI Readiness
 
+- **Instance Manager** — create a native encrypted local vault, save source/destination Omni instance profiles, test saved credentials, configure default models/folders, define internal/test filters, store post-migration action templates, and scan connection or embed-user metrics across saved instances.
 - **Connection Health** — validate Omni connectivity and inspect core account readiness signals.
 - **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
 - **Model & Topic Health** — validate models and inspect topic coverage.
@@ -141,7 +144,7 @@ Every batch run, migration, and bulk operation is appended here with timestamps,
 
 ### Data Privacy
 
-Exactly what is stored locally, where it's stored (localStorage, IndexedDB, or same-tab sessionStorage), and a single button to wipe everything. Semantic Migration Import source files, pasted source text, and Excel to Dashboard workbooks stay in page memory by default; generated semantic YAML, Blobby responses, dashboard draft handoffs, and operation metadata are stored only if you save or export them through normal OmniKit workflows. Walkthrough progress is stored as a small localStorage flag so returning users are not interrupted repeatedly.
+Exactly what is stored locally, where it's stored (native encrypted vault, local job history, localStorage, IndexedDB, or same-tab sessionStorage), and controls to clear each category. Semantic Migration Import source files, pasted source text, and Excel to Dashboard workbooks stay in page memory by default; generated semantic YAML, Blobby responses, dashboard draft handoffs, and operation metadata are stored only if you save or export them through normal OmniKit workflows. Walkthrough progress is stored as a small localStorage flag so returning users are not interrupted repeatedly.
 
 ---
 
@@ -167,9 +170,12 @@ Key points:
 
 - **One port, one process.** The Vite plugin at `server/vitePlugin.ts` mounts an Express-style middleware at `/api/*`. No separate backend process.
 - **Same-origin.** Because the UI and local API share `localhost:5173`, there is no browser CORS setup and no cookie-based app session to manage.
-- **Stateless handlers.** Each `/api/<name>` route forwards one REST call to your Omni instance using the Base URL and API key you provided. Nothing is cached server-side.
+- **Scoped local handlers.** Most `/api/<name>` routes forward one REST call to your Omni instance using the Base URL and API key you provided. Native vault, saved instance, metrics, and migration-job routes run locally and keep secrets on the server side.
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
-- **No database.** Persistent app state lives in your browser (`localStorage` + IndexedDB). The active connection is kept in same-tab `sessionStorage`, which can include your Omni API key for the current browser session and is cleared by the Data Privacy wipe action.
+- **No database.** Persistent app state lives in your browser (`localStorage` + IndexedDB) plus lightweight local files under `./data/` for the native encrypted vault and non-secret migration job history. The active connection is kept in same-tab `sessionStorage`, which can include your Omni API key for the current browser session and is cleared by the Data Privacy wipe action.
+- **Native encrypted vault.** Saved Omni instance profiles are encrypted in `./data/vault.enc` by default using Node `crypto` with scrypt and AES-256-GCM. Plaintext API keys are never returned to the browser; UI responses use masked keys only.
+- **Vault idle auto-lock.** The native vault auto-locks after local server idle time. Override the timeout with `OMNIKIT_VAULT_IDLE_TIMEOUT_MS`.
+- **File-backed job history.** Multi-instance migration jobs are stored in `./data/jobs.json` by default with job metadata, status, warnings, retry state, and post-action results. API keys, bearer tokens, card-like numbers, emails, and phone numbers are redacted before job history is written.
 - **Compatibility-first proxy guardrails.** The generic proxy only forwards HTTPS requests to Omni `/api/v1` paths. Other Omni API surfaces used by the app, such as SCIM, embeds, and dashboard import/export, go through dedicated handlers.
 - **AI intake is local-first.** Uploaded dbt, Looker, Power BI, Tableau, and Domo artifacts, plus Excel workbooks used by AI Dashboard Studio, are parsed in the browser and held in memory for the active page session. OmniKit does not write raw external BI source files or raw Excel workbooks to IndexedDB or localStorage by default.
 - **No external app runtime services.** The app uses bundled public assets and system fonts; it does not require a hosted OmniKit backend, package registry service, database, telemetry endpoint, or external font CDN at runtime.
@@ -186,7 +192,11 @@ Key points:
 | `npm run serve` | Serve an existing `dist/` plus the API proxy (skips rebuild). |
 | `npm run preview` | Vite's built-in static preview (UI only, no API). |
 | `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
+| `npm run typecheck:node` | Run `tsc --noEmit` across the local Node server source. |
 | `npm run lint` | Run ESLint. |
+| `npm run test:security` | Run focused vault, job-history, and post-action security regression tests. |
+| `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
+| `npm run security:check` | Run the full local security gate: audit, security tests, typechecks, lint, and build. |
 
 ---
 
@@ -208,6 +218,11 @@ Optional:
   ```bash
   PORT=8080 npm run start
   ```
+- `OMNIKIT_VAULT_PATH` — override the native encrypted vault path. Default is `./data/vault.enc`.
+- `OMNIKIT_VAULT_IDLE_TIMEOUT_MS` — override the native vault idle auto-lock timeout. Default is `1800000` (30 minutes). Use `0` only for local troubleshooting when you explicitly want to disable auto-lock.
+- `OMNIKIT_JOBS_PATH` — override the non-secret migration job history path. Default is `./data/jobs.json`.
+- `OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS=true` — allow post-migration action templates to call localhost or private-network URLs. By default, post-migration actions must use HTTPS and cannot target private networks.
+- `OMNIKIT_POST_ACTION_ALLOWLIST` — optional comma-separated hostname allowlist for post-migration actions, such as `hooks.example.com,automation.example.com`.
 
 ---
 
@@ -229,7 +244,7 @@ Re-upload the `.pptx` template — it may have been saved with an unsupported fe
 Run `npm run build` again and watch the terminal for errors. A stale `dist/` can also cause this — delete `dist/` and rebuild.
 
 **I want to wipe everything.**
-Open DevTools → Application → Storage → **Clear site data**. Or use the button on the **Data Privacy** page.
+Open **Data Privacy**. Use **Clear all local data** for browser data, and **Reset native vault** for saved instance profiles and migration job history. Browser DevTools → Application → Storage → **Clear site data** clears browser data only.
 
 ---
 
@@ -237,12 +252,22 @@ Open DevTools → Application → Storage → **Clear site data**. Or use the bu
 
 - The local API binds to `127.0.0.1` only — not reachable from other machines on your network.
 - Your Omni API key lives in React state and same-tab `sessionStorage` for the current browser session. It is not included in OmniKit backups and is cleared by **Data Privacy → Clear all local data** or by clearing site data in your browser.
+- Saved instance API keys live in the native encrypted vault file, not browser storage. The vault passphrase is not stored, decrypted contents are kept in server memory only while unlocked, the vault auto-locks after idle time, and API keys are returned to the UI only as masked strings.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.
 - No external font or tracking scripts are loaded by the app shell.
-- OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, and cached dashboard/model context. Open **Data Privacy** to inspect and clear local IndexedDB and localStorage entries.
+- OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, cached dashboard/model context, and multi-instance migration jobs. Job history is redacted before it is written to disk. Open **Data Privacy** to inspect and clear browser entries, and reset the native vault/job files.
+- Post-migration actions are saved as encrypted vault templates and must be explicitly enabled per migration job. Job history stores redacted action metadata only. Actions are HTTPS-only by default, block localhost/private-network targets unless `OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS=true`, and can be restricted with `OMNIKIT_POST_ACTION_ALLOWLIST`.
 - Raw export inspection can display the full dashboard export payload in your browser for troubleshooting. Treat copied diagnostics and exported backups as customer data.
 - The generic proxy is intentionally limited to Omni `/api/v1` endpoints; workflows that need other Omni API surfaces use purpose-built local handlers.
 - Vite's dev server is designed for local development, not for production hosting. Don't expose this app to the public internet.
+
+## Compliance posture
+
+OmniKit is a local-first admin utility, not a certified compliance product.
+
+- **PCI-aware, not PCI certified.** Do not store or process cardholder data in OmniKit unless your environment has been formally scoped for PCI DSS. OmniKit redacts card-like numbers from job history as a safety net, but that does not replace PCI DSS controls or QSA review.
+- **SOC readiness support, not a SOC report.** OmniKit can support evidence gathering through local job history, branch review, and explicit migration outcomes, but SOC 1/SOC 2 require organization-level policies, approvals, monitoring, incident response, and auditor testing.
+- **CIS-aligned local controls.** OmniKit binds locally, uses encrypted local storage for reusable secrets, avoids telemetry, and includes dependency/security checks. Host-level CIS Benchmark hardening remains the responsibility of the machine and organization running OmniKit.
 
 ---
 

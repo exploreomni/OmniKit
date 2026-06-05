@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Download, Upload, Trash2, HardDrive, RefreshCw, GraduationCap, RotateCcw } from 'lucide-react';
+import { Download, Upload, Trash2, HardDrive, RefreshCw, GraduationCap, RotateCcw, ShieldCheck } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -7,6 +7,7 @@ import { toast } from '@/components/ui/Toast';
 import { Blobby } from '@/components/ui/Blobby';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { WALKTHROUGH_STORAGE_KEY } from '@/services/walkthrough';
+import { clearMigrationJobs, getVaultStatus, resetNativeVault, type VaultStatus } from '@/services/opsConsole';
 import {
   clearOmniKitLocalStorage,
   clearOmniKitSessionStorage,
@@ -38,21 +39,34 @@ const STORE_LABELS: Record<StoreName, string> = {
   settings: 'App settings',
 };
 
+function formatDuration(ms: number | undefined): string {
+  if (!ms) return 'disabled';
+  const minutes = Math.round(ms / 60000);
+  if (minutes < 1) return `${ms} ms`;
+  if (minutes === 1) return '1 minute';
+  return `${minutes} minutes`;
+}
+
 export function DataPrivacyPage() {
   const { openWalkthrough, resetWalkthrough, currentVersion } = useWalkthrough();
   const [summary, setSummary] = useState<Array<{ store: StoreName; count: number }>>([]);
   const [localSummary, setLocalSummary] = useState<Array<{ key: string; bytes: number }>>([]);
   const [sessionSummary, setSessionSummary] = useState<Array<{ key: string; bytes: number }>>([]);
+  const [nativeVaultStatus, setNativeVaultStatus] = useState<VaultStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [pendingClear, setPendingClear] = useState<StoreName | 'all' | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const refresh = async () => {
     setLoading(true);
     try {
-      const [indexedDbSummary] = await Promise.all([storageSummary()]);
+      const [indexedDbSummary, vaultStatus] = await Promise.all([
+        storageSummary(),
+        getVaultStatus().catch(() => null),
+      ]);
       setSummary(indexedDbSummary);
       setLocalSummary(localStorageSummary());
       setSessionSummary(sessionStorageSummary());
+      setNativeVaultStatus(vaultStatus);
     } finally {
       setLoading(false);
     }
@@ -135,13 +149,44 @@ export function DataPrivacyPage() {
     }
   };
 
+  const handleNativeVaultReset = async () => {
+    try {
+      await resetNativeVault();
+      await refresh();
+      toast({ type: 'success', title: 'Native vault reset' });
+    } catch (err) {
+      toast({ type: 'error', title: 'Native vault reset failed', detail: err instanceof Error ? err.message : undefined });
+    }
+  };
+
+  const handleBrowserCacheClear = async () => {
+    clearOmniKitLocalStorage();
+    await refresh();
+    toast({ type: 'success', title: 'Browser cache cleared' });
+  };
+
+  const handleSessionClear = async () => {
+    clearOmniKitSessionStorage();
+    await refresh();
+    toast({ type: 'success', title: 'Active session cleared' });
+  };
+
+  const handleJobHistoryClear = async () => {
+    try {
+      await clearMigrationJobs();
+      toast({ type: 'success', title: 'Migration job history cleared' });
+    } catch (err) {
+      toast({ type: 'error', title: 'Job history clear failed', detail: err instanceof Error ? err.message : undefined });
+    }
+  };
+
   const mergeInput = useRef<HTMLInputElement>(null);
 
   return (
     <div className="space-y-5">
       <PageHeader
         title="Data & Privacy"
-        description="Everything OmniKit stores lives in your browser. Export, import, or clear it here."
+        description="Review the browser cache and local native files OmniKit uses on this machine. Export, import, or clear them here."
         icon={<Blobby mood="governance" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
         actions={<StatusChip status="success" label={`${totalRecords} records stored locally`} />}
       />
@@ -154,6 +199,64 @@ export function DataPrivacyPage() {
             <p className="mt-1 text-[13px] leading-relaxed text-omni-700">
               AI Semantic Studio can parse dbt, Looker, Power BI, Tableau, and Domo source artifacts in the browser for migration planning. AI Dashboard Studio can parse Excel workbooks for guarded dashboard draft planning and model follow-up discovery. Raw uploaded files and pasted source text stay in page memory by default and are not written to IndexedDB or localStorage. Generated YAML, Blobby responses, dashboard handoffs, branch validation results, and normal operation metadata follow the storage rules listed below.
             </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="card p-5 border-omni-100 bg-white">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex items-start gap-3">
+            <ShieldCheck size={17} className="mt-0.5 text-omni-700" />
+            <div>
+              <h2 className="text-base font-semibold text-content-primary">Native encrypted instance vault</h2>
+              <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
+                Instance Manager stores reusable Omni instance API keys in an AES-256-GCM encrypted local file managed by the OmniKit Node server. The default location is <span className="font-mono">./data/vault.enc</span>, or <span className="font-mono">OMNIKIT_VAULT_PATH</span> when configured. The decrypted vault and derived key live in server memory only while unlocked, and the server auto-locks the vault after idle time.
+              </p>
+              <div className="mt-2 font-mono text-[11px] text-content-tertiary">
+                {nativeVaultStatus?.path || './data/vault.enc'} · {nativeVaultStatus?.exists ? 'file exists' : 'not created'} · {nativeVaultStatus?.unlocked ? 'unlocked' : 'locked'}
+              </div>
+              <div className="mt-1 font-mono text-[11px] text-content-tertiary">
+                idle auto-lock: {formatDuration(nativeVaultStatus?.idleTimeoutMs)}
+              </div>
+              <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
+                Non-secret multi-instance migration job history is stored in <span className="font-mono">./data/jobs.json</span>. Job records include status, warnings, retry state, imported document IDs, and post-action results. OmniKit redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing job history.
+              </p>
+              <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
+                Post-migration action templates stay in the encrypted vault. Job history stores redacted action metadata only. Actions are HTTPS-only, block private-network targets by default, and can be restricted with <span className="font-mono">OMNIKIT_POST_ACTION_ALLOWLIST</span>.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={handleNativeVaultReset}
+            disabled={!nativeVaultStatus?.exists && (nativeVaultStatus?.instanceCount ?? 0) === 0}
+            className="btn-danger shrink-0 text-sm"
+          >
+            <Trash2 size={14} />
+            Reset native vault
+          </button>
+          <button
+            type="button"
+            onClick={handleJobHistoryClear}
+            className="btn-secondary shrink-0 text-sm"
+          >
+            <Trash2 size={14} />
+            Clear job history
+          </button>
+        </div>
+      </div>
+
+      <div className="card p-5 border-omni-100 bg-white">
+        <div className="flex items-start gap-3">
+          <ShieldCheck size={17} className="mt-0.5 text-omni-700" />
+          <div>
+            <h2 className="text-base font-semibold text-content-primary">Browser vault compatibility bridge</h2>
+            <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
+              Older Model Migrator target credentials may still exist in <span className="font-mono">localStorage</span> as an AES-GCM encrypted browser vault. Instance Manager can import those records into the native vault after both vaults are unlocked. New saved instance profiles should use the native vault.
+            </p>
+            <div className="mt-2 font-mono text-[11px] text-content-tertiary">
+              omnikit:instanceVault:v1 · encrypted browser cache compatibility path
+            </div>
           </div>
         </div>
       </div>
@@ -235,6 +338,15 @@ export function DataPrivacyPage() {
           <span className="text-xs text-content-secondary ml-auto">
             {(totalLocalBytes / 1024).toFixed(1)} KB
           </span>
+          <button
+            type="button"
+            onClick={handleBrowserCacheClear}
+            disabled={localSummary.length === 0}
+            className="btn-secondary text-xs"
+          >
+            <Trash2 size={12} />
+            Clear cache
+          </button>
         </div>
         {localSummary.length === 0 ? (
           <p className="text-sm text-content-secondary">No OmniKit localStorage entries found.</p>
@@ -257,6 +369,15 @@ export function DataPrivacyPage() {
           <span className="text-xs text-content-secondary ml-auto">
             {(totalSessionBytes / 1024).toFixed(1)} KB
           </span>
+          <button
+            type="button"
+            onClick={handleSessionClear}
+            disabled={sessionSummary.length === 0}
+            className="btn-secondary text-xs"
+          >
+            <Trash2 size={12} />
+            Clear session
+          </button>
         </div>
         {sessionSummary.length === 0 ? (
           <p className="text-sm text-content-secondary">No OmniKit sessionStorage entries found.</p>
@@ -321,7 +442,7 @@ export function DataPrivacyPage() {
           <h3 className="text-base font-semibold text-content-primary">Danger zone</h3>
         </div>
         <p className="text-[13px] text-content-secondary mb-4 leading-relaxed">
-          Permanently delete every record OmniKit has stored on this device. This cannot be undone.
+          Permanently delete OmniKit browser data on this device. Use Reset native vault above for encrypted instance profiles and migration job history.
         </p>
         <button
           onClick={() => setPendingClear('all')}
@@ -338,7 +459,7 @@ export function DataPrivacyPage() {
         title={pendingClear === 'all' ? 'Clear all local data?' : 'Clear data?'}
         message={
           pendingClear === 'all'
-            ? 'Every record OmniKit has stored on this device will be permanently deleted. This cannot be undone.'
+            ? 'OmniKit browser data on this device will be permanently deleted. The native vault is managed separately above. This cannot be undone.'
             : pendingClear
             ? `Permanently delete all "${STORE_LABELS[pendingClear]}" records from this device?`
             : ''
