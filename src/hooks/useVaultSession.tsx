@@ -46,7 +46,7 @@ function sessionStateFromStatus(status: VaultStatus | null): VaultSessionState {
 }
 
 export function VaultSessionProvider({ children }: { children: ReactNode }) {
-  const { updateConnection } = useConnection();
+  const { connection, updateConnection, resetConnection } = useConnection();
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const [instances, setInstances] = useState<SavedInstancePublic[]>([]);
   const [loading, setLoading] = useState(true);
@@ -113,13 +113,57 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
     void refreshStatus().catch(() => undefined);
   }), [refreshStatus]);
 
+  useEffect(() => {
+    if (!vaultStatus || vaultStatus.unlocked) return;
+    if (connection.connectionMode !== 'vault' || connection.status !== 'success') return;
+    updateConnection({
+      status: 'untested',
+      errorMessage: lockedMessage || 'Vault locked — unlock to resume.',
+    });
+  }, [connection.connectionMode, connection.status, lockedMessage, updateConnection, vaultStatus]);
+
   const unlock = useCallback(async (passphrase: string) => {
     const result = await unlockNativeVault(passphrase);
     setVaultStatus(result.status);
     const nextInstances = result.status.unlocked ? await listSavedInstances() : { instances: [] };
     setInstances(nextInstances.instances);
     setLockedMessage('');
-  }, []);
+    if (!result.status.unlocked || !connection.instanceId) return;
+
+    const resumableInstance = nextInstances.instances.find((instance) => instance.id === connection.instanceId);
+    if (!resumableInstance) {
+      resetConnection();
+      toast({
+        type: 'warning',
+        title: 'Saved instance no longer available',
+        detail: 'The vault unlocked, but the previous instance was not found. Choose a saved instance to continue.',
+        duration: 5000,
+      });
+      return;
+    }
+
+    try {
+      const resumed = await connectSavedInstance(connection.instanceId);
+      updateConnection({ ...resumed.connection, errorMessage: '' });
+      setInstances((current) => current.map((instance) => (
+        instance.id === resumed.instance.id ? resumed.instance : instance
+      )));
+      toast({
+        type: 'success',
+        title: `Resumed ${resumed.instance.label}`,
+        detail: 'Vault unlocked and the previous saved instance is active again.',
+        duration: 3500,
+      });
+    } catch (error) {
+      resetConnection();
+      toast({
+        type: 'warning',
+        title: 'Could not resume saved instance',
+        detail: error instanceof Error ? error.message : 'Choose a saved instance to continue.',
+        duration: 5000,
+      });
+    }
+  }, [connection.instanceId, resetConnection, updateConnection]);
 
   const lock = useCallback(async () => {
     const result = await lockNativeVault();

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck } from 'lucide-react';
+import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck, UnlockKeyhole } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useVaultSession } from '@/hooks/useVaultSession';
 
@@ -32,12 +32,14 @@ export function InstanceSwitcher() {
     instances,
     loading,
     lockedMessage,
+    unlock,
     connectInstance,
     touch,
   } = useVaultSession();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [passphrase, setPassphrase] = useState('');
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
@@ -59,6 +61,7 @@ export function InstanceSwitcher() {
     : null;
   const showIdleWarning = remainingMs !== null && remainingMs > 0 && remainingMs < 5 * 60 * 1000;
   const manualHost = connection.baseUrl ? hostFromUrl(connection.baseUrl) : '';
+  const canUnlockVault = Boolean(passphrase.trim()) && Boolean(vaultStatus?.exists) && !busy;
 
   async function handleConnect(instanceId: string) {
     setBusy(true);
@@ -80,6 +83,21 @@ export function InstanceSwitcher() {
       await touch();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not extend the vault session.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUnlock() {
+    if (!canUnlockVault) return;
+    setBusy(true);
+    setError('');
+    try {
+      await unlock(passphrase);
+      setPassphrase('');
+      setOpen(false);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not unlock the vault.');
     } finally {
       setBusy(false);
     }
@@ -149,10 +167,36 @@ export function InstanceSwitcher() {
                 Set up on Home
               </Link>
             ) : status === 'locked' || status === 'unknown' ? (
-              <Link to="/" className="btn-primary flex w-full items-center justify-center gap-2 text-xs">
-                <Lock size={13} />
-                Unlock on Home
-              </Link>
+              <div className="space-y-2">
+                <label className="text-[11px] font-semibold text-content-secondary">
+                  Vault passphrase
+                </label>
+                <input
+                  type="password"
+                  value={passphrase}
+                  onChange={(event) => setPassphrase(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter' && canUnlockVault) void handleUnlock();
+                  }}
+                  disabled={busy || status === 'unknown'}
+                  className="input-field h-9 text-xs"
+                  placeholder={status === 'unknown' ? 'Checking vault status...' : 'Enter vault passphrase'}
+                  autoComplete="current-password"
+                />
+                <button
+                  type="button"
+                  onClick={handleUnlock}
+                  disabled={!canUnlockVault}
+                  className="btn-primary flex w-full items-center justify-center gap-2 text-xs"
+                >
+                  {busy ? <Loader2 size={13} className="animate-spin" /> : <UnlockKeyhole size={13} />}
+                  Unlock and resume
+                </button>
+                <Link to="/" className="btn-secondary flex w-full items-center justify-center gap-2 text-xs">
+                  <Lock size={13} />
+                  Open Home
+                </Link>
+              </div>
             ) : (
               <div className="space-y-2">
                 {instances.length === 0 ? (
