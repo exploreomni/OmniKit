@@ -31,6 +31,9 @@ jobs:
       - name: Run fan-out wizard tests
         run: npm run test:fanout
 
+      - name: Run migration planner tests
+        run: npm run test:migration-planner
+
       - name: Run instance dashboard tests
         run: npm run test:instance-dashboard
 
