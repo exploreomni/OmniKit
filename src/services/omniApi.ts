@@ -601,6 +601,24 @@ export async function getAiJobResult(baseUrl: string, apiKey: string, jobId: str
   return res.json();
 }
 
+export async function cancelAiJob(baseUrl: string, apiKey: string, jobId: string): Promise<OmniAiJob> {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-ai'),
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'cancel-job',
+        job_id: jobId,
+      }),
+    },
+    'Cancel AI job'
+  );
+  return res.json();
+}
+
 export async function getDashboardFilters(baseUrl: string, apiKey: string, dashboardId: string) {
   return omniProxy<Record<string, unknown>>(
     baseUrl,

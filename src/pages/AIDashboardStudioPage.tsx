@@ -15,6 +15,7 @@ import {
   Trash2,
   Upload,
   Wand2,
+  XCircle,
 } from 'lucide-react';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -22,8 +23,9 @@ import { Blobby } from '@/components/ui/Blobby';
 import { AIWorkingAnimation, type AIWorkStepStatus } from '@/components/ui/AIWorkingAnimation';
 import { Vehicle } from '@/components/ui/Vehicle';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useLogOperation } from '@/contexts/OperationLogContext';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
-import { ApiError, createAiJob, enrichDocuments, getAiJob, getAiJobResult, listModels, listTopics, type EnrichmentResult, type OmniAiJob, type OmniAiJobResult } from '@/services/omniApi';
+import { ApiError, cancelAiJob, createAiJob, enrichDocuments, getAiJob, getAiJobResult, listModels, listTopics, type EnrichmentResult, type OmniAiJob, type OmniAiJobResult } from '@/services/omniApi';
 import { fetchDashboardList, fetchDashboardSummary } from '@/services/deckBuilder/omniDeckApi';
 import { dashboardCache, type CachedDashboard } from '@/services/deckBuilder/localCache';
 import type { DashboardFilter, DashboardTile } from '@/services/deckBuilder/types';
@@ -42,7 +44,57 @@ interface InspectedDashboard {
 
 type WorkflowStepState = 'active' | 'done' | 'pending';
 type DashboardStudioLane = 'review' | 'builder' | 'excel';
+type AiRunLane = 'review' | 'builder' | 'excel' | 'excel_dashboard';
 type ExcelConversionIntent = 'dashboard_only' | 'semantic_and_dashboard' | 'semantic_only';
+
+const TERMINAL_AI_STATES = ['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'];
+const MAX_EXCEL_UPLOAD_BYTES = 20 * 1024 * 1024;
+
+interface AiRunContext {
+  lane: AiRunLane;
+  requestKey: string;
+  baseUrl: string;
+  apiKey: string;
+  startedAt: number;
+  modelId: string;
+  topicName?: string;
+  dashboardId?: string;
+  jobId?: string;
+  createdConversationId?: string;
+  createdChatUrl?: string;
+}
+
+interface TimedOutAiRun {
+  lane: AiRunLane;
+  jobId: string;
+  chatUrl: string;
+}
+
+class AiRunCancelledError extends Error {
+  constructor() {
+    super('AI run cancelled.');
+    this.name = 'AiRunCancelledError';
+  }
+}
+
+class AiRunStaleError extends Error {
+  constructor() {
+    super('AI run ignored because the active Omni connection changed.');
+    this.name = 'AiRunStaleError';
+  }
+}
+
+class AiJobTimeoutError extends Error {
+  context: AiRunContext;
+  chatUrl: string;
+
+  constructor(context: AiRunContext, chatUrl: string) {
+    super('Omni is still working on this job. Keep waiting, open Omni chat, or cancel it.');
+    this.name = 'AiJobTimeoutError';
+    this.context = context;
+    this.chatUrl = chatUrl;
+  }
+}
 
 function normalizeAiState(state: string | undefined) {
   return (state || '').trim().toUpperCase().replace(/[-\s]/g, '_');
@@ -68,6 +120,7 @@ function readFirstString(value: unknown, keys: string[]) {
 }
 
 function buildOmniChatUrl(baseUrl: string, conversationId: string) {
+  // Fallback only; API-provided omniChatUrl wins whenever Omni returns one.
   const cleanBase = baseUrl.trim().replace(/\/+$/, '').replace(/\/api$/i, '');
   if (!cleanBase || !conversationId) return '';
   return `${cleanBase}/chat/${encodeURIComponent(conversationId)}`;
@@ -265,6 +318,48 @@ function hasAiResultContent(result?: OmniAiJobResult | null, job?: OmniAiJob | n
   return Boolean(extractAiMessage(result, job));
 }
 
+function extractAiProgressMessage(job?: OmniAiJob | null) {
+  const direct = readFirstString(job, [
+    'progressMessage',
+    'progress_message',
+    'statusMessage',
+    'status_message',
+    'detail',
+    'details',
+    'message',
+  ]);
+  if (direct && direct.length < 220) return direct;
+  if (!Array.isArray(job?.actions)) return '';
+  const actionMessages = job.actions
+    .flatMap((action) => [
+      readFirstString(action, ['progressMessage', 'progress_message', 'statusMessage', 'status_message']),
+      readFirstString(action, ['message', 'summary']),
+      readNestedString(action, ['result', 'progressMessage']),
+      readNestedString(action, ['result', 'statusMessage']),
+      readNestedString(action, ['result', 'message']),
+    ])
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0 && value.length < 220);
+  return actionMessages[actionMessages.length - 1] || '';
+}
+
+function dashboardReviewScopeNote(dashboard: InspectedDashboard) {
+  const notes = [
+    dashboard.tiles.length > 25 ? `reviewing first 25 of ${dashboard.tiles.length} tiles` : '',
+    dashboard.filters.length > 15 ? `reviewing first 15 of ${dashboard.filters.length} filters` : '',
+  ].filter(Boolean);
+  return notes.length ? notes.join('; ') : '';
+}
+
+function excelInventoryScopeNotes(inventory: ExcelWorkbookInventory) {
+  return [
+    inventory.sheets.length > 20 ? `reviewing first 20 of ${inventory.sheets.length} sheets` : '',
+    inventory.formulas.length > 40 ? `reviewing first 40 of ${inventory.formulas.length} formulas` : '',
+    inventory.charts.length > 30 ? `reviewing first 30 of ${inventory.charts.length} charts` : '',
+    inventory.warnings.length > 12 ? `reviewing first 12 of ${inventory.warnings.length} parser warnings` : '',
+  ].filter(Boolean);
+}
+
 function buildDashboardReviewPrompt(dashboard: InspectedDashboard) {
   const tileLines = dashboard.tiles.slice(0, 25).map((tile, index) => {
     const section = tile.section ? ` | section: ${tile.section}` : '';
@@ -275,6 +370,7 @@ function buildDashboardReviewPrompt(dashboard: InspectedDashboard) {
     const label = filter.label && filter.label !== filter.field ? ` (${filter.label})` : '';
     return `- ${filter.field}${label}`;
   });
+  const scopeNote = dashboardReviewScopeNote(dashboard);
 
   return `AI Dashboard Studio Review - ${dashboard.name}
 
@@ -300,6 +396,7 @@ Dashboard:
 - Topics: ${dashboard.topics.length ? dashboard.topics.join(', ') : 'None detected'}
 - Tile count: ${dashboard.tiles.length}
 - Filter count: ${dashboard.filters.length}
+${scopeNote ? `- Scope note: ${scopeNote}` : ''}
 
 Tiles:
 ${tileLines.length ? tileLines.join('\n') : '- No tiles detected'}
@@ -390,11 +487,13 @@ function excelInventoryPromptBlock(inventory: ExcelWorkbookInventory) {
     `- ${chart.sheetName}/${chart.chartName}: ${chart.chartType}${chart.title ? `, title: ${chart.title}` : ''}${chart.sourceRanges.length ? `, ranges: ${chart.sourceRanges.slice(0, 4).join('; ')}` : ''}`
   );
   const warningLines = inventory.warnings.slice(0, 12).map((warning) => `- ${warning}`);
+  const scopeNotes = excelInventoryScopeNotes(inventory);
 
   return `Workbook:
 - File: ${inventory.fileName}
 - Size: ${formatSize(inventory.sizeBytes)}
 - Summary: ${inventory.summary}
+${scopeNotes.length ? `- Scope note: ${scopeNotes.join('; ')}` : ''}
 
 Sheets:
 ${sheetLines.length ? sheetLines.join('\n') : '- None detected'}
@@ -519,7 +618,10 @@ Return exactly these sections:
 export function AIDashboardStudioPage() {
   const { connection } = useConnection();
   const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
+  const logOperation = useLogOperation();
   const excelFileInputRef = useRef<HTMLInputElement>(null);
+  const aiRunTrackersRef = useRef<Partial<Record<AiRunLane, { cancelled: boolean; requestKey: string; jobId?: string; startedAt: number }>>>({});
+  const timedOutAiRunRef = useRef<AiRunContext | null>(null);
   const [studioLane, setStudioLane] = useState<DashboardStudioLane>('builder');
   const [dashboards, setDashboards] = useState<CachedDashboard[]>([]);
   const [dashboardsSyncedAt, setDashboardsSyncedAt] = useState<number | null>(null);
@@ -533,7 +635,12 @@ export function AIDashboardStudioPage() {
   const [chatUrl, setChatUrl] = useState('');
   const [aiConversationId, setAiConversationId] = useState('');
   const [reviewStatus, setReviewStatus] = useState('');
-  const [error, setError] = useState('');
+  const [reviewProgress, setReviewProgress] = useState('');
+  const [reviewError, setReviewError] = useState('');
+  const [builderError, setBuilderError] = useState('');
+  const [excelError, setExcelError] = useState('');
+  const [activeAiJobs, setActiveAiJobs] = useState<Partial<Record<AiRunLane, string>>>({});
+  const [timedOutAiRun, setTimedOutAiRun] = useState<TimedOutAiRun | null>(null);
   const [studioModels, setStudioModels] = useState<OmniModel[]>([]);
   const [loadingStudioModels, setLoadingStudioModels] = useState(false);
   const [studioModelSearch, setStudioModelSearch] = useState('');
@@ -579,7 +686,8 @@ export function AIDashboardStudioPage() {
     setSelectedDashboard(null);
     setDashboard(null);
     setInspecting(false);
-    setError('');
+    setReviewError('');
+    setReviewProgress('');
   }, [connection.baseUrl, connectionKey]);
 
   useEffect(() => {
@@ -590,7 +698,11 @@ export function AIDashboardStudioPage() {
         const response = await listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
         if (!cancelled) setStudioModels(Array.isArray(response.models) ? response.models : []);
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load Omni models.');
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : 'Failed to load Omni models.';
+          setBuilderError(message);
+          setExcelError(message);
+        }
       } finally {
         if (!cancelled) setLoadingStudioModels(false);
       }
@@ -628,10 +740,214 @@ export function AIDashboardStudioPage() {
     };
   }, [connection.baseUrl, connection.apiKey, studioModelId]);
 
+  function setLaneStatus(lane: AiRunLane, value: string) {
+    if (lane === 'review') setReviewStatus(value);
+    if (lane === 'builder') setBuilderStatus(value);
+    if (lane === 'excel' || lane === 'excel_dashboard') setExcelStatus(value);
+  }
+
+  function setLaneProgress(lane: AiRunLane, value: string) {
+    if (lane === 'review') setReviewProgress(value);
+    if (lane === 'builder') setBuilderStatus(value);
+    if (lane === 'excel' || lane === 'excel_dashboard') setExcelStatus(value);
+  }
+
+  function setLaneRunning(lane: AiRunLane, value: boolean) {
+    if (lane === 'review') setReviewing(value);
+    if (lane === 'builder') setBuilderRunning(value);
+    if (lane === 'excel') setExcelRunning(value);
+    if (lane === 'excel_dashboard') setExcelDashboardRunning(value);
+  }
+
+  function setLaneError(lane: AiRunLane, value: string) {
+    if (lane === 'review') setReviewError(value);
+    if (lane === 'builder') setBuilderError(value);
+    if (lane === 'excel' || lane === 'excel_dashboard') setExcelError(value);
+  }
+
+  function laneLabel(lane: AiRunLane) {
+    if (lane === 'review') return 'review';
+    if (lane === 'builder') return 'dashboard builder';
+    if (lane === 'excel_dashboard') return 'Excel dashboard builder';
+    return 'Excel conversion';
+  }
+
+  function beginAiRun(lane: AiRunLane, modelId: string, topicName?: string, dashboardId?: string): AiRunContext {
+    const context: AiRunContext = {
+      lane,
+      requestKey: connectionKey,
+      baseUrl: connection.baseUrl,
+      apiKey: connection.apiKey,
+      startedAt: Date.now(),
+      modelId,
+      topicName,
+      dashboardId,
+    };
+    aiRunTrackersRef.current[lane] = {
+      cancelled: false,
+      requestKey: context.requestKey,
+      startedAt: context.startedAt,
+    };
+    setActiveAiJobs((current) => {
+      const next = { ...current };
+      delete next[lane];
+      return next;
+    });
+    setTimedOutAiRun((current) => current?.lane === lane ? null : current);
+    if (timedOutAiRunRef.current?.lane === lane) timedOutAiRunRef.current = null;
+    return context;
+  }
+
+  function markAiRunJob(context: AiRunContext, jobId: string) {
+    context.jobId = jobId;
+    const tracker = aiRunTrackersRef.current[context.lane];
+    if (tracker) tracker.jobId = jobId;
+    setActiveAiJobs((current) => ({ ...current, [context.lane]: jobId }));
+  }
+
+  function isAiRunCurrent(context: AiRunContext) {
+    const tracker = aiRunTrackersRef.current[context.lane];
+    return Boolean(
+      tracker &&
+      !tracker.cancelled &&
+      tracker.requestKey === context.requestKey &&
+      isActiveConnectionRequest(context.requestKey)
+    );
+  }
+
+  function finishAiRun(context: AiRunContext) {
+    const tracker = aiRunTrackersRef.current[context.lane];
+    if (tracker?.startedAt === context.startedAt) {
+      delete aiRunTrackersRef.current[context.lane];
+    }
+    setActiveAiJobs((current) => {
+      const next = { ...current };
+      delete next[context.lane];
+      return next;
+    });
+  }
+
+  function logAiRun(context: AiRunContext, outcome: 'succeeded' | 'failed' | 'cancelled' | 'timed out', message?: string) {
+    const jobPart = context.jobId ? `job ${shortenId(context.jobId)}` : 'job not returned';
+    const modelPart = context.modelId ? `model ${shortenId(context.modelId)}` : 'model unknown';
+    const topicPart = context.topicName ? ` topic ${context.topicName}` : '';
+    const dashboardPart = context.dashboardId ? ` dashboard ${shortenId(context.dashboardId)}` : '';
+    const detailPart = message ? ` - ${message.slice(0, 140)}` : '';
+    logOperation('ai_query', `AI Dashboard Studio ${laneLabel(context.lane)} ${outcome}: ${jobPart}, ${modelPart}${topicPart}${dashboardPart}${detailPart}`, {
+      successCount: outcome === 'succeeded' ? 1 : 0,
+      failureCount: outcome === 'succeeded' ? 0 : 1,
+      durationMs: Date.now() - context.startedAt,
+    });
+  }
+
+  async function cancelActiveAiRun(lane: AiRunLane) {
+    const tracker = aiRunTrackersRef.current[lane];
+    if (!tracker) return;
+    tracker.cancelled = true;
+    const jobId = tracker.jobId;
+    const context: AiRunContext = {
+      lane,
+      requestKey: tracker.requestKey,
+      baseUrl: connection.baseUrl,
+      apiKey: connection.apiKey,
+      startedAt: tracker.startedAt,
+      modelId: studioModelId || dashboard?.modelId || '',
+      topicName: studioTopicName || dashboard?.topics[0],
+      dashboardId: lane === 'review' ? dashboard?.id : undefined,
+      jobId,
+    };
+    setLaneStatus(lane, 'Cancelled.');
+    setLaneRunning(lane, false);
+    setTimedOutAiRun((current) => current?.lane === lane ? null : current);
+    if (timedOutAiRunRef.current?.lane === lane) timedOutAiRunRef.current = null;
+    setActiveAiJobs((current) => {
+      const next = { ...current };
+      delete next[lane];
+      return next;
+    });
+    if (jobId) {
+      try {
+        await cancelAiJob(connection.baseUrl, connection.apiKey, jobId);
+      } catch (err) {
+        setLaneError(lane, err instanceof Error ? err.message : 'Could not cancel the Omni AI job.');
+      }
+    }
+    logAiRun(context, 'cancelled');
+  }
+
+  function applyAiOutcome(context: AiRunContext, outcome: { message: string; conversationId: string; chatUrl: string }) {
+    if (context.lane === 'review') {
+      setAiMessage(outcome.message);
+      if (outcome.conversationId) setAiConversationId(outcome.conversationId);
+      setChatUrl(outcome.chatUrl || chatUrl);
+      setReviewStatus('Review complete.');
+    } else if (context.lane === 'builder') {
+      setBuilderMessage(outcome.message);
+      setBuilderConversationId(outcome.conversationId);
+      setBuilderChatUrl(outcome.chatUrl || builderChatUrl);
+      setBuilderStatus('Dashboard developer handoff ready.');
+    } else if (context.lane === 'excel') {
+      setExcelMessage(outcome.message);
+      setExcelConversationId(outcome.conversationId);
+      setExcelChatUrl(outcome.chatUrl || excelChatUrl);
+      setExcelStatus('Excel formula and dashboard conversion analysis ready.');
+    } else {
+      setExcelDashboardMessage(outcome.message);
+      setExcelConversationId(outcome.conversationId);
+      setExcelChatUrl(outcome.chatUrl || excelChatUrl);
+      setExcelStatus('Excel dashboard handoff ready.');
+    }
+  }
+
+  async function keepWaitingForTimedOutRun() {
+    const context = timedOutAiRunRef.current;
+    if (!context?.jobId) return;
+    aiRunTrackersRef.current[context.lane] = {
+      cancelled: false,
+      requestKey: context.requestKey,
+      jobId: context.jobId,
+      startedAt: context.startedAt,
+    };
+    setActiveAiJobs((current) => ({ ...current, [context.lane]: context.jobId || '' }));
+    setTimedOutAiRun(null);
+    setLaneRunning(context.lane, true);
+    setLaneError(context.lane, '');
+    setLaneStatus(context.lane, 'Still waiting for Omni AI...');
+    try {
+      const pollResult = await waitForAiJob(context);
+      const finalJob = pollResult.job;
+      const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
+      if (pollResult.timedOut && !TERMINAL_AI_STATES.includes(finalState)) {
+        setTimedOutAiRun({ lane: context.lane, jobId: context.jobId, chatUrl: context.createdChatUrl || '' });
+        setLaneStatus(context.lane, 'Omni is still working on this job. Keep waiting, open Omni chat, or cancel it.');
+        logAiRun(context, 'timed out');
+        return;
+      }
+      if (['FAILED', 'CANCELLED', 'CANCELED'].includes(finalState)) throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
+      const outcome = await resolveAiJobOutcome(context, finalJob);
+      applyAiOutcome(context, outcome);
+      logAiRun(context, 'succeeded');
+      finishAiRun(context);
+      timedOutAiRunRef.current = null;
+    } catch (err) {
+      if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) return;
+      const message = err instanceof Error ? err.message : 'Failed while waiting for Omni AI.';
+      setLaneError(context.lane, message);
+      setLaneStatus(context.lane, `${laneLabel(context.lane)} failed: ${message}`);
+      logAiRun(context, 'failed', message);
+      finishAiRun(context);
+      timedOutAiRunRef.current = null;
+    } finally {
+      if (!timedOutAiRunRef.current || timedOutAiRunRef.current.lane !== context.lane) {
+        setLaneRunning(context.lane, false);
+      }
+    }
+  }
+
   async function refreshDashboardList() {
     const requestKey = connectionKey;
     setLoadingDashboards(true);
-    setError('');
+    setReviewError('');
     try {
       const next = await fetchDashboardList(connection.baseUrl, connection.apiKey);
       if (!isActiveConnectionRequest(requestKey)) return;
@@ -640,7 +956,7 @@ export function AIDashboardStudioPage() {
       dashboardCache.save(connection.baseUrl, next);
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
-      setError(err instanceof Error ? err.message : 'Failed to load dashboards');
+      setReviewError(err instanceof Error ? err.message : 'Failed to load dashboards');
     } finally {
       if (isActiveConnectionRequest(requestKey)) setLoadingDashboards(false);
     }
@@ -657,11 +973,12 @@ export function AIDashboardStudioPage() {
       setChatUrl('');
       setAiConversationId('');
       setReviewStatus('');
+      setReviewProgress('');
     } else {
       setReviewStatus(aiConversationId ? 'Continuing the existing Omni AI chat for this dashboard.' : '');
     }
     setInspecting(true);
-    setError('');
+    setReviewError('');
     try {
       const [summary, enrichmentMap] = await Promise.all([
         fetchDashboardSummary(connection.baseUrl, connection.apiKey, picked.id),
@@ -691,38 +1008,48 @@ export function AIDashboardStudioPage() {
       });
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
-      setError(err instanceof Error ? err.message : 'Failed to inspect dashboard');
+      setReviewError(err instanceof Error ? err.message : 'Failed to inspect dashboard');
     } finally {
       if (isActiveConnectionRequest(requestKey)) setInspecting(false);
     }
   }
 
-  async function waitForAiJob(jobId: string, pollIntervalMs = 3000, maxPolls = 36) {
+  async function waitForAiJob(context: AiRunContext, pollIntervalMs = 3000, maxPolls = 36) {
+    if (!context.jobId) throw new Error('Omni did not return an AI job ID.');
     let latest: OmniAiJob | null = null;
     for (let i = 0; i < maxPolls; i += 1) {
-      latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId);
+      if (!isAiRunCurrent(context)) throw new AiRunStaleError();
+      latest = await getAiJob(context.baseUrl, context.apiKey, context.jobId);
+      if (!isAiRunCurrent(context)) throw new AiRunStaleError();
       setAiJob((prev) => ({ ...(prev || {}), ...latest }));
+      const progress = extractAiProgressMessage(latest);
+      if (progress) setLaneProgress(context.lane, progress);
       const state = normalizeAiState(latest.state || latest.status);
-      if (['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'CANCELED'].includes(state)) break;
+      if (TERMINAL_AI_STATES.includes(state)) return { job: latest, timedOut: false };
       await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
     }
-    return latest;
+    if (!isAiRunCurrent(context)) throw new AiRunStaleError();
+    return { job: latest, timedOut: true };
   }
 
-  async function getAiResult(jobId: string, finalJob: OmniAiJob | null) {
+  async function getAiResult(context: AiRunContext, finalJob: OmniAiJob | null) {
+    if (!context.jobId) throw new Error('Omni did not return an AI job ID.');
     const fallbackFromFinalJob = jobToResult(finalJob);
     let lastError: unknown = null;
     for (let i = 0; i < 8; i += 1) {
       try {
-        const result = await getAiJobResult(connection.baseUrl, connection.apiKey, jobId);
+        if (!isAiRunCurrent(context)) throw new AiRunStaleError();
+        const result = await getAiJobResult(context.baseUrl, context.apiKey, context.jobId);
         if (hasAiResultContent(result, finalJob)) return result;
       } catch (err) {
+        if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) throw err;
         lastError = err;
       }
       await new Promise((resolve) => setTimeout(resolve, 3000));
     }
 
-    const latest = await getAiJob(connection.baseUrl, connection.apiKey, jobId).catch(() => null);
+    if (!isAiRunCurrent(context)) throw new AiRunStaleError();
+    const latest = await getAiJob(context.baseUrl, context.apiKey, context.jobId).catch(() => null);
     const fallback = jobToResult(latest) || fallbackFromFinalJob;
     if (fallback) return fallback;
 
@@ -732,69 +1059,97 @@ export function AIDashboardStudioPage() {
     throw lastError instanceof Error ? lastError : new Error('AI result was not available yet.');
   }
 
+  async function resolveAiJobOutcome(context: AiRunContext, finalJob: OmniAiJob | null) {
+    const finalConversationId =
+      readFirstString(finalJob, ['conversationId', 'conversation_id']) ||
+      context.createdConversationId ||
+      '';
+    const finalChatUrl =
+      readFirstString(finalJob, ['omniChatUrl', 'omni_chat_url']) ||
+      context.createdChatUrl ||
+      buildOmniChatUrl(context.baseUrl, finalConversationId);
+    setLaneStatus(context.lane, 'Retrieving AI output...');
+    let result: OmniAiJobResult | null = null;
+    try {
+      result = await getAiResult(context, finalJob);
+    } catch (err) {
+      if (finalChatUrl) {
+        return {
+          message:
+            'Blobby started the Omni dashboard conversation, but Omni did not expose the full AI result stream back to OmniKit yet. Continue the dashboard build in Omni chat using the handoff link below.',
+          conversationId: finalConversationId,
+          chatUrl: finalChatUrl,
+        };
+      }
+      throw err;
+    }
+    const conversationId =
+      readFirstString(result, ['conversationId', 'conversation_id']) ||
+      finalConversationId;
+    const chatUrl =
+      readFirstString(result, ['omniChatUrl', 'omni_chat_url']) ||
+      finalChatUrl ||
+      buildOmniChatUrl(context.baseUrl, conversationId);
+    const aiMessage = extractAiMessage(result, finalJob);
+    const message = aiMessage || (chatUrl
+      ? 'Blobby completed the Omni dashboard conversation, but Omni did not expose the full narrative result back to OmniKit. Continue in Omni chat using the handoff link below, then review any draft dashboard tiles for errors before saving or sharing.'
+      : 'Blobby completed, but no narrative result was returned.');
+    return { message, conversationId, chatUrl };
+  }
+
   async function runModelAiPrompt(params: {
+    lane: AiRunLane;
     modelId: string;
     topicName?: string;
+    dashboardId?: string;
     prompt: string;
     conversationId?: string;
     status: (value: string) => void;
   }) {
+    const context = beginAiRun(params.lane, params.modelId, params.topicName, params.dashboardId);
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 3; attempt += 1) {
       try {
         params.status(attempt > 0 ? 'Retrying Omni AI job...' : 'Creating Omni AI job...');
-        const created = await createAiJob(connection.baseUrl, connection.apiKey, {
+        const created = await createAiJob(context.baseUrl, context.apiKey, {
           modelId: params.modelId,
           topicName: params.topicName || undefined,
           prompt: params.prompt,
           conversationId: params.conversationId || undefined,
         });
+        if (!isAiRunCurrent(context)) throw new AiRunStaleError();
         setAiJob(created);
         const jobId = created.jobId || created.id;
         if (!jobId) throw new Error('Omni did not return an AI job ID.');
+        markAiRunJob(context, jobId);
         const createdConversationId = readFirstString(created, ['conversationId', 'conversation_id']) || params.conversationId || '';
         const createdChatUrl =
           readFirstString(created, ['omniChatUrl', 'omni_chat_url']) ||
-          buildOmniChatUrl(connection.baseUrl, createdConversationId);
+          buildOmniChatUrl(context.baseUrl, createdConversationId);
+        context.createdConversationId = createdConversationId;
+        context.createdChatUrl = createdChatUrl;
         params.status('Waiting for Blobby to finish...');
-        const finalJob = await waitForAiJob(jobId);
+        const pollResult = await waitForAiJob(context);
+        const finalJob = pollResult.job;
         const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
+        if (pollResult.timedOut && !TERMINAL_AI_STATES.includes(finalState)) {
+          timedOutAiRunRef.current = context;
+          setTimedOutAiRun({ lane: context.lane, jobId, chatUrl: createdChatUrl });
+          setLaneStatus(context.lane, 'Omni is still working on this job. Keep waiting, open Omni chat, or cancel it.');
+          logAiRun(context, 'timed out');
+          throw new AiJobTimeoutError(context, createdChatUrl);
+        }
         if (['FAILED', 'CANCELLED', 'CANCELED'].includes(finalState)) throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
-        params.status('Retrieving Blobby output...');
-        const finalConversationId =
-          readFirstString(finalJob, ['conversationId', 'conversation_id']) ||
-          createdConversationId;
-        const finalChatUrl =
-          readFirstString(finalJob, ['omniChatUrl', 'omni_chat_url']) ||
-          createdChatUrl ||
-          buildOmniChatUrl(connection.baseUrl, finalConversationId);
-        let result: OmniAiJobResult | null = null;
-        try {
-          result = await getAiResult(jobId, finalJob);
-        } catch (err) {
-          if (finalChatUrl) {
-            return {
-              message:
-                'Blobby started the Omni dashboard conversation, but Omni did not expose the full AI result stream back to OmniKit yet. Continue the dashboard build in Omni chat using the handoff link below.',
-              conversationId: finalConversationId,
-              chatUrl: finalChatUrl,
-            };
-          }
+        const outcome = await resolveAiJobOutcome(context, finalJob);
+        logAiRun(context, 'succeeded');
+        finishAiRun(context);
+        return outcome;
+      } catch (err) {
+        if (err instanceof AiJobTimeoutError) throw err;
+        if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) {
+          finishAiRun(context);
           throw err;
         }
-        const conversationId =
-          readFirstString(result, ['conversationId', 'conversation_id']) ||
-          finalConversationId;
-        const chatUrl =
-          readFirstString(result, ['omniChatUrl', 'omni_chat_url']) ||
-          finalChatUrl ||
-          buildOmniChatUrl(connection.baseUrl, conversationId);
-        const aiMessage = extractAiMessage(result, finalJob);
-        const message = aiMessage || (chatUrl
-          ? 'Blobby completed the Omni dashboard conversation, but Omni did not expose the full narrative result back to OmniKit. Continue in Omni chat using the handoff link below, then review any draft dashboard tiles for errors before saving or sharing.'
-          : 'Blobby completed, but no narrative result was returned.');
-        return { message, conversationId, chatUrl };
-      } catch (err) {
         lastError = err;
         const retryable = err instanceof ApiError && [429, 500, 502, 503].includes(err.status);
         if (!retryable || attempt === 2) break;
@@ -802,91 +1157,60 @@ export function AIDashboardStudioPage() {
         await new Promise((resolve) => setTimeout(resolve, 8000));
       }
     }
+    logAiRun(context, 'failed', lastError instanceof Error ? lastError.message : undefined);
+    finishAiRun(context);
     throw lastError instanceof Error ? lastError : new Error('Omni AI job failed to start.');
-  }
-
-  async function createDashboardAiJobWithRetry(prompt: string) {
-    let lastError: unknown = null;
-    for (let attempt = 0; attempt < 3; attempt += 1) {
-      try {
-        return await createAiJob(connection.baseUrl, connection.apiKey, {
-          modelId: dashboard?.modelId || '',
-          topicName: dashboard?.topics[0],
-          prompt,
-          conversationId: aiConversationId || undefined,
-        });
-      } catch (err) {
-        lastError = err;
-        const retryable = err instanceof ApiError && [429, 500, 502, 503].includes(err.status);
-        if (!retryable || attempt === 2) break;
-        setReviewStatus('Omni is busy, waiting a moment before retrying...');
-        await new Promise((resolve) => setTimeout(resolve, 8000));
-      }
-    }
-    throw lastError instanceof Error ? lastError : new Error('Omni AI review failed to start.');
   }
 
   async function runDashboardReview() {
     if (!dashboard?.modelId) return;
     setReviewing(true);
-    setError('');
+    setReviewError('');
+    setReviewProgress('');
     setAiMessage('');
     setReviewStatus(aiConversationId ? 'Continuing existing Omni AI chat...' : 'Starting Omni AI review...');
     try {
-      const prompt = buildDashboardReviewPrompt(dashboard);
-      setReviewStatus(aiConversationId ? 'Creating follow-up AI job in the same chat...' : 'Creating Omni AI job...');
-      const created = await createDashboardAiJobWithRetry(prompt);
-      setAiJob(created);
-      const jobId = created.jobId || created.id;
-      if (!jobId) throw new Error('Omni did not return an AI job ID.');
-      const createdConversationId = readFirstString(created, ['conversationId', 'conversation_id']);
-      if (createdConversationId) setAiConversationId(createdConversationId);
-      setReviewStatus('Waiting for Omni AI to finish...');
-      const finalJob = await waitForAiJob(jobId);
-      const finalState = normalizeAiState(finalJob?.state || finalJob?.status);
-      const finalConversationId = readFirstString(finalJob, ['conversationId', 'conversation_id']) || createdConversationId || aiConversationId;
-      if (['FAILED', 'CANCELLED', 'CANCELED'].includes(finalState)) {
-        throw new Error(`Omni AI job ${finalState.toLowerCase()}.`);
-      }
-      setReviewStatus('Retrieving AI review output...');
-      const result = await getAiResult(jobId, finalJob);
-      const message = extractAiMessage(result, finalJob) || 'AI review completed, but no narrative result was returned.';
-      const resultConversationId = readFirstString(result, ['conversationId', 'conversation_id']);
-      const nextConversationId = resultConversationId || finalConversationId;
-      if (nextConversationId) setAiConversationId(nextConversationId);
-      setAiMessage(message);
+      const outcome = await runModelAiPrompt({
+        lane: 'review',
+        modelId: dashboard.modelId,
+        topicName: dashboard.topics[0],
+        dashboardId: dashboard.id,
+        conversationId: aiConversationId || undefined,
+        status: setReviewStatus,
+        prompt: buildDashboardReviewPrompt(dashboard),
+      });
+      setAiMessage(outcome.message);
+      if (outcome.conversationId) setAiConversationId(outcome.conversationId);
+      setChatUrl(outcome.chatUrl || chatUrl);
       setReviewStatus('Review complete.');
-      setChatUrl(
-        readFirstString(result, ['omniChatUrl', 'omni_chat_url']) ||
-        readFirstString(finalJob, ['omniChatUrl', 'omni_chat_url']) ||
-        readFirstString(created, ['omniChatUrl', 'omni_chat_url']) ||
-        chatUrl
-      );
     } catch (err) {
+      if (err instanceof AiJobTimeoutError) return;
+      if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) return;
       const message = err instanceof Error ? err.message : 'Failed to run AI dashboard review';
-      setError(message);
+      setReviewError(message);
       setReviewStatus(`Review failed: ${message}`);
     } finally {
-      setReviewing(false);
+      if (!timedOutAiRunRef.current || timedOutAiRunRef.current.lane !== 'review') setReviewing(false);
     }
   }
 
   async function runDashboardDeveloper() {
     const selectedModel = studioModels.find((model) => model.id === studioModelId);
     if (!selectedModel) {
-      setError('Choose an Omni model before starting the dashboard developer lane.');
+      setBuilderError('Choose an Omni model before starting the dashboard developer lane.');
       return;
     }
     if (!builderGoal.trim()) {
-      setError('Describe the dashboard goal before asking Blobby to build the first pass.');
+      setBuilderError('Describe the dashboard goal before asking Blobby to build the first pass.');
       return;
     }
     setBuilderRunning(true);
     setBuilderMessage('');
-    setError('');
+    setBuilderError('');
     setBuilderStatus(builderConversationId ? 'Continuing dashboard developer chat...' : 'Starting dashboard developer chat...');
     try {
       const outcome = await runModelAiPrompt({
+        lane: 'builder',
         modelId: selectedModel.id,
         topicName: studioTopicName || undefined,
         conversationId: builderConversationId || undefined,
@@ -909,18 +1233,27 @@ export function AIDashboardStudioPage() {
       setBuilderChatUrl(outcome.chatUrl || builderChatUrl);
       setBuilderStatus('Dashboard developer handoff ready.');
     } catch (err) {
+      if (err instanceof AiJobTimeoutError) return;
+      if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) return;
       const message = err instanceof Error ? err.message : 'Failed to start Blobby dashboard developer.';
-      setError(message);
+      setBuilderError(message);
       setBuilderStatus(`Dashboard developer failed: ${message}`);
     } finally {
-      setBuilderRunning(false);
+      if (!timedOutAiRunRef.current || timedOutAiRunRef.current.lane !== 'builder') setBuilderRunning(false);
     }
   }
 
   async function handleExcelUpload(file: File | undefined) {
     if (!file) return;
+    if (file.size > MAX_EXCEL_UPLOAD_BYTES) {
+      const message = `Workbook is ${formatSize(file.size)}. Upload a file under ${formatSize(MAX_EXCEL_UPLOAD_BYTES)} so parsing does not freeze the browser.`;
+      setExcelError(message);
+      setExcelStatus(`Excel parsing blocked: ${message}`);
+      if (excelFileInputRef.current) excelFileInputRef.current.value = '';
+      return;
+    }
     setExcelParsing(true);
-    setError('');
+    setExcelError('');
     setExcelInventory(null);
     setExcelMessage('');
     setExcelDashboardMessage('');
@@ -932,7 +1265,7 @@ export function AIDashboardStudioPage() {
       setExcelStatus(`Parsed ${inventory.summary}.`);
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Failed to parse Excel workbook.';
-      setError(message);
+      setExcelError(message);
       setExcelStatus(`Excel parsing failed: ${message}`);
     } finally {
       setExcelParsing(false);
@@ -943,20 +1276,21 @@ export function AIDashboardStudioPage() {
   async function runExcelConversion() {
     const selectedModel = studioModels.find((model) => model.id === studioModelId);
     if (!selectedModel) {
-      setError('Choose an Omni model before asking Blobby to convert Excel formulas.');
+      setExcelError('Choose an Omni model before asking Blobby to convert Excel formulas.');
       return;
     }
     if (!excelInventory) {
-      setError('Upload an .xlsx workbook before running Excel conversion.');
+      setExcelError('Upload an .xlsx workbook before running Excel conversion.');
       return;
     }
     setExcelRunning(true);
-    setError('');
+    setExcelError('');
     setExcelMessage('');
     setExcelDashboardMessage('');
     setExcelStatus('Starting Excel conversion analysis...');
     try {
       const outcome = await runModelAiPrompt({
+        lane: 'excel',
         modelId: selectedModel.id,
         topicName: studioTopicName || undefined,
         conversationId: excelConversationId || undefined,
@@ -976,25 +1310,28 @@ export function AIDashboardStudioPage() {
       setExcelChatUrl(outcome.chatUrl || excelChatUrl);
       setExcelStatus('Excel formula and dashboard conversion analysis ready.');
     } catch (err) {
+      if (err instanceof AiJobTimeoutError) return;
+      if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) return;
       const message = err instanceof Error ? err.message : 'Failed to convert Excel workbook with Blobby.';
-      setError(message);
+      setExcelError(message);
       setExcelStatus(`Excel conversion failed: ${message}`);
     } finally {
-      setExcelRunning(false);
+      if (!timedOutAiRunRef.current || timedOutAiRunRef.current.lane !== 'excel') setExcelRunning(false);
     }
   }
 
   async function runExcelDashboardDeveloper() {
     const selectedModel = studioModels.find((model) => model.id === studioModelId);
     if (!selectedModel || !excelInventory || !excelMessage) {
-      setError('Run Excel conversion analysis before starting a dashboard build chat.');
+      setExcelError('Run Excel conversion analysis before starting a dashboard build chat.');
       return;
     }
     setExcelDashboardRunning(true);
-    setError('');
+    setExcelError('');
     setExcelStatus('Starting Excel dashboard build chat...');
     try {
       const outcome = await runModelAiPrompt({
+        lane: 'excel_dashboard',
         modelId: selectedModel.id,
         topicName: studioTopicName || undefined,
         conversationId: excelConversationId || undefined,
@@ -1014,16 +1351,25 @@ export function AIDashboardStudioPage() {
       setExcelChatUrl(outcome.chatUrl || excelChatUrl);
       setExcelStatus('Excel dashboard handoff ready.');
     } catch (err) {
+      if (err instanceof AiJobTimeoutError) return;
+      if (err instanceof AiRunStaleError || err instanceof AiRunCancelledError) return;
       const message = err instanceof Error ? err.message : 'Failed to start Excel dashboard build chat.';
-      setError(message);
+      setExcelError(message);
       setExcelStatus(`Excel dashboard build failed: ${message}`);
     } finally {
-      setExcelDashboardRunning(false);
+      if (!timedOutAiRunRef.current || timedOutAiRunRef.current.lane !== 'excel_dashboard') setExcelDashboardRunning(false);
     }
   }
 
   const aiStatus = normalizeAiState(aiJob?.state || aiJob?.status);
   const canRunAi = Boolean(dashboard?.modelId && !reviewing && !inspecting);
+  const activeLaneError = studioLane === 'review' ? reviewError : studioLane === 'builder' ? builderError : excelError;
+  const activeLaneTimeout = timedOutAiRun && (
+    (studioLane === 'review' && timedOutAiRun.lane === 'review') ||
+    (studioLane === 'builder' && timedOutAiRun.lane === 'builder') ||
+    (studioLane === 'excel' && (timedOutAiRun.lane === 'excel' || timedOutAiRun.lane === 'excel_dashboard'))
+  ) ? timedOutAiRun : null;
+  const reviewScopeNote = dashboard ? dashboardReviewScopeNote(dashboard) : '';
   const selectedStudioModel = studioModels.find((model) => model.id === studioModelId) || null;
   const filteredStudioModels = studioModels.filter((model) => {
     const needle = studioModelSearch.toLowerCase().trim();
@@ -1109,8 +1455,33 @@ export function AIDashboardStudioPage() {
         icon={<Blobby mood="dashboard" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
 
-      {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
+      {activeLaneError && (
+        <div role="alert" className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{activeLaneError}</div>
+      )}
+
+      {activeLaneTimeout && (
+        <div className="rounded-card border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+          <div className="font-semibold">Omni is still working on this AI job.</div>
+          <div className="mt-1 text-amber-800">
+            Job <span className="font-mono">{shortenId(activeLaneTimeout.jobId)}</span> is still running. Keep waiting here, continue in Omni chat, or cancel the job.
+          </div>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button type="button" onClick={() => void keepWaitingForTimedOutRun()} className="btn-secondary text-xs">
+              <Loader2 size={13} />
+              Keep waiting
+            </button>
+            {activeLaneTimeout.chatUrl && (
+              <a href={activeLaneTimeout.chatUrl} className="btn-secondary text-xs">
+                <ExternalLink size={13} />
+                Open Omni chat
+              </a>
+            )}
+            <button type="button" onClick={() => void cancelActiveAiRun(activeLaneTimeout.lane)} className="btn-secondary text-xs text-red-700">
+              <XCircle size={13} />
+              Cancel job
+            </button>
+          </div>
+        </div>
       )}
 
       <StudioLaneSelector activeLane={studioLane} onChange={setStudioLane} />
@@ -1214,6 +1585,11 @@ export function AIDashboardStudioPage() {
                       <span className="text-content-secondary">Tiles / filters</span>
                       <span className="text-content-primary">{dashboard.tiles.length} / {dashboard.filters.length}</span>
                     </div>
+                    {reviewScopeNote && (
+                      <div className="rounded-card border border-amber-100 bg-amber-50 px-3 py-2 text-[11px] leading-5 text-amber-800">
+                        Scope note: {reviewScopeNote}.
+                      </div>
+                    )}
                   </div>
                 )}
 
@@ -1237,14 +1613,26 @@ export function AIDashboardStudioPage() {
               </div>
             )}
 
-            <button
-              onClick={runDashboardReview}
-              disabled={!canRunAi}
-              className={`${canRunAi ? 'btn-primary' : 'bg-surface-secondary border border-border text-content-tertiary cursor-not-allowed'} w-full text-sm inline-flex items-center justify-center gap-2 rounded-button px-5 py-2.5 font-semibold transition-all`}
-            >
-              {reviewing ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
-              Run Focused AI Review
-            </button>
+            <div className="grid gap-2">
+              <button
+                onClick={runDashboardReview}
+                disabled={!canRunAi}
+                className={`${canRunAi ? 'btn-primary' : 'bg-surface-secondary border border-border text-content-tertiary cursor-not-allowed'} w-full text-sm inline-flex items-center justify-center gap-2 rounded-button px-5 py-2.5 font-semibold transition-all`}
+              >
+                {reviewing ? <Loader2 size={15} className="animate-spin" /> : <Sparkles size={15} />}
+                Run Focused AI Review
+              </button>
+              {reviewing && activeAiJobs.review && (
+                <button
+                  type="button"
+                  onClick={() => void cancelActiveAiRun('review')}
+                  className="btn-secondary w-full justify-center text-sm text-red-700"
+                >
+                  <XCircle size={14} />
+                  Cancel AI review
+                </button>
+              )}
+            </div>
           </div>
 
 	          <div className="card p-0 overflow-hidden h-full min-h-[420px] xl:self-stretch xl:col-start-1 xl:row-start-2 flex flex-col">
@@ -1309,7 +1697,7 @@ export function AIDashboardStudioPage() {
                 <AIWorkingAnimation
                   variant="dashboard"
                   title="Reviewing dashboard with Omni AI"
-                  detail="Blobby is checking tiles, filters, topic routing, semantic dependencies, and the final admin recommendations."
+                  detail={reviewProgress || 'Blobby is checking tiles, filters, topic routing, semantic dependencies, and the final admin recommendations.'}
                   statusLabel={reviewStatus || 'Working'}
                   steps={dashboardReviewSteps}
                 />
@@ -1430,6 +1818,7 @@ export function AIDashboardStudioPage() {
           onColorScheme={setBuilderColorScheme}
           onNotes={setBuilderNotes}
           onRun={runDashboardDeveloper}
+          onCancel={() => void cancelActiveAiRun('builder')}
         />
       )}
 
@@ -1476,6 +1865,8 @@ export function AIDashboardStudioPage() {
           }}
           onAnalyze={runExcelConversion}
           onBuildDashboard={runExcelDashboardDeveloper}
+          onCancelAnalyze={() => void cancelActiveAiRun('excel')}
+          onCancelBuildDashboard={() => void cancelActiveAiRun('excel_dashboard')}
         />
       )}
     </div>
@@ -1670,6 +2061,7 @@ function DashboardDeveloperLane({
   onColorScheme,
   onNotes,
   onRun,
+  onCancel,
 }: {
   models: OmniModel[];
   loadingModels: boolean;
@@ -1701,6 +2093,7 @@ function DashboardDeveloperLane({
   onColorScheme: (value: string) => void;
   onNotes: (value: string) => void;
   onRun: () => void;
+  onCancel: () => void;
 }) {
   return (
     <div className="grid gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
@@ -1739,15 +2132,23 @@ function DashboardDeveloperLane({
             <LabeledTextarea label="Color / brand style" value={colorScheme} onChange={onColorScheme} placeholder="e.g. Neutral canvas, blue revenue charts, green positive variance, red risk states, accessible contrast" />
             <LabeledTextarea label="Additional notes" value={notes} onChange={onNotes} placeholder="Known constraints, fields to avoid, owner questions..." />
           </div>
-          <button
-            type="button"
-            onClick={onRun}
-            disabled={!selectedModel || !goal.trim() || running}
-            className="btn-primary text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
-          >
-            {running ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
-            Start New Dashboard Build
-          </button>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <button
+              type="button"
+              onClick={onRun}
+              disabled={!selectedModel || !goal.trim() || running}
+              className="btn-primary flex-1 text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {running ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
+              Start New Dashboard Build
+            </button>
+            {running && (
+              <button type="button" onClick={onCancel} className="btn-secondary justify-center text-sm text-red-700">
+                <XCircle size={14} />
+                Cancel
+              </button>
+            )}
+          </div>
           {status && <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs text-content-secondary">{status}</div>}
         </div>
 
@@ -1793,6 +2194,8 @@ function ExcelDashboardLane({
   onClear,
   onAnalyze,
   onBuildDashboard,
+  onCancelAnalyze,
+  onCancelBuildDashboard,
 }: {
   fileInputRef: RefObject<HTMLInputElement>;
   models: OmniModel[];
@@ -1824,6 +2227,8 @@ function ExcelDashboardLane({
   onClear: () => void;
   onAnalyze: () => void;
   onBuildDashboard: () => void;
+  onCancelAnalyze: () => void;
+  onCancelBuildDashboard: () => void;
 }) {
   return (
     <div className="grid gap-5 xl:grid-cols-[380px_minmax(0,1fr)]">
@@ -1920,20 +2325,32 @@ function ExcelDashboardLane({
               type="button"
               onClick={onAnalyze}
               disabled={!selectedModel || !inventory || running}
-              className="btn-primary text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
+              className="btn-primary flex-1 text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
             >
               {running ? <Loader2 size={14} className="animate-spin" /> : <ClipboardCheck size={14} />}
               Convert Formulas & Visuals
             </button>
+            {running && (
+              <button type="button" onClick={onCancelAnalyze} className="btn-secondary justify-center text-sm text-red-700">
+                <XCircle size={14} />
+                Cancel
+              </button>
+            )}
             <button
               type="button"
               onClick={onBuildDashboard}
               disabled={!selectedModel || !inventory || !message || dashboardRunning || intent === 'semantic_only'}
-              className="btn-secondary text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
+              className="btn-secondary flex-1 text-sm justify-center disabled:cursor-not-allowed disabled:opacity-60"
             >
               {dashboardRunning ? <Loader2 size={14} className="animate-spin" /> : <Send size={14} />}
               Start Guarded Draft Chat
             </button>
+            {dashboardRunning && (
+              <button type="button" onClick={onCancelBuildDashboard} className="btn-secondary justify-center text-sm text-red-700">
+                <XCircle size={14} />
+                Cancel
+              </button>
+            )}
           </div>
           {status && <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs text-content-secondary">{status}</div>}
         </div>
@@ -1971,6 +2388,7 @@ function LabeledTextarea({ label, value, onChange, placeholder }: { label: strin
 
 function ExcelInventoryPreview({ inventory }: { inventory: ExcelWorkbookInventory }) {
   const measureCandidates = inventory.formulas.filter((formula) => formula.classification === 'candidate_measure').length;
+  const scopeNotes = excelInventoryScopeNotes(inventory);
   return (
     <div className="space-y-3">
       <div className="grid gap-3 sm:grid-cols-4">
@@ -1985,6 +2403,11 @@ function ExcelInventoryPreview({ inventory }: { inventory: ExcelWorkbookInventor
         </summary>
         <div className="space-y-3 p-3">
           <div className="text-xs text-content-secondary">{inventory.fileName} · {formatSize(inventory.sizeBytes)} · {inventory.summary}</div>
+          {scopeNotes.length > 0 && (
+            <div className="rounded-card border border-amber-100 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              Scope note: {scopeNotes.join('; ')}.
+            </div>
+          )}
           <InventoryList
             title="Sheets"
             items={inventory.sheets.map((sheet) => `${sheet.name}: ${sheet.rowCount} rows, ${sheet.formulaCount} formulas, ${sheet.chartCount} charts`)}
