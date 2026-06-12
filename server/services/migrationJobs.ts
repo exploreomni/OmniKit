@@ -1,5 +1,3 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { OmniClient, OmniClientError } from './omniClient';
 import {
@@ -7,14 +5,30 @@ import {
   type PostMigrationAction,
   type SavedInstance,
 } from './nativeVault';
+import {
+  clearJobs as clearStoredJobs,
+  getJob as getStoredJob,
+  insertJob,
+  listJobs as listStoredJobs,
+  updateJobItem,
+  updateJobStatus,
+} from './jobStore';
+import {
+  publishMigrationJobEvent,
+} from './jobEvents';
+import {
+  sanitizeJob,
+  sanitizePostMigrationAction,
+} from './jobSanitizer';
 
-const DEFAULT_JOBS_PATH = './data/jobs.json';
+export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
+
 const PRIVATE_HOST_RE =
   /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0|::1$|fc00:|fd[0-9a-f]{2}:)/i;
 const LOOPBACK_NAMES = new Set(['localhost', '0.0.0.0']);
-const REDACTED = '[redacted]';
+const DEFAULT_DESTINATION_CONCURRENCY = 10;
 
-export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed';
+export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'warning' | 'skipped';
 export type JobItemKind = 'delete' | 'export' | 'import' | 'metadata' | 'post_action';
 
@@ -51,6 +65,7 @@ export interface MigrationJob {
   emptyFirst: boolean;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
+  parentJobId?: string;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
@@ -97,6 +112,7 @@ interface SourceMeta {
 }
 
 const runningJobs = new Set<string>();
+const canceledJobs = new Set<string>();
 const activePostMigrationActions = new Map<string, PostMigrationAction[]>();
 const FIELD_REF_KEYS = new Set([
   'field',
@@ -116,49 +132,6 @@ const FIELD_REF_KEYS = new Set([
   'series',
 ]);
 const FIELD_REF_PATTERN = /\b([A-Za-z_][\w/]*\.[A-Za-z_][\w]*(?:\[[A-Za-z_][\w]*\])?)\b/g;
-const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
-const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
-const PHONE_PATTERN = /\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g;
-const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
-
-export function getJobsPath(): string {
-  return process.env.OMNIKIT_JOBS_PATH || DEFAULT_JOBS_PATH;
-}
-
-function readJobs(): MigrationJob[] {
-  const jobsPath = getJobsPath();
-  if (!existsSync(jobsPath)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(jobsPath, 'utf8')) as unknown;
-    return Array.isArray(parsed) ? parsed.filter(isJob) : [];
-  } catch {
-    return [];
-  }
-}
-
-function isJob(value: unknown): value is MigrationJob {
-  return Boolean(value)
-    && typeof value === 'object'
-    && !Array.isArray(value)
-    && typeof (value as MigrationJob).id === 'string'
-    && Array.isArray((value as MigrationJob).items);
-}
-
-function writeJobs(jobs: MigrationJob[]): void {
-  const jobsPath = getJobsPath();
-  mkdirSync(dirname(jobsPath), { recursive: true });
-  writeFileSync(jobsPath, JSON.stringify(sanitizeJobHistory(jobs).slice(0, 100), null, 2), { mode: 0o600 });
-  chmodSync(jobsPath, 0o600);
-}
-
-function updateJob(job: MigrationJob): void {
-  const jobs = readJobs();
-  const existingIndex = jobs.findIndex((row) => row.id === job.id);
-  if (existingIndex >= 0) jobs[existingIndex] = job;
-  else jobs.unshift(job);
-  writeJobs(jobs.sort((a, b) => b.createdAt - a.createdAt));
-}
 
 function requireInstance(id: string): SavedInstance {
   const instance = getInstance(id);
@@ -189,77 +162,6 @@ function hashPayload(payload: unknown): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
 }
 
-function isLuhnValid(value: string): boolean {
-  const digits = value.replace(/\D/g, '');
-  if (digits.length < 13 || digits.length > 19) return false;
-  let sum = 0;
-  let shouldDouble = false;
-  for (let index = digits.length - 1; index >= 0; index -= 1) {
-    let digit = Number(digits[index]);
-    if (shouldDouble) {
-      digit *= 2;
-      if (digit > 9) digit -= 9;
-    }
-    sum += digit;
-    shouldDouble = !shouldDouble;
-  }
-  return sum % 10 === 0;
-}
-
-export function redactSensitiveText(value: string): string {
-  return value
-    .replace(TOKEN_PATTERN, `$1${REDACTED}`)
-    .replace(SECRET_ASSIGNMENT_PATTERN, `$1$2${REDACTED}`)
-    .replace(EMAIL_PATTERN, '[redacted-email]')
-    .replace(PHONE_PATTERN, '[redacted-phone]')
-    .replace(PAN_CANDIDATE_PATTERN, (candidate) => (isLuhnValid(candidate) ? '[redacted-pan]' : candidate));
-}
-
-function sanitizePostMigrationAction(action: PostMigrationAction): PostMigrationAction {
-  return {
-    name: redactSensitiveText(action.name),
-    method: action.method,
-    url: redactSensitiveText(action.url),
-    headers: Object.fromEntries(
-      Object.keys(action.headers || {}).map((key) => [redactSensitiveText(key), REDACTED]),
-    ),
-    body: action.body ? REDACTED : '',
-  };
-}
-
-function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
-  return {
-    ...item,
-    destinationLabel: redactSensitiveText(item.destinationLabel),
-    targetModelName: item.targetModelName ? redactSensitiveText(item.targetModelName) : item.targetModelName,
-    targetFolderPath: item.targetFolderPath ? redactSensitiveText(item.targetFolderPath) : item.targetFolderPath,
-    documentName: item.documentName ? redactSensitiveText(item.documentName) : item.documentName,
-    error: item.error ? redactSensitiveText(item.error) : item.error,
-    warnings: item.warnings?.map(redactSensitiveText),
-    importedIdentifier: item.importedIdentifier ? redactSensitiveText(item.importedIdentifier) : item.importedIdentifier,
-    importedDocumentId: item.importedDocumentId ? redactSensitiveText(item.importedDocumentId) : item.importedDocumentId,
-  };
-}
-
-function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarget {
-  return {
-    ...target,
-    destinationLabel: target.destinationLabel ? redactSensitiveText(target.destinationLabel) : target.destinationLabel,
-    targetModelName: target.targetModelName ? redactSensitiveText(target.targetModelName) : target.targetModelName,
-    targetFolderPath: target.targetFolderPath ? redactSensitiveText(target.targetFolderPath) : target.targetFolderPath,
-  };
-}
-
-export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
-  return jobs.map((job) => ({
-    ...job,
-    sourceLabel: redactSensitiveText(job.sourceLabel),
-    targets: job.targets?.map(sanitizeMigrationTarget),
-    postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
-    items: job.items.map(sanitizeJobItem),
-  }));
-}
-
 function markItem(item: MigrationJobItem, status: JobItemStatus, patch: Partial<MigrationJobItem> = {}): void {
   item.status = status;
   if (status === 'running') item.startedAt = Date.now();
@@ -274,6 +176,72 @@ function computeJobStatus(items: MigrationJobItem[]): JobStatus {
   if (failed === 0) return 'succeeded';
   if (succeeded === 0) return 'failed';
   return 'partial';
+}
+
+function isTerminalJobStatus(status: JobStatus): boolean {
+  return status === 'succeeded' || status === 'partial' || status === 'failed' || status === 'canceled';
+}
+
+function destinationConcurrency(): number {
+  const parsed = Number.parseInt(process.env.OMNIKIT_MIGRATION_DEST_CONCURRENCY || '', 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_DESTINATION_CONCURRENCY;
+  return Math.min(parsed, 25);
+}
+
+async function runWithConcurrency<T>(
+  rows: T[],
+  limit: number,
+  worker: (row: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const workers = Array.from({ length: Math.min(limit, rows.length) }, async () => {
+    while (index < rows.length) {
+      const row = rows[index];
+      index += 1;
+      await worker(row);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function persistJobStatus(job: MigrationJob): void {
+  updateJobStatus(job);
+  publishMigrationJobEvent({
+    type: 'job',
+    jobId: job.id,
+    status: job.status,
+    at: Date.now(),
+    job,
+  });
+}
+
+function persistItem(item: MigrationJobItem): void {
+  updateJobItem(item);
+  publishMigrationJobEvent({
+    type: 'item',
+    jobId: item.jobId,
+    itemId: item.id,
+    destinationId: item.destinationId,
+    status: item.status,
+    error: item.error,
+    at: Date.now(),
+    item,
+  });
+}
+
+function markAndPersistItem(
+  item: MigrationJobItem,
+  status: JobItemStatus,
+  patch: Partial<MigrationJobItem> = {},
+): void {
+  markItem(item, status, patch);
+  persistItem(item);
+}
+
+function markPendingItemsSkipped(job: MigrationJob, reason: string): void {
+  for (const item of job.items) {
+    if (item.status === 'pending') markAndPersistItem(item, 'skipped', { error: reason });
+  }
 }
 
 function normalizeFolderPath(value: string | undefined): string {
@@ -443,15 +411,15 @@ function normalizeTargets(input: {
 }
 
 export function listJobs(): MigrationJob[] {
-  return readJobs();
+  return listStoredJobs();
 }
 
 export function getJob(id: string): MigrationJob | undefined {
-  return readJobs().find((job) => job.id === id);
+  return getStoredJob(id);
 }
 
 export function clearJobs(): void {
-  writeJobs([]);
+  clearStoredJobs();
 }
 
 export async function buildMigrationPlan(input: {
@@ -588,6 +556,7 @@ export async function createMigrationJob(input: {
   documentIds: string[];
   emptyFirst: boolean;
   postMigrationActions: PostMigrationAction[];
+  parentJobId?: string;
 }): Promise<MigrationJob> {
   const source = requireInstance(input.sourceId);
   const plan = await buildMigrationPlan(input);
@@ -603,19 +572,23 @@ export async function createMigrationJob(input: {
     emptyFirst: input.emptyFirst,
     postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
     status: 'pending',
+    parentJobId: input.parentJobId,
     createdAt: Date.now(),
     items,
   };
   activePostMigrationActions.set(jobId, input.postMigrationActions);
-  updateJob(job);
+  insertJob(job);
   void runMigrationJob(job.id).catch(() => undefined);
-  return job;
+  return getJob(job.id) || sanitizeJob(job);
 }
 
-export async function retryMigrationJob(id: string): Promise<MigrationJob> {
+export async function retryMigrationJob(id: string, options: { destinationId?: string } = {}): Promise<MigrationJob> {
   const parent = getJob(id);
   if (!parent) throw new Error('Job not found.');
-  const failedImports = parent.items.filter((item) => item.status === 'failed' && (item.kind === 'import' || item.kind === 'export'));
+  const failedImports = parent.items.filter((item) => {
+    if (options.destinationId && item.destinationId !== options.destinationId) return false;
+    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export');
+  });
   const targetsById = new Map<string, MigrationTarget>();
   for (const item of failedImports) {
     const destination = requireInstance(item.destinationId);
@@ -642,6 +615,7 @@ export async function retryMigrationJob(id: string): Promise<MigrationJob> {
     documentIds,
     emptyFirst: false,
     postMigrationActions: [],
+    parentJobId: parent.id,
   });
 }
 
@@ -649,13 +623,35 @@ export async function runMigrationJob(id: string): Promise<void> {
   if (runningJobs.has(id)) return;
   const job = getJob(id);
   if (!job) return;
+  if (isTerminalJobStatus(job.status)) return;
   runningJobs.add(id);
   try {
     await executeJob(job);
+  } catch {
+    const latest = getJob(id) || job;
+    markPendingItemsSkipped(latest, 'Job failed before this step could run.');
+    latest.status = 'failed';
+    latest.endedAt = Date.now();
+    persistJobStatus(latest);
   } finally {
     activePostMigrationActions.delete(id);
+    canceledJobs.delete(id);
     runningJobs.delete(id);
   }
+}
+
+export function cancelMigrationJob(id: string): MigrationJob | undefined {
+  const job = getJob(id);
+  if (!job) return undefined;
+  if (isTerminalJobStatus(job.status)) return job;
+  canceledJobs.add(id);
+  if (!runningJobs.has(id)) {
+    markPendingItemsSkipped(job, 'Canceled by user.');
+    job.status = 'canceled';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+  }
+  return getJob(id) || sanitizeJob(job);
 }
 
 async function executeJob(job: MigrationJob): Promise<void> {
@@ -663,11 +659,15 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const sourceClient = new OmniClient(source);
   job.status = 'running';
   job.startedAt = Date.now();
-  updateJob(job);
+  persistJobStatus(job);
 
   const exports = new Map<string, { payload: Record<string, unknown>; hash: string }>();
+  const importConsumers = new Map<string, number>();
   const sourceMeta = new Map<string, SourceMeta>();
   const sourceLabels = new Map<string, { color?: string | null; description?: string | null }>();
+  const destinationClientCache = new Map<string, OmniClient>();
+  const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
+  const destinationLabelCache = new Map<string, Set<string>>();
 
   try {
     const docs = await listDocumentsForFolder(sourceClient, source.defaultFolderId, source.defaultFolderPath, true);
@@ -683,33 +683,83 @@ async function executeJob(job: MigrationJob): Promise<void> {
     // Metadata preservation is best-effort and should not block core imports.
   }
 
-  const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
-  const destinationLabelCache = new Map<string, Set<string>>();
+  function destinationClientFor(destination: SavedInstance): OmniClient {
+    const cached = destinationClientCache.get(destination.id);
+    if (cached) return cached;
+    const client = new OmniClient(destination);
+    destinationClientCache.set(destination.id, client);
+    return client;
+  }
 
-  for (const item of job.items) {
+  function releaseExportConsumer(documentId: string | undefined): void {
+    if (!documentId) return;
+    const remaining = (importConsumers.get(documentId) || 0) - 1;
+    if (remaining <= 0) {
+      importConsumers.delete(documentId);
+      exports.delete(documentId);
+    } else {
+      importConsumers.set(documentId, remaining);
+    }
+  }
+
+  function skipDependentItems(documentId: string, reason: string): void {
+    for (const item of job.items) {
+      if (item.documentId !== documentId) continue;
+      if ((item.kind === 'import' || item.kind === 'metadata') && item.status === 'pending') {
+        markAndPersistItem(item, 'skipped', { error: reason });
+      }
+    }
+  }
+
+  async function runExportStage(): Promise<void> {
+    const exportItemsByDocument = new Map<string, MigrationJobItem[]>();
+    for (const item of job.items) {
+      if (item.kind !== 'export' || !item.documentId) continue;
+      const rows = exportItemsByDocument.get(item.documentId) || [];
+      rows.push(item);
+      exportItemsByDocument.set(item.documentId, rows);
+    }
+
+    for (const [documentId, exportItems] of exportItemsByDocument.entries()) {
+      if (canceledJobs.has(job.id)) break;
+      for (const item of exportItems) {
+        if (item.status === 'pending') markAndPersistItem(item, 'running');
+      }
+      try {
+        const payload = await sourceClient.exportDocument(documentId);
+        const cached = { payload, hash: hashPayload(payload) };
+        exports.set(documentId, cached);
+        for (const item of exportItems) markAndPersistItem(item, 'succeeded', { exportHash: cached.hash });
+      } catch (error) {
+        const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+        for (const item of exportItems) markAndPersistItem(item, 'failed', { error: message });
+        skipDependentItems(documentId, `Export failed; dependent step skipped. ${message}`);
+      }
+    }
+  }
+
+  async function processDestinationItem(item: MigrationJobItem): Promise<void> {
+    if (canceledJobs.has(job.id)) {
+      markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+      return;
+    }
     const destination = requireInstance(item.destinationId);
-    const destinationClient = new OmniClient(destination);
-    markItem(item, 'running');
-    updateJob(job);
+    const destinationClient = destinationClientFor(destination);
+    markAndPersistItem(item, 'running');
 
     try {
       if (item.kind === 'delete') {
         if (!item.documentId) throw new Error('Delete item missing document id.');
         await destinationClient.requestDeleteDocument(item.documentId);
-        markItem(item, 'succeeded');
-      } else if (item.kind === 'export') {
-        if (!item.documentId) throw new Error('Export item missing document id.');
-        let cached = exports.get(item.documentId);
-        if (!cached) {
-          const payload = await sourceClient.exportDocument(item.documentId);
-          cached = { payload, hash: hashPayload(payload) };
-          exports.set(item.documentId, cached);
-        }
-        markItem(item, 'succeeded', { exportHash: cached.hash });
+        markAndPersistItem(item, 'succeeded');
       } else if (item.kind === 'import') {
         if (!item.documentId) throw new Error('Import item missing document id.');
         const cached = exports.get(item.documentId);
-        if (!cached) throw new Error('Export payload missing before import.');
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; import skipped.' });
+          releaseExportConsumer(item.documentId);
+          return;
+        }
         const targetModelId = item.targetModelId || destination.defaultModelId;
         const targetFolderPath = item.targetFolderPath || destination.defaultFolderPath;
         if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
@@ -759,15 +809,19 @@ async function executeJob(job: MigrationJob): Promise<void> {
           }
         }
         importedByDestinationAndSource.set(`${item.targetId || destination.id}:${item.documentId}`, { identifier, documentId });
-        markItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           importedIdentifier: identifier,
           importedDocumentId: documentId,
           warnings: warnings.length > 0 ? warnings : undefined,
         });
+        releaseExportConsumer(item.documentId);
       } else if (item.kind === 'metadata') {
         if (!item.documentId) throw new Error('Metadata item missing document id.');
         const imported = importedByDestinationAndSource.get(`${item.targetId || destination.id}:${item.documentId}`);
-        if (!imported?.identifier) throw new Error('No imported document identifier available for metadata preservation.');
+        if (!imported?.identifier) {
+          markAndPersistItem(item, 'skipped', { error: 'No imported document identifier available for metadata preservation.' });
+          return;
+        }
         const meta = sourceMeta.get(item.documentId);
         const warnings: string[] = [];
         if (meta?.description) {
@@ -796,46 +850,111 @@ async function executeJob(job: MigrationJob): Promise<void> {
             warnings.push(`Label copy failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        markItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
       }
     } catch (error) {
       const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-      markItem(item, 'failed', { error: message });
+      markAndPersistItem(item, 'failed', { error: message });
+      if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
-    updateJob(job);
+  }
+
+  async function runDestinationStage(): Promise<void> {
+    for (const item of job.items) {
+      if (item.kind === 'import' && item.status === 'pending' && item.documentId) {
+        importConsumers.set(item.documentId, (importConsumers.get(item.documentId) || 0) + 1);
+      }
+    }
+    const groups = new Map<string, MigrationJobItem[]>();
+    for (const item of job.items) {
+      if (item.kind === 'export' || item.status !== 'pending') continue;
+      const rows = groups.get(item.destinationId) || [];
+      rows.push(item);
+      groups.set(item.destinationId, rows);
+    }
+    await runWithConcurrency([...groups.values()], destinationConcurrency(), async (items) => {
+      for (const item of items) {
+        if (canceledJobs.has(job.id)) {
+          markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+          continue;
+        }
+        await processDestinationItem(item);
+      }
+    });
+  }
+
+  await runExportStage();
+  if (!canceledJobs.has(job.id)) await runDestinationStage();
+
+  if (canceledJobs.has(job.id)) {
+    markPendingItemsSkipped(job, 'Canceled by user.');
+    job.status = 'canceled';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+    return;
   }
 
   await runJobPostActions(job);
   job.status = computeJobStatus(job.items);
   job.endedAt = Date.now();
-  updateJob(job);
+  persistJobStatus(job);
 }
 
 async function runJobPostActions(job: MigrationJob): Promise<void> {
   const actions = activePostMigrationActions.get(job.id) ?? [];
   for (const action of actions) {
+    if (canceledJobs.has(job.id)) return;
+    const destination = action.kind === 'refresh-schema' && action.destinationInstanceId
+      ? requireInstance(action.destinationInstanceId)
+      : null;
     const item: MigrationJobItem = {
       id: randomUUID(),
       jobId: job.id,
-      destinationId: 'post-actions',
-      destinationLabel: 'Post-migration',
+      destinationId: destination?.id || 'post-actions',
+      destinationLabel: destination?.label || 'Post-migration',
+      targetModelId: action.targetModelId,
+      targetModelName: action.targetModelName,
       kind: 'post_action',
       documentName: action.name,
       status: 'running',
       startedAt: Date.now(),
     };
     job.items.push(item);
-    updateJob(job);
-    const result = await runPostMigrationAction(action);
-    markItem(item, result.ok ? 'succeeded' : 'failed', {
+    updateJobItem(item);
+    const result = action.kind === 'refresh-schema'
+      ? await runSchemaRefreshAction(action)
+      : await runPostMigrationAction(action);
+    markAndPersistItem(item, result.ok ? 'succeeded' : 'failed', {
       error: result.ok ? undefined : result.error,
       warnings: result.ok && result.warning ? [result.warning] : undefined,
     });
-    updateJob(job);
+    publishMigrationJobEvent({
+      type: 'post-migration',
+      jobId: job.id,
+      results: { action: action.name, ...result },
+      at: Date.now(),
+    });
+  }
+}
+
+async function runSchemaRefreshAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
+  if (!action.destinationInstanceId) return { ok: false, error: 'Schema refresh action is missing a destination instance.' };
+  if (!action.targetModelId) return { ok: false, error: 'Schema refresh action is missing a target model.' };
+  try {
+    const destination = requireInstance(action.destinationInstanceId);
+    const result = await new OmniClient(destination).refreshModel(action.targetModelId);
+    const detail = [
+      result.jobId ? `job ${result.jobId}` : '',
+      result.status ? `status ${result.status}` : '',
+    ].filter(Boolean).join(', ');
+    return { ok: true, warning: detail ? `Schema refresh queued (${detail}).` : 'Schema refresh queued.' };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 export async function runPostMigrationAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
+  if (action.kind === 'refresh-schema') return runSchemaRefreshAction(action);
   let url: URL;
   try {
     url = new URL(action.url);

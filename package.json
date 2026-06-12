@@ -13,12 +13,16 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "test:fanout": "tsx --test tests/fanout-wizard.test.ts",
+    "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:security": "tsx --test tests/security-regression.test.ts",
     "security:audit": "npm audit --audit-level=moderate",
     "security:check": "npm run security:audit && npm run test:security && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "apache-arrow": "^21.1.0",
+    "better-sqlite3": "^12.10.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.344.0",
     "pptxgenjs": "^4.0.1",

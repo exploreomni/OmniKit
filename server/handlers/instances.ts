@@ -12,6 +12,7 @@ import {
   type SavedInstance,
 } from '../services/nativeVault';
 import { OmniClient } from '../services/omniClient';
+import { importLegacyVault } from '../services/legacyVaultImport';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
@@ -60,6 +61,7 @@ function parseActions(value: unknown): PostMigrationAction[] {
   return value
     .filter((action): action is Record<string, unknown> => Boolean(action) && typeof action === 'object' && !Array.isArray(action))
     .map((action) => ({
+      kind: action.kind === 'refresh-schema' ? 'refresh-schema' as const : 'webhook' as const,
       name: cleanString(action.name) || 'Post-migration action',
       method: parseMethod(action.method),
       url: cleanString(action.url) || '',
@@ -67,8 +69,17 @@ function parseActions(value: unknown): PostMigrationAction[] {
         ? Object.fromEntries(Object.entries(action.headers).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
         : {},
       body: typeof action.body === 'string' ? action.body : '',
+      destinationInstanceId: cleanString(action.destinationInstanceId),
+      targetModelId: cleanString(action.targetModelId),
+      targetModelName: cleanString(action.targetModelName),
     }))
-    .filter((action) => action.url);
+    .filter((action) => action.kind === 'refresh-schema' ? Boolean(action.targetModelId) : Boolean(action.url));
+}
+
+function parseLabelNames(value: unknown): string[] {
+  return Array.isArray(value)
+    ? [...new Set(value.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean))]
+    : [];
 }
 
 function parseMethod(value: unknown): PostMigrationAction['method'] {
@@ -136,24 +147,19 @@ export default async function handler(req: Request): Promise<Response> {
       return json({ instance: saved });
     }
 
-    if (req.method === 'POST' && path === 'import-browser') {
+    if (req.method === 'POST' && parts.length === 1 && parts[0] === 'import-legacy') {
       const body = await bodyJson(req);
-      const records = Array.isArray(body.instances) ? body.instances : [];
-      const imported = records.map((record) => {
-        const row = record as Record<string, unknown>;
-        const input: Partial<SavedInstance> & { apiKey?: string } = {
-          label: cleanString(row.name) || cleanString(row.label),
-          role: 'destination',
-          baseUrl: cleanString(row.baseUrl),
-          apiKey: typeof row.apiKey === 'string' ? row.apiKey : undefined,
-          defaultFolderPath: cleanString(row.defaultTargetFolder),
-          metricFilter: parseFilter({}),
-          postMigrationActions: [],
-        };
-        validateInstanceInput(input);
-        return upsertInstance(input);
+      const legacyPath = cleanString(body.path);
+      const passphrase = typeof body.passphrase === 'string' ? body.passphrase : '';
+      if (!legacyPath) return json({ error: 'Legacy vault path is required.' }, 400);
+      if (!passphrase) return json({ error: 'Legacy vault passphrase is required.' }, 400);
+      const result = importLegacyVault({
+        path: legacyPath,
+        passphrase,
+        dryRun: body.dryRun === true,
+        confirmAbsolutePath: body.confirmAbsolutePath === true,
       });
-      return json({ imported });
+      return json(result);
     }
 
     const id = parts[0];
@@ -234,6 +240,37 @@ export default async function handler(req: Request): Promise<Response> {
       const client = new OmniClient(secret);
       const folders = await client.listFolders();
       return json({ folders });
+    }
+
+    if (req.method === 'GET' && parts[1] === 'labels') {
+      const secret = getInstance(id);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const client = new OmniClient(secret);
+      const labels = await client.listLabels();
+      return json({ labels });
+    }
+
+    if (req.method === 'PATCH' && parts[1] === 'documents' && parts[3] === 'metadata') {
+      const secret = getInstance(id);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const documentId = decodeURIComponent(parts[2] || '').trim();
+      if (!documentId) return json({ error: 'Document identifier required.' }, 400);
+      const body = await bodyJson(req);
+      const client = new OmniClient(secret);
+      const description = typeof body.description === 'string' ? body.description : undefined;
+      const labels = parseLabelNames(body.labels);
+      const createLabels = parseLabelNames(body.createLabels);
+      if (description !== undefined) {
+        await client.patchDocument(documentId, {
+          description,
+          clearExistingDraft: body.clearExistingDraft !== false,
+        });
+      }
+      for (const label of createLabels) {
+        await client.createLabel({ name: label });
+      }
+      if (labels.length > 0) await client.setDocumentLabels(documentId, labels);
+      return json({ ok: true });
     }
 
     return json({ error: `Unknown instances route: ${path}` }, 404);

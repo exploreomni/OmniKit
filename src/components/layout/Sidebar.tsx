@@ -26,6 +26,7 @@ import { useEffect, useState } from 'react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
+import { InstanceSwitcher } from '@/components/layout/InstanceSwitcher';
 
 interface NavSection {
   label: string;
@@ -163,7 +164,7 @@ export function Sidebar() {
         style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
       >
         <NavLink
-          to="/connect"
+          to="/"
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
               isActive
@@ -185,7 +186,7 @@ export function Sidebar() {
           <Plug size={15} className="flex-shrink-0 opacity-80" />
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 leading-none">
-              <span>Connect</span>
+              <span>Home</span>
               {isConnected ? (
                 <span
                   className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"
@@ -201,6 +202,8 @@ export function Sidebar() {
           </div>
         </NavLink>
       </div>
+
+      <InstanceSwitcher />
 
       <nav className="flex-1 overflow-y-auto py-3 space-y-2" aria-label="Main sections">
         {sections.map((section) => (

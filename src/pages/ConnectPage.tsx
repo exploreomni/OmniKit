@@ -1,10 +1,8 @@
-import { useCallback, useEffect, useMemo, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   CheckCircle,
-  XCircle,
   Loader2,
-  Wifi,
   ShieldCheck,
   Lock,
   KeyRound,
@@ -32,19 +30,14 @@ import {
   Server,
   UnlockKeyhole,
 } from 'lucide-react';
-import { listDocuments, listFolders, listGroups, listModels, listUsers, omniProxy, testConnection } from '@/services/omniApi';
+import { listDocuments, listFolders, listGroups, listModels, listUsers, omniProxy } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useVaultSession } from '@/hooks/useVaultSession';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';
 import {
-  connectSavedInstance,
-  getVaultStatus,
-  listSavedInstances,
   saveSavedInstance,
-  unlockNativeVault,
   type InstanceRole,
-  type SavedInstancePublic,
-  type VaultStatus,
 } from '@/services/opsConsole';
 
 type CapabilityIcon = typeof Sparkles;
@@ -88,11 +81,6 @@ function parseHost(url: string): string | null {
   } catch {
     return null;
   }
-}
-
-function isRecognizedOmniHost(host: string | null) {
-  if (!host) return false;
-  return /(^|\.)((explore)?omni\.dev|omni\.co|exploreomni\.dev)$/i.test(host);
 }
 
 function CapabilityCard({ cap }: { cap: Capability }) {
@@ -360,13 +348,18 @@ function WorkspaceSnapshotPanel({
 
 export function ConnectPage() {
   const navigate = useNavigate();
-  const { connection, updateConnection, resetConnection, isConnected, setStatus } = useConnection();
-  const [testing, setTesting] = useState(false);
+  const { connection, resetConnection, isConnected } = useConnection();
+  const {
+    status: vaultSessionState,
+    vaultStatus,
+    instances: savedInstances,
+    unlock: unlockVault,
+    connectInstance,
+    refreshInstances,
+  } = useVaultSession();
   const [snapshot, setSnapshot] = useState<WorkspaceSnapshot>(EMPTY_SNAPSHOT);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [snapshotLoadedFor, setSnapshotLoadedFor] = useState('');
-  const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
-  const [savedInstances, setSavedInstances] = useState<SavedInstancePublic[]>([]);
   const [selectedInstanceId, setSelectedInstanceId] = useState('');
   const [vaultPassphrase, setVaultPassphrase] = useState('');
   const [vaultBusy, setVaultBusy] = useState(false);
@@ -374,32 +367,16 @@ export function ConnectPage() {
   const [vaultError, setVaultError] = useState('');
   const [newVaultInstance, setNewVaultInstance] = useState<NewVaultInstanceForm>(EMPTY_VAULT_INSTANCE_FORM);
   const [showAddVaultInstance, setShowAddVaultInstance] = useState(false);
-  const [showManualConnection, setShowManualConnection] = useState(false);
 
   const connectionKey = `${connection.baseUrl.trim()}|${connection.instanceId || (connection.apiKey ? 'manual-key-present' : 'no-key')}`;
   const selectedInstance = savedInstances.find((instance) => instance.id === selectedInstanceId) || savedInstances[0] || null;
 
-  const loadVaultState = useCallback(async () => {
-    const status = await getVaultStatus();
-    setVaultStatus(status);
-    if (!status.unlocked) {
-      setSavedInstances([]);
-      setSelectedInstanceId('');
-      return;
-    }
-    const res = await listSavedInstances();
-    setSavedInstances(res.instances);
-    setSelectedInstanceId((current) => {
-      if (current && res.instances.some((instance) => instance.id === current)) return current;
-      return res.instances[0]?.id || '';
-    });
-  }, []);
-
   useEffect(() => {
-    void loadVaultState().catch(() => {
-      setVaultStatus(null);
+    setSelectedInstanceId((current) => {
+      if (current && savedInstances.some((instance) => instance.id === current)) return current;
+      return savedInstances[0]?.id || '';
     });
-  }, [loadVaultState]);
+  }, [savedInstances]);
 
   async function handleVaultUnlock() {
     setVaultBusy(true);
@@ -407,12 +384,11 @@ export function ConnectPage() {
     setVaultMessage('');
     const hadExistingVault = Boolean(vaultStatus?.exists);
     try {
-      const res = await unlockNativeVault(vaultPassphrase);
-      setVaultStatus(res.status);
+      await unlockVault(vaultPassphrase);
       setVaultPassphrase('');
-      await loadVaultState();
+      const instances = await refreshInstances();
       setVaultMessage(hadExistingVault ? 'Vault unlocked. Choose a saved instance to connect.' : 'Vault created. Add your first Omni instance to continue.');
-      setShowAddVaultInstance(res.status.instanceCount === 0);
+      setShowAddVaultInstance(instances.length === 0);
     } catch (err) {
       setVaultError(err instanceof Error ? err.message : 'Could not unlock the vault.');
     } finally {
@@ -426,13 +402,9 @@ export function ConnectPage() {
     setVaultError('');
     setVaultMessage('');
     try {
-      const res = await connectSavedInstance(instanceId);
-      updateConnection({
-        ...res.connection,
-        errorMessage: '',
-      });
-      await loadVaultState();
-      setVaultMessage(`Connected to ${res.instance.label}.`);
+      const instance = await connectInstance(instanceId);
+      await refreshInstances();
+      setVaultMessage(`Connected to ${instance.label}.`);
     } catch (err) {
       setVaultError(err instanceof Error ? err.message : 'Could not connect to the saved instance.');
     } finally {
@@ -460,9 +432,11 @@ export function ConnectPage() {
       });
       setNewVaultInstance(EMPTY_VAULT_INSTANCE_FORM);
       setShowAddVaultInstance(false);
-      await loadVaultState();
+      await refreshInstances();
       setSelectedInstanceId(saved.instance.id);
-      await handleUseSavedInstance(saved.instance.id);
+      const instance = await connectInstance(saved.instance.id);
+      await refreshInstances();
+      setVaultMessage(`Saved and connected to ${instance.label}.`);
     } catch (err) {
       setVaultError(err instanceof Error ? err.message : 'Could not save and test this instance.');
     } finally {
@@ -543,46 +517,8 @@ export function ConnectPage() {
     loadWorkspaceSnapshot();
   }, [connectionKey, isConnected, loadWorkspaceSnapshot, snapshotLoadedFor, snapshotLoading]);
 
-  async function handleTest() {
-    if (!connection.baseUrl || !connection.apiKey) return;
-    setTesting(true);
-    setStatus('testing');
-
-    try {
-      const result = await testConnection(connection.baseUrl, connection.apiKey);
-      if (result.status === 'ok') {
-        updateConnection({
-          status: 'success',
-          errorMessage: '',
-          connectionMode: 'manual',
-          instanceId: undefined,
-          instanceLabel: undefined,
-          apiKeyMasked: undefined,
-        });
-      } else {
-        setStatus('error', result.message || 'Connection failed.');
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Could not connect. Check your base URL and API key.';
-      setStatus('error', message);
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  function handleFieldKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-    if (e.key === 'Enter' && connection.baseUrl && connection.apiKey && !testing) {
-      e.preventDefault();
-      handleTest();
-    }
-  }
-
   const parsedHost = useMemo(() => parseHost(connection.baseUrl), [connection.baseUrl]);
-  const hostNeedsReview = Boolean(parsedHost && !isRecognizedOmniHost(parsedHost));
-  const urlValid = Boolean(parsedHost);
-  const apiKeyHasValidShape = connection.apiKey.trim().length >= 12;
-  const canTest = urlValid && apiKeyHasValidShape && !testing;
-  const vaultUnlocked = Boolean(vaultStatus?.unlocked);
+  const vaultUnlocked = vaultSessionState === 'unlocked';
   const canUnlockVault = Boolean(vaultPassphrase.trim()) && (vaultStatus?.exists || vaultPassphrase.trim().length >= 8) && !vaultBusy;
   const newInstanceHost = parseHost(newVaultInstance.baseUrl);
   const canSaveVaultInstance = Boolean(newInstanceHost && newVaultInstance.apiKey.trim().length >= 12 && !vaultBusy);
@@ -623,14 +559,14 @@ export function ConnectPage() {
           eyebrow: "You're in",
           titleTop: 'What would you like',
           titleBottom: 'to do first?',
-          body: 'Pick the workflow you want to start. OmniKit will keep using this connection while the tab stays open.',
+          body: 'Pick the workflow you want to start. OmniKit will keep using this saved vault instance while the tab stays open.',
         };
       case 'error':
         return {
           eyebrow: 'Connection needs attention',
           titleTop: "Let's get you",
           titleBottom: 'connected.',
-          body: 'Check the URL and API key, then test again. OmniKit will keep your key masked the whole time.',
+          body: 'Return Home, unlock the vault, and choose a saved instance again. OmniKit keeps plaintext keys out of the browser.',
         };
       default:
         return {
@@ -681,7 +617,7 @@ export function ConnectPage() {
 
         <div className="relative z-10 mx-auto w-full max-w-5xl">
           <div className="flex items-center justify-between mb-14">
-            <OmniKitLogo variant="light" size="sm" subtitle="Connect" />
+            <OmniKitLogo variant="light" size="sm" subtitle="Home" />
             <div
               className="flex items-center gap-2 rounded-full px-4 py-2"
               style={{
@@ -744,7 +680,7 @@ export function ConnectPage() {
                   <div className="mt-4 flex items-center gap-3 text-[11px] text-white/75 font-medium">
                     <span>15 tools</span>
                     <span className="w-1 h-1 rounded-full bg-white" />
-                    <span>No data stored</span>
+                    <span>Vault-first</span>
                     <span className="w-1 h-1 rounded-full bg-white" />
                     <span>Works offline-ready</span>
                   </div>
@@ -829,7 +765,7 @@ export function ConnectPage() {
               {isConnected
                 ? isVaultConnected
                   ? 'This session is using a saved vault profile. The browser only keeps a non-secret reference.'
-                  : 'This session is using a one-time connection. Save it to the vault if you want to reuse it later.'
+                  : 'This session was created by an older connection path. Choose a saved vault instance before starting new work.'
                 : 'Create or unlock your local encrypted vault, then choose the Omni instance you want to use.'}
             </p>
           </div>
@@ -857,7 +793,7 @@ export function ConnectPage() {
                     </div>
                     <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-omni-50 px-2.5 py-1 text-[11px] font-semibold text-omni-700">
                       <ShieldCheck size={12} />
-                      {isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Session-only key'}
+                      {isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Legacy session key'}
                     </div>
                   </div>
                 </div>
@@ -1057,187 +993,6 @@ export function ConnectPage() {
                   </div>
                 )}
               </div>
-
-              <button
-                type="button"
-                onClick={() => setShowManualConnection((prev) => !prev)}
-                className="w-full rounded-xl border border-border-subtle bg-white px-4 py-2.5 text-[12px] font-semibold text-content-secondary transition-colors hover:text-omni-700"
-              >
-                {showManualConnection ? 'Hide one-time connection' : 'Use one-time connection instead'}
-              </button>
-
-              {showManualConnection && (
-                <div
-                  className="rounded-2xl p-5"
-                  style={{
-                    background: '#FFFFFF',
-                    border: '1px solid rgba(217,222,232,0.95)',
-                    boxShadow: '0 6px 18px rgba(64,71,84,0.10)',
-                  }}
-                >
-                  <div className="space-y-4">
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label htmlFor="base-url" className="text-[12px] font-semibold" style={{ color: '#1A0818' }}>
-                          Base URL
-                        </label>
-                        {connection.baseUrl && (
-                          <span className={`text-[10px] font-medium ${urlValid ? 'text-emerald-600' : 'text-amber-600'}`}>
-                            {urlValid ? 'Valid' : 'Check format'}
-                          </span>
-                        )}
-                      </div>
-                      <div className="relative">
-                        <input
-                          id="base-url"
-                          type="url"
-                          value={connection.connectionMode === 'vault' ? '' : connection.baseUrl}
-                          onChange={(e) => updateConnection({
-                            baseUrl: e.target.value,
-                            status: 'untested',
-                            connectionMode: 'manual',
-                            instanceId: undefined,
-                            instanceLabel: undefined,
-                            apiKeyMasked: undefined,
-                          })}
-                          onKeyDown={handleFieldKeyDown}
-                          placeholder="https://your-org.omni.co"
-                          className="input-field pr-9"
-                          aria-describedby="base-url-hint"
-                        />
-                        {connection.baseUrl && urlValid && connection.connectionMode !== 'vault' && (
-                          <CheckCircle
-                            size={15}
-                            className="absolute right-3 top-1/2 -translate-y-1/2 text-emerald-500"
-                            aria-hidden
-                          />
-                        )}
-                      </div>
-                      <p id="base-url-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
-                        {parsedHost && connection.connectionMode !== 'vault' ? (
-                          <>
-                            Will connect to{' '}
-                            <span className="font-mono font-medium" style={{ color: '#C83B70' }}>
-                              {parsedHost}
-                            </span>
-                          </>
-                        ) : (
-                          'Your Omni workspace URL, including https://'
-                        )}
-                      </p>
-                      {hostNeedsReview && connection.connectionMode !== 'vault' && (
-                        <p className="mt-1.5 rounded-button border border-amber-200 bg-amber-50 px-2.5 py-2 text-[11px] leading-relaxed text-amber-800">
-                          Confirm this is a trusted Omni host before testing. OmniKit keeps the key masked, but the API call will be sent to this URL.
-                        </p>
-                      )}
-                    </div>
-
-                    <div>
-                      <div className="flex items-center justify-between mb-1.5">
-                        <label
-                          htmlFor="api-key"
-                          className="text-[12px] font-semibold flex items-center gap-1"
-                          style={{ color: '#1A0818' }}
-                        >
-                          API Key
-                          <a
-                            href="https://docs.omni.co/docs/API/authentication"
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex text-content-tertiary hover:text-omni-700 transition-colors"
-                            aria-label="Where do I find my API key?"
-                          >
-                            <HelpCircle size={12} />
-                          </a>
-                        </label>
-                        <span className="text-[10px] font-medium" style={{ color: '#8A6078' }}>
-                          Settings → API
-                        </span>
-                      </div>
-                      <div className="relative">
-                        <input
-                          id="api-key"
-                          type="password"
-                          value={connection.connectionMode === 'vault' ? '' : connection.apiKey}
-                          onChange={(e) => updateConnection({
-                            apiKey: e.target.value,
-                            status: 'untested',
-                            connectionMode: 'manual',
-                            instanceId: undefined,
-                            instanceLabel: undefined,
-                            apiKeyMasked: undefined,
-                          })}
-                          onKeyDown={handleFieldKeyDown}
-                          placeholder="Paste your API key"
-                          className="input-field pr-10 font-mono text-[13px]"
-                          autoComplete="new-password"
-                          spellCheck={false}
-                          autoCapitalize="off"
-                          aria-describedby="api-key-hint"
-                        />
-                        <Lock
-                          size={14}
-                          className="absolute right-3 top-1/2 -translate-y-1/2 text-content-tertiary"
-                          aria-hidden
-                        />
-                      </div>
-                      <p id="api-key-hint" className="text-[11px] mt-1.5" style={{ color: '#8A6078' }}>
-                        Session-only fallback. Use the vault above when you want reusable saved instances.
-                      </p>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={handleTest}
-                    disabled={!canTest}
-                    className="mt-4 w-full relative flex items-center justify-center gap-2 px-4 py-3 rounded-xl text-[13px] font-semibold transition-all duration-200 text-white disabled:opacity-50 disabled:cursor-not-allowed enabled:hover:-translate-y-px enabled:hover:brightness-110 enabled:active:translate-y-0 overflow-hidden"
-                    style={{
-                      background: connection.status === 'success' ? '#10B981' : '#C83B70',
-                      boxShadow: 'none',
-                    }}
-                  >
-                    <span className="relative flex items-center gap-2">
-                      {testing ? (
-                        <Loader2 size={14} className="animate-spin" />
-                      ) : connection.status === 'success' ? (
-                        <CheckCircle size={14} />
-                      ) : (
-                        <Wifi size={14} />
-                      )}
-                      {testing
-                        ? 'Testing connection…'
-                        : connection.status === 'success'
-                          ? 'Connected'
-                          : 'Test one-time connection'}
-                    </span>
-                  </button>
-
-                  <div className="mt-3 flex items-center justify-center gap-2 text-[12px]" aria-live="polite">
-                    {connection.status === 'untested' && (
-                      <>
-                        <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'rgba(155,48,101,0.3)' }} />
-                        <span style={{ color: 'rgba(155,48,101,0.6)' }}>Not tested yet</span>
-                      </>
-                    )}
-                    {connection.status === 'testing' && (
-                      <>
-                        <Loader2 size={12} className="animate-spin" style={{ color: '#E4477C' }} />
-                        <span style={{ color: '#E4477C' }} className="font-medium">
-                          Verifying credentials…
-                        </span>
-                      </>
-                    )}
-                    {connection.status === 'error' && (
-                      <>
-                        <XCircle size={12} className="text-red-500" />
-                        <span className="text-red-600 font-medium truncate max-w-[320px]">
-                          {connection.errorMessage || 'Connection failed'}
-                        </span>
-                      </>
-                    )}
-                  </div>
-                </div>
-              )}
             </div>
           )}
 

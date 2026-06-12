@@ -487,6 +487,16 @@ export class OmniClient {
     });
   }
 
+  async refreshModel(modelId: string): Promise<{ jobId?: string; status?: string; raw: unknown }> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/refresh`);
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return {
+      jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')),
+      status: firstString(raw.status, nested(raw, 'job', 'status')),
+      raw,
+    };
+  }
+
   async listEmbedUsers(): Promise<OmniEmbedUserRecord[]> {
     const users: OmniEmbedUserRecord[] = [];
     let startIndex = 1;

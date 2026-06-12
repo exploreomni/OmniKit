@@ -1,6 +1,7 @@
-import { jsonHeaders } from '../security';
+import { jsonHeaders, sseHeaders } from '../security';
 import {
   buildMigrationPlan,
+  cancelMigrationJob,
   clearJobs,
   createMigrationJob,
   getJob,
@@ -9,10 +10,13 @@ import {
   runPostMigrationAction,
   type MigrationTarget,
 } from '../services/migrationJobs';
+import { subscribeMigrationJobEvents } from '../services/jobEvents';
 import {
   isVaultUnlocked,
   type PostMigrationAction,
 } from '../services/nativeVault';
+
+const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'canceled']);
 
 async function bodyJson(req: Request): Promise<Record<string, unknown>> {
   try {
@@ -51,6 +55,7 @@ function parseActions(value: unknown): PostMigrationAction[] {
   return value
     .filter((action): action is Record<string, unknown> => Boolean(action) && typeof action === 'object' && !Array.isArray(action))
     .map((action) => ({
+      kind: action.kind === 'refresh-schema' ? 'refresh-schema' as const : 'webhook' as const,
       name: cleanString(action.name) || 'Post-migration action',
       method: parseMethod(action.method),
       url: cleanString(action.url) || '',
@@ -58,8 +63,11 @@ function parseActions(value: unknown): PostMigrationAction[] {
         ? Object.fromEntries(Object.entries(action.headers).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
         : {},
       body: typeof action.body === 'string' ? action.body : '',
+      destinationInstanceId: cleanString(action.destinationInstanceId),
+      targetModelId: cleanString(action.targetModelId),
+      targetModelName: cleanString(action.targetModelName),
     }))
-    .filter((action) => action.url);
+    .filter((action) => action.kind === 'refresh-schema' ? Boolean(action.targetModelId) : Boolean(action.url));
 }
 
 function parseTargets(value: unknown): MigrationTarget[] {
@@ -94,6 +102,55 @@ function parseJobInput(body: Record<string, unknown>) {
   };
 }
 
+function sseEncode(event: string, data: unknown): string {
+  return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+function jobEventsResponse(jobId: string, signal: AbortSignal): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+      let unsubscribe: () => void = () => undefined;
+      const close = () => {
+        if (closed) return;
+        closed = true;
+        clearInterval(keepalive);
+        unsubscribe();
+        controller.close();
+      };
+      const send = (event: string, data: unknown) => {
+        if (closed) return;
+        controller.enqueue(encoder.encode(sseEncode(event, data)));
+      };
+      const keepalive = setInterval(() => {
+        if (!closed) controller.enqueue(encoder.encode(': keepalive\n\n'));
+      }, 15_000);
+
+      const snapshot = getJob(jobId);
+      if (!snapshot) {
+        send('error', { error: 'Job not found.' });
+        close();
+        return;
+      }
+      send('snapshot', { job: snapshot });
+      if (TERMINAL_JOB_STATUSES.has(snapshot.status)) {
+        close();
+        return;
+      }
+
+      unsubscribe = subscribeMigrationJobEvents(jobId, (event) => {
+        send(event.type, event);
+        if (event.type === 'job' && TERMINAL_JOB_STATUSES.has(event.status)) {
+          setTimeout(close, 250);
+        }
+      });
+      signal.addEventListener('abort', close, { once: true });
+    },
+  });
+  return new Response(stream, { headers: sseHeaders });
+}
+
 export default async function handler(req: Request): Promise<Response> {
   try {
     const url = new URL(req.url);
@@ -107,6 +164,12 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'DELETE' && parts.length === 0) {
       clearJobs();
       return json({ ok: true });
+    }
+
+    if (req.method === 'GET' && parts.length === 2 && parts[1] === 'events') {
+      const job = getJob(parts[0]);
+      if (!job) return json({ error: 'Job not found.' }, 404);
+      return jobEventsResponse(parts[0], req.signal);
     }
 
     if (req.method === 'GET' && parts.length === 1) {
@@ -156,7 +219,14 @@ export default async function handler(req: Request): Promise<Response> {
     if (!id) return json({ error: 'Job id required.' }, 400);
 
     if (req.method === 'POST' && parts[1] === 'retry') {
-      const job = await retryMigrationJob(id);
+      const body = await bodyJson(req);
+      const job = await retryMigrationJob(id, { destinationId: cleanString(body.destinationId) });
+      return json({ job });
+    }
+
+    if (req.method === 'POST' && parts[1] === 'cancel') {
+      const job = cancelMigrationJob(id);
+      if (!job) return json({ error: 'Job not found.' }, 404);
       return json({ job });
     }
 

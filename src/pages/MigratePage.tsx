@@ -5,7 +5,7 @@ import { SelectStep } from '@/components/steps/SelectStep';
 import { MapStep } from '@/components/steps/MapStep';
 import { ReviewStep } from '@/components/steps/ReviewStep';
 import { ResultsStep } from '@/components/steps/ResultsStep';
-import { MultiInstanceMigratePanel } from '@/components/steps/MultiInstanceMigratePanel';
+import { FanOutWizard } from '@/components/migrateFanout/FanOutWizard';
 import { useWizard } from '@/hooks/useWizard';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { PageHeader } from '@/components/layout/PageHeader';
@@ -84,37 +84,45 @@ export function MigratePage() {
     <div className="space-y-5">
       <PageHeader
         title="Model Migrator"
-        description="Remap dashboards within the current instance by default, or copy/import dashboards into explicit models and folders across saved Omni instances."
+        description="Pick the migration path first: remap dashboards inside the active instance, or fan out selected dashboards from one saved source to many saved destination instances."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
-      <div className="card p-2">
-        <div className="grid gap-2 md:grid-cols-2">
-          <a
-            href="/dashboards/migrate"
-            className={`rounded-button px-4 py-3 text-left transition ${
+      <div className="card p-5">
+        <div className="mb-4">
+          <h2 className="text-base font-semibold text-content-primary">Where are you migrating to?</h2>
+          <p className="mt-1 text-sm text-content-secondary">
+            Same-instance remap uses the active Connect session. Fan-out copy/import uses saved profiles from the native encrypted vault.
+          </p>
+        </div>
+        <div className="grid gap-3 md:grid-cols-2">
+          <button
+            type="button"
+            onClick={() => navigate('/dashboards/migrate')}
+            className={`rounded-button px-4 py-4 text-left transition ${
               mode === 'remap' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
-            <div className="text-sm font-semibold">Same-instance model remap</div>
+            <div className="text-sm font-semibold">Within this instance</div>
             <div className={`mt-1 text-xs ${mode === 'remap' ? 'text-white/80' : 'text-content-secondary'}`}>
-              Default path. Move dashboards between models inside the connected Omni instance.
+              Remap selected dashboards from one model to another inside the connected Omni instance.
             </div>
-          </a>
-          <a
-            href="/dashboards/migrate?mode=copy"
-            className={`rounded-button px-4 py-3 text-left transition ${
+          </button>
+          <button
+            type="button"
+            onClick={() => navigate('/dashboards/migrate?mode=copy')}
+            className={`rounded-button px-4 py-4 text-left transition ${
               mode === 'copy' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
-            <div className="text-sm font-semibold">Saved-instance dashboard copy/import</div>
+            <div className="text-sm font-semibold">To other saved instances</div>
             <div className={`mt-1 text-xs ${mode === 'copy' ? 'text-white/80' : 'text-content-secondary'}`}>
-              Use encrypted saved profiles to choose exact destination models and folders.
+              Copy dashboards from one vault source into many destination instances, models, and folders.
             </div>
-          </a>
+          </button>
         </div>
       </div>
       {mode === 'copy' ? (
-        <MultiInstanceMigratePanel />
+        <FanOutWizard />
       ) : isConnected ? (
         <>
           <Stepper currentStep={state.currentStep} />

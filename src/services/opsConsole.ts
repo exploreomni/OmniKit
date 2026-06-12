@@ -1,4 +1,5 @@
 import { ApiError } from '@/services/omniApi';
+import { emitVaultChanged, emitVaultLocked } from '@/services/vaultEvents';
 
 const defaultHeaders = {
   'Content-Type': 'application/json',
@@ -8,7 +9,8 @@ export const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
 export type InstanceRole = 'source' | 'destination' | 'both';
 export type PostMigrationMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
-export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed';
+export type PostMigrationActionKind = 'webhook' | 'refresh-schema';
+export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'warning' | 'skipped';
 export type JobItemKind = 'delete' | 'export' | 'import' | 'metadata' | 'post_action';
 
@@ -20,11 +22,15 @@ export interface InstanceMetricFilter {
 }
 
 export interface PostMigrationAction {
+  kind?: PostMigrationActionKind;
   name: string;
   method: PostMigrationMethod;
   url: string;
   headers: Record<string, string>;
   body: string;
+  destinationInstanceId?: string;
+  targetModelId?: string;
+  targetModelName?: string;
 }
 
 export interface SavedInstancePublic {
@@ -51,6 +57,14 @@ export interface VaultStatus {
   idleTimeoutMs?: number;
   lastActivityAt?: number;
   instanceCount: number;
+}
+
+export interface LegacyVaultImportResult {
+  dryRun: boolean;
+  imported: number;
+  wouldImport: number;
+  skipped: Array<{ label: string; reason: string }>;
+  warnings: string[];
 }
 
 export interface SavedInstanceConnection {
@@ -97,6 +111,12 @@ export interface InstanceFolder {
   children?: InstanceFolder[];
 }
 
+export interface InstanceLabel {
+  name: string;
+  color?: string | null;
+  description?: string | null;
+}
+
 export interface ConnectionMetricRecord {
   id: string;
   name: string;
@@ -107,6 +127,7 @@ export interface ConnectionMetricRecord {
   hasSchemaModel: boolean;
   schemaModelGenerated: boolean;
   schemaModelId: string | null;
+  schemaModelCreatedAt?: string | null;
   schemaModelUpdatedAt: string | null;
   readiness: 'missing_schema_model' | 'schema_model_stuck' | 'ready';
 }
@@ -145,6 +166,14 @@ export interface InstanceEmbedUserStats {
   inactiveUsers: number;
   filteredCount: number;
   entityCount: number;
+  activity: {
+    active7d: number;
+    active30d: number;
+    active90d: number;
+    neverLoggedIn: number;
+    weeklyLogins: Array<{ weekStart: string; count: number }>;
+    monthlySignups: Array<{ month: string; count: number }>;
+  };
   users: EmbedUserMetricRecord[];
   error?: string;
 }
@@ -228,11 +257,18 @@ export interface MigrationJob {
   emptyFirst: boolean;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
+  parentJobId?: string;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
   items: MigrationJobItem[];
 }
+
+export type MigrationJobStreamEvent =
+  | { type: 'snapshot'; job: MigrationJob }
+  | { type: 'job'; jobId: string; status: JobStatus; at: number; job?: MigrationJob }
+  | { type: 'item'; jobId: string; itemId: string; destinationId: string; status: JobItemStatus; error?: string; at: number; item?: MigrationJobItem }
+  | { type: 'post-migration'; jobId: string; results: unknown; at: number };
 
 export interface SaveInstanceInput {
   id?: string;
@@ -283,6 +319,7 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
     } catch {
       detail = await res.text().catch(() => '');
     }
+    if (res.status === 423) emitVaultLocked(message);
     throw new ApiError(res.status, message, detail || undefined);
   }
   return await res.json() as T;
@@ -331,14 +368,24 @@ export async function getVaultStatus() {
 }
 
 export async function unlockNativeVault(passphrase: string) {
-  return apiFetch<{ status: VaultStatus }>('/api/vault/unlock', {
+  const result = await apiFetch<{ status: VaultStatus }>('/api/vault/unlock', {
     method: 'POST',
     body: JSON.stringify({ passphrase }),
   });
+  emitVaultChanged();
+  return result;
 }
 
 export async function lockNativeVault() {
-  return apiFetch<{ status: VaultStatus }>('/api/vault/lock', { method: 'POST' });
+  const result = await apiFetch<{ status: VaultStatus }>('/api/vault/lock', { method: 'POST' });
+  emitVaultChanged();
+  return result;
+}
+
+export async function touchNativeVault() {
+  const result = await apiFetch<{ status: VaultStatus }>('/api/vault/touch', { method: 'POST' });
+  emitVaultChanged();
+  return result;
 }
 
 export async function changeNativeVaultPassphrase(currentPassphrase: string, nextPassphrase: string) {
@@ -349,11 +396,25 @@ export async function changeNativeVaultPassphrase(currentPassphrase: string, nex
 }
 
 export async function resetNativeVault() {
-  return apiFetch<{ status: VaultStatus }>('/api/vault/reset', { method: 'DELETE' });
+  const result = await apiFetch<{ status: VaultStatus }>('/api/vault/reset', { method: 'DELETE' });
+  emitVaultChanged();
+  return result;
 }
 
 export async function listSavedInstances() {
   return apiFetch<{ instances: SavedInstancePublic[] }>('/api/instances');
+}
+
+export async function importLegacyVault(input: {
+  path: string;
+  passphrase: string;
+  dryRun: boolean;
+  confirmAbsolutePath: boolean;
+}) {
+  return apiFetch<LegacyVaultImportResult>('/api/instances/import-legacy', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
 }
 
 export async function saveSavedInstance(input: SaveInstanceInput) {
@@ -381,13 +442,6 @@ export async function connectSavedInstance(id: string) {
   );
 }
 
-export async function importBrowserVaultInstances(instances: unknown[]) {
-  return apiFetch<{ imported: SavedInstancePublic[] }>('/api/instances/import-browser', {
-    method: 'POST',
-    body: JSON.stringify({ instances }),
-  });
-}
-
 export async function listInstanceDocuments(id: string) {
   return apiFetch<{ documents: InstanceDocument[] }>(`/api/instances/${encodeURIComponent(id)}/documents`);
 }
@@ -398,6 +452,24 @@ export async function listInstanceModels(id: string) {
 
 export async function listInstanceFolders(id: string) {
   return apiFetch<{ folders: InstanceFolder[] }>(`/api/instances/${encodeURIComponent(id)}/folders`);
+}
+
+export async function listInstanceLabels(id: string) {
+  return apiFetch<{ labels: InstanceLabel[] }>(`/api/instances/${encodeURIComponent(id)}/labels`);
+}
+
+export async function updateInstanceDocumentMetadata(
+  instanceId: string,
+  documentId: string,
+  input: { description?: string; labels?: string[]; createLabels?: string[]; clearExistingDraft?: boolean },
+) {
+  return apiFetch<{ ok: boolean }>(
+    `/api/instances/${encodeURIComponent(instanceId)}/documents/${encodeURIComponent(documentId)}/metadata`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify(input),
+    },
+  );
 }
 
 export async function loadConnectionMetrics() {
@@ -416,6 +488,16 @@ export async function loadEmbedUserMetrics() {
     embedUsers: { savedAt: new Date().toISOString(), instances: result.instances },
   });
   return result;
+}
+
+export async function refreshInstanceSchemaModel(instanceId: string, modelId: string) {
+  return apiFetch<{ ok: boolean; instanceId: string; modelId: string; jobId?: string; status?: string }>(
+    `/api/instance-dashboard/${encodeURIComponent(instanceId)}/refresh-schema`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ modelId }),
+    },
+  );
 }
 
 export async function previewMigrationJob(input: MigrationJobInput) {
@@ -444,6 +526,47 @@ export async function clearMigrationJobs() {
   return apiFetch<{ ok: boolean }>('/api/migration-jobs', { method: 'DELETE' });
 }
 
-export async function retryOpsMigrationJob(id: string) {
-  return apiFetch<{ job: MigrationJob }>(`/api/migration-jobs/${encodeURIComponent(id)}/retry`, { method: 'POST' });
+export async function runPostMigrationActions(actions: PostMigrationAction[]) {
+  return apiFetch<{ results: Array<{ action: string; ok: boolean; error?: string; warning?: string }> }>(
+    '/api/migration-jobs/actions/run',
+    {
+      method: 'POST',
+      body: JSON.stringify({ actions }),
+    },
+  );
+}
+
+export async function retryOpsMigrationJob(id: string, destinationId?: string) {
+  return apiFetch<{ job: MigrationJob }>(`/api/migration-jobs/${encodeURIComponent(id)}/retry`, {
+    method: 'POST',
+    body: JSON.stringify(destinationId ? { destinationId } : {}),
+  });
+}
+
+export async function cancelOpsMigrationJob(id: string) {
+  return apiFetch<{ job: MigrationJob }>(`/api/migration-jobs/${encodeURIComponent(id)}/cancel`, { method: 'POST' });
+}
+
+export function subscribeMigrationJob(
+  id: string,
+  onEvent: (event: MigrationJobStreamEvent) => void,
+  onError?: (error: Event) => void,
+): () => void {
+  const source = new EventSource(`/api/migration-jobs/${encodeURIComponent(id)}/events`);
+  const parse = (type: MigrationJobStreamEvent['type']) => (event: MessageEvent<string>) => {
+    try {
+      onEvent({ type, ...JSON.parse(event.data) } as MigrationJobStreamEvent);
+    } catch {
+      // Ignore malformed stream events; the fallback job-list refresh can recover.
+    }
+  };
+  source.addEventListener('snapshot', parse('snapshot'));
+  source.addEventListener('job', parse('job'));
+  source.addEventListener('item', parse('item'));
+  source.addEventListener('post-migration', parse('post-migration'));
+  source.onerror = (error) => {
+    onError?.(error);
+    source.close();
+  };
+  return () => source.close();
 }
