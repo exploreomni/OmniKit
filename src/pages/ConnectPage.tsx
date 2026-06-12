@@ -35,6 +35,7 @@ import { useConnection } from '@/contexts/ConnectionContext';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';
+import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import {
   saveSavedInstance,
   type InstanceRole,
@@ -73,6 +74,8 @@ const capabilities: Capability[] = [
     icons: [Users, Shield, Tag, Calendar, Link2],
   },
 ];
+
+const totalToolCount = capabilities.reduce((sum, capability) => sum + capability.count, 0);
 
 function parseHost(url: string): string | null {
   try {
@@ -237,6 +240,23 @@ async function settle<T>(promise: Promise<T>): Promise<PromiseSettledResult<T>> 
   }
 }
 
+function describePassphraseStrength(passphrase: string) {
+  const trimmed = passphrase.trim();
+  if (!trimmed) return { label: 'Strength: waiting for passphrase', tone: 'text-content-tertiary' };
+
+  const variety = [
+    /[a-z]/.test(trimmed),
+    /[A-Z]/.test(trimmed),
+    /\d/.test(trimmed),
+    /[^A-Za-z0-9]/.test(trimmed),
+  ].filter(Boolean).length;
+  const score = (trimmed.length >= 12 ? 1 : 0) + (trimmed.length >= 16 ? 1 : 0) + Math.min(variety, 3);
+
+  if (score >= 4) return { label: 'Strength: strong', tone: 'text-emerald-700' };
+  if (score >= 3) return { label: 'Strength: good', tone: 'text-amber-700' };
+  return { label: 'Strength: basic. Use 12+ characters with a mix of character types.', tone: 'text-amber-800' };
+}
+
 function formatMetric(value: number | null) {
   if (value === null) return '—';
   return new Intl.NumberFormat().format(value);
@@ -363,6 +383,7 @@ export function ConnectPage() {
   const [snapshotLoadedFor, setSnapshotLoadedFor] = useState('');
   const [selectedInstanceId, setSelectedInstanceId] = useState('');
   const [vaultPassphrase, setVaultPassphrase] = useState('');
+  const [vaultPassphraseConfirm, setVaultPassphraseConfirm] = useState('');
   const [vaultBusy, setVaultBusy] = useState(false);
   const [vaultMessage, setVaultMessage] = useState('');
   const [vaultError, setVaultError] = useState('');
@@ -393,6 +414,7 @@ export function ConnectPage() {
       const hadExistingVault = Boolean(beforeUnlockStatus?.exists);
       const unlockResult = await unlockVault(vaultPassphrase);
       setVaultPassphrase('');
+      setVaultPassphraseConfirm('');
       const instances = await refreshInstances();
       if (unlockResult.resumedInstance) {
         setVaultMessage(`Vault unlocked and resumed ${unlockResult.resumedInstance.label}.`);
@@ -463,6 +485,7 @@ export function ConnectPage() {
     setSnapshotLoading(true);
 
     try {
+      // Connect spends one read-only burst on the workspace snapshot; batch before adding more probes.
       const documentsRes = await settle(listDocuments(connection.baseUrl, connection.apiKey, undefined, { allPages: true, pageSize: 250 }));
       const foldersRes = await settle(listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 }));
       const modelsRes = await settle(listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100, include: 'activeBranches' }));
@@ -535,7 +558,12 @@ export function ConnectPage() {
 
   const parsedHost = useMemo(() => parseHost(connection.baseUrl), [connection.baseUrl]);
   const vaultUnlocked = vaultSessionState === 'unlocked';
-  const canUnlockVault = Boolean(vaultPassphrase.trim()) && (vaultStatus?.exists || vaultPassphrase.trim().length >= 8) && !vaultBusy;
+  const creatingVault = !vaultStatus?.exists;
+  const passphraseStrength = useMemo(() => describePassphraseStrength(vaultPassphrase), [vaultPassphrase]);
+  const passphraseMatches = !creatingVault || vaultPassphrase === vaultPassphraseConfirm;
+  const canUnlockVault = Boolean(vaultPassphrase.trim())
+    && !vaultBusy
+    && (creatingVault ? vaultPassphrase.trim().length >= 8 && passphraseMatches : Boolean(vaultStatus?.exists));
   const newInstanceHost = parseHost(newVaultInstance.baseUrl);
   const canSaveVaultInstance = Boolean(newInstanceHost && newVaultInstance.apiKey.trim().length >= 12 && !vaultBusy);
   const isVaultConnected = connection.connectionMode === 'vault' && Boolean(connection.instanceId);
@@ -582,7 +610,7 @@ export function ConnectPage() {
           eyebrow: 'Connection needs attention',
           titleTop: "Let's get you",
           titleBottom: 'connected.',
-          body: 'Return Home, unlock the vault, and choose a saved instance again. OmniKit keeps plaintext keys out of the browser.',
+          body: connection.errorMessage || 'Return Home, unlock the vault, and choose a saved instance again. OmniKit keeps plaintext keys out of the browser.',
         };
       default:
         return {
@@ -592,45 +620,11 @@ export function ConnectPage() {
           body: 'A unified admin toolkit for every corner of your Omni analytics instance, from AI queries to governance.',
         };
     }
-  }, [connection.status]);
+  }, [connection.errorMessage, connection.status]);
 
   return (
     <div className="flex min-h-screen max-h-screen overflow-hidden">
-      <div
-        className="flex flex-col justify-center flex-1 relative overflow-hidden px-12 py-10"
-        style={{
-          background:
-            'linear-gradient(155deg, #4A0E2E 0%, #8A1651 28%, #D4236F 60%, #FF6FA8 100%)',
-        }}
-      >
-        <div
-          aria-hidden
-          className="absolute inset-0 pointer-events-none"
-          style={{
-	            backgroundImage: 'none',
-            backgroundSize: '34px 34px',
-	            maskImage: 'none',
-	            WebkitMaskImage: 'none',
-          }}
-        />
-        <div
-          aria-hidden
-          className="absolute -top-24 -right-24 w-[520px] h-[520px] rounded-full pointer-events-none animate-float"
-          style={{
-	            background: 'transparent',
-            animationDuration: '9s',
-          }}
-        />
-        <div
-          aria-hidden
-          className="absolute -bottom-32 -left-24 w-[460px] h-[460px] rounded-full pointer-events-none animate-float"
-          style={{
-	            background: 'transparent',
-            animationDuration: '11s',
-            animationDelay: '1.5s',
-          }}
-        />
-
+      <div className="flex flex-col justify-center flex-1 relative overflow-hidden px-12 py-10 bg-omni-gradient-dark">
         <div className="relative z-10 mx-auto w-full max-w-5xl">
           <div className="flex items-center justify-between mb-14">
             <OmniKitLogo variant="light" size="sm" subtitle="Home" />
@@ -663,14 +657,6 @@ export function ConnectPage() {
           <div className="animate-fadeIn">
             <div className="flex items-center gap-7 mb-7">
               <div className="relative flex-shrink-0">
-                <div
-                  aria-hidden
-                  className="absolute inset-0 rounded-full"
-                  style={{
-	                    background: 'transparent',
-                    transform: 'scale(2.4)',
-                  }}
-                />
                 <img
                   key={currentBlobby.src}
                   src={currentBlobby.src}
@@ -694,7 +680,7 @@ export function ConnectPage() {
                 </p>
                 {!isConnected && (
                   <div className="mt-4 flex items-center gap-3 text-[11px] text-white/75 font-medium">
-                    <span>15 tools</span>
+                    <span>{totalToolCount} tools</span>
                     <span className="w-1 h-1 rounded-full bg-white" />
                     <span>Vault-first</span>
                     <span className="w-1 h-1 rounded-full bg-white" />
@@ -758,26 +744,13 @@ export function ConnectPage() {
         </div>
       </div>
 
-      <div
-        className="w-[460px] flex-shrink-0 flex flex-col overflow-y-auto relative"
-        style={{ background: '#FFFFFF' }}
-      >
-        <div
-          aria-hidden
-          className="absolute inset-0 pointer-events-none"
-          style={{
-	            backgroundImage: 'none',
-            backgroundSize: '32px 32px',
-	            maskImage: 'none',
-	            WebkitMaskImage: 'none',
-          }}
-        />
+      <div className="w-[460px] flex-shrink-0 flex flex-col overflow-y-auto relative bg-white">
         <div className="relative z-10 flex-1 px-9 py-10">
           <div className="mb-7">
-            <h2 className="text-[22px] font-bold tracking-tight mb-1.5" style={{ color: '#1A0818' }}>
+            <h2 className="text-[22px] font-bold tracking-tight mb-1.5 text-content-primary">
               {isConnected ? 'Connected workspace' : 'Start with your vault'}
             </h2>
-            <p className="text-[13px] leading-relaxed" style={{ color: '#6B4A60' }}>
+            <p className="text-[13px] leading-relaxed text-content-secondary">
               {isConnected
                 ? isVaultConnected
                   ? 'This session is using a saved vault profile. The browser only keeps a non-secret reference.'
@@ -801,10 +774,10 @@ export function ConnectPage() {
                     <CheckCircle size={18} />
                   </div>
                   <div className="min-w-0 flex-1">
-                    <div className="text-[13px] font-semibold" style={{ color: '#1A0818' }}>
+                    <div className="text-[13px] font-semibold text-content-primary">
                       {connection.instanceLabel || parsedHost || 'Omni instance'}
                     </div>
-                    <div className="mt-1 truncate text-[12px]" style={{ color: '#6B4A60' }}>
+                    <div className="mt-1 truncate text-[12px] text-content-secondary">
                       {connection.baseUrl}
                     </div>
                     <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-omni-50 px-2.5 py-1 text-[11px] font-semibold text-omni-700">
@@ -838,11 +811,10 @@ export function ConnectPage() {
                   <button
                     type="button"
                     onClick={resetConnection}
-                    className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold transition-all duration-150 hover:-translate-y-px"
+                    className="flex items-center justify-center gap-2 px-4 py-2.5 rounded-xl text-[13px] font-semibold text-content-secondary transition-all duration-150 hover:-translate-y-px"
                     style={{
                       background: '#FFFFFF',
                       border: '1px solid rgba(217,222,232,0.95)',
-                      color: '#6B4A60',
                     }}
                   >
                     Change
@@ -862,11 +834,11 @@ export function ConnectPage() {
               >
                 <div className="flex items-start justify-between gap-3">
                   <div>
-                    <div className="flex items-center gap-2 text-[14px] font-semibold" style={{ color: '#1A0818' }}>
+                    <div className="flex items-center gap-2 text-[14px] font-semibold text-content-primary">
                       <ShieldCheck size={16} className="text-omni-600" />
                       Local encrypted vault
                     </div>
-                    <p className="mt-1 text-[12px] leading-relaxed" style={{ color: '#6B4A60' }}>
+                    <p className="mt-1 text-[12px] leading-relaxed text-content-secondary">
                       Save Omni URLs and API keys locally so users can pick from dropdowns instead of re-entering credentials.
                     </p>
                   </div>
@@ -880,17 +852,47 @@ export function ConnectPage() {
 
                 {!vaultUnlocked ? (
                   <div className="mt-4 space-y-3">
-                    <input
-                      type="password"
+                    <PassphraseInput
                       value={vaultPassphrase}
-                      onChange={(event) => setVaultPassphrase(event.target.value)}
-                      onKeyDown={(event) => {
-                        if (event.key === 'Enter' && canUnlockVault) void handleVaultUnlock();
+                      onChange={setVaultPassphrase}
+                      onSubmit={() => {
+                        if (canUnlockVault) void handleVaultUnlock();
                       }}
-                      className="input-field"
                       placeholder={vaultStatus?.exists ? 'Enter vault passphrase' : 'Create vault passphrase'}
-                      autoComplete="new-password"
+                      autoComplete={vaultStatus?.exists ? 'current-password' : 'new-password'}
                     />
+                    {creatingVault && (
+                      <>
+                        <PassphraseInput
+                          value={vaultPassphraseConfirm}
+                          onChange={setVaultPassphraseConfirm}
+                          onSubmit={() => {
+                            if (canUnlockVault) void handleVaultUnlock();
+                          }}
+                          placeholder="Confirm vault passphrase"
+                          autoComplete="new-password"
+                        />
+                        <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-800">
+                          This passphrase cannot be recovered. Store it in your password manager before saving credentials.
+                        </div>
+                        <div className={`text-[11px] font-medium ${passphraseStrength.tone}`}>
+                          {passphraseStrength.label}
+                        </div>
+                        {vaultPassphraseConfirm && !passphraseMatches && (
+                          <div className="text-[11px] font-medium text-red-700">
+                            Passphrases do not match.
+                          </div>
+                        )}
+                        <div className="rounded-xl border border-omni-100 bg-omni-50 px-3 py-3 text-[11px] leading-relaxed text-omni-800">
+                          <div className="font-semibold text-omni-900">First run path</div>
+                          <div className="mt-1 grid gap-1">
+                            <span>1. Create vault</span>
+                            <span>2. Add your Omni instance</span>
+                            <span>3. Pick a workflow from Home</span>
+                          </div>
+                        </div>
+                      </>
+                    )}
                     <button
                       type="button"
                       onClick={handleVaultUnlock}
@@ -900,7 +902,7 @@ export function ConnectPage() {
                       {vaultBusy ? <Loader2 size={15} className="animate-spin" /> : <UnlockKeyhole size={15} />}
                       {vaultStatus?.exists ? 'Unlock vault' : 'Create vault'}
                     </button>
-                    <p className="text-[11px] leading-relaxed" style={{ color: '#8A6078' }}>
+                    <p className="text-[11px] leading-relaxed text-content-tertiary">
                       The passphrase never leaves your machine. The vault file lives under OmniKit's local data folder.
                     </p>
                   </div>
@@ -908,7 +910,7 @@ export function ConnectPage() {
                   <div className="mt-4 space-y-4">
                     {savedInstances.length > 0 && (
                       <div className="space-y-2">
-                        <label className="text-[12px] font-semibold" style={{ color: '#1A0818' }}>
+                        <label className="text-[12px] font-semibold text-content-primary">
                           Choose saved instance
                         </label>
                         <select
@@ -923,7 +925,7 @@ export function ConnectPage() {
                           ))}
                         </select>
                         {selectedInstance && (
-                          <div className="rounded-xl border border-border-subtle bg-surface-subtle px-3 py-2 text-[11px]" style={{ color: '#6B4A60' }}>
+                          <div className="rounded-xl border border-border-subtle bg-surface-subtle px-3 py-2 text-[11px] text-content-secondary">
                             <div className="flex items-center justify-between gap-2">
                               <span className="truncate">{selectedInstance.apiKeyMasked}</span>
                               <span className="rounded-full bg-white px-2 py-0.5 font-semibold text-content-secondary">
@@ -946,10 +948,10 @@ export function ConnectPage() {
 
                     {(showAddVaultInstance || savedInstances.length === 0) ? (
                       <div className="rounded-xl border border-border-subtle p-3">
-                        <div className="text-[13px] font-semibold" style={{ color: '#1A0818' }}>
+                        <div className="text-[13px] font-semibold text-content-primary">
                           {savedInstances.length === 0 ? 'Add your first connection' : 'Add another connection'}
                         </div>
-                        <p className="mt-1 text-[11px] leading-relaxed" style={{ color: '#8A6078' }}>
+                        <p className="mt-1 text-[11px] leading-relaxed text-content-tertiary">
                           Only URL and API key are required. Model, folder, filters, and actions can be selected later.
                         </p>
                         <div className="mt-3 space-y-3">
@@ -1033,12 +1035,6 @@ export function ConnectPage() {
         </div>
       </div>
 
-      <style>{`
-        @keyframes shimmer {
-          0% { background-position: 200% 0; }
-          100% { background-position: -200% 0; }
-        }
-      `}</style>
     </div>
   );
 }
@@ -1067,14 +1063,14 @@ function TrustRow({
         {icon}
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-[12px] font-semibold mb-0.5" style={{ color: '#1A0818' }}>
+        <p className="text-[12px] font-semibold mb-0.5 text-content-primary">
           {title}
         </p>
-        <p className="text-[11px] leading-relaxed" style={{ color: '#6B4A60' }}>
+        <p className="text-[11px] leading-relaxed text-content-secondary">
           {body}
         </p>
       </div>
-      {href && <ArrowRight size={12} className="flex-shrink-0 mt-1" style={{ color: '#C83B70', opacity: 0.6 }} />}
+      {href && <ArrowRight size={12} className="flex-shrink-0 mt-1 text-omni-600 opacity-60" />}
     </>
   );
 

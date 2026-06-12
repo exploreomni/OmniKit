@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck, UnlockKeyhole } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useVaultSession } from '@/hooks/useVaultSession';
+import { PassphraseInput } from '@/components/ui/PassphraseInput';
 
 function hostFromUrl(value: string): string {
   try {
@@ -171,15 +172,14 @@ export function InstanceSwitcher() {
                 <label className="text-[11px] font-semibold text-content-secondary">
                   Vault passphrase
                 </label>
-                <input
-                  type="password"
+                <PassphraseInput
                   value={passphrase}
-                  onChange={(event) => setPassphrase(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === 'Enter' && canUnlockVault) void handleUnlock();
+                  onChange={setPassphrase}
+                  onSubmit={() => {
+                    if (canUnlockVault) void handleUnlock();
                   }}
                   disabled={busy || status === 'unknown'}
-                  className="input-field h-9 text-xs"
+                  inputClassName="h-9 text-xs"
                   placeholder={status === 'unknown' ? 'Checking vault status...' : 'Enter vault passphrase'}
                   autoComplete="current-password"
                 />
