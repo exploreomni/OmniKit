@@ -200,6 +200,15 @@ Key points:
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the full local security gate: audit, security tests, typechecks, lint, and build. |
 
+### Live E2E gate
+
+Before cutting a release, run the automated gate above and spot-check these vault-mode flows against a real saved instance:
+
+1. Start OmniKit with a short idle timeout, for example `OMNIKIT_VAULT_IDLE_TIMEOUT_MS=10000 npm run dev`.
+2. Unlock the native vault, connect a saved instance, wait for the idle timeout, and confirm Home shows the vault unlock prompt instead of **Connected workspace**.
+3. Unlock from the sidebar instance switcher and confirm the previous saved instance resumes without re-selecting it.
+4. Start a migration job, lock the vault, cancel the running job, and confirm cancel succeeds while retry still requires the vault to be unlocked.
+
 ---
 
 ## Release & package information

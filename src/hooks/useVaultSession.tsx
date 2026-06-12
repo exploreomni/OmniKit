@@ -22,6 +22,11 @@ interface VaultTestResult {
   error?: string;
 }
 
+interface VaultUnlockResult {
+  resumedInstance?: SavedInstancePublic;
+  resetConnection?: boolean;
+}
+
 interface VaultSessionContextValue {
   status: VaultSessionState;
   vaultStatus: VaultStatus | null;
@@ -30,7 +35,7 @@ interface VaultSessionContextValue {
   lockedMessage: string;
   refreshStatus: () => Promise<VaultStatus | null>;
   refreshInstances: () => Promise<SavedInstancePublic[]>;
-  unlock: (passphrase: string) => Promise<void>;
+  unlock: (passphrase: string) => Promise<VaultUnlockResult>;
   lock: () => Promise<void>;
   touch: () => Promise<void>;
   connectInstance: (instanceId: string) => Promise<SavedInstancePublic>;
@@ -122,13 +127,13 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
     });
   }, [connection.connectionMode, connection.status, lockedMessage, updateConnection, vaultStatus]);
 
-  const unlock = useCallback(async (passphrase: string) => {
+  const unlock = useCallback(async (passphrase: string): Promise<VaultUnlockResult> => {
     const result = await unlockNativeVault(passphrase);
     setVaultStatus(result.status);
     const nextInstances = result.status.unlocked ? await listSavedInstances() : { instances: [] };
     setInstances(nextInstances.instances);
     setLockedMessage('');
-    if (!result.status.unlocked || !connection.instanceId) return;
+    if (!result.status.unlocked || !connection.instanceId) return {};
 
     const resumableInstance = nextInstances.instances.find((instance) => instance.id === connection.instanceId);
     if (!resumableInstance) {
@@ -139,7 +144,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
         detail: 'The vault unlocked, but the previous instance was not found. Choose a saved instance to continue.',
         duration: 5000,
       });
-      return;
+      return { resetConnection: true };
     }
 
     try {
@@ -154,6 +159,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
         detail: 'Vault unlocked and the previous saved instance is active again.',
         duration: 3500,
       });
+      return { resumedInstance: resumed.instance };
     } catch (error) {
       resetConnection();
       toast({
@@ -162,6 +168,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
         detail: error instanceof Error ? error.message : 'Choose a saved instance to continue.',
         duration: 5000,
       });
+      return { resetConnection: true };
     }
   }, [connection.instanceId, resetConnection, updateConnection]);
 

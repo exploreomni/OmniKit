@@ -391,10 +391,16 @@ export function ConnectPage() {
     try {
       const beforeUnlockStatus = await refreshStatus().catch(() => vaultStatus);
       const hadExistingVault = Boolean(beforeUnlockStatus?.exists);
-      await unlockVault(vaultPassphrase);
+      const unlockResult = await unlockVault(vaultPassphrase);
       setVaultPassphrase('');
       const instances = await refreshInstances();
-      setVaultMessage(hadExistingVault ? 'Vault unlocked. Choose a saved instance to connect.' : 'Vault created. Add your first Omni instance to continue.');
+      if (unlockResult.resumedInstance) {
+        setVaultMessage(`Vault unlocked and resumed ${unlockResult.resumedInstance.label}.`);
+      } else if (unlockResult.resetConnection) {
+        setVaultMessage('Vault unlocked. Choose a saved instance to continue.');
+      } else {
+        setVaultMessage(hadExistingVault ? 'Vault unlocked. Choose a saved instance to connect.' : 'Vault created. Add your first Omni instance to continue.');
+      }
       setShowAddVaultInstance(instances.length === 0);
     } catch (err) {
       setVaultError(err instanceof Error ? err.message : 'Could not unlock the vault.');
