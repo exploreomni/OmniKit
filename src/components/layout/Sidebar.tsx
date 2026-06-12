@@ -42,7 +42,7 @@ const sections: NavSection[] = [
     label: 'Dashboard AI & Delivery',
     items: [
       { to: '/dashboards/ai-studio', icon: <Sparkles size={15} />, label: 'AI Dashboard Studio' },
-      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Model Migrator' },
+      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Dashboard Migrator' },
       { to: '/dashboards/operations', icon: <FolderCog size={15} />, label: 'Dashboard Operations' },
       { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Dashboard Downloads' },
       { to: '/deck-builder', icon: <Presentation size={15} />, label: 'Deck Builder' },

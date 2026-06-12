@@ -255,7 +255,7 @@ export function DataPrivacyPage() {
           <div>
             <h2 className="text-base font-semibold text-content-primary">Browser vault compatibility bridge</h2>
             <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
-              Older Model Migrator target credentials may still exist in <span className="font-mono">localStorage</span> as an AES-GCM encrypted browser vault. OmniKit no longer decrypts or imports that browser-side vault. Re-add any still-needed browser profiles to the native vault manually, then dismiss the legacy cache from Instance Manager or clear browser cache here. This is separate from the server-side legacy multi-instance <span className="font-mono">.enc</span> vault import available in Instance Manager.
+              Older Dashboard Migrator target credentials may still exist in <span className="font-mono">localStorage</span> as an AES-GCM encrypted browser vault. OmniKit no longer decrypts or imports that browser-side vault. Re-add any still-needed browser profiles to the native vault manually, then dismiss the legacy cache from Instance Manager or clear browser cache here. This is separate from the server-side legacy multi-instance <span className="font-mono">.enc</span> vault import available in Instance Manager.
             </p>
             <div className="mt-2 font-mono text-[11px] text-content-tertiary">
               omnikit:instanceVault:v1 · encrypted browser cache compatibility path

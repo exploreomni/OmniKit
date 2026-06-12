@@ -30,7 +30,7 @@ import { clearMigrationJobs, listMigrationJobs, type JobStatus, type MigrationJo
 import type { OperationLogEntry, OperationType } from '@/types';
 
 const TYPE_CONFIG: Record<OperationType, { icon: typeof Clock; label: string; color: string }> = {
-  migration: { icon: ArrowRightLeft, label: 'Model Migrator', color: 'text-blue-600 bg-blue-50' },
+  migration: { icon: ArrowRightLeft, label: 'Dashboard Migrator', color: 'text-blue-600 bg-blue-50' },
   bulk_move: { icon: FolderInput, label: 'Dashboard Move', color: 'text-sky-600 bg-sky-50' },
   bulk_delete: { icon: Trash2, label: 'Dashboard Delete', color: 'text-red-600 bg-red-50' },
   download: { icon: Download, label: 'Download', color: 'text-sky-600 bg-sky-50' },

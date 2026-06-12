@@ -83,8 +83,8 @@ export function MigratePage() {
   return (
     <div className="space-y-5">
       <PageHeader
-        title="Model Migrator"
-        description="Pick the migration path first: remap dashboards inside the active instance, or fan out selected dashboards from one saved source to many saved destination instances."
+        title="Dashboard Migrator"
+        description="Pick the migration path first: remap dashboards inside the active instance, or copy dashboards to one or many saved destination instances."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
       <div className="card p-5">

@@ -1,4 +1,4 @@
-export const WALKTHROUGH_VERSION = '2026-06-12-vault-home';
+export const WALKTHROUGH_VERSION = '2026-06-12-dashboard-migrator-rename';
 export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 12, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
@@ -143,8 +143,8 @@ export const walkthroughSteps: WalkthroughStep[] = [
     id: 'model-migrator',
     route: '/dashboards/migrate',
     label: 'Migrate',
-    title: 'Use Model Migrator for same-instance remaps or fan-out copy/import',
-    purpose: 'Model Migrator now starts with a clear path choice. Same-instance remap keeps the existing connected-instance workflow, while fan-out copy/import lets admins pick one saved source and copy selected dashboards to many saved destination instances.',
+    title: 'Use Dashboard Migrator for same-instance remaps or fan-out copy/import',
+    purpose: 'Model Migrator is now Dashboard Migrator because this workflow moves dashboards. Model Migrator is reserved for a new semantic-layer tool that will move models between connections before handing off dashboard migration here.',
     directions: [
       'Choose Within this instance when the selected saved instance is the source and destination and only the dashboard base model changes.',
       'Choose To other saved instances when dashboards need to fan out from one saved source profile to multiple destination instances, models, or folders.',

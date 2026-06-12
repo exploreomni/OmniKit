@@ -163,7 +163,7 @@ interface WorkspaceSnapshot {
 }
 
 const quickStartTiles: QuickStartTile[] = [
-  { label: 'Migrate dashboards', description: 'Remap models or copy to another instance', to: '/dashboards/migrate', icon: ArrowRightLeft },
+  { label: 'Migrate dashboards', description: 'Remap dashboard models or copy to another instance', to: '/dashboards/migrate', icon: ArrowRightLeft },
   { label: 'Audit permissions', description: 'Review users and group access', to: '/users', icon: Shield },
   { label: 'Build a deck', description: 'Export dashboards to PowerPoint', to: '/deck-builder', icon: Presentation },
 ];

@@ -2,6 +2,12 @@
 
 This page summarizes OmniKit release notes for repository visitors and administrators deciding whether to clone or upgrade the app.
 
+## Unreleased - Dashboard Migrator Rename
+
+- Renamed the dashboard migration workflow from **Model Migrator** to **Dashboard Migrator** to reflect what the current tool actually moves: dashboards, dashboard metadata, and dashboard base-model mappings.
+- Reserved **Model Migrator** for a future semantic-layer workflow that will move Omni models between connections before handing off to Dashboard Migrator.
+- Added the migration planner regression suite to the security workflow and local `security:check` gate.
+
 ## v1.1.0 - Multi-Instance Ops Console
 
 OmniKit v1.1.0 adds the full multi-instance operations console requested by early admin feedback.
@@ -13,7 +19,7 @@ OmniKit v1.1.0 adds the full multi-instance operations console requested by earl
 - New **Instance Manager** page for vault lock/unlock/reset, saved instance CRUD, structured metric filters, structured post-migration webhooks, connection metrics, schema refresh actions, and embed-user activity metrics.
 - Home is now the vault-first starting point: users create or unlock the native vault there, choose a saved instance there, and use the sidebar only for active-instance status and switching.
 - Legacy `omni-multi-instance-tools` vault import with dry-run review, duplicate base-URL detection, invalid profile skipping, unsafe post-action dropping, and native-vault re-encryption.
-- Model Migrator remains same-instance model remap by default, with a separate saved-instance dashboard copy/import mode.
+- Dashboard Migrator remains same-instance dashboard base-model remap by default, with a separate saved-instance dashboard copy/import mode.
 - Saved-instance migration now uses a four-step fan-out wizard: pick one source/model/dashboard set, check one or more destination instances, review a per-target preflight matrix, and monitor live per-destination run progress.
 - The fan-out wizard supports same-destination multi-model fan-out, cross-instance fan-out, optional target-folder cleanup, metadata preservation where supported, job history, cancel, and retry of failed destinations without rerunning successful work.
 - Multi-instance connection metrics now use schema-model coverage by connection ID instead of treating `defaultSchema` as the readiness signal.
@@ -56,7 +62,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - A versioned in-app walkthrough for non-technical users, with first-run display, sidebar replay, update prompts, and Data Privacy reset controls.
 - Dashboard AI & Delivery workflows:
   - AI Dashboard Studio with Build New Dashboard, Excel to Dashboard, and Review Existing Dashboard lanes.
-  - Model Migrator with compatibility preflight for payload and target-field warnings.
+  - Dashboard Migrator with compatibility preflight for payload and target-field warnings.
   - Dashboard Operations
   - Dashboard Downloads
   - Deck Builder
@@ -100,7 +106,7 @@ OmniKit v1.0.0 is the first public release of the local-first Omni admin workspa
 - The Vite dev server is for local use only.
 - AI Dashboard Studio dashboard builds are first-pass drafts; final tile review, layout cleanup, save/share, and publishing remain in Omni.
 - Excel to Dashboard does not mutate the semantic model directly. Formula-derived measures, lookup dimensions, and other semantic gaps are routed to AI Semantic Studio for reviewed YAML and dev-branch validation.
-- Model Migrator compatibility preflight checks payload structure and target-field presence, but it cannot prove that same-named metrics have identical business definitions.
+- Dashboard Migrator compatibility preflight checks payload structure and target-field presence, but it cannot prove that same-named metrics have identical business definitions.
 - Generated dashboard exports, deck files, copied diagnostics, and imported backups may contain customer data and should be handled according to your organization's data policy.
 - The IndexedDB database name remains `omnikit-local` for browser data continuity from earlier builds.
 
