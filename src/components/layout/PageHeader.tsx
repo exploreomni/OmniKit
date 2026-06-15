@@ -14,12 +14,7 @@ export function PageHeader({ title, description, actions, icon, gradient = false
       <div className="flex min-w-0 items-start gap-4">
         {icon && (
           <div
-            className="w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0 overflow-visible"
-            style={{
-              background: '#FFFFFF',
-              border: '1px solid rgba(217,222,232,0.95)',
-              color: '#C83B70',
-            }}
+            className="w-14 h-14 rounded-2xl flex items-center justify-center flex-shrink-0 overflow-visible border border-border bg-surface-primary text-omni-700"
           >
             {icon}
           </div>
