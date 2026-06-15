@@ -8,7 +8,6 @@ import {
   GitBranch,
   Layers3,
   Loader2,
-  Lock,
   PlayCircle,
   RefreshCw,
   Server,
@@ -17,8 +16,8 @@ import {
   Workflow,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { Blobby } from '@/components/ui/Blobby';
-import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import {
   cancelOpsMigrationJob,
@@ -34,7 +33,6 @@ import {
   retryOpsMigrationJob,
   subscribeMigrationJob,
   translateModelMigratorYaml,
-  unlockNativeVault,
   type InstanceModel,
   type ModelMigratorConnection,
   type ModelMigratorInventoryDocument,
@@ -250,10 +248,7 @@ export function ModelMigratorPage() {
   const [selectedSourceModelIds, setSelectedSourceModelIds] = useState<string[]>([]);
   const [targetModelBySourceId, setTargetModelBySourceId] = useState<Record<string, string>>({});
   const [inventory, setInventory] = useState<ModelMigratorInventoryRow[]>([]);
-  const [passphrase, setPassphrase] = useState('');
-  const [confirmPassphrase, setConfirmPassphrase] = useState('');
   const [loadingVault, setLoadingVault] = useState(true);
-  const [unlocking, setUnlocking] = useState(false);
   const [loadingInstances, setLoadingInstances] = useState(false);
   const [loadingSource, setLoadingSource] = useState(false);
   const [loadingTarget, setLoadingTarget] = useState(false);
@@ -355,11 +350,6 @@ export function ModelMigratorPage() {
     && workbookBlockerCount === 0
     && !jobActive
     && !startingJob;
-  const vaultExists = vaultStatus?.exists !== false;
-  const unlockDisabled = unlocking
-    || !passphrase.trim()
-    || (!vaultExists && (passphrase.length < 8 || passphrase !== confirmPassphrase));
-
   async function refreshVault() {
     setLoadingVault(true);
     setError('');
@@ -383,26 +373,6 @@ export function ModelMigratorPage() {
       setError(errorText(err, 'Failed to load saved instances.'));
     } finally {
       setLoadingInstances(false);
-    }
-  }
-
-  async function unlockVault() {
-    if (unlockDisabled) return;
-    const creatingVault = !vaultExists;
-    setUnlocking(true);
-    setError('');
-    setMessage('');
-    try {
-      const result = await unlockNativeVault(passphrase);
-      setVaultStatus(result.status);
-      setPassphrase('');
-      setConfirmPassphrase('');
-      setMessage(creatingVault ? 'Vault created. Add saved Omni instances before migrating models.' : 'Vault unlocked. Choose source and target instances.');
-      await refreshInstances();
-    } catch (err) {
-      setError(errorText(err, 'Could not unlock the vault.'));
-    } finally {
-      setUnlocking(false);
     }
   }
 
@@ -910,6 +880,15 @@ export function ModelMigratorPage() {
 
   const unlocked = Boolean(vaultStatus?.unlocked);
 
+  if (!unlocked) {
+    return (
+      <>
+        {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+        <SavedInstanceRequiredEmptyState toolName="Model Migrator" />
+      </>
+    );
+  }
+
   return (
     <div className="space-y-5 pb-12">
       <PageHeader
@@ -933,54 +912,7 @@ export function ModelMigratorPage() {
         ))}
       </div>
 
-      {!unlocked ? (
-        <div className="card p-5">
-          <div className="mb-4 flex items-start gap-3">
-            <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-card bg-omni-50 text-omni-700">
-              <Lock size={18} />
-            </span>
-            <div>
-              <h2 className="text-base font-semibold text-content-primary">{vaultExists ? 'Unlock the native vault' : 'Create the native vault'}</h2>
-              <p className="mt-1 text-sm text-content-secondary">
-                Model Migrator uses saved Omni instances only. Plaintext API keys stay encrypted in the local native vault.
-              </p>
-            </div>
-          </div>
-          <div className="max-w-md space-y-3">
-            {!vaultExists && (
-              <div className="rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                This passphrase cannot be recovered. Store it in your password manager.
-              </div>
-            )}
-            <PassphraseInput
-              value={passphrase}
-              onChange={setPassphrase}
-              placeholder={vaultExists ? 'Vault passphrase' : 'Create vault passphrase'}
-              autoComplete={vaultExists ? 'current-password' : 'new-password'}
-              onSubmit={unlockVault}
-            />
-            {!vaultExists && (
-              <PassphraseInput
-                value={confirmPassphrase}
-                onChange={setConfirmPassphrase}
-                placeholder="Confirm passphrase"
-                autoComplete="new-password"
-                onSubmit={unlockVault}
-              />
-            )}
-            {!vaultExists && passphrase && passphrase.length < 8 && (
-              <div className="text-xs text-amber-700">Use at least 8 characters.</div>
-            )}
-            {!vaultExists && confirmPassphrase && passphrase !== confirmPassphrase && (
-              <div className="text-xs text-red-700">Passphrases do not match.</div>
-            )}
-            <button type="button" onClick={unlockVault} disabled={unlockDisabled} className="btn-primary inline-flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-60">
-              {unlocking ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-              {vaultExists ? 'Unlock vault' : 'Create vault'}
-            </button>
-          </div>
-        </div>
-      ) : loadingInstances ? (
+      {loadingInstances ? (
         <LoadingLine label="Loading saved instances" />
       ) : instances.length === 0 ? (
         <div className="card p-5">
