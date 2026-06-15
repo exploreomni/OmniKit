@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
@@ -146,6 +147,7 @@ function strategyForTileExports(renderStrategy: RenderStrategy): RenderStrategy 
 
 export function DeckBuilderPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const logOp = useLogOperation();
 
   const [step, setStep] = useState<StepId>('inspect');
@@ -321,18 +323,21 @@ export function DeckBuilderPage() {
 
   const refreshDashboardList = useCallback(async () => {
     if (!connection.baseUrl || !connection.apiKey) return;
+    const requestKey = connectionKey;
     setLoadingDashboards(true);
     try {
       const list = await fetchDashboardList(connection.baseUrl, connection.apiKey);
+      if (!isActiveConnectionRequest(requestKey)) return;
       setDashboards(list);
       setDashboardsSyncedAt(Date.now());
       dashboardCache.save(connection.baseUrl, list);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       deckLog.warn('inspect', 'Failed to fetch dashboard list', { error: err instanceof Error ? err.message : String(err) });
     } finally {
-      setLoadingDashboards(false);
+      if (isActiveConnectionRequest(requestKey)) setLoadingDashboards(false);
     }
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
 
   useEffect(() => {
     if (!connection.baseUrl || !connection.apiKey) return;

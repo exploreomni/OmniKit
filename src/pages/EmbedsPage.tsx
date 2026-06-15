@@ -1,14 +1,27 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link2, Copy, Check, ExternalLink } from 'lucide-react';
 import { generateEmbedUrl } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
+import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
+import { fetchDashboardList } from '@/services/deckBuilder/omniDeckApi';
+import { dashboardCache, type CachedDashboard } from '@/services/deckBuilder/localCache';
 import { friendlyApiError } from '@/utils/apiErrors';
+
+function dashboardContentPath(dashboard: CachedDashboard) {
+  return `/dashboards/${dashboard.id}`;
+}
 
 export function EmbedsPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [contentPath, setContentPath] = useState('');
+  const [selectedDashboardId, setSelectedDashboardId] = useState('');
+  const [dashboards, setDashboards] = useState<CachedDashboard[]>([]);
+  const [dashboardsSyncedAt, setDashboardsSyncedAt] = useState<number | null>(null);
+  const [loadingDashboards, setLoadingDashboards] = useState(false);
   const [externalId, setExternalId] = useState('');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
@@ -19,8 +32,53 @@ export function EmbedsPage() {
   const [copied, setCopied] = useState(false);
   const [recentUrls, setRecentUrls] = useState<Array<{ path: string; url: string; time: string }>>([]);
 
+  useEffect(() => {
+    const cached = dashboardCache.load(connection.baseUrl);
+    if (cached?.data) {
+      setDashboards(cached.data);
+      setDashboardsSyncedAt(cached.savedAt);
+    } else {
+      setDashboards([]);
+      setDashboardsSyncedAt(null);
+    }
+    setSelectedDashboardId('');
+    setContentPath('');
+    setResult(null);
+    setError('');
+    setCopied(false);
+    setLoading(false);
+    setLoadingDashboards(false);
+    setRecentUrls([]);
+  }, [connection.baseUrl, connectionKey]);
+
+  async function refreshDashboards() {
+    const requestKey = connectionKey;
+    setLoadingDashboards(true);
+    setError('');
+    try {
+      const next = await fetchDashboardList(connection.baseUrl, connection.apiKey);
+      if (!isActiveConnectionRequest(requestKey)) return;
+      setDashboards(next);
+      setDashboardsSyncedAt(Date.now());
+      dashboardCache.save(connection.baseUrl, next);
+    } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
+      setError(friendlyApiError(err, 'Failed to load dashboards'));
+    } finally {
+      if (isActiveConnectionRequest(requestKey)) setLoadingDashboards(false);
+    }
+  }
+
+  function pickDashboard(dashboard: CachedDashboard) {
+    setSelectedDashboardId(dashboard.id);
+    setContentPath(dashboardContentPath(dashboard));
+    setResult(null);
+    setCopied(false);
+  }
+
   async function handleGenerate(e: React.FormEvent) {
     e.preventDefault();
+    const requestKey = connectionKey;
     setLoading(true);
     setError('');
     setResult(null);
@@ -37,6 +95,7 @@ export function EmbedsPage() {
       }
 
       const res = await generateEmbedUrl(connection.baseUrl, connection.apiKey, body);
+      if (!isActiveConnectionRequest(requestKey)) return;
       const url = res.url || res.embed_url || JSON.stringify(res);
       setResult(url);
       setRecentUrls((prev) => [
@@ -44,9 +103,10 @@ export function EmbedsPage() {
         ...prev.slice(0, 9),
       ]);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to generate embed URL'));
     } finally {
-      setLoading(false);
+      if (isActiveConnectionRequest(requestKey)) setLoading(false);
     }
   }
 
@@ -129,11 +189,27 @@ export function EmbedsPage() {
 
           <form onSubmit={handleGenerate} className="space-y-4">
             <div>
+              <label className="block text-xs font-medium text-content-secondary mb-1">Dashboard Picker</label>
+              <DashboardSearch
+                dashboards={dashboards}
+                loading={loadingDashboards}
+                lastSyncedAt={dashboardsSyncedAt}
+                onRefresh={refreshDashboards}
+                onPick={pickDashboard}
+                selectedDashboardId={selectedDashboardId}
+                disabled={!connection.baseUrl || !connection.apiKey}
+              />
+            </div>
+            <div>
               <label className="block text-xs font-medium text-content-secondary mb-1">Content Path *</label>
               <input
                 type="text"
                 value={contentPath}
-                onChange={(e) => setContentPath(e.target.value)}
+                onChange={(e) => {
+                  setContentPath(e.target.value);
+                  setSelectedDashboardId('');
+                  setResult(null);
+                }}
                 className="input-field"
                 placeholder="/dashboards/my-dashboard"
               />

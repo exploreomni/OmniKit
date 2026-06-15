@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { ChevronDown, ChevronRight, Download, Loader2, Plus, Search, Trash2, CreditCard as Edit3, X, Upload } from 'lucide-react';
 import { listAllUsers, createUser, updateUser, deleteUser, findUserByEmail } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
@@ -284,6 +284,8 @@ function mapScimUser(user: Record<string, unknown>): OmniUser {
 
 export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { connection } = useConnection();
+  const connectionKey = connection.instanceId || connection.baseUrl;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [users, setUsers] = useState<OmniUser[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -303,26 +305,34 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [creatingMany, setCreatingMany] = useState(false);
   const pageSize = 50;
 
+  useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
+
   const fetchUsers = useCallback(async () => {
+    const requestKey = connectionKey;
     setLoading(true);
     setError('');
     try {
       const res = await listAllUsers(connection.baseUrl, connection.apiKey, { pageSize: 100, maxPages: 200 });
       if (res.error) {
+        if (activeConnectionKeyRef.current !== requestKey) return;
         setError(friendlyApiError(res.error, 'Failed to load users'));
         return;
       }
+      if (activeConnectionKeyRef.current !== requestKey) return;
       const nextUsers = (res.Resources || []).map(mapScimUser);
       setUsers(nextUsers);
       setTotalResults(Number(res.totalResults) || nextUsers.length);
       setUserLoadTruncated(Boolean(res.truncated));
       setPage(1);
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setError(friendlyApiError(err, 'Failed to load users'));
     } finally {
-      setLoading(false);
+      if (activeConnectionKeyRef.current === requestKey) setLoading(false);
     }
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey]);
 
   useEffect(() => {
     fetchUsers();

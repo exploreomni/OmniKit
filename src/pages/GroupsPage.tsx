@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useMemo } from 'react';
 import { CheckCircle2, ChevronDown, ChevronRight, Download, Loader2, UserPlus, UserMinus, Upload, X } from 'lucide-react';
 import { listGroups, getGroup, updateGroup, findUserByEmail, listAllUsers } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
@@ -174,6 +175,7 @@ function downloadCsv(fileName: string, rows: string[][]) {
 
 export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [groups, setGroups] = useState<OmniGroup[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -196,6 +198,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [assignResults, setAssignResults] = useState<string[]>([]);
 
   const fetchGroups = useCallback(async () => {
+    const requestKey = connectionKey;
     setLoading(true);
     setError('');
     try {
@@ -204,6 +207,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
       const count = 100;
       while (true) {
         const res = await listGroups(connection.baseUrl, connection.apiKey, count, startIndex);
+        if (!isActiveConnectionRequest(requestKey)) return;
         if (res.error) {
           setError(friendlyApiError(res.error, 'Failed to load groups'));
           break;
@@ -217,19 +221,32 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         if ((res.totalResults || 0) <= startIndex + count - 1) break;
         startIndex += count;
       }
+      if (!isActiveConnectionRequest(requestKey)) return;
       setGroups(allGroups);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to load groups'));
     } finally {
-      setLoading(false);
+      if (isActiveConnectionRequest(requestKey)) setLoading(false);
     }
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
+
+  useEffect(() => {
+    setGroups([]);
+    setExpandedIds(new Set());
+    setDetailedGroups({});
+    setAssignUsers([]);
+    setSelectedAssignUserIds(new Set());
+    setBulkAssignGroupId('');
+    setAssignResults([]);
+  }, [connectionKey]);
 
   useEffect(() => {
     fetchGroups();
   }, [fetchGroups]);
 
   async function toggleExpand(groupId: string) {
+    const requestKey = connectionKey;
     const next = new Set(expandedIds);
     if (next.has(groupId)) {
       next.delete(groupId);
@@ -240,6 +257,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         setLoadingDetail(groupId);
         try {
           const detail = await getGroup(connection.baseUrl, connection.apiKey, groupId);
+          if (!isActiveConnectionRequest(requestKey)) return;
           setDetailedGroups((prev) => ({
             ...prev,
             [groupId]: {
@@ -251,7 +269,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         } catch {
           // use basic data
         } finally {
-          setLoadingDetail(null);
+          if (isActiveConnectionRequest(requestKey)) setLoadingDetail(null);
         }
       }
     }
@@ -364,6 +382,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   }
 
   async function handleDownloadGroupAssignments() {
+    const requestKey = connectionKey;
     setExportingMemberships(true);
     setError('');
     const rows: string[][] = [['email', 'group_name', 'op']];
@@ -374,6 +393,7 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
         let detail = detailedGroups[group.id] || group;
         if (!detailedGroups[group.id]) {
           const fetched = await getGroup(connection.baseUrl, connection.apiKey, group.id);
+          if (!isActiveConnectionRequest(requestKey)) return;
           detail = {
             id: fetched.id,
             displayName: fetched.displayName,
@@ -398,9 +418,10 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
       downloadCsv('omnikit-current-group-memberships.csv', rows);
       showExportNotice(`Group membership export started (${groups.length} groups).`);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to export group memberships'));
     } finally {
-      setExportingMemberships(false);
+      if (isActiveConnectionRequest(requestKey)) setExportingMemberships(false);
     }
   }
 
@@ -410,10 +431,12 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
   }
 
   async function loadUsersForAssignment() {
+    const requestKey = connectionKey;
     setLoadingAssignUsers(true);
     setError('');
     try {
       const res = await listAllUsers(connection.baseUrl, connection.apiKey, { pageSize: 100, maxPages: 200 });
+      if (!isActiveConnectionRequest(requestKey)) return;
       if (res.error) throw new Error(friendlyApiError(res.error, 'Failed to load users'));
       const allUsers = (res.Resources || []).map((user: Record<string, unknown>) => ({
         id: user.id as string,
@@ -424,9 +447,10 @@ export function GroupsPage({ embedded = false }: { embedded?: boolean } = {}) {
       }));
       setAssignUsers(allUsers);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to load users for assignment'));
     } finally {
-      setLoadingAssignUsers(false);
+      if (isActiveConnectionRequest(requestKey)) setLoadingAssignUsers(false);
     }
   }
 

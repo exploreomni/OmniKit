@@ -13,12 +13,18 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p tsconfig.app.json",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
+    "test:fanout": "tsx --test tests/fanout-wizard.test.ts",
+    "test:migration-planner": "tsx --test tests/migration-planner.test.ts",
+    "test:model-migrator": "tsx --test tests/model-migrator.test.ts",
+    "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:security": "tsx --test tests/security-regression.test.ts",
     "security:audit": "npm audit --audit-level=moderate",
-    "security:check": "npm run security:audit && npm run test:security && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
+    "security:check": "npm run security:audit && npm run test:security && npm run test:fanout && npm run test:migration-planner && npm run test:model-migrator && npm run test:instance-dashboard && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "apache-arrow": "^21.1.0",
+    "better-sqlite3": "^12.10.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.344.0",
     "pptxgenjs": "^4.0.1",
@@ -40,9 +46,12 @@
     "globals": "^15.9.0",
     "postcss": "^8.4.35",
     "tailwindcss": "^3.4.1",
-    "tsx": "^4.19.2",
+    "tsx": "^4.22.4",
     "typescript": "^5.5.3",
     "typescript-eslint": "^8.3.0",
     "vite": "^6.4.2"
+  },
+  "overrides": {
+    "esbuild": "^0.28.1"
   }
 }

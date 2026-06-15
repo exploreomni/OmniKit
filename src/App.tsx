@@ -8,6 +8,7 @@ import { OmniKitWalkthrough } from '@/components/walkthrough/OmniKitWalkthrough'
 import { usePreloadBlobby } from '@/components/ui/Blobby';
 import { WalkthroughProvider } from '@/contexts/WalkthroughContext';
 import { ConnectPage } from '@/pages/ConnectPage';
+import { VaultSessionProvider } from '@/hooks/useVaultSession';
 
 function PaddedLayout() {
   return (
@@ -19,6 +20,7 @@ function PaddedLayout() {
   );
 }
 import { MigratePage } from '@/pages/MigratePage';
+import { ModelMigratorPage } from '@/pages/ModelMigratorPage';
 import { UserManagementPage } from '@/pages/UserManagementPage';
 import { ModelsPage } from '@/pages/ModelsPage';
 import { TopicsPage } from '@/pages/TopicsPage';
@@ -48,10 +50,11 @@ function AppLayout() {
       <Sidebar />
       <main id="main-content" className="flex-1 min-w-0 min-h-0 flex flex-col overflow-y-auto" tabIndex={-1}>
         <Routes>
-          <Route path="/" element={<Navigate to="/connect" replace />} />
-          <Route path="/connect" element={<ConnectPage />} />
+          <Route path="/" element={<ConnectPage />} />
+          <Route path="/connect" element={<Navigate to="/" replace />} />
           <Route element={<PaddedLayout />}>
             <Route path="/dashboards/migrate" element={<MigratePage />} />
+            <Route path="/models/migrate" element={<ModelMigratorPage />} />
             <Route
               path="/dashboards/ai-studio"
               element={<RequireConnection><AIDashboardStudioPage /></RequireConnection>}
@@ -137,11 +140,13 @@ function App() {
   return (
     <BrowserRouter>
       <ConnectionProvider>
-        <OperationLogProvider>
-          <WalkthroughProvider>
-            <AppLayout />
-          </WalkthroughProvider>
-        </OperationLogProvider>
+        <VaultSessionProvider>
+          <OperationLogProvider>
+            <WalkthroughProvider>
+              <AppLayout />
+            </WalkthroughProvider>
+          </OperationLogProvider>
+        </VaultSessionProvider>
       </ConnectionProvider>
     </BrowserRouter>
   );

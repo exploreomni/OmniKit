@@ -1,5 +1,3 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { OmniClient, OmniClientError } from './omniClient';
 import {
@@ -7,16 +5,57 @@ import {
   type PostMigrationAction,
   type SavedInstance,
 } from './nativeVault';
+import {
+  clearJobs as clearStoredJobs,
+  getJob as getStoredJob,
+  insertJob,
+  listJobs as listStoredJobs,
+  updateJobItem,
+  updateJobStatus,
+} from './jobStore';
+import {
+  publishMigrationJobEvent,
+} from './jobEvents';
+import {
+  sanitizeJob,
+  sanitizePostMigrationAction,
+} from './jobSanitizer';
+import {
+  buildFieldUniverseFromYaml,
+  buildWorkbookTabResultDetails,
+  collectFieldReferences,
+  normalizeContentValidationIssues,
+  preflightWorkbookQueryFields,
+  rewriteQueryModelReferences,
+} from './modelMigration/helpers';
 
-const DEFAULT_JOBS_PATH = './data/jobs.json';
+export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
+
 const PRIVATE_HOST_RE =
   /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0|::1$|fc00:|fd[0-9a-f]{2}:)/i;
 const LOOPBACK_NAMES = new Set(['localhost', '0.0.0.0']);
-const REDACTED = '[redacted]';
+const DEFAULT_DESTINATION_CONCURRENCY = 10;
 
-export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed';
+export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'warning' | 'skipped';
-export type JobItemKind = 'delete' | 'export' | 'import' | 'metadata' | 'post_action';
+export type MigrationWorkflow = 'dashboard' | 'model';
+export type JobItemKind =
+  | 'delete'
+  | 'export'
+  | 'import'
+  | 'metadata'
+  | 'post_action'
+  | 'model_fast_path'
+  | 'model_translate'
+  | 'model_branch_create'
+  | 'model_yaml_write'
+  | 'model_validate'
+  | 'model_merge'
+  | 'content_validate'
+  | 'workbook_queries'
+  | 'workbook_preflight'
+  | 'workbook_create'
+  | 'dashboard_handoff';
 
 export interface MigrationJobItem {
   id: string;
@@ -31,6 +70,7 @@ export interface MigrationJobItem {
   kind: JobItemKind;
   documentId?: string;
   documentName?: string;
+  replacement?: boolean;
   status: JobItemStatus;
   error?: string;
   warnings?: string[];
@@ -39,21 +79,28 @@ export interface MigrationJobItem {
   exportHash?: string;
   importedIdentifier?: string;
   importedDocumentId?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface MigrationJob {
   id: string;
+  workflow?: MigrationWorkflow;
   sourceId: string;
   sourceLabel: string;
   destinationIds: string[];
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
+  parentJobId?: string;
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
+  details?: Record<string, unknown>;
   items: MigrationJobItem[];
 }
 
@@ -68,6 +115,7 @@ export interface MigrationPlanStep {
   kind: JobItemKind;
   documentId?: string;
   documentName?: string;
+  replacement?: boolean;
   warnings?: string[];
 }
 
@@ -78,6 +126,9 @@ export interface MigrationPlan {
   targets: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   steps: MigrationPlanStep[];
 }
 
@@ -96,7 +147,53 @@ interface SourceMeta {
   labels: string[];
 }
 
+export interface ModelMigrationAcceptedFile {
+  fileName: string;
+  yaml: string;
+  previousChecksum?: string;
+}
+
+export interface ModelMigrationModelInput {
+  sourceModelId: string;
+  sourceModelName?: string;
+  targetModelId: string;
+  targetModelName?: string;
+  targetConnectionId: string;
+  mode: 'fast' | 'translate';
+  branchName: string;
+  gitRef?: string;
+  fastPathSchemaConfirmed?: boolean;
+  mergeHandoffRequired?: boolean;
+  acceptedFiles?: ModelMigrationAcceptedFile[];
+}
+
+export interface ModelMigrationContentInput {
+  documentId: string;
+  documentName: string;
+  kind: 'dashboard' | 'workbook';
+  sourceModelId: string;
+  targetModelId: string;
+  targetModelName?: string;
+  targetFolderId?: string;
+  targetFolderPath?: string;
+}
+
+export interface ModelMigrationJobInput {
+  sourceId: string;
+  targetId: string;
+  targetLabel?: string;
+  models: ModelMigrationModelInput[];
+  content: ModelMigrationContentInput[];
+  replaceSameNamed: boolean;
+  mergeAfterValidation?: boolean;
+  publishDrafts?: boolean;
+  deleteBranch?: boolean;
+  postMigrationActions: PostMigrationAction[];
+  parentJobId?: string;
+}
+
 const runningJobs = new Set<string>();
+const canceledJobs = new Set<string>();
 const activePostMigrationActions = new Map<string, PostMigrationAction[]>();
 const FIELD_REF_KEYS = new Set([
   'field',
@@ -116,49 +213,6 @@ const FIELD_REF_KEYS = new Set([
   'series',
 ]);
 const FIELD_REF_PATTERN = /\b([A-Za-z_][\w/]*\.[A-Za-z_][\w]*(?:\[[A-Za-z_][\w]*\])?)\b/g;
-const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
-const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
-const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
-const PHONE_PATTERN = /\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g;
-const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
-
-export function getJobsPath(): string {
-  return process.env.OMNIKIT_JOBS_PATH || DEFAULT_JOBS_PATH;
-}
-
-function readJobs(): MigrationJob[] {
-  const jobsPath = getJobsPath();
-  if (!existsSync(jobsPath)) return [];
-  try {
-    const parsed = JSON.parse(readFileSync(jobsPath, 'utf8')) as unknown;
-    return Array.isArray(parsed) ? parsed.filter(isJob) : [];
-  } catch {
-    return [];
-  }
-}
-
-function isJob(value: unknown): value is MigrationJob {
-  return Boolean(value)
-    && typeof value === 'object'
-    && !Array.isArray(value)
-    && typeof (value as MigrationJob).id === 'string'
-    && Array.isArray((value as MigrationJob).items);
-}
-
-function writeJobs(jobs: MigrationJob[]): void {
-  const jobsPath = getJobsPath();
-  mkdirSync(dirname(jobsPath), { recursive: true });
-  writeFileSync(jobsPath, JSON.stringify(sanitizeJobHistory(jobs).slice(0, 100), null, 2), { mode: 0o600 });
-  chmodSync(jobsPath, 0o600);
-}
-
-function updateJob(job: MigrationJob): void {
-  const jobs = readJobs();
-  const existingIndex = jobs.findIndex((row) => row.id === job.id);
-  if (existingIndex >= 0) jobs[existingIndex] = job;
-  else jobs.unshift(job);
-  writeJobs(jobs.sort((a, b) => b.createdAt - a.createdAt));
-}
 
 function requireInstance(id: string): SavedInstance {
   const instance = getInstance(id);
@@ -180,6 +234,7 @@ function createItem(jobId: string, destination: SavedInstance, step: Omit<Migrat
     kind: step.kind,
     documentId: step.documentId,
     documentName: step.documentName,
+    replacement: step.replacement,
     status: 'pending',
     warnings: step.warnings,
   };
@@ -187,77 +242,6 @@ function createItem(jobId: string, destination: SavedInstance, step: Omit<Migrat
 
 function hashPayload(payload: unknown): string {
   return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
-}
-
-function isLuhnValid(value: string): boolean {
-  const digits = value.replace(/\D/g, '');
-  if (digits.length < 13 || digits.length > 19) return false;
-  let sum = 0;
-  let shouldDouble = false;
-  for (let index = digits.length - 1; index >= 0; index -= 1) {
-    let digit = Number(digits[index]);
-    if (shouldDouble) {
-      digit *= 2;
-      if (digit > 9) digit -= 9;
-    }
-    sum += digit;
-    shouldDouble = !shouldDouble;
-  }
-  return sum % 10 === 0;
-}
-
-export function redactSensitiveText(value: string): string {
-  return value
-    .replace(TOKEN_PATTERN, `$1${REDACTED}`)
-    .replace(SECRET_ASSIGNMENT_PATTERN, `$1$2${REDACTED}`)
-    .replace(EMAIL_PATTERN, '[redacted-email]')
-    .replace(PHONE_PATTERN, '[redacted-phone]')
-    .replace(PAN_CANDIDATE_PATTERN, (candidate) => (isLuhnValid(candidate) ? '[redacted-pan]' : candidate));
-}
-
-function sanitizePostMigrationAction(action: PostMigrationAction): PostMigrationAction {
-  return {
-    name: redactSensitiveText(action.name),
-    method: action.method,
-    url: redactSensitiveText(action.url),
-    headers: Object.fromEntries(
-      Object.keys(action.headers || {}).map((key) => [redactSensitiveText(key), REDACTED]),
-    ),
-    body: action.body ? REDACTED : '',
-  };
-}
-
-function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
-  return {
-    ...item,
-    destinationLabel: redactSensitiveText(item.destinationLabel),
-    targetModelName: item.targetModelName ? redactSensitiveText(item.targetModelName) : item.targetModelName,
-    targetFolderPath: item.targetFolderPath ? redactSensitiveText(item.targetFolderPath) : item.targetFolderPath,
-    documentName: item.documentName ? redactSensitiveText(item.documentName) : item.documentName,
-    error: item.error ? redactSensitiveText(item.error) : item.error,
-    warnings: item.warnings?.map(redactSensitiveText),
-    importedIdentifier: item.importedIdentifier ? redactSensitiveText(item.importedIdentifier) : item.importedIdentifier,
-    importedDocumentId: item.importedDocumentId ? redactSensitiveText(item.importedDocumentId) : item.importedDocumentId,
-  };
-}
-
-function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarget {
-  return {
-    ...target,
-    destinationLabel: target.destinationLabel ? redactSensitiveText(target.destinationLabel) : target.destinationLabel,
-    targetModelName: target.targetModelName ? redactSensitiveText(target.targetModelName) : target.targetModelName,
-    targetFolderPath: target.targetFolderPath ? redactSensitiveText(target.targetFolderPath) : target.targetFolderPath,
-  };
-}
-
-export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
-  return jobs.map((job) => ({
-    ...job,
-    sourceLabel: redactSensitiveText(job.sourceLabel),
-    targets: job.targets?.map(sanitizeMigrationTarget),
-    postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
-    items: job.items.map(sanitizeJobItem),
-  }));
 }
 
 function markItem(item: MigrationJobItem, status: JobItemStatus, patch: Partial<MigrationJobItem> = {}): void {
@@ -274,6 +258,72 @@ function computeJobStatus(items: MigrationJobItem[]): JobStatus {
   if (failed === 0) return 'succeeded';
   if (succeeded === 0) return 'failed';
   return 'partial';
+}
+
+function isTerminalJobStatus(status: JobStatus): boolean {
+  return status === 'succeeded' || status === 'partial' || status === 'failed' || status === 'canceled';
+}
+
+function destinationConcurrency(): number {
+  const parsed = Number.parseInt(process.env.OMNIKIT_MIGRATION_DEST_CONCURRENCY || '', 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_DESTINATION_CONCURRENCY;
+  return Math.min(parsed, 25);
+}
+
+async function runWithConcurrency<T>(
+  rows: T[],
+  limit: number,
+  worker: (row: T) => Promise<void>,
+): Promise<void> {
+  let index = 0;
+  const workers = Array.from({ length: Math.min(limit, rows.length) }, async () => {
+    while (index < rows.length) {
+      const row = rows[index];
+      index += 1;
+      await worker(row);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function persistJobStatus(job: MigrationJob): void {
+  updateJobStatus(job);
+  publishMigrationJobEvent({
+    type: 'job',
+    jobId: job.id,
+    status: job.status,
+    at: Date.now(),
+    job,
+  });
+}
+
+function persistItem(item: MigrationJobItem): void {
+  updateJobItem(item);
+  publishMigrationJobEvent({
+    type: 'item',
+    jobId: item.jobId,
+    itemId: item.id,
+    destinationId: item.destinationId,
+    status: item.status,
+    error: item.error,
+    at: Date.now(),
+    item,
+  });
+}
+
+function markAndPersistItem(
+  item: MigrationJobItem,
+  status: JobItemStatus,
+  patch: Partial<MigrationJobItem> = {},
+): void {
+  markItem(item, status, patch);
+  persistItem(item);
+}
+
+function markPendingItemsSkipped(job: MigrationJob, reason: string): void {
+  for (const item of job.items) {
+    if (item.status === 'pending') markAndPersistItem(item, 'skipped', { error: reason });
+  }
 }
 
 function normalizeFolderPath(value: string | undefined): string {
@@ -443,15 +493,15 @@ function normalizeTargets(input: {
 }
 
 export function listJobs(): MigrationJob[] {
-  return readJobs();
+  return listStoredJobs();
 }
 
 export function getJob(id: string): MigrationJob | undefined {
-  return readJobs().find((job) => job.id === id);
+  return getStoredJob(id);
 }
 
 export function clearJobs(): void {
-  writeJobs([]);
+  clearStoredJobs();
 }
 
 export async function buildMigrationPlan(input: {
@@ -460,14 +510,21 @@ export async function buildMigrationPlan(input: {
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed?: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
 }): Promise<MigrationPlan> {
   const source = requireInstance(input.sourceId);
   const targets = normalizeTargets(input);
   const sourceClient = new OmniClient(source);
-  const sourceDocs = await listDocumentsForFolder(sourceClient, source.defaultFolderId, source.defaultFolderPath, true);
+  const sourceFolderId = input.sourceFolderId?.trim() || source.defaultFolderId;
+  const sourceFolderPath = input.sourceFolderPath?.trim() || source.defaultFolderPath;
+  const replaceSameNamed = input.replaceSameNamed !== false;
+  const sourceDocs = await listDocumentsForFolder(sourceClient, sourceFolderId, sourceFolderPath, true);
   const selected = sourceDocs.filter((doc) => input.documentIds.includes(doc.identifier));
   const missing = input.documentIds.filter((id) => !selected.some((doc) => doc.identifier === id));
   if (missing.length > 0) throw new Error(`Source documents not found: ${missing.join(', ')}`);
+  const selectedNames = new Set(selected.map((doc) => doc.name).filter(Boolean));
 
   const steps: MigrationPlanStep[] = [];
   const deleteStepKeys = new Set<string>();
@@ -486,23 +543,24 @@ export async function buildMigrationPlan(input: {
     if (targetFields.warning) destinationWarnings.push(targetFields.warning);
 
     for (const existingDoc of existing) {
-      if (input.emptyFirst) {
-        const deleteKey = `${destination.id}:${existingDoc.identifier}`;
-        if (deleteStepKeys.has(deleteKey)) continue;
-        deleteStepKeys.add(deleteKey);
-        steps.push({
-          targetId: target.id,
-          destinationId: destination.id,
-          destinationLabel: destination.label,
-          targetModelId: target.targetModelId,
-          targetModelName: target.targetModelName,
-          targetFolderId: target.targetFolderId,
-          targetFolderPath: target.targetFolderPath,
-          kind: 'delete',
-          documentId: existingDoc.identifier,
-          documentName: existingDoc.name,
-        });
-      }
+      const replacingExistingDoc = !input.emptyFirst && replaceSameNamed && selectedNames.has(existingDoc.name);
+      if (!input.emptyFirst && !replacingExistingDoc) continue;
+      const deleteKey = `${destination.id}:${existingDoc.identifier}`;
+      if (deleteStepKeys.has(deleteKey)) continue;
+      deleteStepKeys.add(deleteKey);
+      steps.push({
+        targetId: target.id,
+        destinationId: destination.id,
+        destinationLabel: destination.label,
+        targetModelId: target.targetModelId,
+        targetModelName: target.targetModelName,
+        targetFolderId: target.targetFolderId,
+        targetFolderPath: target.targetFolderPath,
+        kind: 'delete',
+        documentId: existingDoc.identifier,
+        documentName: existingDoc.name,
+        replacement: replacingExistingDoc,
+      });
     }
 
     for (const doc of selected) {
@@ -577,6 +635,9 @@ export async function buildMigrationPlan(input: {
     targets,
     documentIds: input.documentIds,
     emptyFirst: input.emptyFirst,
+    replaceSameNamed,
+    sourceFolderId,
+    sourceFolderPath,
     steps,
   };
 }
@@ -587,7 +648,11 @@ export async function createMigrationJob(input: {
   targets?: MigrationTarget[];
   documentIds: string[];
   emptyFirst: boolean;
+  replaceSameNamed?: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
   postMigrationActions: PostMigrationAction[];
+  parentJobId?: string;
 }): Promise<MigrationJob> {
   const source = requireInstance(input.sourceId);
   const plan = await buildMigrationPlan(input);
@@ -601,21 +666,263 @@ export async function createMigrationJob(input: {
     targets: plan.targets,
     documentIds: input.documentIds,
     emptyFirst: input.emptyFirst,
+    replaceSameNamed: input.replaceSameNamed !== false,
+    sourceFolderId: plan.sourceFolderId,
+    sourceFolderPath: plan.sourceFolderPath,
     postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
     status: 'pending',
+    parentJobId: input.parentJobId,
     createdAt: Date.now(),
     items,
   };
   activePostMigrationActions.set(jobId, input.postMigrationActions);
-  updateJob(job);
+  insertJob(job);
   void runMigrationJob(job.id).catch(() => undefined);
-  return job;
+  return getJob(job.id) || sanitizeJob(job);
 }
 
-export async function retryMigrationJob(id: string): Promise<MigrationJob> {
+export async function createModelMigrationJob(input: ModelMigrationJobInput): Promise<MigrationJob> {
+  const source = requireInstance(input.sourceId);
+  const target = requireInstance(input.targetId);
+  if (input.models.length === 0) throw new Error('Select at least one source model before starting Model Migrator.');
+  const jobId = randomUUID();
+  const items: MigrationJobItem[] = [];
+  const contentIds = input.content.map((row) => row.documentId);
+
+  for (const model of input.models) {
+    const baseDetails = {
+      sourceModelId: model.sourceModelId,
+      sourceModelName: model.sourceModelName,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      targetConnectionId: model.targetConnectionId,
+      branchName: model.branchName,
+      mode: model.mode,
+    };
+    if (model.mode === 'fast') {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_fast_path',
+        status: 'pending',
+        details: {
+          ...baseDetails,
+          gitRef: model.gitRef,
+          fastPathSchemaConfirmed: model.fastPathSchemaConfirmed === true,
+        },
+      });
+    } else {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_translate',
+        status: 'pending',
+        details: { ...baseDetails, acceptedFileCount: model.acceptedFiles?.length || 0 },
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_branch_create',
+        status: 'pending',
+        details: baseDetails,
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_yaml_write',
+        status: 'pending',
+        details: { ...baseDetails, files: model.acceptedFiles || [] },
+      });
+    }
+    items.push({
+      id: randomUUID(),
+      jobId,
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      kind: 'model_validate',
+      status: 'pending',
+      details: baseDetails,
+    });
+    items.push({
+      id: randomUUID(),
+      jobId,
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      kind: 'content_validate',
+      status: 'pending',
+      details: baseDetails,
+    });
+  }
+
+  for (const content of input.content) {
+    if (content.kind === 'dashboard') {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: 'export',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content, workflow: 'model' },
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: 'import',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content },
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: 'metadata',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content },
+      });
+      continue;
+    }
+    for (const kind of ['workbook_queries', 'workbook_preflight', 'workbook_create'] as const) {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind,
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content },
+      });
+    }
+  }
+
+  const job: MigrationJob = {
+    id: jobId,
+    workflow: 'model',
+    sourceId: input.sourceId,
+    sourceLabel: source.label,
+    destinationIds: [target.id],
+    targets: input.models.map((model) => ({
+      id: `${target.id}:${model.targetModelId}`,
+      destinationInstanceId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+    })),
+    documentIds: contentIds,
+    emptyFirst: false,
+    replaceSameNamed: input.replaceSameNamed !== false,
+    postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
+    status: 'pending',
+    parentJobId: input.parentJobId,
+    createdAt: Date.now(),
+    details: {
+      targetId: target.id,
+      targetLabel: input.targetLabel || target.label,
+      modelCount: input.models.length,
+      dashboardCount: input.content.filter((row) => row.kind === 'dashboard').length,
+      workbookCount: input.content.filter((row) => row.kind === 'workbook').length,
+      mergeAfterValidation: false,
+      retryInput: {
+        sourceId: input.sourceId,
+        targetId: input.targetId,
+        targetLabel: input.targetLabel,
+        models: input.models,
+        content: input.content,
+        replaceSameNamed: false,
+        mergeAfterValidation: false,
+        publishDrafts: input.publishDrafts,
+        deleteBranch: input.deleteBranch,
+        postMigrationActions: input.postMigrationActions,
+      },
+    },
+    items,
+  };
+  activePostMigrationActions.set(jobId, input.postMigrationActions);
+  insertJob(job);
+  void runMigrationJob(job.id).catch(() => undefined);
+  return getJob(job.id) || sanitizeJob(job);
+}
+
+export async function retryMigrationJob(id: string, options: { destinationId?: string } = {}): Promise<MigrationJob> {
   const parent = getJob(id);
   if (!parent) throw new Error('Job not found.');
-  const failedImports = parent.items.filter((item) => item.status === 'failed' && (item.kind === 'import' || item.kind === 'export'));
+  if (parent.workflow === 'model') {
+    const retryInput = parent.details?.retryInput;
+    if (!retryInput || typeof retryInput !== 'object' || Array.isArray(retryInput)) {
+      throw new Error('Model migration retry details are unavailable.');
+    }
+    const input = retryInput as ModelMigrationJobInput;
+    const failedModelIds = new Set(parent.items
+      .filter((item) => item.status === 'failed' && item.targetModelId)
+      .map((item) => item.targetModelId as string));
+    const failedDocumentIds = new Set(parent.items
+      .filter((item) => item.status === 'failed' && item.documentId)
+      .map((item) => item.documentId as string));
+    const retryModels = input.models.filter((model) => failedModelIds.has(model.targetModelId));
+    const retryContent = input.content.filter((content) => failedDocumentIds.has(content.documentId) || failedModelIds.has(content.targetModelId));
+    if (retryModels.length === 0 && retryContent.length === 0) {
+      throw new Error('No failed model migration items are available to retry.');
+    }
+    return createModelMigrationJob({
+      ...input,
+      models: retryModels.length > 0 ? retryModels : input.models.filter((model) => retryContent.some((content) => content.targetModelId === model.targetModelId)),
+      content: retryContent,
+      parentJobId: parent.id,
+      postMigrationActions: input.postMigrationActions || [],
+      replaceSameNamed: false,
+    });
+  }
+  const failedImports = parent.items.filter((item) => {
+    if (options.destinationId && item.destinationId !== options.destinationId) return false;
+    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export');
+  });
   const targetsById = new Map<string, MigrationTarget>();
   for (const item of failedImports) {
     const destination = requireInstance(item.destinationId);
@@ -641,21 +948,535 @@ export async function retryMigrationJob(id: string): Promise<MigrationJob> {
     targets,
     documentIds,
     emptyFirst: false,
+    replaceSameNamed: parent.replaceSameNamed,
+    sourceFolderId: parent.sourceFolderId,
+    sourceFolderPath: parent.sourceFolderPath,
     postMigrationActions: [],
+    parentJobId: parent.id,
   });
+}
+
+function modelMigrationInputFromJob(job: MigrationJob): ModelMigrationJobInput {
+  const retryInput = job.details?.retryInput;
+  if (!retryInput || typeof retryInput !== 'object' || Array.isArray(retryInput)) {
+    throw new Error('Model migration details are unavailable.');
+  }
+  return retryInput as ModelMigrationJobInput;
+}
+
+function branchNameForModel(job: MigrationJob, model: ModelMigrationModelInput): string {
+  const branchItem = job.items.find((item) => (
+    item.targetModelId === model.targetModelId
+    && (item.kind === 'model_branch_create' || item.kind === 'model_fast_path')
+    && (item.status === 'succeeded' || item.status === 'warning')
+  ));
+  return detailString(branchItem?.details, 'branchName') || model.branchName;
+}
+
+export async function mergeModelMigrationJob(id: string, options: { publishDrafts?: boolean; deleteBranch?: boolean } = {}): Promise<MigrationJob> {
+  const job = getJob(id);
+  if (!job) throw new Error('Job not found.');
+  if (job.workflow !== 'model') throw new Error('Only Model Migrator jobs can be merged from this endpoint.');
+  if (job.status === 'running' || job.status === 'pending') throw new Error('Wait for model validation to finish before merging.');
+  if (job.items.some((item) => item.kind === 'model_merge' && (item.status === 'succeeded' || item.status === 'running'))) {
+    throw new Error('This model migration job already has a merge in progress or completed.');
+  }
+
+  const input = modelMigrationInputFromJob(job);
+  const validationByModel = new Map(job.items
+    .filter((item) => item.kind === 'model_validate' && item.targetModelId)
+    .map((item) => [item.targetModelId as string, item]));
+  const blockers = input.models.filter((model) => validationByModel.get(model.targetModelId)?.status !== 'succeeded');
+  if (blockers.length > 0) {
+    throw new Error(`Cannot merge until every target model validates successfully: ${blockers.map((model) => model.targetModelName || model.targetModelId).join(', ')}`);
+  }
+
+  const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
+  const target = requireInstance(targetId);
+  const targetClient = new OmniClient(target);
+  job.status = 'running';
+  job.endedAt = undefined;
+  persistJobStatus(job);
+
+  for (const model of input.models) {
+    const branchName = branchNameForModel(job, model);
+    const item: MigrationJobItem = {
+      id: randomUUID(),
+      jobId: job.id,
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      kind: 'model_merge',
+      status: 'running',
+      startedAt: Date.now(),
+      details: {
+        sourceModelId: model.sourceModelId,
+        sourceModelName: model.sourceModelName,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        branchName,
+        publishDrafts: options.publishDrafts === true,
+        deleteBranch: options.deleteBranch !== false,
+        mergeHandoffRequired: model.mergeHandoffRequired === true,
+      },
+    };
+    job.items.push(item);
+    persistItem(item);
+    try {
+      if (model.mergeHandoffRequired) {
+        markAndPersistItem(item, 'warning', {
+          warnings: ['This model appears to require a git/PR handoff. Open the target branch in Omni and complete review there; OmniKit did not force merge settings.'],
+        });
+        continue;
+      }
+      await targetClient.mergeModelBranch(model.targetModelId, branchName, {
+        publishDrafts: options.publishDrafts === true,
+        deleteBranch: options.deleteBranch !== false,
+        forceOverrideGitSettings: false,
+      });
+      markAndPersistItem(item, 'succeeded');
+    } catch (error) {
+      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+      markAndPersistItem(item, 'failed', { error: message });
+    }
+  }
+
+  job.status = computeJobStatus(job.items);
+  job.endedAt = Date.now();
+  persistJobStatus(job);
+  return getJob(job.id) || sanitizeJob(job);
 }
 
 export async function runMigrationJob(id: string): Promise<void> {
   if (runningJobs.has(id)) return;
   const job = getJob(id);
   if (!job) return;
+  if (isTerminalJobStatus(job.status)) return;
   runningJobs.add(id);
   try {
-    await executeJob(job);
+    if (job.workflow === 'model') await executeModelJob(job);
+    else await executeJob(job);
+  } catch {
+    const latest = getJob(id) || job;
+    markPendingItemsSkipped(latest, 'Job failed before this step could run.');
+    latest.status = 'failed';
+    latest.endedAt = Date.now();
+    persistJobStatus(latest);
   } finally {
     activePostMigrationActions.delete(id);
+    canceledJobs.delete(id);
     runningJobs.delete(id);
   }
+}
+
+export function cancelMigrationJob(id: string): MigrationJob | undefined {
+  const job = getJob(id);
+  if (!job) return undefined;
+  if (isTerminalJobStatus(job.status)) return job;
+  canceledJobs.add(id);
+  if (!runningJobs.has(id)) {
+    markPendingItemsSkipped(job, 'Canceled by user.');
+    job.status = 'canceled';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+  }
+  return getJob(id) || sanitizeJob(job);
+}
+
+function detailString(details: Record<string, unknown> | undefined, key: string): string {
+  const value = details?.[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function detailFiles(details: Record<string, unknown> | undefined): ModelMigrationAcceptedFile[] {
+  const files = details?.files;
+  if (!Array.isArray(files)) return [];
+  return files
+    .filter((file): file is Record<string, unknown> => Boolean(file) && typeof file === 'object' && !Array.isArray(file))
+    .map((file) => ({
+      fileName: typeof file.fileName === 'string' ? file.fileName : '',
+      yaml: typeof file.yaml === 'string' ? file.yaml : '',
+      previousChecksum: typeof file.previousChecksum === 'string' ? file.previousChecksum : undefined,
+    }))
+    .filter((file) => file.fileName && file.yaml);
+}
+
+function detailBoolean(details: Record<string, unknown> | undefined, key: string): boolean {
+  return details?.[key] === true;
+}
+
+async function executeModelJob(job: MigrationJob): Promise<void> {
+  const source = requireInstance(job.sourceId);
+  const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
+  const target = requireInstance(targetId);
+  const sourceClient = new OmniClient(source);
+  const targetClient = new OmniClient(target);
+  const branchByTargetModel = new Map<string, { branchId: string; branchName: string }>();
+  const targetYamlByModel = new Map<string, Record<string, string>>();
+  const workbookQueries = new Map<string, Array<{ id: string; name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string }>>();
+  const workbookRewrites = new Map<string, Array<{ name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string; blockers: string[] }>>();
+  const blockedTargetModels = new Set<string>();
+  const blockedWorkbooks = new Set<string>();
+  const dashboardExports = new Map<string, { payload: Record<string, unknown>; hash: string }>();
+  const importedDashboards = new Map<string, { identifier: string; documentId: string }>();
+  let sourceDocuments: Array<{ id: string; identifier: string; name: string; description?: string | null; labels?: string[] }> | null = null;
+  let sourceLabels: Map<string, { color?: string | null; description?: string | null }> | null = null;
+  let targetLabelSet: Set<string> | null = null;
+
+  job.status = 'running';
+  job.startedAt = Date.now();
+  persistJobStatus(job);
+
+  async function targetYaml(targetModelId: string, branchId?: string): Promise<Record<string, string>> {
+    const key = `${targetModelId}:${branchId || 'main'}`;
+    const cached = targetYamlByModel.get(key);
+    if (cached) return cached;
+    const yaml = (await targetClient.getModelYaml(targetModelId, { branchId, includeChecksums: true })).files;
+      targetYamlByModel.set(key, yaml);
+      return yaml;
+  }
+
+  async function sourceDocument(documentId: string) {
+    if (!sourceDocuments) {
+      sourceDocuments = await sourceClient.listFolderDocuments(undefined, true);
+    }
+    return sourceDocuments.find((doc) => doc.id === documentId || doc.identifier === documentId);
+  }
+
+  async function sourceLabelMeta(name: string) {
+    if (!sourceLabels) {
+      sourceLabels = new Map((await sourceClient.listLabels()).map((label) => [label.name, { color: label.color, description: label.description }]));
+    }
+    return sourceLabels.get(name);
+  }
+
+  async function ensureTargetLabels(labels: string[]): Promise<void> {
+    if (labels.length === 0) return;
+    if (!targetLabelSet) {
+      targetLabelSet = new Set((await targetClient.listLabels()).map((label) => label.name));
+    }
+    for (const label of labels) {
+      if (targetLabelSet.has(label)) continue;
+      const sourceLabel = await sourceLabelMeta(label);
+      await targetClient.createLabel({ name: label, color: sourceLabel?.color, description: sourceLabel?.description });
+      targetLabelSet.add(label);
+    }
+  }
+
+  function isDownstreamOfModel(item: MigrationJobItem): boolean {
+    return [
+      'content_validate',
+      'model_merge',
+      'export',
+      'import',
+      'metadata',
+      'workbook_queries',
+      'workbook_preflight',
+      'workbook_create',
+    ].includes(item.kind);
+  }
+
+  for (const item of job.items) {
+    if (canceledJobs.has(job.id)) {
+      if (item.status === 'pending') markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+      continue;
+    }
+    if (item.status !== 'pending') continue;
+    const details = item.details || {};
+    const sourceModelId = detailString(details, 'sourceModelId');
+    const targetModelId = item.targetModelId || detailString(details, 'targetModelId');
+    const branchName = detailString(details, 'branchName');
+    if (targetModelId && blockedTargetModels.has(targetModelId) && isDownstreamOfModel(item)) {
+      markAndPersistItem(item, 'skipped', { error: 'Skipped because target model validation failed.' });
+      continue;
+    }
+    if (item.documentId && blockedWorkbooks.has(item.documentId) && item.kind === 'workbook_create') {
+      markAndPersistItem(item, 'skipped', { error: 'Skipped because workbook preflight failed.' });
+      continue;
+    }
+
+    try {
+      markAndPersistItem(item, 'running');
+      if (item.kind === 'model_fast_path') {
+        if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
+        await sourceClient.migrateModel({
+          sourceModelId,
+          targetModelId,
+          gitRef: detailString(details, 'gitRef') || undefined,
+          branchName,
+          commitMessage: `OmniKit Model Migrator fast path for ${item.targetModelName || targetModelId}`,
+        });
+        branchByTargetModel.set(targetModelId, { branchId: '', branchName });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName } });
+      } else if (item.kind === 'model_translate') {
+        const acceptedFileCount = typeof details.acceptedFileCount === 'number' ? details.acceptedFileCount : 0;
+        if (acceptedFileCount === 0) {
+          markAndPersistItem(item, 'warning', { warnings: ['No accepted YAML files were provided; validation will run against the current target model.'] });
+        } else {
+          markAndPersistItem(item, 'succeeded');
+        }
+      } else if (item.kind === 'model_branch_create') {
+        const branch = await targetClient.createModelBranch({
+          connectionId: detailString(details, 'targetConnectionId'),
+          baseModelId: targetModelId,
+          branchName,
+        });
+        branchByTargetModel.set(targetModelId, { branchId: branch.id, branchName: branch.name });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.id, branchName: branch.name } });
+      } else if (item.kind === 'model_yaml_write') {
+        const branch = branchByTargetModel.get(targetModelId);
+        if (!branch?.branchId) throw new Error('Target branch was not created before YAML write.');
+        const files = detailFiles(details);
+        await targetClient.updateModelYamlFiles({
+          modelId: targetModelId,
+          branchId: branch.branchId,
+          files,
+          commitMessage: `OmniKit Model Migrator update ${files.length} YAML file${files.length === 1 ? '' : 's'}`,
+        });
+        targetYamlByModel.delete(`${targetModelId}:${branch.branchId}`);
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, writtenFiles: files.map((file) => file.fileName) } });
+      } else if (item.kind === 'model_validate') {
+        const branch = branchByTargetModel.get(targetModelId);
+        const issues = await targetClient.validateModel(targetModelId, branch?.branchId);
+        const errors = issues.filter((issue) => issue.is_warning !== true);
+        if (errors.length > 0) blockedTargetModels.add(targetModelId);
+        markAndPersistItem(item, errors.length > 0 ? 'failed' : 'succeeded', {
+          error: errors.length > 0 ? `${errors.length} model validation error${errors.length === 1 ? '' : 's'} returned.` : undefined,
+          details: { ...details, branchId: branch?.branchId, issueCount: issues.length, errorCount: errors.length, issues },
+        });
+      } else if (item.kind === 'content_validate') {
+        const branch = branchByTargetModel.get(targetModelId);
+        const result = await targetClient.validateModelContent(targetModelId, branch?.branchId);
+        const issues = normalizeContentValidationIssues(result);
+        const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+        if (errorCount > 0) blockedTargetModels.add(targetModelId);
+        markAndPersistItem(item, errorCount > 0 ? 'failed' : 'succeeded', {
+          error: errorCount > 0 ? `${errorCount} content validation error${errorCount === 1 ? '' : 's'} returned.` : undefined,
+          details: { ...details, branchId: branch?.branchId, result, issues },
+        });
+      } else if (item.kind === 'model_merge') {
+        const branch = branchByTargetModel.get(targetModelId);
+        if (!branch?.branchName) throw new Error('Target branch was not available for merge.');
+        if (detailBoolean(details, 'mergeHandoffRequired')) {
+          markAndPersistItem(item, 'warning', {
+            warnings: ['This model appears to require a git/PR handoff. Open the target branch in Omni and complete review there; OmniKit did not force merge settings.'],
+            details: { ...details, branchName: branch.branchName },
+          });
+          continue;
+        }
+        await targetClient.mergeModelBranch(targetModelId, branch.branchName, {
+          publishDrafts: detailBoolean(details, 'publishDrafts'),
+          deleteBranch: detailBoolean(details, 'deleteBranch'),
+          forceOverrideGitSettings: false,
+        });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName: branch.branchName } });
+      } else if (item.kind === 'workbook_queries') {
+        if (!item.documentId) throw new Error('Workbook query item missing document id.');
+        const queries = await sourceClient.getDocumentQueries(item.documentId);
+        workbookQueries.set(item.documentId, queries);
+        markAndPersistItem(item, queries.length === 0 ? 'warning' : 'succeeded', {
+          warnings: queries.length === 0 ? ['No query tabs were returned for this workbook.'] : undefined,
+          details: { ...details, tabCount: queries.length, tabs: queries.map((query) => query.name) },
+        });
+      } else if (item.kind === 'workbook_preflight') {
+        if (!item.documentId) throw new Error('Workbook preflight item missing document id.');
+        const queries = workbookQueries.get(item.documentId) || [];
+        const branch = branchByTargetModel.get(targetModelId);
+        const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));
+        const rewrites = queries.map((query) => {
+          const rewritten = rewriteQueryModelReferences(query.query, detailString(details, 'sourceModelId'), targetModelId);
+          const preflight = preflightWorkbookQueryFields(rewritten, universe);
+          return {
+            name: query.name,
+            description: query.description,
+            query: preflight.query,
+            visConfig: query.visConfig,
+            blockers: preflight.blockers,
+          };
+        });
+        workbookRewrites.set(item.documentId, rewrites);
+        const blockers = rewrites.flatMap((rewrite) => rewrite.blockers.map((blocker) => `${rewrite.name}: ${blocker}`));
+        if (blockers.length > 0) blockedWorkbooks.add(item.documentId);
+        markAndPersistItem(item, blockers.length > 0 ? 'failed' : 'succeeded', {
+          error: blockers.length > 0 ? `${blockers.length} workbook query blocker${blockers.length === 1 ? '' : 's'} found.` : undefined,
+          details: { ...details, blockers, tabCount: rewrites.length },
+        });
+      } else if (item.kind === 'workbook_create') {
+        if (!item.documentId) throw new Error('Workbook create item missing document id.');
+        const rewrites = workbookRewrites.get(item.documentId) || [];
+        if (rewrites.some((rewrite) => rewrite.blockers.length > 0)) throw new Error('Workbook has unresolved preflight blockers.');
+        if (rewrites.length === 0) throw new Error('No workbook tabs were available to create.');
+        const pendingTabDetails = buildWorkbookTabResultDetails(rewrites, 'pending');
+        try {
+          if (job.replaceSameNamed && item.documentName) {
+            const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+            const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard === false);
+            if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
+          }
+          const created = await targetClient.createWorkbookDocument({
+            modelId: targetModelId,
+            name: item.documentName || 'Migrated workbook',
+            folderId: item.targetFolderId,
+            folderPath: item.targetFolderPath,
+            queryPresentations: rewrites.map((rewrite) => ({
+              name: rewrite.name,
+              description: rewrite.description,
+              query: rewrite.query,
+              visConfig: rewrite.visConfig,
+            })),
+          });
+          markAndPersistItem(item, 'succeeded', {
+            importedIdentifier: created.identifier,
+            importedDocumentId: created.id,
+            details: {
+              ...details,
+              url: created.url,
+              tabCount: rewrites.length,
+              tabs: buildWorkbookTabResultDetails(rewrites, 'created'),
+              ported: ['queryPresentations', 'tab names', 'tab descriptions when present', 'visConfig when present'],
+              limitations: ['Workbook-level filters, parameters, schedules, permissions, sharing, favorites, and artifacts not exposed by Omni document-query APIs are not ported automatically.'],
+            },
+          });
+        } catch (error) {
+          const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+          markAndPersistItem(item, 'failed', {
+            error: message,
+            details: {
+              ...details,
+              tabCount: rewrites.length,
+              tabs: pendingTabDetails.map((tab) => ({ ...tab, status: 'not_created' })),
+              retryBoundary: 'document',
+              ported: ['queryPresentations', 'tab names', 'tab descriptions when present', 'visConfig when present'],
+              limitations: ['Omni workbook creation is document-level here; retry reruns this workbook document rather than an individual tab.'],
+            },
+          });
+        }
+      } else if (item.kind === 'export') {
+        if (!item.documentId) throw new Error('Dashboard export item missing document id.');
+        const payload = await sourceClient.exportDocument(item.documentId);
+        const branch = branchByTargetModel.get(targetModelId);
+        const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));
+        const fieldReferences = [...collectFieldReferences(payload)].sort();
+        const blockers = fieldReferences
+          .filter((field) => universe.size > 0 && !universe.has(field))
+          .map((field) => `Dashboard field is not available on the target model: ${field}`);
+        if (blockers.length > 0) {
+          markAndPersistItem(item, 'failed', {
+            error: `${blockers.length} dashboard field blocker${blockers.length === 1 ? '' : 's'} found before import.`,
+            details: { ...details, blockers, fieldReferences },
+          });
+          continue;
+        }
+        const cached = { payload, hash: hashPayload(payload) };
+        dashboardExports.set(item.documentId, cached);
+        markAndPersistItem(item, 'succeeded', { exportHash: cached.hash, details: { ...details, fieldReferences } });
+      } else if (item.kind === 'import') {
+        if (!item.documentId) throw new Error('Dashboard import item missing document id.');
+        const cached = dashboardExports.get(item.documentId);
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; dashboard import skipped.' });
+          continue;
+        }
+        if (job.replaceSameNamed && item.documentName) {
+          const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+          const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard !== false);
+          if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
+        }
+        const imported = await targetClient.importDocument({
+          exportPayload: cached.payload,
+          baseModelId: targetModelId,
+          folderPath: item.targetFolderPath,
+          documentName: item.documentName || 'Migrated dashboard',
+        });
+        let identifier = imported.identifier;
+        let documentId = imported.documentId;
+        if (!identifier || !documentId) {
+          const docs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+          const match = docs
+            .filter((doc) => doc.name === item.documentName)
+            .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0];
+          identifier ||= match?.identifier ?? '';
+          documentId ||= match?.id ?? '';
+        }
+        if (!identifier && !documentId) throw new Error('Dashboard import succeeded but destination document could not be identified.');
+        const warnings: string[] = [];
+        if (item.targetFolderPath && documentId) {
+          try {
+            await targetClient.moveDocument(documentId, item.targetFolderPath);
+          } catch (error) {
+            warnings.push(`Folder move failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (item.targetFolderPath && identifier) {
+          try {
+            const docsAfterImport = await targetClient.listFolderDocuments(undefined);
+            const importedDoc = docsAfterImport.find((doc) => doc.identifier === identifier || doc.id === documentId);
+            const requestedPath = normalizeFolderPath(item.targetFolderPath);
+            const actualPath = normalizeFolderPath(importedDoc?.folderPath);
+            if (!actualPath) {
+              warnings.push(`Folder placement could not be verified for imported dashboard ${identifier}.`);
+            } else if (actualPath !== requestedPath && !actualPath.endsWith(`/${requestedPath}`)) {
+              warnings.push(`Folder placement mismatch for imported dashboard ${identifier}: expected ${item.targetFolderPath}, found ${importedDoc?.folderPath}.`);
+            }
+          } catch (error) {
+            warnings.push(`Folder placement verification failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        importedDashboards.set(item.documentId, { identifier, documentId });
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          importedIdentifier: identifier,
+          importedDocumentId: documentId,
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...details, exportHash: cached.hash },
+        });
+      } else if (item.kind === 'metadata') {
+        if (!item.documentId) throw new Error('Dashboard metadata item missing document id.');
+        const imported = importedDashboards.get(item.documentId);
+        if (!imported?.identifier) {
+          markAndPersistItem(item, 'skipped', { error: 'No imported dashboard identifier available for metadata preservation.' });
+          continue;
+        }
+        const sourceDoc = await sourceDocument(item.documentId);
+        const warnings: string[] = [];
+        if (sourceDoc?.description) {
+          try {
+            await targetClient.patchDocument(imported.identifier, { description: sourceDoc.description, clearExistingDraft: true });
+          } catch (error) {
+            warnings.push(`Description copy failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (sourceDoc?.labels?.length) {
+          try {
+            await ensureTargetLabels(sourceDoc.labels);
+            await targetClient.setDocumentLabels(imported.identifier, sourceDoc.labels);
+          } catch (error) {
+            warnings.push(`Label copy failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...details, copiedDescription: Boolean(sourceDoc?.description), labelCount: sourceDoc?.labels?.length || 0 },
+        });
+      }
+    } catch (error) {
+      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+      markAndPersistItem(item, 'failed', { error: message });
+    }
+  }
+
+  if (canceledJobs.has(job.id)) {
+    markPendingItemsSkipped(job, 'Canceled by user.');
+    job.status = 'canceled';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+    return;
+  }
+
+  await runJobPostActions(job);
+  job.status = computeJobStatus(job.items);
+  job.endedAt = Date.now();
+  persistJobStatus(job);
 }
 
 async function executeJob(job: MigrationJob): Promise<void> {
@@ -663,14 +1484,23 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const sourceClient = new OmniClient(source);
   job.status = 'running';
   job.startedAt = Date.now();
-  updateJob(job);
+  persistJobStatus(job);
 
   const exports = new Map<string, { payload: Record<string, unknown>; hash: string }>();
+  const importConsumers = new Map<string, number>();
   const sourceMeta = new Map<string, SourceMeta>();
   const sourceLabels = new Map<string, { color?: string | null; description?: string | null }>();
+  const destinationClientCache = new Map<string, OmniClient>();
+  const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
+  const destinationLabelCache = new Map<string, Set<string>>();
 
   try {
-    const docs = await listDocumentsForFolder(sourceClient, source.defaultFolderId, source.defaultFolderPath, true);
+    const docs = await listDocumentsForFolder(
+      sourceClient,
+      job.sourceFolderId || source.defaultFolderId,
+      job.sourceFolderPath || source.defaultFolderPath,
+      true,
+    );
     for (const doc of docs) {
       sourceMeta.set(doc.identifier, {
         description: doc.description ?? null,
@@ -683,33 +1513,84 @@ async function executeJob(job: MigrationJob): Promise<void> {
     // Metadata preservation is best-effort and should not block core imports.
   }
 
-  const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
-  const destinationLabelCache = new Map<string, Set<string>>();
+  function destinationClientFor(destination: SavedInstance): OmniClient {
+    const cached = destinationClientCache.get(destination.id);
+    if (cached) return cached;
+    const client = new OmniClient(destination);
+    destinationClientCache.set(destination.id, client);
+    return client;
+  }
 
-  for (const item of job.items) {
+  function releaseExportConsumer(documentId: string | undefined): void {
+    if (!documentId) return;
+    const remaining = (importConsumers.get(documentId) || 0) - 1;
+    if (remaining <= 0) {
+      importConsumers.delete(documentId);
+      exports.delete(documentId);
+    } else {
+      importConsumers.set(documentId, remaining);
+    }
+  }
+
+  function skipDependentItems(documentId: string, reason: string): void {
+    for (const item of job.items) {
+      if (item.documentId !== documentId) continue;
+      if ((item.kind === 'import' || item.kind === 'metadata') && item.status === 'pending') {
+        markAndPersistItem(item, 'skipped', { error: reason });
+      }
+    }
+  }
+
+  async function runExportStage(): Promise<void> {
+    const exportItemsByDocument = new Map<string, MigrationJobItem[]>();
+    for (const item of job.items) {
+      if (item.kind !== 'export' || !item.documentId) continue;
+      const rows = exportItemsByDocument.get(item.documentId) || [];
+      rows.push(item);
+      exportItemsByDocument.set(item.documentId, rows);
+    }
+
+    for (const [documentId, exportItems] of exportItemsByDocument.entries()) {
+      if (canceledJobs.has(job.id)) break;
+      for (const item of exportItems) {
+        if (item.status === 'pending') markAndPersistItem(item, 'running');
+      }
+      try {
+        const payload = await sourceClient.exportDocument(documentId);
+        const cached = { payload, hash: hashPayload(payload) };
+        exports.set(documentId, cached);
+        for (const item of exportItems) markAndPersistItem(item, 'succeeded', { exportHash: cached.hash });
+      } catch (error) {
+        const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+        for (const item of exportItems) markAndPersistItem(item, 'failed', { error: message });
+        skipDependentItems(documentId, `Export failed; dependent step skipped. ${message}`);
+      }
+    }
+  }
+
+  async function processDestinationItem(item: MigrationJobItem): Promise<void> {
+    if (canceledJobs.has(job.id)) {
+      markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+      if (item.kind === 'import') releaseExportConsumer(item.documentId);
+      return;
+    }
     const destination = requireInstance(item.destinationId);
-    const destinationClient = new OmniClient(destination);
-    markItem(item, 'running');
-    updateJob(job);
+    const destinationClient = destinationClientFor(destination);
+    markAndPersistItem(item, 'running');
 
     try {
       if (item.kind === 'delete') {
         if (!item.documentId) throw new Error('Delete item missing document id.');
         await destinationClient.requestDeleteDocument(item.documentId);
-        markItem(item, 'succeeded');
-      } else if (item.kind === 'export') {
-        if (!item.documentId) throw new Error('Export item missing document id.');
-        let cached = exports.get(item.documentId);
-        if (!cached) {
-          const payload = await sourceClient.exportDocument(item.documentId);
-          cached = { payload, hash: hashPayload(payload) };
-          exports.set(item.documentId, cached);
-        }
-        markItem(item, 'succeeded', { exportHash: cached.hash });
+        markAndPersistItem(item, 'succeeded');
       } else if (item.kind === 'import') {
         if (!item.documentId) throw new Error('Import item missing document id.');
         const cached = exports.get(item.documentId);
-        if (!cached) throw new Error('Export payload missing before import.');
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; import skipped.' });
+          releaseExportConsumer(item.documentId);
+          return;
+        }
         const targetModelId = item.targetModelId || destination.defaultModelId;
         const targetFolderPath = item.targetFolderPath || destination.defaultFolderPath;
         if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
@@ -759,15 +1640,19 @@ async function executeJob(job: MigrationJob): Promise<void> {
           }
         }
         importedByDestinationAndSource.set(`${item.targetId || destination.id}:${item.documentId}`, { identifier, documentId });
-        markItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
           importedIdentifier: identifier,
           importedDocumentId: documentId,
           warnings: warnings.length > 0 ? warnings : undefined,
         });
+        releaseExportConsumer(item.documentId);
       } else if (item.kind === 'metadata') {
         if (!item.documentId) throw new Error('Metadata item missing document id.');
         const imported = importedByDestinationAndSource.get(`${item.targetId || destination.id}:${item.documentId}`);
-        if (!imported?.identifier) throw new Error('No imported document identifier available for metadata preservation.');
+        if (!imported?.identifier) {
+          markAndPersistItem(item, 'skipped', { error: 'No imported document identifier available for metadata preservation.' });
+          return;
+        }
         const meta = sourceMeta.get(item.documentId);
         const warnings: string[] = [];
         if (meta?.description) {
@@ -796,46 +1681,112 @@ async function executeJob(job: MigrationJob): Promise<void> {
             warnings.push(`Label copy failed: ${error instanceof Error ? error.message : String(error)}`);
           }
         }
-        markItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', { warnings: warnings.length > 0 ? warnings : undefined });
       }
     } catch (error) {
       const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-      markItem(item, 'failed', { error: message });
+      markAndPersistItem(item, 'failed', { error: message });
+      if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
-    updateJob(job);
+  }
+
+  async function runDestinationStage(): Promise<void> {
+    for (const item of job.items) {
+      if (item.kind === 'import' && item.status === 'pending' && item.documentId) {
+        importConsumers.set(item.documentId, (importConsumers.get(item.documentId) || 0) + 1);
+      }
+    }
+    const groups = new Map<string, MigrationJobItem[]>();
+    for (const item of job.items) {
+      if (item.kind === 'export' || item.status !== 'pending') continue;
+      const rows = groups.get(item.destinationId) || [];
+      rows.push(item);
+      groups.set(item.destinationId, rows);
+    }
+    await runWithConcurrency([...groups.values()], destinationConcurrency(), async (items) => {
+      for (const item of items) {
+        if (canceledJobs.has(job.id)) {
+          markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+          if (item.kind === 'import') releaseExportConsumer(item.documentId);
+          continue;
+        }
+        await processDestinationItem(item);
+      }
+    });
+  }
+
+  await runExportStage();
+  if (!canceledJobs.has(job.id)) await runDestinationStage();
+
+  if (canceledJobs.has(job.id)) {
+    markPendingItemsSkipped(job, 'Canceled by user.');
+    job.status = 'canceled';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+    return;
   }
 
   await runJobPostActions(job);
   job.status = computeJobStatus(job.items);
   job.endedAt = Date.now();
-  updateJob(job);
+  persistJobStatus(job);
 }
 
 async function runJobPostActions(job: MigrationJob): Promise<void> {
   const actions = activePostMigrationActions.get(job.id) ?? [];
   for (const action of actions) {
+    if (canceledJobs.has(job.id)) return;
+    const destination = action.kind === 'refresh-schema' && action.destinationInstanceId
+      ? requireInstance(action.destinationInstanceId)
+      : null;
     const item: MigrationJobItem = {
       id: randomUUID(),
       jobId: job.id,
-      destinationId: 'post-actions',
-      destinationLabel: 'Post-migration',
+      destinationId: destination?.id || 'post-actions',
+      destinationLabel: destination?.label || 'Post-migration',
+      targetModelId: action.targetModelId,
+      targetModelName: action.targetModelName,
       kind: 'post_action',
       documentName: action.name,
       status: 'running',
       startedAt: Date.now(),
     };
     job.items.push(item);
-    updateJob(job);
-    const result = await runPostMigrationAction(action);
-    markItem(item, result.ok ? 'succeeded' : 'failed', {
+    updateJobItem(item);
+    const result = action.kind === 'refresh-schema'
+      ? await runSchemaRefreshAction(action)
+      : await runPostMigrationAction(action);
+    markAndPersistItem(item, result.ok ? 'succeeded' : 'failed', {
       error: result.ok ? undefined : result.error,
       warnings: result.ok && result.warning ? [result.warning] : undefined,
     });
-    updateJob(job);
+    publishMigrationJobEvent({
+      type: 'post-migration',
+      jobId: job.id,
+      results: { action: action.name, ...result },
+      at: Date.now(),
+    });
+  }
+}
+
+async function runSchemaRefreshAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
+  if (!action.destinationInstanceId) return { ok: false, error: 'Schema refresh action is missing a destination instance.' };
+  if (!action.targetModelId) return { ok: false, error: 'Schema refresh action is missing a target model.' };
+  try {
+    const destination = requireInstance(action.destinationInstanceId);
+    const result = await new OmniClient(destination).refreshModel(action.targetModelId);
+    const detail = [
+      result.jobId ? `job ${result.jobId}` : '',
+      result.status ? `status ${result.status}` : '',
+    ].filter(Boolean).join(', ');
+    return { ok: true, warning: detail ? `Schema refresh queued (${detail}).` : 'Schema refresh queued.' };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 export async function runPostMigrationAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
+  if (action.kind === 'refresh-schema') return runSchemaRefreshAction(action);
   let url: URL;
   try {
     url = new URL(action.url);

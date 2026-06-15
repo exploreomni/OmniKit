@@ -34,6 +34,9 @@ export interface OmniModelRecord {
   connectionName?: string;
   baseModelId?: string;
   kind?: string;
+  gitConfigured?: boolean;
+  pullRequestRequired?: boolean;
+  gitProtected?: boolean;
   createdAt?: string;
   updatedAt?: string;
   deletedAt?: string | null;
@@ -55,6 +58,8 @@ export interface OmniDocumentRecord {
   folderId?: string;
   folderPath?: string;
   baseModelId?: string;
+  type?: string;
+  hasDashboard?: boolean | null;
   description?: string | null;
   labels?: string[];
   updatedAt?: string;
@@ -75,6 +80,62 @@ export interface OmniEmbedUserRecord {
   groups: Array<{ display: string; value: string }>;
   lastLogin?: string | null;
   createdAt?: string;
+}
+
+export interface OmniModelYamlResponse {
+  files: Record<string, string>;
+  checksums?: Record<string, string>;
+  raw: unknown;
+}
+
+export interface OmniModelBranchResult {
+  id: string;
+  name: string;
+  raw: unknown;
+}
+
+export interface OmniValidationIssue {
+  message?: string;
+  is_warning?: boolean;
+  yaml_path?: string;
+  [key: string]: unknown;
+}
+
+export interface OmniDocumentQueryRecord {
+  id: string;
+  name: string;
+  url?: string;
+  query: Record<string, unknown>;
+  visConfig?: Record<string, unknown>;
+  description?: string;
+}
+
+export interface OmniCreateWorkbookInput {
+  modelId: string;
+  name: string;
+  description?: string | null;
+  folderId?: string;
+  folderPath?: string;
+  queryPresentations: Array<{
+    name: string;
+    description?: string | null;
+    query: Record<string, unknown>;
+    visConfig?: Record<string, unknown>;
+  }>;
+}
+
+export interface OmniCreateWorkbookResult {
+  id: string;
+  identifier: string;
+  url?: string;
+  raw: unknown;
+}
+
+export interface OmniAiJobResult {
+  id: string;
+  status?: string;
+  result?: unknown;
+  raw: unknown;
 }
 
 export class OmniClientError extends Error {
@@ -290,6 +351,22 @@ export class OmniClient {
         connectionName: firstString(row.connectionName, row.connection_name, nested(row, 'connection', 'name')),
         baseModelId: firstString(row.baseModelId, row.base_model_id, nested(row, 'baseModel', 'id')),
         kind: firstString(row.kind, row.modelKind, row.model_kind, row.type),
+        gitConfigured: Boolean(row.gitRepository || row.git_repository || row.gitRepo || row.git_repo || nested(row, 'git', 'repository') || nested(row, 'gitConfig', 'repository')),
+        pullRequestRequired: Boolean(
+          row.pullRequestRequired
+          || row.pull_request_required
+          || row.prRequired
+          || row.pr_required
+          || nested(row, 'git', 'pullRequestRequired')
+          || nested(row, 'gitConfig', 'pullRequestRequired')
+        ),
+        gitProtected: Boolean(
+          row.gitProtected
+          || row.git_protected
+          || row.protected
+          || nested(row, 'git', 'protected')
+          || nested(row, 'gitConfig', 'protected')
+        ),
         createdAt: firstString(row.createdAt, row.created_at),
         updatedAt: firstString(row.updatedAt, row.updated_at),
         deletedAt: firstString(row.deletedAt, row.deleted_at) ?? null,
@@ -391,6 +468,16 @@ export class OmniClient {
           nested(row, 'baseModel', 'id'),
           nested(row, 'model', 'id'),
         ),
+        type: firstString(row.type, row.documentType, row.document_type, content.type, metadata.type),
+        hasDashboard: typeof row.hasDashboard === 'boolean'
+          ? row.hasDashboard
+          : typeof row.has_dashboard === 'boolean'
+            ? row.has_dashboard
+            : typeof content.hasDashboard === 'boolean'
+              ? content.hasDashboard
+              : typeof content.has_dashboard === 'boolean'
+                ? content.has_dashboard
+                : null,
         description: typeof row.description === 'string' ? row.description : null,
         labels: Array.isArray(row.labels) ? row.labels.filter((label): label is string => typeof label === 'string') : undefined,
         updatedAt: firstString(row.updatedAt, row.updated_at),
@@ -412,17 +499,224 @@ export class OmniClient {
   }
 
   async getModelYamlFiles(modelId: string): Promise<Record<string, string>> {
+    const data = await this.getModelYaml(modelId, { fullyResolved: true });
+    return data.files;
+  }
+
+  async getModelYaml(modelId: string, options: {
+    branchId?: string;
+    fileName?: string;
+    mode?: 'combined' | 'extension' | 'staged' | 'merged' | 'history';
+    includeChecksums?: boolean;
+    fullyResolved?: boolean;
+  } = {}): Promise<OmniModelYamlResponse> {
     const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/yaml`, {
-      query: { fullyResolved: true },
+      query: {
+        branchId: options.branchId,
+        fileName: options.fileName,
+        mode: options.mode,
+        includeChecksums: options.includeChecksums,
+        fullyResolved: options.fullyResolved,
+      },
     });
-    const data = await response.json();
+    const data = await response.json() as Record<string, unknown>;
     const files = data && typeof data === 'object' && !Array.isArray(data)
       ? (data as Record<string, unknown>).files
       : null;
-    if (!files || typeof files !== 'object' || Array.isArray(files)) return {};
-    return Object.fromEntries(
+    const normalizedFiles = !files || typeof files !== 'object' || Array.isArray(files)
+      ? {}
+      : Object.fromEntries(
       Object.entries(files).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
     );
+    const checksums = data.checksums && typeof data.checksums === 'object' && !Array.isArray(data.checksums)
+      ? Object.fromEntries(Object.entries(data.checksums).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
+      : undefined;
+    return { files: normalizedFiles, checksums, raw: data };
+  }
+
+  async createModelBranch(input: { connectionId: string; baseModelId: string; branchName: string }): Promise<OmniModelBranchResult> {
+    const response = await this.request('POST', '/api/v1/models', {
+      body: {
+        connectionId: input.connectionId,
+        modelName: input.branchName,
+        modelKind: 'BRANCH',
+        baseModelId: input.baseModelId,
+      },
+    });
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const id = firstString(raw.id, raw.modelId, raw.model_id, raw.branchId, raw.branch_id, nested(raw, 'model', 'id'), nested(raw, 'branch', 'id')) ?? '';
+    const name = firstString(raw.name, raw.modelName, raw.model_name, raw.branchName, raw.branch_name, nested(raw, 'model', 'name'), nested(raw, 'branch', 'name')) ?? input.branchName;
+    if (!id) throw new Error('Omni did not return a branch model id.');
+    return { id, name, raw };
+  }
+
+  async updateModelYamlFile(input: {
+    modelId: string;
+    fileName: string;
+    yaml: string;
+    branchId: string;
+    previousChecksum?: string;
+    commitMessage?: string;
+  }): Promise<unknown> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
+      body: {
+        fileName: input.fileName,
+        yaml: input.yaml,
+        mode: 'combined',
+        branchId: input.branchId,
+        previousChecksum: input.previousChecksum,
+        commitMessage: input.commitMessage,
+      },
+    });
+    return response.json().catch(() => ({}));
+  }
+
+  async updateModelYamlFiles(input: {
+    modelId: string;
+    branchId: string;
+    files: Array<{ fileName: string; yaml: string; previousChecksum?: string }>;
+    commitMessage?: string;
+  }): Promise<unknown> {
+    if (input.files.length === 0) return {};
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
+      body: {
+        mode: 'combined',
+        branchId: input.branchId,
+        commitMessage: input.commitMessage,
+        files: input.files.map((file) => ({
+          fileName: file.fileName,
+          yaml: file.yaml,
+          previousChecksum: file.previousChecksum,
+        })),
+      },
+    });
+    return response.json().catch(() => ({}));
+  }
+
+  async validateModel(modelId: string, branchId?: string): Promise<OmniValidationIssue[]> {
+    const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/validate`, {
+      query: branchId ? { branchId } : undefined,
+    });
+    const data = await response.json().catch(() => []) as unknown;
+    return extractArray(data, ['issues', 'errors', 'warnings', 'data']).map((issue) => issue as OmniValidationIssue);
+  }
+
+  async validateModelContent(modelId: string, branchId?: string): Promise<Record<string, unknown>> {
+    const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/content-validator`, {
+      query: branchId ? { branch_id: branchId } : undefined,
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async migrateModel(input: {
+    sourceModelId: string;
+    gitRef?: string;
+    targetModelId: string;
+    branchName: string;
+    commitMessage: string;
+  }): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.sourceModelId)}/migrate`, {
+      body: {
+        gitRef: input.gitRef,
+        targetModelId: input.targetModelId,
+        branchName: input.branchName,
+        commitMessage: input.commitMessage,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async mergeModelBranch(modelId: string, branchName: string, options: {
+    publishDrafts?: boolean;
+    deleteBranch?: boolean;
+    forceOverrideGitSettings?: boolean;
+  } = {}): Promise<Record<string, unknown>> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/branch/${encodeURIComponent(branchName)}/merge`, {
+      body: {
+        publish_drafts: options.publishDrafts === true,
+        delete_branch: options.deleteBranch === true,
+        force_override_git_settings: options.forceOverrideGitSettings === true,
+      },
+    });
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async getDocumentQueries(documentId: string): Promise<OmniDocumentQueryRecord[]> {
+    const response = await this.request('GET', `/api/v1/documents/${encodeURIComponent(documentId)}/queries`);
+    const data = await response.json().catch(() => []) as unknown;
+    return extractArray(data, ['queries', 'queryPresentations', 'records', 'data', 'items']).map((raw) => {
+      const row = raw as Record<string, unknown>;
+      const query = row.query && typeof row.query === 'object' && !Array.isArray(row.query)
+        ? row.query as Record<string, unknown>
+        : {};
+      const visConfig = row.visConfig && typeof row.visConfig === 'object' && !Array.isArray(row.visConfig)
+        ? row.visConfig as Record<string, unknown>
+        : row.vis_config && typeof row.vis_config === 'object' && !Array.isArray(row.vis_config)
+          ? row.vis_config as Record<string, unknown>
+          : undefined;
+      return {
+        id: String(row.id ?? row.identifier ?? row.name ?? ''),
+        name: firstString(row.name, row.title) ?? 'Workbook tab',
+        url: firstString(row.url),
+        query,
+        visConfig,
+        description: firstString(row.description),
+      };
+    }).filter((query) => query.id || Object.keys(query.query).length > 0);
+  }
+
+  async createWorkbookDocument(input: OmniCreateWorkbookInput): Promise<OmniCreateWorkbookResult> {
+    const body: Record<string, unknown> = {
+      modelId: input.modelId,
+      name: input.name,
+      description: input.description || undefined,
+      queryPresentations: input.queryPresentations,
+    };
+    if (input.folderId) body.folderId = input.folderId;
+    if (input.folderPath) body.folderPath = input.folderPath;
+    const response = await this.request('POST', '/api/v1/documents', { body });
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const id = firstString(raw.id, raw.documentId, raw.document_id, nested(raw, 'document', 'id')) ?? '';
+    const identifier = firstString(raw.identifier, raw.miniUuid, nested(raw, 'document', 'identifier')) ?? id;
+    return {
+      id,
+      identifier,
+      url: firstString(raw.url, nested(raw, 'document', 'url')),
+      raw,
+    };
+  }
+
+  async createAiJob(input: { modelId: string; prompt: string; branchId?: string }): Promise<OmniAiJobResult> {
+    const response = await this.request('POST', '/api/v1/ai/jobs', {
+      body: {
+        modelId: input.modelId,
+        prompt: input.prompt,
+        branchId: input.branchId,
+      },
+    });
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return {
+      id: firstString(raw.id, raw.jobId, raw.job_id, nested(raw, 'job', 'id')) ?? '',
+      status: firstString(raw.status, nested(raw, 'job', 'status')),
+      result: raw.result,
+      raw,
+    };
+  }
+
+  async getAiJob(jobId: string): Promise<OmniAiJobResult> {
+    const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}`);
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return {
+      id: firstString(raw.id, raw.jobId, raw.job_id, nested(raw, 'job', 'id')) ?? jobId,
+      status: firstString(raw.status, nested(raw, 'job', 'status')),
+      result: raw.result,
+      raw,
+    };
+  }
+
+  async getAiJobResult(jobId: string): Promise<unknown> {
+    const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/result`);
+    return response.json().catch(() => ({}));
   }
 
   async createLabel(label: OmniLabelRecord): Promise<void> {
@@ -485,6 +779,16 @@ export class OmniClient {
     await this.request('PUT', `/api/v1/documents/${encodeURIComponent(documentId)}/move`, {
       body: { folderPath },
     });
+  }
+
+  async refreshModel(modelId: string): Promise<{ jobId?: string; status?: string; raw: unknown }> {
+    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/refresh`);
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    return {
+      jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')),
+      status: firstString(raw.status, nested(raw, 'job', 'status')),
+      raw,
+    };
   }
 
   async listEmbedUsers(): Promise<OmniEmbedUserRecord[]> {
