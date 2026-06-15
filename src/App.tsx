@@ -20,6 +20,7 @@ function PaddedLayout() {
   );
 }
 import { MigratePage } from '@/pages/MigratePage';
+import { ModelMigratorPage } from '@/pages/ModelMigratorPage';
 import { UserManagementPage } from '@/pages/UserManagementPage';
 import { ModelsPage } from '@/pages/ModelsPage';
 import { TopicsPage } from '@/pages/TopicsPage';
@@ -53,6 +54,7 @@ function AppLayout() {
           <Route path="/connect" element={<Navigate to="/" replace />} />
           <Route element={<PaddedLayout />}>
             <Route path="/dashboards/migrate" element={<MigratePage />} />
+            <Route path="/models/migrate" element={<ModelMigratorPage />} />
             <Route
               path="/dashboards/ai-studio"
               element={<RequireConnection><AIDashboardStudioPage /></RequireConnection>}

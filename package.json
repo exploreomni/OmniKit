@@ -15,10 +15,11 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "test:fanout": "tsx --test tests/fanout-wizard.test.ts",
     "test:migration-planner": "tsx --test tests/migration-planner.test.ts",
+    "test:model-migrator": "tsx --test tests/model-migrator.test.ts",
     "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:security": "tsx --test tests/security-regression.test.ts",
     "security:audit": "npm audit --audit-level=moderate",
-    "security:check": "npm run security:audit && npm run test:security && npm run test:fanout && npm run test:migration-planner && npm run test:instance-dashboard && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
+    "security:check": "npm run security:audit && npm run test:security && npm run test:fanout && npm run test:migration-planner && npm run test:model-migrator && npm run test:instance-dashboard && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
     "@types/better-sqlite3": "^7.6.13",

@@ -43,6 +43,7 @@ const TYPE_CONFIG: Record<OperationType, { icon: typeof Clock; label: string; co
   user_delete: { icon: UserMinus, label: 'User Deleted', color: 'text-red-600 bg-red-50' },
   group_update: { icon: Shield, label: 'Group Updated', color: 'text-blue-600 bg-blue-50' },
   model_create: { icon: Database, label: 'Model Created', color: 'text-green-600 bg-green-50' },
+  model_migration: { icon: Database, label: 'Model Migration', color: 'text-purple-600 bg-purple-50' },
   topic_create: { icon: BookOpen, label: 'Topic Created', color: 'text-green-600 bg-green-50' },
   topic_update: { icon: BookOpen, label: 'Topic Updated', color: 'text-blue-600 bg-blue-50' },
   topic_delete: { icon: BookOpen, label: 'Topic Deleted', color: 'text-red-600 bg-red-50' },
@@ -102,6 +103,11 @@ function jobCounts(job: MigrationJob) {
   };
 }
 
+function numberDetail(job: MigrationJob, key: string): number {
+  const value = job.details?.[key];
+  return typeof value === 'number' ? value : 0;
+}
+
 function downloadJson(filename: string, payload: unknown) {
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
@@ -114,13 +120,16 @@ function downloadJson(filename: string, payload: unknown) {
 
 function JobDetail({ job }: { job: MigrationJob }) {
   const counts = jobCounts(job);
+  const isModelJob = job.workflow === 'model';
+  const modelCount = numberDetail(job, 'modelCount') || job.targets?.length || 0;
+  const workbookCount = numberDetail(job, 'workbookCount');
   return (
     <div className="card p-5">
       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
         <div>
-          <h2 className="text-base font-semibold text-content-primary">Migration job detail</h2>
+          <h2 className="text-base font-semibold text-content-primary">{isModelJob ? 'Model migration job detail' : 'Migration job detail'}</h2>
           <p className="mt-1 text-sm text-content-secondary">
-            {job.sourceLabel} · {job.documentIds.length} dashboard{job.documentIds.length === 1 ? '' : 's'} · {job.targets?.length || job.destinationIds.length} target{(job.targets?.length || job.destinationIds.length) === 1 ? '' : 's'}
+            {job.sourceLabel} · {isModelJob ? `${modelCount} model${modelCount === 1 ? '' : 's'} · ${workbookCount} workbook${workbookCount === 1 ? '' : 's'}` : `${job.documentIds.length} dashboard${job.documentIds.length === 1 ? '' : 's'}`} · {job.targets?.length || job.destinationIds.length} target{(job.targets?.length || job.destinationIds.length) === 1 ? '' : 's'}
           </p>
           {job.parentJobId && <p className="mt-1 text-xs text-content-secondary">Retry of {job.parentJobId}</p>}
         </div>
@@ -151,8 +160,24 @@ function JobDetail({ job }: { job: MigrationJob }) {
             </div>
             {item.importedDocumentId && <div className="mt-1 text-content-secondary">Imported document: {item.importedDocumentId}</div>}
             {item.importedIdentifier && <div className="mt-1 text-content-secondary">Imported identifier: {item.importedIdentifier}</div>}
+            {typeof item.details?.url === 'string' && (
+              <a href={item.details.url} target="_blank" rel="noreferrer" className="mt-1 inline-flex text-omni-700 underline">
+                Open imported document
+              </a>
+            )}
             {item.warnings?.map((warning) => <div key={warning} className="mt-1 text-yellow-700">{warning}</div>)}
             {item.error && <div className="mt-1 text-red-700">{item.error}</div>}
+            {item.kind === 'workbook_create' && Array.isArray(item.details?.tabs) && (
+              <div className="mt-2 rounded-card border border-border-subtle bg-surface-secondary p-2">
+                <div className="mb-1 font-semibold text-content-primary">Workbook tabs</div>
+                {(item.details.tabs as Array<{ name?: string; status?: string; carried?: string[]; retryBoundary?: string }>).map((tab, tabIndex) => (
+                  <div key={`${item.id}:history-tab:${tabIndex}`} className="flex items-center justify-between gap-2 py-0.5 text-content-secondary">
+                    <span>{tab.name || `Tab ${tabIndex + 1}`}</span>
+                    <span>{tab.status || 'created'} · {(tab.carried || []).join(', ') || 'query'}{tab.retryBoundary ? ` · retry: ${tab.retryBoundary}` : ''}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -336,16 +361,20 @@ export function HistoryPage() {
 
               const counts = jobCounts(item.job);
               const children = childJobsByParent.get(item.job.id) || [];
+              const isModelJob = item.job.workflow === 'model';
+              const modelCount = numberDetail(item.job, 'modelCount') || item.job.targets?.length || 0;
+              const workbookCount = numberDetail(item.job, 'workbookCount');
+              const dashboardCount = numberDetail(item.job, 'dashboardCount') || item.job.documentIds.length;
               return (
                 <div key={item.id} className="card p-4 animate-fadeIn">
                   <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <ArrowRightLeft size={16} className="text-omni-600" />
-                        <span className="truncate text-sm font-semibold text-content-primary">Fan-out migration from {item.job.sourceLabel}</span>
+                        <span className="truncate text-sm font-semibold text-content-primary">{isModelJob ? 'Model migration' : 'Fan-out migration'} from {item.job.sourceLabel}</span>
                       </div>
                       <div className="mt-1 text-xs text-content-secondary">
-                        {formatTime(item.job.createdAt)} · {item.job.documentIds.length} dashboard{item.job.documentIds.length === 1 ? '' : 's'} · {item.job.targets?.length || item.job.destinationIds.length} target{(item.job.targets?.length || item.job.destinationIds.length) === 1 ? '' : 's'} · {formatDuration((item.job.endedAt || Date.now()) - (item.job.startedAt || item.job.createdAt))}
+                        {formatTime(item.job.createdAt)} · {isModelJob ? `${modelCount} model${modelCount === 1 ? '' : 's'} · ${dashboardCount} dashboard${dashboardCount === 1 ? '' : 's'} · ${workbookCount} workbook${workbookCount === 1 ? '' : 's'}` : `${item.job.documentIds.length} dashboard${item.job.documentIds.length === 1 ? '' : 's'}`} · {item.job.targets?.length || item.job.destinationIds.length} target{(item.job.targets?.length || item.job.destinationIds.length) === 1 ? '' : 's'} · {formatDuration((item.job.endedAt || Date.now()) - (item.job.startedAt || item.job.createdAt))}
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">

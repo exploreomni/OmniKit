@@ -106,6 +106,7 @@ New users see a click-through walkthrough the first time they open OmniKit. The 
   - **Excel to Dashboard** parses `.xlsx` workbooks in page memory, inventories sheets/formulas/charts, drafts safe dashboard tiles from existing Omni fields, and lists formula/lookup work as AI Semantic Studio follow-ups instead of updating topics or views directly.
   - **Review Existing Dashboard** inspects a live Omni dashboard and returns a review checklist for purpose, UX risks, semantic risks, and Omni UI handoff.
 - **Dashboard Migrator** — use **Within this instance** when dashboards stay inside the connected Omni instance and only need base-model remapping. Use **To other saved instances** for the fan-out wizard: unlock the native vault, pick one saved source/model/dashboard set, check one or more destination instances, confirm each destination model/folder, run a preflight matrix, and monitor live per-destination progress. The fan-out path preserves descriptions and labels where Omni supports it, records per-step job status, and lets failed destinations be retried without rerunning successful work.
+- **Model Migrator** — migrate semantic models between saved Omni instances through a branch-only workflow. Choose source/target connections, select shared models, map target models, review fast-path versus translate-pipeline YAML changes, port workbook-only query content, and track model/workbook progress in unified job history without exposing API keys in browser payloads. Dashboard selections are carried in the same scope as explicit Dashboard Migrator handoff items.
 - **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
 - **Dashboard Downloads** — export one or more dashboards to local files.
 - **Deck Builder** — build repeatable PowerPoint decks from live Omni dashboard tiles.
@@ -197,6 +198,7 @@ Key points:
 | `npm run lint` | Run ESLint. |
 | `npm run test:fanout` | Run focused Dashboard Migrator fan-out wizard helper tests. |
 | `npm run test:migration-planner` | Run focused Dashboard Migrator planner tests. |
+| `npm run test:model-migrator` | Run focused Model Migrator inventory helper tests. |
 | `npm run test:security` | Run focused vault, job-history, and post-action security regression tests. |
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the full local security gate: audit, all focused tests, typechecks, lint, and build. |

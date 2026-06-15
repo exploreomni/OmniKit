@@ -20,6 +20,14 @@ import {
   sanitizeJob,
   sanitizePostMigrationAction,
 } from './jobSanitizer';
+import {
+  buildFieldUniverseFromYaml,
+  buildWorkbookTabResultDetails,
+  collectFieldReferences,
+  normalizeContentValidationIssues,
+  preflightWorkbookQueryFields,
+  rewriteQueryModelReferences,
+} from './modelMigration/helpers';
 
 export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
 
@@ -30,7 +38,24 @@ const DEFAULT_DESTINATION_CONCURRENCY = 10;
 
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'warning' | 'skipped';
-export type JobItemKind = 'delete' | 'export' | 'import' | 'metadata' | 'post_action';
+export type MigrationWorkflow = 'dashboard' | 'model';
+export type JobItemKind =
+  | 'delete'
+  | 'export'
+  | 'import'
+  | 'metadata'
+  | 'post_action'
+  | 'model_fast_path'
+  | 'model_translate'
+  | 'model_branch_create'
+  | 'model_yaml_write'
+  | 'model_validate'
+  | 'model_merge'
+  | 'content_validate'
+  | 'workbook_queries'
+  | 'workbook_preflight'
+  | 'workbook_create'
+  | 'dashboard_handoff';
 
 export interface MigrationJobItem {
   id: string;
@@ -54,10 +79,12 @@ export interface MigrationJobItem {
   exportHash?: string;
   importedIdentifier?: string;
   importedDocumentId?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface MigrationJob {
   id: string;
+  workflow?: MigrationWorkflow;
   sourceId: string;
   sourceLabel: string;
   destinationIds: string[];
@@ -73,6 +100,7 @@ export interface MigrationJob {
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
+  details?: Record<string, unknown>;
   items: MigrationJobItem[];
 }
 
@@ -117,6 +145,51 @@ export interface MigrationTarget {
 interface SourceMeta {
   description?: string | null;
   labels: string[];
+}
+
+export interface ModelMigrationAcceptedFile {
+  fileName: string;
+  yaml: string;
+  previousChecksum?: string;
+}
+
+export interface ModelMigrationModelInput {
+  sourceModelId: string;
+  sourceModelName?: string;
+  targetModelId: string;
+  targetModelName?: string;
+  targetConnectionId: string;
+  mode: 'fast' | 'translate';
+  branchName: string;
+  gitRef?: string;
+  fastPathSchemaConfirmed?: boolean;
+  mergeHandoffRequired?: boolean;
+  acceptedFiles?: ModelMigrationAcceptedFile[];
+}
+
+export interface ModelMigrationContentInput {
+  documentId: string;
+  documentName: string;
+  kind: 'dashboard' | 'workbook';
+  sourceModelId: string;
+  targetModelId: string;
+  targetModelName?: string;
+  targetFolderId?: string;
+  targetFolderPath?: string;
+}
+
+export interface ModelMigrationJobInput {
+  sourceId: string;
+  targetId: string;
+  targetLabel?: string;
+  models: ModelMigrationModelInput[];
+  content: ModelMigrationContentInput[];
+  replaceSameNamed: boolean;
+  mergeAfterValidation?: boolean;
+  publishDrafts?: boolean;
+  deleteBranch?: boolean;
+  postMigrationActions: PostMigrationAction[];
+  parentJobId?: string;
 }
 
 const runningJobs = new Set<string>();
@@ -608,9 +681,244 @@ export async function createMigrationJob(input: {
   return getJob(job.id) || sanitizeJob(job);
 }
 
+export async function createModelMigrationJob(input: ModelMigrationJobInput): Promise<MigrationJob> {
+  const source = requireInstance(input.sourceId);
+  const target = requireInstance(input.targetId);
+  if (input.models.length === 0) throw new Error('Select at least one source model before starting Model Migrator.');
+  const jobId = randomUUID();
+  const items: MigrationJobItem[] = [];
+  const contentIds = input.content.map((row) => row.documentId);
+
+  for (const model of input.models) {
+    const baseDetails = {
+      sourceModelId: model.sourceModelId,
+      sourceModelName: model.sourceModelName,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      targetConnectionId: model.targetConnectionId,
+      branchName: model.branchName,
+      mode: model.mode,
+    };
+    if (model.mode === 'fast') {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_fast_path',
+        status: 'pending',
+        details: {
+          ...baseDetails,
+          gitRef: model.gitRef,
+          fastPathSchemaConfirmed: model.fastPathSchemaConfirmed === true,
+        },
+      });
+    } else {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_translate',
+        status: 'pending',
+        details: { ...baseDetails, acceptedFileCount: model.acceptedFiles?.length || 0 },
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_branch_create',
+        status: 'pending',
+        details: baseDetails,
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        kind: 'model_yaml_write',
+        status: 'pending',
+        details: { ...baseDetails, files: model.acceptedFiles || [] },
+      });
+    }
+    items.push({
+      id: randomUUID(),
+      jobId,
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      kind: 'model_validate',
+      status: 'pending',
+      details: baseDetails,
+    });
+    items.push({
+      id: randomUUID(),
+      jobId,
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      kind: 'content_validate',
+      status: 'pending',
+      details: baseDetails,
+    });
+  }
+
+  for (const content of input.content) {
+    if (content.kind === 'dashboard') {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: 'export',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content, workflow: 'model' },
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: 'import',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content },
+      });
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind: 'metadata',
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content },
+      });
+      continue;
+    }
+    for (const kind of ['workbook_queries', 'workbook_preflight', 'workbook_create'] as const) {
+      items.push({
+        id: randomUUID(),
+        jobId,
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: content.targetModelId,
+        targetModelName: content.targetModelName,
+        targetFolderId: content.targetFolderId,
+        targetFolderPath: content.targetFolderPath,
+        kind,
+        documentId: content.documentId,
+        documentName: content.documentName,
+        status: 'pending',
+        details: { ...content },
+      });
+    }
+  }
+
+  const job: MigrationJob = {
+    id: jobId,
+    workflow: 'model',
+    sourceId: input.sourceId,
+    sourceLabel: source.label,
+    destinationIds: [target.id],
+    targets: input.models.map((model) => ({
+      id: `${target.id}:${model.targetModelId}`,
+      destinationInstanceId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+    })),
+    documentIds: contentIds,
+    emptyFirst: false,
+    replaceSameNamed: input.replaceSameNamed !== false,
+    postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
+    status: 'pending',
+    parentJobId: input.parentJobId,
+    createdAt: Date.now(),
+    details: {
+      targetId: target.id,
+      targetLabel: input.targetLabel || target.label,
+      modelCount: input.models.length,
+      dashboardCount: input.content.filter((row) => row.kind === 'dashboard').length,
+      workbookCount: input.content.filter((row) => row.kind === 'workbook').length,
+      mergeAfterValidation: false,
+      retryInput: {
+        sourceId: input.sourceId,
+        targetId: input.targetId,
+        targetLabel: input.targetLabel,
+        models: input.models,
+        content: input.content,
+        replaceSameNamed: false,
+        mergeAfterValidation: false,
+        publishDrafts: input.publishDrafts,
+        deleteBranch: input.deleteBranch,
+        postMigrationActions: input.postMigrationActions,
+      },
+    },
+    items,
+  };
+  activePostMigrationActions.set(jobId, input.postMigrationActions);
+  insertJob(job);
+  void runMigrationJob(job.id).catch(() => undefined);
+  return getJob(job.id) || sanitizeJob(job);
+}
+
 export async function retryMigrationJob(id: string, options: { destinationId?: string } = {}): Promise<MigrationJob> {
   const parent = getJob(id);
   if (!parent) throw new Error('Job not found.');
+  if (parent.workflow === 'model') {
+    const retryInput = parent.details?.retryInput;
+    if (!retryInput || typeof retryInput !== 'object' || Array.isArray(retryInput)) {
+      throw new Error('Model migration retry details are unavailable.');
+    }
+    const input = retryInput as ModelMigrationJobInput;
+    const failedModelIds = new Set(parent.items
+      .filter((item) => item.status === 'failed' && item.targetModelId)
+      .map((item) => item.targetModelId as string));
+    const failedDocumentIds = new Set(parent.items
+      .filter((item) => item.status === 'failed' && item.documentId)
+      .map((item) => item.documentId as string));
+    const retryModels = input.models.filter((model) => failedModelIds.has(model.targetModelId));
+    const retryContent = input.content.filter((content) => failedDocumentIds.has(content.documentId) || failedModelIds.has(content.targetModelId));
+    if (retryModels.length === 0 && retryContent.length === 0) {
+      throw new Error('No failed model migration items are available to retry.');
+    }
+    return createModelMigrationJob({
+      ...input,
+      models: retryModels.length > 0 ? retryModels : input.models.filter((model) => retryContent.some((content) => content.targetModelId === model.targetModelId)),
+      content: retryContent,
+      parentJobId: parent.id,
+      postMigrationActions: input.postMigrationActions || [],
+      replaceSameNamed: false,
+    });
+  }
   const failedImports = parent.items.filter((item) => {
     if (options.destinationId && item.destinationId !== options.destinationId) return false;
     return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export');
@@ -648,6 +956,98 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
   });
 }
 
+function modelMigrationInputFromJob(job: MigrationJob): ModelMigrationJobInput {
+  const retryInput = job.details?.retryInput;
+  if (!retryInput || typeof retryInput !== 'object' || Array.isArray(retryInput)) {
+    throw new Error('Model migration details are unavailable.');
+  }
+  return retryInput as ModelMigrationJobInput;
+}
+
+function branchNameForModel(job: MigrationJob, model: ModelMigrationModelInput): string {
+  const branchItem = job.items.find((item) => (
+    item.targetModelId === model.targetModelId
+    && (item.kind === 'model_branch_create' || item.kind === 'model_fast_path')
+    && (item.status === 'succeeded' || item.status === 'warning')
+  ));
+  return detailString(branchItem?.details, 'branchName') || model.branchName;
+}
+
+export async function mergeModelMigrationJob(id: string, options: { publishDrafts?: boolean; deleteBranch?: boolean } = {}): Promise<MigrationJob> {
+  const job = getJob(id);
+  if (!job) throw new Error('Job not found.');
+  if (job.workflow !== 'model') throw new Error('Only Model Migrator jobs can be merged from this endpoint.');
+  if (job.status === 'running' || job.status === 'pending') throw new Error('Wait for model validation to finish before merging.');
+  if (job.items.some((item) => item.kind === 'model_merge' && (item.status === 'succeeded' || item.status === 'running'))) {
+    throw new Error('This model migration job already has a merge in progress or completed.');
+  }
+
+  const input = modelMigrationInputFromJob(job);
+  const validationByModel = new Map(job.items
+    .filter((item) => item.kind === 'model_validate' && item.targetModelId)
+    .map((item) => [item.targetModelId as string, item]));
+  const blockers = input.models.filter((model) => validationByModel.get(model.targetModelId)?.status !== 'succeeded');
+  if (blockers.length > 0) {
+    throw new Error(`Cannot merge until every target model validates successfully: ${blockers.map((model) => model.targetModelName || model.targetModelId).join(', ')}`);
+  }
+
+  const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
+  const target = requireInstance(targetId);
+  const targetClient = new OmniClient(target);
+  job.status = 'running';
+  job.endedAt = undefined;
+  persistJobStatus(job);
+
+  for (const model of input.models) {
+    const branchName = branchNameForModel(job, model);
+    const item: MigrationJobItem = {
+      id: randomUUID(),
+      jobId: job.id,
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: model.targetModelId,
+      targetModelName: model.targetModelName,
+      kind: 'model_merge',
+      status: 'running',
+      startedAt: Date.now(),
+      details: {
+        sourceModelId: model.sourceModelId,
+        sourceModelName: model.sourceModelName,
+        targetModelId: model.targetModelId,
+        targetModelName: model.targetModelName,
+        branchName,
+        publishDrafts: options.publishDrafts === true,
+        deleteBranch: options.deleteBranch !== false,
+        mergeHandoffRequired: model.mergeHandoffRequired === true,
+      },
+    };
+    job.items.push(item);
+    persistItem(item);
+    try {
+      if (model.mergeHandoffRequired) {
+        markAndPersistItem(item, 'warning', {
+          warnings: ['This model appears to require a git/PR handoff. Open the target branch in Omni and complete review there; OmniKit did not force merge settings.'],
+        });
+        continue;
+      }
+      await targetClient.mergeModelBranch(model.targetModelId, branchName, {
+        publishDrafts: options.publishDrafts === true,
+        deleteBranch: options.deleteBranch !== false,
+        forceOverrideGitSettings: false,
+      });
+      markAndPersistItem(item, 'succeeded');
+    } catch (error) {
+      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+      markAndPersistItem(item, 'failed', { error: message });
+    }
+  }
+
+  job.status = computeJobStatus(job.items);
+  job.endedAt = Date.now();
+  persistJobStatus(job);
+  return getJob(job.id) || sanitizeJob(job);
+}
+
 export async function runMigrationJob(id: string): Promise<void> {
   if (runningJobs.has(id)) return;
   const job = getJob(id);
@@ -655,7 +1055,8 @@ export async function runMigrationJob(id: string): Promise<void> {
   if (isTerminalJobStatus(job.status)) return;
   runningJobs.add(id);
   try {
-    await executeJob(job);
+    if (job.workflow === 'model') await executeModelJob(job);
+    else await executeJob(job);
   } catch {
     const latest = getJob(id) || job;
     markPendingItemsSkipped(latest, 'Job failed before this step could run.');
@@ -681,6 +1082,401 @@ export function cancelMigrationJob(id: string): MigrationJob | undefined {
     persistJobStatus(job);
   }
   return getJob(id) || sanitizeJob(job);
+}
+
+function detailString(details: Record<string, unknown> | undefined, key: string): string {
+  const value = details?.[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function detailFiles(details: Record<string, unknown> | undefined): ModelMigrationAcceptedFile[] {
+  const files = details?.files;
+  if (!Array.isArray(files)) return [];
+  return files
+    .filter((file): file is Record<string, unknown> => Boolean(file) && typeof file === 'object' && !Array.isArray(file))
+    .map((file) => ({
+      fileName: typeof file.fileName === 'string' ? file.fileName : '',
+      yaml: typeof file.yaml === 'string' ? file.yaml : '',
+      previousChecksum: typeof file.previousChecksum === 'string' ? file.previousChecksum : undefined,
+    }))
+    .filter((file) => file.fileName && file.yaml);
+}
+
+function detailBoolean(details: Record<string, unknown> | undefined, key: string): boolean {
+  return details?.[key] === true;
+}
+
+async function executeModelJob(job: MigrationJob): Promise<void> {
+  const source = requireInstance(job.sourceId);
+  const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
+  const target = requireInstance(targetId);
+  const sourceClient = new OmniClient(source);
+  const targetClient = new OmniClient(target);
+  const branchByTargetModel = new Map<string, { branchId: string; branchName: string }>();
+  const targetYamlByModel = new Map<string, Record<string, string>>();
+  const workbookQueries = new Map<string, Array<{ id: string; name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string }>>();
+  const workbookRewrites = new Map<string, Array<{ name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string; blockers: string[] }>>();
+  const blockedTargetModels = new Set<string>();
+  const blockedWorkbooks = new Set<string>();
+  const dashboardExports = new Map<string, { payload: Record<string, unknown>; hash: string }>();
+  const importedDashboards = new Map<string, { identifier: string; documentId: string }>();
+  let sourceDocuments: Array<{ id: string; identifier: string; name: string; description?: string | null; labels?: string[] }> | null = null;
+  let sourceLabels: Map<string, { color?: string | null; description?: string | null }> | null = null;
+  let targetLabelSet: Set<string> | null = null;
+
+  job.status = 'running';
+  job.startedAt = Date.now();
+  persistJobStatus(job);
+
+  async function targetYaml(targetModelId: string, branchId?: string): Promise<Record<string, string>> {
+    const key = `${targetModelId}:${branchId || 'main'}`;
+    const cached = targetYamlByModel.get(key);
+    if (cached) return cached;
+    const yaml = (await targetClient.getModelYaml(targetModelId, { branchId, includeChecksums: true })).files;
+      targetYamlByModel.set(key, yaml);
+      return yaml;
+  }
+
+  async function sourceDocument(documentId: string) {
+    if (!sourceDocuments) {
+      sourceDocuments = await sourceClient.listFolderDocuments(undefined, true);
+    }
+    return sourceDocuments.find((doc) => doc.id === documentId || doc.identifier === documentId);
+  }
+
+  async function sourceLabelMeta(name: string) {
+    if (!sourceLabels) {
+      sourceLabels = new Map((await sourceClient.listLabels()).map((label) => [label.name, { color: label.color, description: label.description }]));
+    }
+    return sourceLabels.get(name);
+  }
+
+  async function ensureTargetLabels(labels: string[]): Promise<void> {
+    if (labels.length === 0) return;
+    if (!targetLabelSet) {
+      targetLabelSet = new Set((await targetClient.listLabels()).map((label) => label.name));
+    }
+    for (const label of labels) {
+      if (targetLabelSet.has(label)) continue;
+      const sourceLabel = await sourceLabelMeta(label);
+      await targetClient.createLabel({ name: label, color: sourceLabel?.color, description: sourceLabel?.description });
+      targetLabelSet.add(label);
+    }
+  }
+
+  function isDownstreamOfModel(item: MigrationJobItem): boolean {
+    return [
+      'content_validate',
+      'model_merge',
+      'export',
+      'import',
+      'metadata',
+      'workbook_queries',
+      'workbook_preflight',
+      'workbook_create',
+    ].includes(item.kind);
+  }
+
+  for (const item of job.items) {
+    if (canceledJobs.has(job.id)) {
+      if (item.status === 'pending') markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+      continue;
+    }
+    if (item.status !== 'pending') continue;
+    const details = item.details || {};
+    const sourceModelId = detailString(details, 'sourceModelId');
+    const targetModelId = item.targetModelId || detailString(details, 'targetModelId');
+    const branchName = detailString(details, 'branchName');
+    if (targetModelId && blockedTargetModels.has(targetModelId) && isDownstreamOfModel(item)) {
+      markAndPersistItem(item, 'skipped', { error: 'Skipped because target model validation failed.' });
+      continue;
+    }
+    if (item.documentId && blockedWorkbooks.has(item.documentId) && item.kind === 'workbook_create') {
+      markAndPersistItem(item, 'skipped', { error: 'Skipped because workbook preflight failed.' });
+      continue;
+    }
+
+    try {
+      markAndPersistItem(item, 'running');
+      if (item.kind === 'model_fast_path') {
+        if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
+        await sourceClient.migrateModel({
+          sourceModelId,
+          targetModelId,
+          gitRef: detailString(details, 'gitRef') || undefined,
+          branchName,
+          commitMessage: `OmniKit Model Migrator fast path for ${item.targetModelName || targetModelId}`,
+        });
+        branchByTargetModel.set(targetModelId, { branchId: '', branchName });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName } });
+      } else if (item.kind === 'model_translate') {
+        const acceptedFileCount = typeof details.acceptedFileCount === 'number' ? details.acceptedFileCount : 0;
+        if (acceptedFileCount === 0) {
+          markAndPersistItem(item, 'warning', { warnings: ['No accepted YAML files were provided; validation will run against the current target model.'] });
+        } else {
+          markAndPersistItem(item, 'succeeded');
+        }
+      } else if (item.kind === 'model_branch_create') {
+        const branch = await targetClient.createModelBranch({
+          connectionId: detailString(details, 'targetConnectionId'),
+          baseModelId: targetModelId,
+          branchName,
+        });
+        branchByTargetModel.set(targetModelId, { branchId: branch.id, branchName: branch.name });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.id, branchName: branch.name } });
+      } else if (item.kind === 'model_yaml_write') {
+        const branch = branchByTargetModel.get(targetModelId);
+        if (!branch?.branchId) throw new Error('Target branch was not created before YAML write.');
+        const files = detailFiles(details);
+        await targetClient.updateModelYamlFiles({
+          modelId: targetModelId,
+          branchId: branch.branchId,
+          files,
+          commitMessage: `OmniKit Model Migrator update ${files.length} YAML file${files.length === 1 ? '' : 's'}`,
+        });
+        targetYamlByModel.delete(`${targetModelId}:${branch.branchId}`);
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, writtenFiles: files.map((file) => file.fileName) } });
+      } else if (item.kind === 'model_validate') {
+        const branch = branchByTargetModel.get(targetModelId);
+        const issues = await targetClient.validateModel(targetModelId, branch?.branchId);
+        const errors = issues.filter((issue) => issue.is_warning !== true);
+        if (errors.length > 0) blockedTargetModels.add(targetModelId);
+        markAndPersistItem(item, errors.length > 0 ? 'failed' : 'succeeded', {
+          error: errors.length > 0 ? `${errors.length} model validation error${errors.length === 1 ? '' : 's'} returned.` : undefined,
+          details: { ...details, branchId: branch?.branchId, issueCount: issues.length, errorCount: errors.length, issues },
+        });
+      } else if (item.kind === 'content_validate') {
+        const branch = branchByTargetModel.get(targetModelId);
+        const result = await targetClient.validateModelContent(targetModelId, branch?.branchId);
+        const issues = normalizeContentValidationIssues(result);
+        const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+        if (errorCount > 0) blockedTargetModels.add(targetModelId);
+        markAndPersistItem(item, errorCount > 0 ? 'failed' : 'succeeded', {
+          error: errorCount > 0 ? `${errorCount} content validation error${errorCount === 1 ? '' : 's'} returned.` : undefined,
+          details: { ...details, branchId: branch?.branchId, result, issues },
+        });
+      } else if (item.kind === 'model_merge') {
+        const branch = branchByTargetModel.get(targetModelId);
+        if (!branch?.branchName) throw new Error('Target branch was not available for merge.');
+        if (detailBoolean(details, 'mergeHandoffRequired')) {
+          markAndPersistItem(item, 'warning', {
+            warnings: ['This model appears to require a git/PR handoff. Open the target branch in Omni and complete review there; OmniKit did not force merge settings.'],
+            details: { ...details, branchName: branch.branchName },
+          });
+          continue;
+        }
+        await targetClient.mergeModelBranch(targetModelId, branch.branchName, {
+          publishDrafts: detailBoolean(details, 'publishDrafts'),
+          deleteBranch: detailBoolean(details, 'deleteBranch'),
+          forceOverrideGitSettings: false,
+        });
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName: branch.branchName } });
+      } else if (item.kind === 'workbook_queries') {
+        if (!item.documentId) throw new Error('Workbook query item missing document id.');
+        const queries = await sourceClient.getDocumentQueries(item.documentId);
+        workbookQueries.set(item.documentId, queries);
+        markAndPersistItem(item, queries.length === 0 ? 'warning' : 'succeeded', {
+          warnings: queries.length === 0 ? ['No query tabs were returned for this workbook.'] : undefined,
+          details: { ...details, tabCount: queries.length, tabs: queries.map((query) => query.name) },
+        });
+      } else if (item.kind === 'workbook_preflight') {
+        if (!item.documentId) throw new Error('Workbook preflight item missing document id.');
+        const queries = workbookQueries.get(item.documentId) || [];
+        const branch = branchByTargetModel.get(targetModelId);
+        const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));
+        const rewrites = queries.map((query) => {
+          const rewritten = rewriteQueryModelReferences(query.query, detailString(details, 'sourceModelId'), targetModelId);
+          const preflight = preflightWorkbookQueryFields(rewritten, universe);
+          return {
+            name: query.name,
+            description: query.description,
+            query: preflight.query,
+            visConfig: query.visConfig,
+            blockers: preflight.blockers,
+          };
+        });
+        workbookRewrites.set(item.documentId, rewrites);
+        const blockers = rewrites.flatMap((rewrite) => rewrite.blockers.map((blocker) => `${rewrite.name}: ${blocker}`));
+        if (blockers.length > 0) blockedWorkbooks.add(item.documentId);
+        markAndPersistItem(item, blockers.length > 0 ? 'failed' : 'succeeded', {
+          error: blockers.length > 0 ? `${blockers.length} workbook query blocker${blockers.length === 1 ? '' : 's'} found.` : undefined,
+          details: { ...details, blockers, tabCount: rewrites.length },
+        });
+      } else if (item.kind === 'workbook_create') {
+        if (!item.documentId) throw new Error('Workbook create item missing document id.');
+        const rewrites = workbookRewrites.get(item.documentId) || [];
+        if (rewrites.some((rewrite) => rewrite.blockers.length > 0)) throw new Error('Workbook has unresolved preflight blockers.');
+        if (rewrites.length === 0) throw new Error('No workbook tabs were available to create.');
+        const pendingTabDetails = buildWorkbookTabResultDetails(rewrites, 'pending');
+        try {
+          if (job.replaceSameNamed && item.documentName) {
+            const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+            const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard === false);
+            if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
+          }
+          const created = await targetClient.createWorkbookDocument({
+            modelId: targetModelId,
+            name: item.documentName || 'Migrated workbook',
+            folderId: item.targetFolderId,
+            folderPath: item.targetFolderPath,
+            queryPresentations: rewrites.map((rewrite) => ({
+              name: rewrite.name,
+              description: rewrite.description,
+              query: rewrite.query,
+              visConfig: rewrite.visConfig,
+            })),
+          });
+          markAndPersistItem(item, 'succeeded', {
+            importedIdentifier: created.identifier,
+            importedDocumentId: created.id,
+            details: {
+              ...details,
+              url: created.url,
+              tabCount: rewrites.length,
+              tabs: buildWorkbookTabResultDetails(rewrites, 'created'),
+              ported: ['queryPresentations', 'tab names', 'tab descriptions when present', 'visConfig when present'],
+              limitations: ['Workbook-level filters, parameters, schedules, permissions, sharing, favorites, and artifacts not exposed by Omni document-query APIs are not ported automatically.'],
+            },
+          });
+        } catch (error) {
+          const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+          markAndPersistItem(item, 'failed', {
+            error: message,
+            details: {
+              ...details,
+              tabCount: rewrites.length,
+              tabs: pendingTabDetails.map((tab) => ({ ...tab, status: 'not_created' })),
+              retryBoundary: 'document',
+              ported: ['queryPresentations', 'tab names', 'tab descriptions when present', 'visConfig when present'],
+              limitations: ['Omni workbook creation is document-level here; retry reruns this workbook document rather than an individual tab.'],
+            },
+          });
+        }
+      } else if (item.kind === 'export') {
+        if (!item.documentId) throw new Error('Dashboard export item missing document id.');
+        const payload = await sourceClient.exportDocument(item.documentId);
+        const branch = branchByTargetModel.get(targetModelId);
+        const universe = buildFieldUniverseFromYaml(await targetYaml(targetModelId, branch?.branchId));
+        const fieldReferences = [...collectFieldReferences(payload)].sort();
+        const blockers = fieldReferences
+          .filter((field) => universe.size > 0 && !universe.has(field))
+          .map((field) => `Dashboard field is not available on the target model: ${field}`);
+        if (blockers.length > 0) {
+          markAndPersistItem(item, 'failed', {
+            error: `${blockers.length} dashboard field blocker${blockers.length === 1 ? '' : 's'} found before import.`,
+            details: { ...details, blockers, fieldReferences },
+          });
+          continue;
+        }
+        const cached = { payload, hash: hashPayload(payload) };
+        dashboardExports.set(item.documentId, cached);
+        markAndPersistItem(item, 'succeeded', { exportHash: cached.hash, details: { ...details, fieldReferences } });
+      } else if (item.kind === 'import') {
+        if (!item.documentId) throw new Error('Dashboard import item missing document id.');
+        const cached = dashboardExports.get(item.documentId);
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; dashboard import skipped.' });
+          continue;
+        }
+        if (job.replaceSameNamed && item.documentName) {
+          const existingDocs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+          const match = existingDocs.find((doc) => doc.name === item.documentName && doc.hasDashboard !== false);
+          if (match) await targetClient.requestDeleteDocument(match.identifier || match.id);
+        }
+        const imported = await targetClient.importDocument({
+          exportPayload: cached.payload,
+          baseModelId: targetModelId,
+          folderPath: item.targetFolderPath,
+          documentName: item.documentName || 'Migrated dashboard',
+        });
+        let identifier = imported.identifier;
+        let documentId = imported.documentId;
+        if (!identifier || !documentId) {
+          const docs = await targetClient.listFolderDocuments(item.targetFolderId, true);
+          const match = docs
+            .filter((doc) => doc.name === item.documentName)
+            .sort((a, b) => (b.updatedAt ?? '').localeCompare(a.updatedAt ?? ''))[0];
+          identifier ||= match?.identifier ?? '';
+          documentId ||= match?.id ?? '';
+        }
+        if (!identifier && !documentId) throw new Error('Dashboard import succeeded but destination document could not be identified.');
+        const warnings: string[] = [];
+        if (item.targetFolderPath && documentId) {
+          try {
+            await targetClient.moveDocument(documentId, item.targetFolderPath);
+          } catch (error) {
+            warnings.push(`Folder move failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (item.targetFolderPath && identifier) {
+          try {
+            const docsAfterImport = await targetClient.listFolderDocuments(undefined);
+            const importedDoc = docsAfterImport.find((doc) => doc.identifier === identifier || doc.id === documentId);
+            const requestedPath = normalizeFolderPath(item.targetFolderPath);
+            const actualPath = normalizeFolderPath(importedDoc?.folderPath);
+            if (!actualPath) {
+              warnings.push(`Folder placement could not be verified for imported dashboard ${identifier}.`);
+            } else if (actualPath !== requestedPath && !actualPath.endsWith(`/${requestedPath}`)) {
+              warnings.push(`Folder placement mismatch for imported dashboard ${identifier}: expected ${item.targetFolderPath}, found ${importedDoc?.folderPath}.`);
+            }
+          } catch (error) {
+            warnings.push(`Folder placement verification failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        importedDashboards.set(item.documentId, { identifier, documentId });
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          importedIdentifier: identifier,
+          importedDocumentId: documentId,
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...details, exportHash: cached.hash },
+        });
+      } else if (item.kind === 'metadata') {
+        if (!item.documentId) throw new Error('Dashboard metadata item missing document id.');
+        const imported = importedDashboards.get(item.documentId);
+        if (!imported?.identifier) {
+          markAndPersistItem(item, 'skipped', { error: 'No imported dashboard identifier available for metadata preservation.' });
+          continue;
+        }
+        const sourceDoc = await sourceDocument(item.documentId);
+        const warnings: string[] = [];
+        if (sourceDoc?.description) {
+          try {
+            await targetClient.patchDocument(imported.identifier, { description: sourceDoc.description, clearExistingDraft: true });
+          } catch (error) {
+            warnings.push(`Description copy failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        if (sourceDoc?.labels?.length) {
+          try {
+            await ensureTargetLabels(sourceDoc.labels);
+            await targetClient.setDocumentLabels(imported.identifier, sourceDoc.labels);
+          } catch (error) {
+            warnings.push(`Label copy failed: ${error instanceof Error ? error.message : String(error)}`);
+          }
+        }
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...details, copiedDescription: Boolean(sourceDoc?.description), labelCount: sourceDoc?.labels?.length || 0 },
+        });
+      }
+    } catch (error) {
+      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+      markAndPersistItem(item, 'failed', { error: message });
+    }
+  }
+
+  if (canceledJobs.has(job.id)) {
+    markPendingItemsSkipped(job, 'Canceled by user.');
+    job.status = 'canceled';
+    job.endedAt = Date.now();
+    persistJobStatus(job);
+    return;
+  }
+
+  await runJobPostActions(job);
+  job.status = computeJobStatus(job.items);
+  job.endedAt = Date.now();
+  persistJobStatus(job);
 }
 
 async function executeJob(job: MigrationJob): Promise<void> {

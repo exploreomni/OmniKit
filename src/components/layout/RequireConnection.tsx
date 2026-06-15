@@ -12,6 +12,7 @@ const protectedToolNames: Record<string, string> = {
   '/uploads': 'Upload Governance',
   '/users': 'User Management',
   '/groups': 'User Management',
+  '/models/migrate': 'Model Migrator',
   '/models': 'Model & Topic Health',
   '/topics': 'AI Semantic Studio',
   '/labels': 'Labels',

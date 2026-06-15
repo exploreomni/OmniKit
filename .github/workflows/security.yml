@@ -34,6 +34,9 @@ jobs:
       - name: Run migration planner tests
         run: npm run test:migration-planner
 
+      - name: Run model migrator tests
+        run: npm run test:model-migrator
+
       - name: Run instance dashboard tests
         run: npm run test:instance-dashboard
 

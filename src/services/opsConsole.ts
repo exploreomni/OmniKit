@@ -12,7 +12,24 @@ export type PostMigrationMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
 export type PostMigrationActionKind = 'webhook' | 'refresh-schema';
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
 export type JobItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'warning' | 'skipped';
-export type JobItemKind = 'delete' | 'export' | 'import' | 'metadata' | 'post_action';
+export type MigrationWorkflow = 'dashboard' | 'model';
+export type JobItemKind =
+  | 'delete'
+  | 'export'
+  | 'import'
+  | 'metadata'
+  | 'post_action'
+  | 'model_fast_path'
+  | 'model_translate'
+  | 'model_branch_create'
+  | 'model_yaml_write'
+  | 'model_validate'
+  | 'model_merge'
+  | 'content_validate'
+  | 'workbook_queries'
+  | 'workbook_preflight'
+  | 'workbook_create'
+  | 'dashboard_handoff';
 
 export interface InstanceMetricFilter {
   connectionDatabaseContains: string[];
@@ -97,9 +114,104 @@ export interface InstanceModel {
   connectionName?: string;
   baseModelId?: string;
   kind?: string;
+  gitConfigured?: boolean;
+  pullRequestRequired?: boolean;
+  gitProtected?: boolean;
   createdAt?: string;
   updatedAt?: string;
   deletedAt?: string | null;
+}
+
+export interface ModelMigratorConnection {
+  id: string;
+  name: string;
+  dialect: string;
+  database: string;
+  defaultSchema?: string;
+  deletedAt?: string | null;
+}
+
+export type ModelMigratorDocumentKind = 'dashboard' | 'workbook' | 'unknown';
+
+export interface ModelMigratorInventoryDocument {
+  id: string;
+  identifier: string;
+  name: string;
+  folderId?: string;
+  folderPath?: string;
+  baseModelId?: string;
+  type?: string;
+  kind: ModelMigratorDocumentKind;
+  description?: string | null;
+  labels?: string[];
+  updatedAt?: string;
+}
+
+export interface ModelMigratorInventoryRow {
+  modelId: string;
+  dashboardCount: number;
+  workbookCount: number;
+  unknownCount: number;
+  documents: ModelMigratorInventoryDocument[];
+}
+
+export interface ModelMigratorTranslatedFile {
+  fileName: string;
+  original: string;
+  deterministic: string;
+  translated: string;
+  aiDraft?: string;
+  aiJobId?: string;
+  aiRefusal?: string;
+  blocked?: boolean;
+  changed: boolean;
+  promptVersion: string;
+  reviewRequired: boolean;
+  warnings: string[];
+}
+
+export interface ModelMigratorWorkbookPreflight {
+  documentId: string;
+  tabCount: number;
+  blockerCount: number;
+  tabs: Array<{
+    id: string;
+    name: string;
+    fieldReferences: string[];
+    blockers: string[];
+    replacementCount: number;
+  }>;
+}
+
+export interface ModelMigratorAcceptedFile {
+  fileName: string;
+  yaml: string;
+  previousChecksum?: string;
+}
+
+export interface ModelMigratorJobModelInput {
+  sourceModelId: string;
+  sourceModelName?: string;
+  targetModelId: string;
+  targetModelName?: string;
+  targetConnectionId: string;
+  mode: 'fast' | 'translate';
+  branchName: string;
+  gitRef?: string;
+  fastPathSchemaConfirmed?: boolean;
+  mergeHandoffRequired?: boolean;
+  acceptedFiles?: ModelMigratorAcceptedFile[];
+}
+
+export interface ModelMigratorJobContentInput {
+  documentId: string;
+  documentName: string;
+  kind: 'dashboard' | 'workbook';
+  sourceModelId: string;
+  targetModelId: string;
+  targetModelName?: string;
+  targetFolderId?: string;
+  targetFolderPath?: string;
 }
 
 export interface InstanceFolder {
@@ -250,10 +362,12 @@ export interface MigrationJobItem {
   importedIdentifier?: string;
   importedDocumentId?: string;
   replacement?: boolean;
+  details?: Record<string, unknown>;
 }
 
 export interface MigrationJob {
   id: string;
+  workflow?: MigrationWorkflow;
   sourceId: string;
   sourceLabel: string;
   destinationIds: string[];
@@ -269,6 +383,7 @@ export interface MigrationJob {
   createdAt: number;
   startedAt?: number;
   endedAt?: number;
+  details?: Record<string, unknown>;
   items: MigrationJobItem[];
 }
 
@@ -465,6 +580,84 @@ export async function listInstanceDocuments(id: string, options: { folderId?: st
 
 export async function listInstanceModels(id: string) {
   return apiFetch<{ models: InstanceModel[] }>(`/api/instances/${encodeURIComponent(id)}/models?modelKind=SHARED`);
+}
+
+export async function listModelMigratorConnections(instanceId: string) {
+  return apiFetch<{ connections: ModelMigratorConnection[] }>(
+    `/api/model-migrator/${encodeURIComponent(instanceId)}/connections`,
+  );
+}
+
+export async function listModelMigratorModels(instanceId: string, options: { connectionId?: string } = {}) {
+  const params = new URLSearchParams({ modelKind: 'SHARED' });
+  if (options.connectionId) params.set('connectionId', options.connectionId);
+  return apiFetch<{ models: InstanceModel[] }>(
+    `/api/model-migrator/${encodeURIComponent(instanceId)}/models?${params.toString()}`,
+  );
+}
+
+export async function loadModelMigratorInventory(instanceId: string, modelIds: string[]) {
+  const params = new URLSearchParams();
+  if (modelIds.length > 0) params.set('modelIds', modelIds.join(','));
+  return apiFetch<{ models: ModelMigratorInventoryRow[] }>(
+    `/api/model-migrator/${encodeURIComponent(instanceId)}/inventory?${params.toString()}`,
+  );
+}
+
+export async function translateModelMigratorYaml(input: {
+  sourceInstanceId: string;
+  modelId: string;
+  schemaMapText: string;
+  sourceDialect?: string;
+  targetDialect?: string;
+  runAi?: boolean;
+}) {
+  return apiFetch<{
+    files: ModelMigratorTranslatedFile[];
+    checksums: Record<string, string>;
+    prompts: Array<{ fileName: string; prompt: string }>;
+  }>('/api/model-migrator/translate', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function preflightModelMigratorWorkbooks(input: {
+  sourceInstanceId: string;
+  targetInstanceId: string;
+  sourceModelId: string;
+  targetModelId: string;
+  documentIds: string[];
+}) {
+  return apiFetch<{ workbooks: ModelMigratorWorkbookPreflight[] }>('/api/model-migrator/preflight', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function createModelMigratorJob(input: {
+  sourceId: string;
+  targetId: string;
+  targetLabel?: string;
+  models: ModelMigratorJobModelInput[];
+  content: ModelMigratorJobContentInput[];
+  replaceSameNamed: boolean;
+  mergeAfterValidation?: boolean;
+  publishDrafts?: boolean;
+  deleteBranch?: boolean;
+  postMigrationActions?: PostMigrationAction[];
+}) {
+  return apiFetch<{ job: MigrationJob }>('/api/model-migrator/jobs', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function mergeModelMigratorJob(jobId: string, input: { publishDrafts?: boolean; deleteBranch?: boolean }) {
+  return apiFetch<{ job: MigrationJob }>(`/api/model-migrator/jobs/${encodeURIComponent(jobId)}/merge`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
 }
 
 export async function listInstanceFolders(id: string) {

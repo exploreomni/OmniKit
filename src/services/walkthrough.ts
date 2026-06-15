@@ -1,4 +1,4 @@
-export const WALKTHROUGH_VERSION = '2026-06-12-dashboard-migrator-rename';
+export const WALKTHROUGH_VERSION = '2026-06-12-model-migrator-foundation';
 export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 12, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
@@ -10,6 +10,7 @@ export type WalkthroughStepId =
   | 'dashboard-ai'
   | 'dashboard-builder'
   | 'excel-dashboard'
+  | 'dashboard-migrator'
   | 'model-migrator'
   | 'dashboard-operations'
   | 'downloads-decks'
@@ -140,7 +141,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     caution: 'Raw workbook contents are not stored by default. Missing lookup tabs, manually entered summaries, and hardcoded thresholds require human validation.',
   },
   {
-    id: 'model-migrator',
+    id: 'dashboard-migrator',
     route: '/dashboards/migrate',
     label: 'Migrate',
     title: 'Use Dashboard Migrator for same-instance remaps or fan-out copy/import',
@@ -153,6 +154,21 @@ export const walkthroughSteps: WalkthroughStep[] = [
     ],
     outcome: 'Dashboard migration work becomes a reviewed, retryable fan-out job with clear warnings for missing fields, folder placement, metadata preservation, and destination-specific failures.',
     caution: 'Preflight checks field presence and job shape, not business-definition equivalence. Destructive cleanup should be enabled only when the destination folder contents are understood.',
+  },
+  {
+    id: 'model-migrator',
+    route: '/models/migrate',
+    label: 'Model Migrator',
+    title: 'Stage semantic model migration from saved instances',
+    purpose: 'Model Migrator is the semantic-layer workflow. It starts with saved source and target Omni profiles, then inventories source models and dependent dashboards or workbook-only content before creating branch-only migration jobs.',
+    directions: [
+      'Unlock the native vault and choose a saved source instance.',
+      'Choose the source connection and one or more shared models to migrate.',
+      'Choose the target instance and connection, then map each source model to its intended target model.',
+      'Review translated YAML, workbook preflight, and selected content before starting the unified migration job.',
+    ],
+    outcome: 'Admins can pick once, understand model/content scope, write accepted YAML to target branches, port workbook queries, and keep dashboard selections visible as handoff items in the same run.',
+    caution: 'Main branches are never written. Validate and merge only from target dev branches, and disclose unsupported schedules, sharing, alerts, and permission artifacts in results.',
   },
   {
     id: 'dashboard-operations',

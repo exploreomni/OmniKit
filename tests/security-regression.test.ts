@@ -17,6 +17,7 @@ import {
 import { importLegacyVault } from '../server/services/legacyVaultImport';
 import {
   clearJobs,
+  mergeModelMigrationJob,
   redactSensitiveText,
   runPostMigrationAction,
   sanitizeJobHistory,
@@ -24,10 +25,12 @@ import {
 } from '../server/services/migrationJobs';
 import {
   closeJobStoreForTests,
+  getJob,
   getJobsDbPath,
   insertJob,
 } from '../server/services/jobStore';
 import migrationJobsHandler from '../server/handlers/migration-jobs';
+import modelMigratorHandler from '../server/handlers/model-migrator';
 import {
   publishMigrationJobEvent,
   subscribeMigrationJobEvents,
@@ -38,6 +41,10 @@ import {
   draftContainsForbiddenKeys,
   sanitizeFanoutDraftForStorage,
 } from '../src/components/migrateFanout/fanoutStorage';
+import {
+  modelMigratorDraftContainsForbiddenKeys,
+  sanitizeModelMigratorDraftForStorage,
+} from '../src/services/modelMigratorDraft';
 
 let tempDir = '';
 
@@ -402,6 +409,43 @@ test('fan-out wizard draft stores only non-secret IDs and paths', () => {
   assert.equal(draftContainsForbiddenKeys({ ...sanitized, apiKey: 'secret' }), true);
 });
 
+test('model migrator review draft stores translation state without plaintext secrets', () => {
+  const draft = sanitizeModelMigratorDraftForStorage({
+    schemaMapText: 'ANALYTICS.PUBLIC -> main.analytics',
+    translationsByModelId: {
+      'model-1': {
+        files: [{
+          fileName: 'orders.view',
+          original: 'api_key: omni_live_source_secret_123456\nsql: SELECT 1',
+          deterministic: 'api_key: omni_live_source_secret_123456\nsql: SELECT 1',
+          translated: 'sql: SELECT 1',
+          aiDraft: 'authorization: Bearer abc123\nsql: SELECT 1',
+          aiJobId: 'ai-job-1',
+          aiRefusal: 'token: abc123 failed',
+          changed: true,
+          promptVersion: 'v1',
+          reviewRequired: true,
+          warnings: ['Bearer abc123 failed for admin@example.com'],
+        }],
+        checksums: { 'orders.view': 'sha256:abc' },
+        prompts: [{ fileName: 'orders.view', prompt: 'Do not use token: abc123' }],
+      },
+    },
+    acceptedFilesByModelId: {
+      'model-1': {
+        'orders.view': 'password: hunter2\nsql: SELECT 1',
+      },
+    },
+  });
+
+  assert.equal(modelMigratorDraftContainsForbiddenKeys(draft), false);
+  const raw = JSON.stringify(draft);
+  assert.equal(raw.includes('omni_live_source_secret_123456'), false);
+  assert.equal(raw.includes('Bearer abc123'), false);
+  assert.equal(raw.includes('hunter2'), false);
+  assert.match(raw, /\[redacted\]/);
+});
+
 test('job history sanitizer removes secrets and common sensitive data', () => {
   const job: MigrationJob = {
     id: 'job-1',
@@ -450,6 +494,36 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
   assert.equal(serialized.includes('212-555-0199'), false);
   assert.equal(serialized.includes('4111 1111 1111 1111'), false);
   assert.equal(serialized.includes('abc123'), false);
+});
+
+test('model migration job details are redacted before history persistence', () => {
+  const job = makeStoredJob({
+    workflow: 'model',
+    details: {
+      branchName: 'omnikit-model-migration',
+      api_key: 'secret-token',
+      contact: 'owner@example.com',
+    },
+    items: [{
+      id: 'model-item',
+      jobId: 'job-test',
+      destinationId: 'dest-1',
+      destinationLabel: 'Destination',
+      targetModelId: 'model-1',
+      kind: 'model_yaml_write',
+      status: 'failed',
+      details: {
+        authorization: 'Bearer abc123',
+        fileName: 'orders.view',
+      },
+    }],
+  });
+
+  const serialized = JSON.stringify(sanitizeJobHistory([job]));
+  assert.equal(serialized.includes('secret-token'), false);
+  assert.equal(serialized.includes('owner@example.com'), false);
+  assert.equal(serialized.includes('Bearer abc123'), false);
+  assert.equal(serialized.includes('orders.view'), true);
 });
 
 test('local job database is created with 0600 permissions', () => {
@@ -511,6 +585,56 @@ test('local job database does not store plaintext secrets or common sensitive da
   assert.equal(dbContents.includes('212-555-0199'), false);
   assert.equal(dbContents.includes('supersecret'), false);
   assert.equal(dbContents.includes('abc123'), false);
+});
+
+test('model migration job reload preserves details and retry lineage', () => {
+  const job = makeStoredJob({
+    id: 'model-reload-lineage',
+    workflow: 'model',
+    parentJobId: 'parent-model-job',
+    details: {
+      modelCount: 1,
+      workbookCount: 1,
+      retryInput: {
+        sourceId: 'source-1',
+        targetId: 'target-1',
+        models: [{
+          sourceModelId: 'source-model',
+          targetModelId: 'target-model',
+          targetConnectionId: 'target-connection',
+          mode: 'translate',
+          branchName: 'reload-branch',
+          acceptedFiles: [{ fileName: 'orders.view', yaml: 'dimensions: {}' }],
+        }],
+        content: [{ documentId: 'workbook-1', documentName: 'Workbook', kind: 'workbook', sourceModelId: 'source-model', targetModelId: 'target-model' }],
+        postMigrationActions: [],
+      },
+    },
+    items: [{
+      id: 'workbook-create-reload',
+      jobId: 'model-reload-lineage',
+      destinationId: 'target-1',
+      destinationLabel: 'Target',
+      targetModelId: 'target-model',
+      kind: 'workbook_create',
+      documentId: 'workbook-1',
+      documentName: 'Workbook',
+      status: 'failed',
+      details: {
+        tabs: [{ name: 'Revenue', status: 'not_created', retryBoundary: 'document', carried: ['query', 'visConfig'] }],
+      },
+    }],
+  });
+  insertJob(job);
+  closeJobStoreForTests();
+
+  const reloaded = getJob(job.id);
+  assert.equal(reloaded?.workflow, 'model');
+  assert.equal(reloaded?.parentJobId, 'parent-model-job');
+  assert.equal(reloaded?.details?.modelCount, 1);
+  assert.deepEqual(reloaded?.items[0].details?.tabs, [
+    { name: 'Revenue', status: 'not_created', retryBoundary: 'document', carried: ['query', 'visConfig'] },
+  ]);
 });
 
 test('migration job cancel works while vault is locked but retry still requires unlock', async () => {
@@ -590,4 +714,192 @@ test('redactSensitiveText keeps non-sensitive text useful', () => {
     redactSensitiveText('Folder placement mismatch for Finance Dashboard'),
     'Folder placement mismatch for Finance Dashboard',
   );
+});
+
+test('model migrator handler requires unlocked vault and rejects incomplete starts without leaking secrets', async () => {
+  const locked = await modelMigratorHandler(new Request('http://localhost/api/model-migrator/source/connections'));
+  assert.equal(locked.status, 423);
+
+  const apiKey = 'omni_live_model_migrator_secret_123456';
+  unlockVault('native passphrase');
+  const source = upsertInstance({
+    label: 'Model Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey,
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const target = upsertInstance({
+    label: 'Model Target',
+    role: 'destination',
+    baseUrl: 'https://target.example.omniapp.co',
+    apiKey: 'omni_live_model_migrator_target_abcdef',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+
+  const missingModels = await modelMigratorHandler(new Request('http://localhost/api/model-migrator/jobs', {
+    method: 'POST',
+    body: JSON.stringify({ sourceId: source.id, targetId: target.id, models: [] }),
+  }));
+  const missingText = await missingModels.text();
+  assert.equal(missingModels.status, 400);
+  assert.equal(missingText.includes(apiKey), false);
+  assert.match(missingText, /At least one model migration target/);
+
+  const unsafeFastPath = await modelMigratorHandler(new Request('http://localhost/api/model-migrator/jobs', {
+    method: 'POST',
+    body: JSON.stringify({
+      sourceId: source.id,
+      targetId: target.id,
+      models: [{
+        sourceModelId: 'source-model',
+        targetModelId: 'target-model',
+        targetConnectionId: 'target-connection',
+        mode: 'fast',
+        branchName: 'migration-branch',
+      }],
+    }),
+  }));
+  const unsafeText = await unsafeFastPath.text();
+  assert.equal(unsafeFastPath.status, 400);
+  assert.equal(unsafeText.includes(apiKey), false);
+  assert.match(unsafeText, /schema identity confirmation/);
+});
+
+test('model migration merge requires successful validation before branch merge', async () => {
+  unlockVault('native passphrase');
+  const target = upsertInstance({
+    label: 'Merge Target',
+    role: 'destination',
+    baseUrl: 'https://target.example.omniapp.co',
+    apiKey: 'omni_live_merge_target_secret_123456',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const job = makeStoredJob({
+    id: 'model-merge-blocked',
+    workflow: 'model',
+    destinationIds: [target.id],
+    status: 'failed',
+    details: {
+      targetId: target.id,
+      retryInput: {
+        sourceId: 'source-1',
+        targetId: target.id,
+        models: [{
+          sourceModelId: 'source-model',
+          targetModelId: 'target-model',
+          targetConnectionId: 'target-connection',
+          mode: 'translate',
+          branchName: 'blocked-branch',
+          acceptedFiles: [{ fileName: 'orders.view', yaml: 'dimensions: {}' }],
+        }],
+        content: [],
+        replaceSameNamed: false,
+        postMigrationActions: [],
+      },
+    },
+    items: [{
+      id: 'validate-failed',
+      jobId: 'model-merge-blocked',
+      destinationId: target.id,
+      destinationLabel: target.label,
+      targetModelId: 'target-model',
+      kind: 'model_validate',
+      status: 'failed',
+      error: 'Validation failed.',
+    }],
+  });
+  insertJob(job);
+
+  await assert.rejects(
+    () => mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true }),
+    /Cannot merge until every target model validates successfully/,
+  );
+});
+
+test('model migration merge records PR handoff without forcing protected git settings', async () => {
+  unlockVault('native passphrase');
+  const target = upsertInstance({
+    label: 'PR Target',
+    role: 'destination',
+    baseUrl: 'https://target.example.omniapp.co',
+    apiKey: 'omni_live_pr_target_secret_123456',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const job = makeStoredJob({
+    id: 'model-merge-pr-handoff',
+    workflow: 'model',
+    destinationIds: [target.id],
+    status: 'succeeded',
+    details: {
+      targetId: target.id,
+      retryInput: {
+        sourceId: 'source-1',
+        targetId: target.id,
+        models: [{
+          sourceModelId: 'source-model',
+          targetModelId: 'target-model',
+          targetConnectionId: 'target-connection',
+          mode: 'translate',
+          branchName: 'protected-branch',
+          mergeHandoffRequired: true,
+          acceptedFiles: [{ fileName: 'orders.view', yaml: 'dimensions: {}' }],
+        }],
+        content: [],
+        replaceSameNamed: false,
+        postMigrationActions: [],
+      },
+    },
+    items: [
+      {
+        id: 'branch-created',
+        jobId: 'model-merge-pr-handoff',
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: 'target-model',
+        kind: 'model_branch_create',
+        status: 'succeeded',
+        details: { branchName: 'protected-branch' },
+      },
+      {
+        id: 'validate-succeeded',
+        jobId: 'model-merge-pr-handoff',
+        destinationId: target.id,
+        destinationLabel: target.label,
+        targetModelId: 'target-model',
+        kind: 'model_validate',
+        status: 'succeeded',
+      },
+    ],
+  });
+  insertJob(job);
+
+  const merged = await mergeModelMigrationJob(job.id, { publishDrafts: true, deleteBranch: true });
+  const mergeItem = merged.items.find((item) => item.kind === 'model_merge');
+  assert.equal(mergeItem?.status, 'warning');
+  assert.match(mergeItem?.warnings?.join('\n') || '', /git\/PR handoff/);
 });

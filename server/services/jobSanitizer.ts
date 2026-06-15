@@ -5,6 +5,7 @@ const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
+const SENSITIVE_KEY_PATTERN = /^(api[_-]?key|authorization|token|secret|password|passphrase)$/i;
 const PHONE_PATTERN = /\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g;
 const PAN_CANDIDATE_PATTERN = /\b(?:\d[ -]?){13,19}\b/g;
 
@@ -61,6 +62,7 @@ export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
     warnings: item.warnings?.map(redactSensitiveText),
     importedIdentifier: item.importedIdentifier ? redactSensitiveText(item.importedIdentifier) : item.importedIdentifier,
     importedDocumentId: item.importedDocumentId ? redactSensitiveText(item.importedDocumentId) : item.importedDocumentId,
+    details: sanitizeDetails(item.details),
   };
 }
 
@@ -80,10 +82,28 @@ export function sanitizeJob(job: MigrationJob): MigrationJob {
     sourceFolderPath: job.sourceFolderPath ? redactSensitiveText(job.sourceFolderPath) : job.sourceFolderPath,
     targets: job.targets?.map(sanitizeMigrationTarget),
     postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
+    details: sanitizeDetails(job.details),
     items: job.items.map(sanitizeJobItem),
   };
 }
 
 export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
   return jobs.map(sanitizeJob);
+}
+
+function sanitizeDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
+  if (!value) return value;
+  return sanitizeUnknown(value) as Record<string, unknown>;
+}
+
+function sanitizeUnknown(value: unknown): unknown {
+  if (typeof value === 'string') return redactSensitiveText(value);
+  if (Array.isArray(value)) return value.map(sanitizeUnknown);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
+      redactSensitiveText(key),
+      SENSITIVE_KEY_PATTERN.test(key) ? REDACTED : sanitizeUnknown(item),
+    ]),
+  );
 }

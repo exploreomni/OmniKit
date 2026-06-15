@@ -20,6 +20,7 @@ import {
   FileUp,
   FileSearch,
   GraduationCap,
+  GitBranch,
   Server,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
@@ -43,6 +44,7 @@ const sections: NavSection[] = [
     items: [
       { to: '/dashboards/ai-studio', icon: <Sparkles size={15} />, label: 'AI Dashboard Studio' },
       { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Dashboard Migrator' },
+      { to: '/models/migrate', icon: <GitBranch size={15} />, label: 'Model Migrator' },
       { to: '/dashboards/operations', icon: <FolderCog size={15} />, label: 'Dashboard Operations' },
       { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Dashboard Downloads' },
       { to: '/deck-builder', icon: <Presentation size={15} />, label: 'Deck Builder' },

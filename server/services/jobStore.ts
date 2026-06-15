@@ -28,6 +28,7 @@ let dbPath = '';
 
 interface JobRow {
   id: string;
+  workflow: string | null;
   source_id: string;
   source_label: string;
   destination_ids: string;
@@ -43,6 +44,7 @@ interface JobRow {
   created_at: number;
   started_at: number | null;
   ended_at: number | null;
+  details: string | null;
 }
 
 interface JobItemRow {
@@ -67,6 +69,7 @@ interface JobItemRow {
   imported_document_id: string | null;
   started_at: number | null;
   ended_at: number | null;
+  details: string | null;
 }
 
 export function getJobsDbPath(): string {
@@ -107,6 +110,7 @@ function initializeSchema(database: Database.Database): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
+      workflow TEXT,
       source_id TEXT NOT NULL,
       source_label TEXT NOT NULL,
       destination_ids TEXT NOT NULL,
@@ -121,7 +125,8 @@ function initializeSchema(database: Database.Database): void {
       parent_job_id TEXT,
       created_at INTEGER NOT NULL,
       started_at INTEGER,
-      ended_at INTEGER
+      ended_at INTEGER,
+      details TEXT
     );
     CREATE TABLE IF NOT EXISTS job_items (
       id TEXT PRIMARY KEY,
@@ -144,7 +149,8 @@ function initializeSchema(database: Database.Database): void {
       imported_identifier TEXT,
       imported_document_id TEXT,
       started_at INTEGER,
-      ended_at INTEGER
+      ended_at INTEGER,
+      details TEXT
     );
     CREATE INDEX IF NOT EXISTS job_items_job ON job_items(job_id);
     CREATE INDEX IF NOT EXISTS job_items_job_status ON job_items(job_id, status);
@@ -152,7 +158,10 @@ function initializeSchema(database: Database.Database): void {
   ensureColumn(database, 'jobs', 'replace_same_named', 'INTEGER NOT NULL DEFAULT 1');
   ensureColumn(database, 'jobs', 'source_folder_id', 'TEXT');
   ensureColumn(database, 'jobs', 'source_folder_path', 'TEXT');
+  ensureColumn(database, 'jobs', 'workflow', 'TEXT');
+  ensureColumn(database, 'jobs', 'details', 'TEXT');
   ensureColumn(database, 'job_items', 'replacement', 'INTEGER NOT NULL DEFAULT 0');
+  ensureColumn(database, 'job_items', 'details', 'TEXT');
 }
 
 function ensureColumn(database: Database.Database, tableName: string, columnName: string, definition: string): void {
@@ -212,6 +221,7 @@ function parseJson<T>(value: string, fallback: T): T {
 function rowToJob(row: JobRow, items: JobItemRow[]): MigrationJob {
   return {
     id: row.id,
+    workflow: row.workflow === 'model' ? 'model' : 'dashboard',
     sourceId: row.source_id,
     sourceLabel: row.source_label,
     destinationIds: parseJson<string[]>(row.destination_ids, []),
@@ -227,6 +237,7 @@ function rowToJob(row: JobRow, items: JobItemRow[]): MigrationJob {
     createdAt: row.created_at,
     startedAt: row.started_at || undefined,
     endedAt: row.ended_at || undefined,
+    details: parseJson<Record<string, unknown>>(row.details || '', {}),
     items: items.map(rowToItem),
   };
 }
@@ -254,6 +265,7 @@ function rowToItem(row: JobItemRow): MigrationJobItem {
     exportHash: row.export_hash || undefined,
     importedIdentifier: row.imported_identifier || undefined,
     importedDocumentId: row.imported_document_id || undefined,
+    details: parseJson<Record<string, unknown>>(row.details || '', {}),
   };
 }
 
@@ -263,11 +275,11 @@ function insertJobRows(database: Database.Database, job: MigrationJob): void {
     INSERT INTO job_items (
       id, job_id, target_id, destination_id, destination_label, target_model_id, target_model_name,
       target_folder_id, target_folder_path, kind, document_id, document_name, status, error,
-      replacement, warnings, export_hash, imported_identifier, imported_document_id, started_at, ended_at
+      replacement, warnings, export_hash, imported_identifier, imported_document_id, started_at, ended_at, details
     ) VALUES (
       @id, @job_id, @target_id, @destination_id, @destination_label, @target_model_id, @target_model_name,
       @target_folder_id, @target_folder_path, @kind, @document_id, @document_name, @status, @error,
-      @replacement, @warnings, @export_hash, @imported_identifier, @imported_document_id, @started_at, @ended_at
+      @replacement, @warnings, @export_hash, @imported_identifier, @imported_document_id, @started_at, @ended_at, @details
     )
     ON CONFLICT(id) DO UPDATE SET
       target_id = excluded.target_id,
@@ -288,7 +300,8 @@ function insertJobRows(database: Database.Database, job: MigrationJob): void {
       imported_identifier = excluded.imported_identifier,
       imported_document_id = excluded.imported_document_id,
       started_at = excluded.started_at,
-      ended_at = excluded.ended_at
+      ended_at = excluded.ended_at,
+      details = excluded.details
   `);
   for (const item of job.items) insertItem.run(itemParams(item));
 }
@@ -297,15 +310,16 @@ function upsertJobRow(database: Database.Database, job: MigrationJob): void {
   const sanitized = sanitizeJob(job);
   database.prepare(`
     INSERT INTO jobs (
-      id, source_id, source_label, destination_ids, targets, document_ids, empty_first,
+      id, workflow, source_id, source_label, destination_ids, targets, document_ids, empty_first,
       replace_same_named, source_folder_id, source_folder_path,
-      post_migration_actions, status, parent_job_id, created_at, started_at, ended_at
+      post_migration_actions, status, parent_job_id, created_at, started_at, ended_at, details
     ) VALUES (
-      @id, @source_id, @source_label, @destination_ids, @targets, @document_ids, @empty_first,
+      @id, @workflow, @source_id, @source_label, @destination_ids, @targets, @document_ids, @empty_first,
       @replace_same_named, @source_folder_id, @source_folder_path,
-      @post_migration_actions, @status, @parent_job_id, @created_at, @started_at, @ended_at
+      @post_migration_actions, @status, @parent_job_id, @created_at, @started_at, @ended_at, @details
     )
     ON CONFLICT(id) DO UPDATE SET
+      workflow = excluded.workflow,
       source_id = excluded.source_id,
       source_label = excluded.source_label,
       destination_ids = excluded.destination_ids,
@@ -319,9 +333,11 @@ function upsertJobRow(database: Database.Database, job: MigrationJob): void {
       status = excluded.status,
       parent_job_id = excluded.parent_job_id,
       started_at = excluded.started_at,
-      ended_at = excluded.ended_at
+      ended_at = excluded.ended_at,
+      details = excluded.details
   `).run({
     id: sanitized.id,
+    workflow: sanitized.workflow || 'dashboard',
     source_id: sanitized.sourceId,
     source_label: sanitized.sourceLabel,
     destination_ids: JSON.stringify(sanitized.destinationIds),
@@ -337,6 +353,7 @@ function upsertJobRow(database: Database.Database, job: MigrationJob): void {
     created_at: sanitized.createdAt,
     started_at: sanitized.startedAt || null,
     ended_at: sanitized.endedAt || null,
+    details: JSON.stringify(sanitized.details || {}),
   });
 }
 
@@ -364,6 +381,7 @@ function itemParams(item: MigrationJobItem): Record<string, unknown> {
     imported_document_id: sanitized.importedDocumentId || null,
     started_at: sanitized.startedAt || null,
     ended_at: sanitized.endedAt || null,
+    details: JSON.stringify(sanitized.details || {}),
   };
 }
 
@@ -383,11 +401,11 @@ export function updateJobItem(item: MigrationJobItem): void {
     INSERT INTO job_items (
       id, job_id, target_id, destination_id, destination_label, target_model_id, target_model_name,
       target_folder_id, target_folder_path, kind, document_id, document_name, status, error,
-      replacement, warnings, export_hash, imported_identifier, imported_document_id, started_at, ended_at
+      replacement, warnings, export_hash, imported_identifier, imported_document_id, started_at, ended_at, details
     ) VALUES (
       @id, @job_id, @target_id, @destination_id, @destination_label, @target_model_id, @target_model_name,
       @target_folder_id, @target_folder_path, @kind, @document_id, @document_name, @status, @error,
-      @replacement, @warnings, @export_hash, @imported_identifier, @imported_document_id, @started_at, @ended_at
+      @replacement, @warnings, @export_hash, @imported_identifier, @imported_document_id, @started_at, @ended_at, @details
     )
     ON CONFLICT(id) DO UPDATE SET
       replacement = excluded.replacement,
@@ -398,7 +416,8 @@ export function updateJobItem(item: MigrationJobItem): void {
       imported_identifier = excluded.imported_identifier,
       imported_document_id = excluded.imported_document_id,
       started_at = excluded.started_at,
-      ended_at = excluded.ended_at
+      ended_at = excluded.ended_at,
+      details = excluded.details
   `).run(itemParams(item));
   secureDbFiles();
 }
