@@ -1,3 +1,5 @@
+import { emitVaultLocked } from '@/services/vaultEvents';
+
 function edgeFunctionUrl(name: string): string {
   return `/api/${name}`;
 }
@@ -221,7 +223,10 @@ async function safeFetch(url: string, options: RequestInit, context: string): Pr
     const res = (await promise).clone();
     return await handleResponse(res, context);
   } catch (err) {
-    if (err instanceof ApiError) throw err;
+    if (err instanceof ApiError) {
+      if (err.status === 423) emitVaultLocked(err.message);
+      throw err;
+    }
     if (err instanceof TypeError) {
       throw new ApiError(0, 'Network error -- check your internet connection and try again.');
     }
@@ -592,6 +597,24 @@ export async function getAiJobResult(baseUrl: string, apiKey: string, jobId: str
       }),
     },
     'Get AI job result'
+  );
+  return res.json();
+}
+
+export async function cancelAiJob(baseUrl: string, apiKey: string, jobId: string): Promise<OmniAiJob> {
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-ai'),
+    {
+      method: 'POST',
+      headers: defaultHeaders,
+      body: JSON.stringify({
+        base_url: baseUrl,
+        api_key: apiKey,
+        action: 'cancel-job',
+        job_id: jobId,
+      }),
+    },
+    'Cancel AI job'
   );
   return res.json();
 }

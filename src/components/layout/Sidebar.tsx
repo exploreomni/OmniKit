@@ -20,12 +20,14 @@ import {
   FileUp,
   FileSearch,
   GraduationCap,
+  GitBranch,
   Server,
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
+import { InstanceSwitcher } from '@/components/layout/InstanceSwitcher';
 
 interface NavSection {
   label: string;
@@ -41,7 +43,8 @@ const sections: NavSection[] = [
     label: 'Dashboard AI & Delivery',
     items: [
       { to: '/dashboards/ai-studio', icon: <Sparkles size={15} />, label: 'AI Dashboard Studio' },
-      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Model Migrator' },
+      { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Dashboard Migrator' },
+      { to: '/models/migrate', icon: <GitBranch size={15} />, label: 'Model Migrator' },
       { to: '/dashboards/operations', icon: <FolderCog size={15} />, label: 'Dashboard Operations' },
       { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Dashboard Downloads' },
       { to: '/deck-builder', icon: <Presentation size={15} />, label: 'Deck Builder' },
@@ -163,7 +166,7 @@ export function Sidebar() {
         style={{ borderBottom: '1px solid rgba(217,222,232,0.95)' }}
       >
         <NavLink
-          to="/connect"
+          to="/"
           className={({ isActive }) =>
             `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 ${
               isActive
@@ -185,7 +188,7 @@ export function Sidebar() {
           <Plug size={15} className="flex-shrink-0 opacity-80" />
           <div className="flex-1 min-w-0">
             <div className="flex items-center gap-2 leading-none">
-              <span>Connect</span>
+              <span>Home</span>
               {isConnected ? (
                 <span
                   className="w-1.5 h-1.5 rounded-full bg-emerald-400 flex-shrink-0"
@@ -201,6 +204,8 @@ export function Sidebar() {
           </div>
         </NavLink>
       </div>
+
+      <InstanceSwitcher />
 
       <nav className="flex-1 overflow-y-auto py-3 space-y-2" aria-label="Main sections">
         {sections.map((section) => (

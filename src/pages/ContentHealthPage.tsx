@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, ArrowRight, CheckCircle2, FolderOpen, Loader2, RefreshCw } from 'lucide-react';
 import { enrichDocuments, listDocuments, listFolders } from '@/services/omniApi';
@@ -44,6 +44,8 @@ function contentSignals(doc: OmniDocument): Array<{ label: string; className: st
 export function ContentHealthPage() {
   const { connection } = useConnection();
   const navigate = useNavigate();
+  const connectionKey = connection.instanceId || connection.baseUrl;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [folders, setFolders] = useState<OmniFolder[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState('');
   const [documents, setDocuments] = useState<OmniDocument[]>([]);
@@ -57,26 +59,34 @@ export function ContentHealthPage() {
   const selectedFolder = folderOptions.find((folder) => folder.id === selectedFolderId) || null;
 
   useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
+
+  useEffect(() => {
     async function loadFolders() {
+      const requestKey = connectionKey;
       setLoadingFolders(true);
       setError('');
       try {
         const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
+        if (activeConnectionKeyRef.current !== requestKey) return;
         const nextFolders = Array.isArray(res.folders) ? res.folders : [];
         setFolders(nextFolders);
         const first = flattenFolders(nextFolders)[0];
         if (first) setSelectedFolderId((current) => current || first.id);
       } catch (err) {
+        if (activeConnectionKeyRef.current !== requestKey) return;
         setError(err instanceof Error ? err.message : 'Failed to load folders');
       } finally {
-        setLoadingFolders(false);
+        if (activeConnectionKeyRef.current === requestKey) setLoadingFolders(false);
       }
     }
     loadFolders();
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey]);
 
   async function scanSelectedFolder() {
     if (!selectedFolderId) return;
+    const requestKey = connectionKey;
     setScanning(true);
     setError('');
     try {
@@ -90,12 +100,14 @@ export function ContentHealthPage() {
         Object.assign(enrichmentById, enriched);
       }
 
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setDocuments(docs.map((doc) => ({ ...doc, ...enrichmentById[doc.id], folderPath: selectedFolder?.path })));
       setLastScanAt(new Date().toISOString());
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setError(err instanceof Error ? err.message : 'Failed to scan content health');
     } finally {
-      setScanning(false);
+      if (activeConnectionKeyRef.current === requestKey) setScanning(false);
     }
   }
 

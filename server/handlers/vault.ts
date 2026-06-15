@@ -4,6 +4,7 @@ import {
   isVaultUnlocked,
   lockVault,
   resetVault,
+  touchVaultSession,
   unlockVault,
   vaultStatus,
 } from '../services/nativeVault';
@@ -40,6 +41,10 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'POST' && path === 'lock') {
       lockVault();
       return json({ ok: true, status: vaultStatus() });
+    }
+
+    if (req.method === 'POST' && path === 'touch') {
+      return json({ ok: true, status: touchVaultSession() });
     }
 
     if (req.method === 'POST' && path === 'change-passphrase') {

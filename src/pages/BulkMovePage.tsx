@@ -14,6 +14,7 @@ import {
 import { listFolders, listDocuments, bulkMoveDocuments } from '@/services/omniApi';
 import { deriveScopeFromFolderPath } from '@/services/scope';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { SkeletonRow } from '@/components/ui/SkeletonRow';
@@ -276,6 +277,7 @@ function DebugRow({ result }: { result: BulkOperationResult }) {
 
 export function BulkMovePage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [folders, setFolders] = useState<OmniFolder[]>([]);
   const [documents, setDocuments] = useState<OmniDocument[]>([]);
   const [selected, setSelected] = useState<OmniDocument[]>([]);
@@ -326,30 +328,39 @@ export function BulkMovePage() {
 
   useEffect(() => {
     async function fetchFolders() {
+      const requestKey = connectionKey;
       setLoadingFolders(true);
       setError('');
+      setFolders([]);
+      setDocuments([]);
+      setSelected([]);
+      setSelectedFolderId(null);
       try {
         const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
+        if (!isActiveConnectionRequest(requestKey)) return;
         if (res.error) {
           setError(`API error: ${res.error}`);
           return;
         }
         setFolders(Array.isArray(res.folders) ? res.folders : []);
       } catch (err) {
+        if (!isActiveConnectionRequest(requestKey)) return;
         setError(`Failed to load folders: ${err instanceof Error ? err.message : 'Unknown error'}`);
       } finally {
-        setLoadingFolders(false);
+        if (isActiveConnectionRequest(requestKey)) setLoadingFolders(false);
       }
     }
     fetchFolders();
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
 
   async function handleFolderSelect(folder: OmniFolder) {
+    const requestKey = connectionKey;
     setSelectedFolderId(folder.id);
     setLoadingDocs(true);
     setError('');
     try {
       const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id, { allPages: true, pageSize: 100 });
+      if (!isActiveConnectionRequest(requestKey)) return;
       if (res.error) {
         setError(`API error: ${res.error}`);
         return;
@@ -357,9 +368,10 @@ export function BulkMovePage() {
       const docs: OmniDocument[] = Array.isArray(res.documents) ? res.documents : [];
       setDocuments(docs);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(`Failed to load documents: ${err instanceof Error ? err.message : 'Unknown error'}`);
     } finally {
-      setLoadingDocs(false);
+      if (isActiveConnectionRequest(requestKey)) setLoadingDocs(false);
     }
   }
 

@@ -390,6 +390,7 @@ export type OperationType =
   | 'user_delete'
   | 'group_update'
   | 'model_create'
+  | 'model_migration'
   | 'topic_create'
   | 'topic_update'
   | 'topic_delete'

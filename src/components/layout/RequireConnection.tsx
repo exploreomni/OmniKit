@@ -4,7 +4,7 @@ import { useLocation, useNavigate } from 'react-router-dom';
 
 const protectedToolNames: Record<string, string> = {
   '/dashboards/ai-studio': 'AI Dashboard Studio',
-  '/dashboards/migrate': 'Model Migrator',
+  '/dashboards/migrate': 'Dashboard Migrator',
   '/dashboards/operations': 'Dashboard Operations',
   '/dashboards/downloads': 'Dashboard Downloads',
   '/deck-builder': 'Deck Builder',
@@ -12,6 +12,7 @@ const protectedToolNames: Record<string, string> = {
   '/uploads': 'Upload Governance',
   '/users': 'User Management',
   '/groups': 'User Management',
+  '/models/migrate': 'Model Migrator',
   '/models': 'Model & Topic Health',
   '/topics': 'AI Semantic Studio',
   '/labels': 'Labels',
@@ -21,8 +22,8 @@ const protectedToolNames: Record<string, string> = {
 };
 
 const assuranceItems = [
-  { icon: ShieldCheck, label: 'Credentials stay in browser memory' },
-  { icon: Sparkles, label: 'One connection unlocks every workflow' },
+  { icon: ShieldCheck, label: 'Plaintext keys stay in the local vault' },
+  { icon: Sparkles, label: 'One saved instance unlocks every workflow' },
   { icon: LockKeyhole, label: 'API calls run only when you start an action' },
 ];
 
@@ -73,14 +74,14 @@ export function RequireConnection({ children }: { children: React.ReactNode }) {
 
           <div className="inline-flex items-center gap-1.5 rounded-chip bg-omni-50 px-2.5 py-1 text-[11px] font-semibold text-omni-700 border border-omni-200 mb-3">
             <Plug size={12} />
-            Connection required
+            Saved instance required
           </div>
 
           <h2 className="text-xl font-bold text-content-primary mb-2 tracking-tight">
-            Connect to unlock {toolName}
+            Choose an instance to unlock {toolName}
           </h2>
           <p className="text-sm text-content-secondary mb-5 leading-relaxed max-w-sm">
-            OmniKit needs your Omni instance URL and API key before it can read metadata or run guided actions.
+            Unlock your local vault on Home, then choose the saved Omni instance this workflow should use.
           </p>
 
           <div className="grid w-full gap-2 mb-6 text-left">
@@ -98,10 +99,10 @@ export function RequireConnection({ children }: { children: React.ReactNode }) {
           </div>
 
           <button
-            onClick={() => navigate('/connect')}
+            onClick={() => navigate('/')}
             className="btn-primary w-full justify-center"
           >
-            Go to Connect
+            Go to Home
             <ArrowRight size={14} />
           </button>
         </div>

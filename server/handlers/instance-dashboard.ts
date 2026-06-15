@@ -6,8 +6,20 @@ function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), { status, headers: jsonHeaders });
 }
 
+async function bodyJson(req: Request): Promise<Record<string, unknown>> {
+  try {
+    return await req.json() as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 function requireUnlocked(): Response | null {
   return isVaultUnlocked() ? null : json({ error: 'vault locked' }, 423);
+}
+
+function cleanString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
 function lowerPatterns(values: string[] | undefined): string[] {
@@ -24,6 +36,70 @@ function groupEntityName(user: OmniEmbedUserRecord, separator?: string): string 
   const group = user.groups.find((row) => row.display.includes(separator));
   if (!group) return '';
   return group.display.split(separator)[0]?.trim() ?? '';
+}
+
+function parseDateMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+function weekStartIso(time: number): string {
+  const date = new Date(time);
+  const day = date.getUTCDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + diff));
+  return start.toISOString().slice(0, 10);
+}
+
+function monthKey(time: number): string {
+  const date = new Date(time);
+  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`;
+}
+
+function lastWeeks(count: number, now = new Date()): string[] {
+  const currentStart = Date.parse(weekStartIso(now.getTime()));
+  return Array.from({ length: count }, (_, index) => weekStartIso(currentStart - (count - index - 1) * 7 * 24 * 60 * 60 * 1000));
+}
+
+function lastMonths(count: number, now = new Date()): string[] {
+  return Array.from({ length: count }, (_, index) => {
+    const date = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - (count - index - 1), 1));
+    return monthKey(date.getTime());
+  });
+}
+
+export function buildEmbedActivity(records: Array<OmniEmbedUserRecord & { filtered: boolean }>) {
+  const counted = records.filter((user) => !user.filtered);
+  const now = Date.now();
+  const days = (value: number) => value * 24 * 60 * 60 * 1000;
+  const lastLoginTimes = counted.map((user) => ({ user, time: parseDateMs(user.lastLogin) }));
+  const weeks = lastWeeks(12);
+  const months = lastMonths(12);
+  const weeklyCounts = new Map(weeks.map((week) => [week, 0]));
+  const monthlyCounts = new Map(months.map((month) => [month, 0]));
+
+  for (const { time } of lastLoginTimes) {
+    if (!time) continue;
+    const week = weekStartIso(time);
+    if (weeklyCounts.has(week)) weeklyCounts.set(week, (weeklyCounts.get(week) || 0) + 1);
+  }
+
+  for (const user of counted) {
+    const createdAt = parseDateMs(user.createdAt);
+    if (!createdAt) continue;
+    const month = monthKey(createdAt);
+    if (monthlyCounts.has(month)) monthlyCounts.set(month, (monthlyCounts.get(month) || 0) + 1);
+  }
+
+  return {
+    active7d: lastLoginTimes.filter(({ time }) => Boolean(time && now - time <= days(7))).length,
+    active30d: lastLoginTimes.filter(({ time }) => Boolean(time && now - time <= days(30))).length,
+    active90d: lastLoginTimes.filter(({ time }) => Boolean(time && now - time <= days(90))).length,
+    neverLoggedIn: lastLoginTimes.filter(({ time }) => !time).length,
+    weeklyLogins: weeks.map((weekStart) => ({ weekStart, count: weeklyCounts.get(weekStart) || 0 })),
+    monthlySignups: months.map((month) => ({ month, count: monthlyCounts.get(month) || 0 })),
+  };
 }
 
 async function connectionStats(instance: SavedInstancePublic) {
@@ -58,6 +134,7 @@ async function connectionStats(instance: SavedInstancePublic) {
         hasSchemaModel,
         schemaModelGenerated,
         schemaModelId: schemaModel?.id ?? null,
+        schemaModelCreatedAt: schemaModel?.createdAt ?? null,
         schemaModelUpdatedAt: schemaModel?.updatedAt ?? null,
         readiness: !hasSchemaModel
           ? 'missing_schema_model'
@@ -105,6 +182,7 @@ async function embedUserStats(instance: SavedInstancePublic) {
     inactiveUsers: records.filter((user) => !user.filtered && !user.active).length,
     filteredCount: records.filter((user) => user.filtered).length,
     entityCount: entityNames.size,
+    activity: buildEmbedActivity(records),
     users: records,
   };
 }
@@ -115,6 +193,7 @@ export default async function handler(req: Request): Promise<Response> {
     if (locked) return locked;
     const url = new URL(req.url);
     const path = url.pathname.replace(/^\/api\/instance-dashboard\/?/, '');
+    const parts = path.split('/').filter(Boolean);
     const instances = listInstances().filter((instance) => instance.role === 'source' || instance.role === 'both' || instance.role === 'destination');
 
     if (req.method === 'GET' && path === 'connections') {
@@ -159,6 +238,23 @@ export default async function handler(req: Request): Promise<Response> {
             error: result.reason instanceof Error ? result.reason.message : String(result.reason),
           };
         }),
+      });
+    }
+
+    if (req.method === 'POST' && parts.length === 2 && parts[1] === 'refresh-schema') {
+      const instanceId = parts[0];
+      const secret = getInstance(instanceId);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const body = await bodyJson(req);
+      const modelId = cleanString(body.modelId);
+      if (!modelId) return json({ error: 'Model ID is required for schema refresh.' }, 400);
+      const result = await new OmniClient(secret).refreshModel(modelId);
+      return json({
+        ok: true,
+        instanceId,
+        modelId,
+        jobId: result.jobId,
+        status: result.status,
       });
     }
 

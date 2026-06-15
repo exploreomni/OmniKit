@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Download, Loader2, FileText, Image, FileSpreadsheet, CheckCircle, AlertCircle } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
@@ -28,6 +28,8 @@ const PAPER_FORMATS = [
 export function DownloadsPage() {
   const { connection } = useConnection();
   const logOp = useLogOperation();
+  const connectionKey = connection.instanceId || connection.baseUrl;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [folders, setFolders] = useState<OmniFolder[]>([]);
   const [documents, setDocuments] = useState<OmniDocument[]>([]);
   const [selectedFolder, setSelectedFolder] = useState('');
@@ -51,18 +53,27 @@ export function DownloadsPage() {
   const [maxRowLimit, setMaxRowLimit] = useState('');
 
   useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
+
+  useEffect(() => {
     async function load() {
+      const requestKey = connectionKey;
       setLoadingFolders(true);
       try {
         const res = await listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
+        if (activeConnectionKeyRef.current !== requestKey) return;
         setFolders(Array.isArray(res.folders) ? res.folders : []);
       } catch { /* ignore */ }
-      finally { setLoadingFolders(false); }
+      finally {
+        if (activeConnectionKeyRef.current === requestKey) setLoadingFolders(false);
+      }
     }
     load();
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey]);
 
   async function handleFolderChange(folderId: string) {
+    const requestKey = connectionKey;
     setSelectedFolder(folderId);
     setSelectedDoc('');
     setSelectedDocName('');
@@ -70,9 +81,14 @@ export function DownloadsPage() {
     setLoadingDocs(true);
     try {
       const res = await listDocuments(connection.baseUrl, connection.apiKey, folderId, { allPages: true, pageSize: 100 });
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setDocuments(Array.isArray(res.documents) ? res.documents : []);
-    } catch { setDocuments([]); }
-    finally { setLoadingDocs(false); }
+    } catch {
+      if (activeConnectionKeyRef.current !== requestKey) return;
+      setDocuments([]);
+    } finally {
+      if (activeConnectionKeyRef.current === requestKey) setLoadingDocs(false);
+    }
   }
 
   function flattenFolders(folders: OmniFolder[], depth = 0): Array<OmniFolder & { depth: number }> {

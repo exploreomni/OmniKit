@@ -1,5 +1,5 @@
-export const WALKTHROUGH_VERSION = '2026-06-04-multi-instance-ops-console';
-export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 4, 2026';
+export const WALKTHROUGH_VERSION = '2026-06-12-model-migrator-foundation';
+export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 12, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
 export type WalkthroughStepId =
@@ -10,6 +10,7 @@ export type WalkthroughStepId =
   | 'dashboard-ai'
   | 'dashboard-builder'
   | 'excel-dashboard'
+  | 'dashboard-migrator'
   | 'model-migrator'
   | 'dashboard-operations'
   | 'downloads-decks'
@@ -41,12 +42,13 @@ export interface WalkthroughStorageState {
 export const walkthroughSteps: WalkthroughStep[] = [
   {
     id: 'start',
-    route: '/connect',
+    route: '/',
     label: 'Overview',
     title: 'Start with the big picture',
-    purpose: 'OmniKit is a local workspace for Omni admins. It helps you connect, review content, make safer bulk changes, and prepare AI-assisted semantic work without leaving a controlled local tool.',
+    purpose: 'OmniKit is a local workspace for Omni admins. It starts from a native encrypted vault, then helps you review content, make safer bulk changes, and prepare AI-assisted semantic work without leaving a controlled local tool.',
     directions: [
-      'Use the sidebar like a checklist, moving from Connect into the area that matches your task.',
+      'Use Home to unlock or create the local vault and choose the saved Omni instance for your session.',
+      'Use the sidebar like a checklist, moving from the selected saved instance into the area that matches your task.',
       'Look for selected-state badges and progress panels to confirm what OmniKit will act on.',
       'When a workflow writes changes, expect a review step before anything is applied.',
     ],
@@ -54,17 +56,18 @@ export const walkthroughSteps: WalkthroughStep[] = [
   },
   {
     id: 'connect',
-    route: '/connect',
-    label: 'Connect',
-    title: 'Connect to your Omni instance',
-    purpose: 'Connect is the front door. A non-technical user only needs the Omni URL and an API key from their admin team.',
+    route: '/',
+    label: 'Vault',
+    title: 'Choose a saved Omni instance',
+    purpose: 'Home is the front door. A non-technical user unlocks the local vault, chooses a saved Omni instance, and avoids re-entering credentials for every workflow.',
     directions: [
-      'Paste the Omni base URL, such as yourcompany.omniapp.co.',
-      'Paste the API key and test the connection.',
+      'Create or unlock the native vault on Home.',
+      'Add a saved instance if the vault is empty, using the Omni base URL and API key from the admin team.',
+      'Choose the saved instance you want to use; the browser receives only a non-secret vault reference.',
       'After success, use the recommended next actions or the sidebar.',
     ],
     outcome: 'OmniKit can read the Omni content and model metadata needed by the rest of the app.',
-    caution: 'The active API key stays in same-tab session storage and is cleared by Data & Privacy.',
+    caution: 'Plaintext saved-instance API keys stay encrypted in the native vault and are not returned to the browser.',
   },
   {
     id: 'workflow-map',
@@ -87,8 +90,10 @@ export const walkthroughSteps: WalkthroughStep[] = [
     purpose: 'Instance Manager is the new multi-instance operations home. It uses a native encrypted local vault so technical admins can save source and destination Omni profiles without re-entering API keys for every migration.',
     directions: [
       'Unlock or create the native vault, then add source, destination, or source + destination instance profiles.',
-      'Save default model IDs, folder IDs or folder paths, metric filters, and optional post-migration action templates.',
-      'Use the Connections and Embed Users tabs to scan saved instances, filter internal/test records, and find schema model coverage issues without relying on default schema fields.',
+      'If you are moving from omni-multi-instance-tools, use Import legacy multi-instance vault, run the dry run first, import valid profiles, then test each imported instance.',
+      'Save default model IDs, folder IDs or folder paths, tag-based metric filters, and optional HTTPS post-migration action templates.',
+      'Use the Connections tab to scan saved instances, filter internal/test records, find schema model coverage issues, and queue schema refresh jobs from the local vault.',
+      'Use the Embed Users tab to review active 7/30/90-day counts, never-logged-in users, signup/login trends, and entity rollups.',
     ],
     outcome: 'Admins can manage reusable multi-instance credentials and metrics while keeping secrets encrypted locally.',
     caution: 'Native vault secrets are not included in browser backups. Resetting the native vault removes saved instance profiles and local migration job history.',
@@ -136,19 +141,34 @@ export const walkthroughSteps: WalkthroughStep[] = [
     caution: 'Raw workbook contents are not stored by default. Missing lookup tabs, manually entered summaries, and hardcoded thresholds require human validation.',
   },
   {
-    id: 'model-migrator',
+    id: 'dashboard-migrator',
     route: '/dashboards/migrate',
     label: 'Migrate',
-    title: 'Use Model Migrator for Omni-to-Omni dashboard moves',
-    purpose: 'Model Migrator starts with same-instance model remaps, and now has a separate saved-instance dashboard copy/import mode for one source to one or more explicit migration targets.',
+    title: 'Use Dashboard Migrator for same-instance remaps or fan-out copy/import',
+    purpose: 'Model Migrator is now Dashboard Migrator because this workflow moves dashboards. Model Migrator is reserved for a new semantic-layer tool that will move models between connections before handing off dashboard migration here.',
     directions: [
-      'Use Same-instance model remap when the active Omni connection is both source and destination and only the dashboard base model is changing.',
-      'Use Saved-instance dashboard copy/import when dashboards need to move across instances or fan out to multiple target models/folders.',
-      'In saved-instance mode, choose the source, add one or more migration targets, select dashboards, review optional target-folder cleanup, and enable any post-migration actions.',
-      'Run Compatibility Preflight before starting the job, then monitor per-target export, import, metadata, folder move, and post-action status.',
+      'Choose Within this instance when the selected saved instance is the source and destination and only the dashboard base model changes.',
+      'Choose To other saved instances when dashboards need to fan out from one saved source profile to multiple destination instances, models, or folders.',
+      'In fan-out mode, unlock the native vault, choose the source model and dashboards once, then check the destination instances you want to receive copies.',
+      'Review the preflight matrix before running. During the job, use the live board to watch export, import, metadata, folder move, schema refresh, and post-action status by destination.',
     ],
-    outcome: 'Dashboard migration work becomes a reviewed, retryable job with clear warnings for missing fields, folder placement, metadata preservation, and destination failures.',
+    outcome: 'Dashboard migration work becomes a reviewed, retryable fan-out job with clear warnings for missing fields, folder placement, metadata preservation, and destination-specific failures.',
     caution: 'Preflight checks field presence and job shape, not business-definition equivalence. Destructive cleanup should be enabled only when the destination folder contents are understood.',
+  },
+  {
+    id: 'model-migrator',
+    route: '/models/migrate',
+    label: 'Model Migrator',
+    title: 'Stage semantic model migration from saved instances',
+    purpose: 'Model Migrator is the semantic-layer workflow. It starts with saved source and target Omni profiles, then inventories source models and dependent dashboards or workbook-only content before creating branch-only migration jobs.',
+    directions: [
+      'Unlock the native vault and choose a saved source instance.',
+      'Choose the source connection and one or more shared models to migrate.',
+      'Choose the target instance and connection, then map each source model to its intended target model.',
+      'Review translated YAML, workbook preflight, and selected content before starting the unified migration job.',
+    ],
+    outcome: 'Admins can pick once, understand model/content scope, write accepted YAML to target branches, port workbook queries, and keep dashboard selections visible as handoff items in the same run.',
+    caution: 'Main branches are never written. Validate and merge only from target dev branches, and disclose unsupported schedules, sharing, alerts, and permission artifacts in results.',
   },
   {
     id: 'dashboard-operations',
@@ -184,7 +204,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     title: 'Check connection, upload, model, and content health',
     purpose: 'The readiness pages help admins understand whether the Omni environment is healthy before they ask Blobby or bulk workflows to act on it.',
     directions: [
-      'Use Instance Manager for multi-instance totals, filtered internal/test counts, embed-user rollups, and saved instance configuration.',
+      'Use Instance Manager for multi-instance totals, filtered internal/test counts, schema refresh actions, embed-user activity charts, entity rollups, and saved instance configuration.',
       'Use Connection Health to inspect the active Omni connection in detail.',
       'Use Upload Governance, Model & Topic Health, and Content Health to identify stale content or semantic gaps.',
       'Treat these scans as triage: they tell you where to repair, not just what is broken.',
@@ -228,6 +248,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
       'Review IndexedDB records for operation history and saved app metadata.',
       'Review localStorage and sessionStorage entries for browser-based state.',
       'Review the native vault path and reset controls for encrypted instance profiles and local migration job history.',
+      'Use Instance Manager for one-time legacy multi-instance vault imports; keep the old tool data folder until imported profiles are verified.',
       'Use Clear all local data for browser data, and Reset native vault only when saved instance profiles should be removed.',
     ],
     outcome: 'Users can trust what the local app keeps and can cleanly reset it.',
@@ -239,7 +260,8 @@ export const walkthroughSteps: WalkthroughStep[] = [
     title: 'Use history and validation as the operating rhythm',
     purpose: 'The safest OmniKit habit is simple: select, review, apply only when validation passes, then use History and Omni review screens as the audit trail.',
     directions: [
-      'Check History after meaningful operations.',
+      'Check History after meaningful operations or fan-out migration jobs.',
+      'Open a migration job detail to review redacted step history, retry lineage, imported document IDs, warnings, and post-action results.',
       'Prefer dev branches and validation for semantic changes.',
       'Return to this guide from the sidebar any time someone needs a refresher.',
     ],

@@ -5,6 +5,9 @@ import { omniApiPlugin } from './server/vitePlugin';
 
 export default defineConfig({
   plugins: [react(), omniApiPlugin()],
+  build: {
+    target: 'esnext',
+  },
   resolve: {
     alias: {
       '@': path.resolve(__dirname, './src'),

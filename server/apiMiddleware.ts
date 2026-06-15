@@ -19,6 +19,7 @@ import manageTopics from './handlers/manage-topics';
 import manageUsers from './handlers/manage-users';
 import migrate from './handlers/migrate';
 import migrationJobs from './handlers/migration-jobs';
+import modelMigrator from './handlers/model-migrator';
 import omniProxy from './handlers/omni-proxy';
 import testConnection from './handlers/test-connection';
 import vault from './handlers/vault';
@@ -27,7 +28,7 @@ import { getInstance } from './services/nativeVault';
 type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator']);
 
 const routes: Record<string, Handler> = {
   'bulk-copy-documents': bulkCopyDocuments,
@@ -48,6 +49,7 @@ const routes: Record<string, Handler> = {
   'manage-users': manageUsers,
   migrate,
   'migration-jobs': migrationJobs,
+  'model-migrator': modelMigrator,
   'omni-proxy': omniProxy,
   'test-connection': testConnection,
   vault,
