@@ -768,13 +768,13 @@ export function DashboardOperationsPage() {
         </div>
       </div>
 
-      <div className="sticky bottom-4 z-20 rounded-card border border-border bg-white/95 p-4 shadow-dropdown backdrop-blur">
-        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-          <div className="space-y-4">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <div>
+      <div className="sticky bottom-3 z-20 max-h-[44vh] overflow-y-auto overscroll-contain rounded-card border border-border bg-white/95 p-3 shadow-dropdown backdrop-blur">
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
                 <h3 className="text-sm font-semibold text-content-primary">Operation settings</h3>
-                <p className="text-xs text-content-secondary mt-0.5">{actionConfig.description}</p>
+                <p className="mt-0.5 line-clamp-1 text-xs text-content-secondary">{actionConfig.description}</p>
               </div>
               <span className={`inline-flex items-center gap-1.5 text-xs font-semibold border rounded-full px-2.5 py-1 ${actionConfig.tone}`}>
                 <ActionIcon size={13} />
@@ -783,11 +783,11 @@ export function DashboardOperationsPage() {
             </div>
 
             {needsDestination ? (
-              <div className="space-y-3">
-                <div className="flex items-center justify-between">
-                  <div>
+              <div className="space-y-2.5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
                     <h4 className="text-xs font-semibold text-content-primary">Destination Folder</h4>
-                    <p className="text-xs text-content-secondary mt-0.5">
+                    <p className="mt-0.5 line-clamp-1 text-xs text-content-secondary">
                       Choose where to {action} the selected dashboard{selected.length === 1 ? '' : 's'}.
                     </p>
                   </div>
@@ -801,7 +801,7 @@ export function DashboardOperationsPage() {
                 </div>
 
                 {showFolderPicker ? (
-                  <div className="border border-border rounded-card p-3 max-h-[220px] overflow-y-auto bg-surface-secondary">
+                  <div className="max-h-40 overflow-y-auto rounded-card border border-border bg-surface-secondary p-2.5">
                     {folders.length === 0 ? (
                       <p className="text-xs text-content-secondary py-2">No folders available.</p>
                     ) : (
@@ -847,12 +847,12 @@ export function DashboardOperationsPage() {
                 )}
 
                 {targetFolderPath && (
-                  <div className="flex items-center gap-2 text-xs text-content-secondary">
+                  <div className="flex min-w-0 items-center gap-2 text-xs text-content-secondary">
                     {action === 'copy' ? <Copy size={13} className="text-content-secondary" /> : <FolderInput size={13} className="text-content-secondary" />}
                     {action === 'copy' ? 'Copying to:' : 'Moving to:'}{' '}
-                    <span className="font-mono font-medium text-content-primary">{targetFolderDisplay || targetFolderPath}</span>
+                    <span className="truncate font-mono font-medium text-content-primary">{targetFolderDisplay || targetFolderPath}</span>
                     {targetFolderDisplay && targetFolderDisplay !== targetFolderPath && (
-                      <span className="font-mono text-[10px] text-content-secondary/60">({targetFolderPath})</span>
+                      <span className="hidden shrink-0 font-mono text-[10px] text-content-secondary/60 sm:inline">({targetFolderPath})</span>
                     )}
                   </div>
                 )}
@@ -865,8 +865,8 @@ export function DashboardOperationsPage() {
             )}
           </div>
 
-          <div className="flex flex-col justify-between gap-4 border-t border-border pt-4 xl:border-l xl:border-t-0 xl:pl-4 xl:pt-0">
-            <div className="space-y-3">
+          <div className="flex flex-col justify-between gap-3 border-t border-border pt-3 xl:border-l xl:border-t-0 xl:pl-3 xl:pt-0">
+            <div className="space-y-2.5">
               <div className="flex items-center justify-between">
                 <h3 className="text-sm font-semibold text-content-primary">Ready check</h3>
                 <button type="button" onClick={handleReset} className="text-xs text-content-secondary hover:text-content-primary inline-flex items-center gap-1">
@@ -893,7 +893,7 @@ export function DashboardOperationsPage() {
                 )}
               </div>
               {needsDestination && (
-                <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs leading-relaxed text-content-secondary">
+                <div className="line-clamp-2 rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs leading-relaxed text-content-secondary">
                   {actionConfig.safetyCopy}
                 </div>
               )}
