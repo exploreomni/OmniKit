@@ -31,6 +31,7 @@ import {
   type OmniModelYamlResponse,
 } from '@/services/omniApi';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -4832,6 +4833,7 @@ function ManualCopyFallback({
 
 export function TopicsPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [studioMode, setStudioMode] = useState<'builders' | 'migration'>('builders');
   const [models, setModels] = useState<OmniModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState('');
@@ -4893,6 +4895,7 @@ export function TopicsPage() {
   const [deployReviewAcknowledged, setDeployReviewAcknowledged] = useState(false);
 
   async function loadModelFileOptions(modelId: string, path: StudioPathSelection = selectedStudioPath) {
+    const requestKey = connectionKey;
     if (!modelId) {
       setModelFileOptions([]);
       return;
@@ -4900,6 +4903,7 @@ export function TopicsPage() {
     setLoadingModelFiles(true);
     try {
       const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId).catch(() => null);
+      if (!isActiveConnectionRequest(requestKey)) return;
       const fileNames = Object.keys(yaml?.files || {});
       const supported = fileNames.filter((fileName) => {
         if (path === 'permissions') {
@@ -4910,35 +4914,48 @@ export function TopicsPage() {
       const pinnedTargets = path === 'permissions' ? ['model'] : ['model', 'relationships'];
       setModelFileOptions(uniqueStrings([...pinnedTargets, ...supported], 120));
     } finally {
-      setLoadingModelFiles(false);
+      if (isActiveConnectionRequest(requestKey)) setLoadingModelFiles(false);
     }
   }
 
   useEffect(() => {
     async function fetchModels() {
+      const requestKey = connectionKey;
       setLoading(true);
       try {
         const res = await listModels(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 });
+        if (!isActiveConnectionRequest(requestKey)) return;
         setModels(Array.isArray(res.models) ? res.models : []);
       } catch (err) {
+        if (!isActiveConnectionRequest(requestKey)) return;
         setError(err instanceof Error ? err.message : 'Failed to load models');
       } finally {
-        setLoading(false);
+        if (isActiveConnectionRequest(requestKey)) setLoading(false);
       }
     }
     fetchModels();
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
+
+  useEffect(() => {
+    setModels([]);
+    setSelectedModelId('');
+    setSelectedTopicName('');
+    setTopics([]);
+    setTopicDetails({});
+    setModelFileOptions([]);
+  }, [connectionKey]);
 
   useEffect(() => {
     const modelId = selectedModelId;
     const detailKey = selectedTopicName ? topicDetailKey(selectedTopicName, modelId) : '';
     if (!modelId || !selectedTopicName || topicDetails[detailKey]) return;
     let cancelled = false;
+    const requestKey = connectionKey;
 
     async function fetchSelectedTopicDetail() {
       try {
         const data = await getTopic(connection.baseUrl, connection.apiKey, modelId, selectedTopicName);
-        if (!cancelled) {
+        if (!cancelled && isActiveConnectionRequest(requestKey)) {
           setTopicDetails((prev) => ({ ...prev, [detailKey]: data }));
         }
       } catch {
@@ -4950,14 +4967,16 @@ export function TopicsPage() {
     return () => {
       cancelled = true;
     };
-  }, [connection.baseUrl, connection.apiKey, selectedModelId, selectedTopicName, topicDetails]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest, selectedModelId, selectedTopicName, topicDetails]);
 
   async function fetchTopicDetail(topicName: string, modelId = selectedModelId) {
+    const requestKey = connectionKey;
     const detailKey = topicDetailKey(topicName, modelId);
     if (topicDetails[detailKey]) return topicDetails[detailKey];
     if (!modelId) return null;
     try {
       const data = await getTopic(connection.baseUrl, connection.apiKey, modelId, topicName);
+      if (!isActiveConnectionRequest(requestKey)) return null;
       setTopicDetails((prev) => ({ ...prev, [detailKey]: data }));
       return data;
     } catch {
@@ -5003,6 +5022,7 @@ export function TopicsPage() {
   }
 
   async function loadTopicsForModel(modelId: string) {
+    const requestKey = connectionKey;
     setLoadingTopics(true);
     setError('');
     setTopics([]);
@@ -5018,16 +5038,18 @@ export function TopicsPage() {
 
     try {
       const nextTopics = await listTopics(connection.baseUrl, connection.apiKey, modelId);
+      if (!isActiveConnectionRequest(requestKey)) return;
       setTopics(nextTopics);
 
       // Leave topic selection empty by default so admins can intentionally
       // create a new .topic candidate instead of accidentally updating the
       // first existing topic returned by Omni.
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(err instanceof Error ? err.message : 'Failed to load topics for this model');
       setTopics([]);
     } finally {
-      setLoadingTopics(false);
+      if (isActiveConnectionRequest(requestKey)) setLoadingTopics(false);
     }
   }
 

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ArrowRight, AlertTriangle, CheckCircle2, Database, RefreshCw, GitBranch, Clock, Loader2 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
@@ -30,6 +30,8 @@ interface ConnectionDetail {
 export function ConnectionsPage() {
   const { connection } = useConnection();
   const navigate = useNavigate();
+  const connectionKey = connection.instanceId || connection.baseUrl;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [connections, setConnections] = useState<OmniConnection[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -42,7 +44,12 @@ export function ConnectionsPage() {
   const [schemaModelError, setSchemaModelError] = useState('');
 
   useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
+
+  useEffect(() => {
     async function load() {
+      const requestKey = connectionKey;
       setLoading(true);
       setError('');
       setSchemaModelError('');
@@ -63,6 +70,7 @@ export function ConnectionsPage() {
         if (connectionRes.status === 'rejected') {
           throw connectionRes.reason;
         }
+        if (activeConnectionKeyRef.current !== requestKey) return;
 
         const data = connectionRes.value.records || connectionRes.value.connections || [];
         setConnections(Array.isArray(data) ? data : []);
@@ -77,16 +85,18 @@ export function ConnectionsPage() {
           setSchemaModelError(message);
         }
       } catch (err) {
+        if (activeConnectionKeyRef.current !== requestKey) return;
         setError(err instanceof Error ? err.message : 'Failed to load connections');
       } finally {
-        setLoading(false);
+        if (activeConnectionKeyRef.current === requestKey) setLoading(false);
       }
     }
     load();
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey]);
 
   async function loadDetail(connId: string) {
     if (details[connId] && !details[connId].loadingDetail) return;
+    const requestKey = connectionKey;
     setDetails((prev) => ({ ...prev, [connId]: { ...prev[connId], loadingDetail: true } }));
 
     try {
@@ -95,6 +105,7 @@ export function ConnectionsPage() {
         omniProxy<{ records?: Array<Record<string, unknown>> }>(connection.baseUrl, connection.apiKey, 'GET', `/v1/connections/${connId}/schedules`),
       ]);
 
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setDetails((prev) => ({
         ...prev,
         [connId]: {
@@ -104,6 +115,7 @@ export function ConnectionsPage() {
         },
       }));
     } catch {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setDetails((prev) => ({ ...prev, [connId]: { dbt: null, schedules: [], loadingDetail: false } }));
     }
   }

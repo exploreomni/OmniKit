@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertTriangle, CheckCircle2, Database, FileCode2, GitBranch, Loader2, RefreshCw, ShieldCheck, X } from 'lucide-react';
 import { listModels, listTopics, validateModel } from '@/services/omniApi';
@@ -102,6 +102,8 @@ function isRateLimitError(message: string) {
 export function ModelsPage() {
   const navigate = useNavigate();
   const { connection } = useConnection();
+  const connectionKey = connection.instanceId || connection.baseUrl;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [models, setModels] = useState<OmniModel[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -120,12 +122,17 @@ export function ModelsPage() {
   const [selectedIssue, setSelectedIssue] = useState<{ model: OmniModel; issue: ValidationIssue } | null>(null);
 
   useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
+
+  useEffect(() => {
     fetchModels(false);
     // fetchModels intentionally stays local so filter changes are explicit dependencies.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connection.baseUrl, connection.apiKey, includeDeleted]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, includeDeleted]);
 
   async function fetchModels(keepRows: boolean) {
+    const requestKey = connectionKey;
     if (keepRows) {
       setRefreshing(true);
     } else {
@@ -142,38 +149,48 @@ export function ModelsPage() {
         sortDirection: 'asc',
       });
       if (res.error) {
+        if (activeConnectionKeyRef.current !== requestKey) return;
         setError(res.error);
         return;
       }
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setModels(Array.isArray(res.models) ? res.models : []);
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setError(err instanceof Error ? err.message : 'Failed to load models');
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (activeConnectionKeyRef.current === requestKey) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
   }
 
   async function handleValidate(model: OmniModel) {
+    const requestKey = connectionKey;
     setValidatingId(model.id);
     setError('');
     try {
       const issues = await validateModel(connection.baseUrl, connection.apiKey, model.id);
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setValidationResults((prev) => ({ ...prev, [model.id]: Array.isArray(issues) ? issues : [] }));
       await scanTopicHealth(model);
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setValidationResults((prev) => ({
         ...prev,
         [model.id]: [{ message: err instanceof Error ? err.message : 'Validation failed', is_warning: false }],
       }));
     } finally {
-      setValidatingId(null);
+      if (activeConnectionKeyRef.current === requestKey) setValidatingId(null);
     }
   }
 
   async function scanTopicHealth(model: OmniModel) {
+    const requestKey = connectionKey;
     try {
       const topics = await listTopics(connection.baseUrl, connection.apiKey, model.id);
+      if (activeConnectionKeyRef.current !== requestKey) return;
       const missingDescription = topics
         .filter((topic) => !topic.description?.trim())
         .map((topic) => topic.label || topic.name)
@@ -187,6 +204,7 @@ export function ModelsPage() {
         },
       }));
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setTopicHealthResults((prev) => ({
         ...prev,
         [model.id]: {

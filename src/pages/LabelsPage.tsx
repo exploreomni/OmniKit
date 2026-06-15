@@ -13,6 +13,7 @@ import {
 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { omniProxy, listFolders, listDocuments } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
@@ -180,6 +181,7 @@ function labelFromCreateResponse(payload: LabelCreateResponse | undefined, fallb
 
 export function LabelsPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const logOp = useLogOperation();
   const [labels, setLabels] = useState<OmniLabel[]>([]);
   const [loading, setLoading] = useState(false);
@@ -229,13 +231,25 @@ export function LabelsPage() {
 
   useEffect(() => {
     async function load() {
+      const requestKey = connectionKey;
       setLoading(true);
       setError('');
+      setLabels([]);
+      setFolders([]);
+      setFolderLabels({});
+      setActiveFolderId('');
+      setSelectedFolderIds(new Set());
+      setDocumentsByFolder({});
+      setSelectedDocumentsById({});
+      setDocumentLabels({});
+      setLoadingLabelIds(new Set());
+      setLoadingFolderDocumentIds(new Set());
       try {
         const [labelsRes, foldersRes] = await Promise.all([
           omniProxy<{ records?: OmniLabel[]; labels?: OmniLabel[] }>(connection.baseUrl, connection.apiKey, 'GET', '/v1/labels'),
           listFolders(connection.baseUrl, connection.apiKey, { allPages: true, pageSize: 100 }),
         ]);
+        if (!isActiveConnectionRequest(requestKey)) return;
 
         const nextFolders = Array.isArray(foldersRes.folders) ? foldersRes.folders : [];
         const nextLabels = labelsRes.records || labelsRes.labels || [];
@@ -249,6 +263,7 @@ export function LabelsPage() {
             '/v1/folders',
             { queryParams: { include: 'labels', pageSize: '1000' } },
           );
+          if (!isActiveConnectionRequest(requestKey)) return;
           const detailedFolders = folderDetails.records || folderDetails.folders || [];
           for (const folder of detailedFolders) {
             const labelsFromDetail = extractLabels(folder);
@@ -262,13 +277,14 @@ export function LabelsPage() {
         setFolders(nextFolders);
         setFolderLabels(nextFolderLabels);
       } catch (err) {
+        if (!isActiveConnectionRequest(requestKey)) return;
         setError(friendlyApiError(err, 'Failed to load labels'));
       } finally {
-        setLoading(false);
+        if (isActiveConnectionRequest(requestKey)) setLoading(false);
       }
     }
     load();
-  }, [connection.baseUrl, connection.apiKey]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
 
   const fetchFolderDocuments = useCallback(async (folder: OmniFolder): Promise<FolderDashboard[]> => {
     const res = await listDocuments(connection.baseUrl, connection.apiKey, folder.id, { allPages: true, pageSize: 100 });
@@ -291,6 +307,7 @@ export function LabelsPage() {
   }, [connection.baseUrl, connection.apiKey]);
 
   const loadFolderDocuments = useCallback(async (folderId: string, options?: { makeActive?: boolean }) => {
+    const requestKey = connectionKey;
     const folder = foldersById.get(folderId);
     if (options?.makeActive !== false) {
       setActiveFolderId(folderId);
@@ -303,6 +320,7 @@ export function LabelsPage() {
     setLoadingFolderDocumentIds((prev) => new Set([...prev, folderId]));
     try {
       const nextDocs = await fetchFolderDocuments(folder);
+      if (!isActiveConnectionRequest(requestKey)) return;
       setDocumentsByFolder((prev) => ({ ...prev, [folderId]: nextDocs }));
       const labelSeed: Record<string, string[]> = {};
       for (const doc of nextDocs) {
@@ -313,27 +331,31 @@ export function LabelsPage() {
       for (const doc of nextDocs) {
         if (labelSeed[doc.id]) continue;
         const labelsForDoc = await fetchDocumentLabels(doc.id);
+        if (!isActiveConnectionRequest(requestKey)) return;
         setDocumentLabels((prev) => ({ ...prev, [doc.id]: labelsForDoc }));
       }
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setDocumentsByFolder((prev) => ({ ...prev, [folderId]: [] }));
       setError(friendlyApiError(err, 'Failed to load folder dashboards'));
     } finally {
-      setLoadingFolderDocumentIds((prev) => {
+      if (isActiveConnectionRequest(requestKey)) setLoadingFolderDocumentIds((prev) => {
         const next = new Set(prev);
         next.delete(folderId);
         return next;
       });
     }
-  }, [documentsByFolder, fetchDocumentLabels, fetchFolderDocuments, foldersById]);
+  }, [connectionKey, documentsByFolder, fetchDocumentLabels, fetchFolderDocuments, foldersById, isActiveConnectionRequest]);
 
   async function ensureDocumentLabels(ids: string[]) {
+    const requestKey = connectionKey;
     const missing = ids.filter((id) => !documentLabels[id] && !loadingLabelIds.has(id));
     if (missing.length === 0) return;
 
     setLoadingLabelIds((prev) => new Set([...prev, ...missing]));
     for (const id of missing) {
       const labelsForDoc = await fetchDocumentLabels(id);
+      if (!isActiveConnectionRequest(requestKey)) return;
       setDocumentLabels((prev) => ({ ...prev, [id]: labelsForDoc }));
       setLoadingLabelIds((prev) => {
         const next = new Set(prev);

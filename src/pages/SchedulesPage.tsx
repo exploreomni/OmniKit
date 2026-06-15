@@ -18,6 +18,7 @@ import {
   X,
 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
+import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { listDocuments, omniProxy } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
@@ -195,6 +196,7 @@ function ScheduleFormModal({
   onSave: (values: ScheduleFormValues) => Promise<void>;
 }) {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [values, setValues] = useState<ScheduleFormValues>(EMPTY_SCHEDULE);
   const [dashboards, setDashboards] = useState<ScheduleDashboardOption[]>([]);
   const [dashboardsLoaded, setDashboardsLoaded] = useState(false);
@@ -231,18 +233,19 @@ function ScheduleFormModal({
     setDashboards([]);
     setDashboardsLoaded(false);
     setDashboardError('');
-  }, [connection.apiKey, connection.baseUrl]);
+  }, [connectionKey]);
 
   useEffect(() => {
     if (!open || dashboardsLoaded) return;
     let cancelled = false;
+    const requestKey = connectionKey;
 
     async function loadDashboards() {
       setLoadingDashboards(true);
       setDashboardError('');
       try {
         const res = await listDocuments(connection.baseUrl, connection.apiKey, undefined, { allPages: true, pageSize: 250 });
-        if (cancelled) return;
+        if (cancelled || !isActiveConnectionRequest(requestKey)) return;
         const nextDashboards = extractScheduleDocuments(res)
           .map(normalizeDashboardOption)
           .filter((doc): doc is ScheduleDashboardOption => Boolean(doc))
@@ -250,13 +253,13 @@ function ScheduleFormModal({
         setDashboards(nextDashboards);
         setDashboardsLoaded(true);
       } catch (err) {
-        if (!cancelled) {
+        if (!cancelled && isActiveConnectionRequest(requestKey)) {
           setDashboards([]);
           setDashboardsLoaded(false);
           setDashboardError(friendlyApiError(err, 'Failed to load dashboards'));
         }
       } finally {
-        if (!cancelled) setLoadingDashboards(false);
+        if (!cancelled && isActiveConnectionRequest(requestKey)) setLoadingDashboards(false);
       }
     }
 
@@ -264,7 +267,7 @@ function ScheduleFormModal({
     return () => {
       cancelled = true;
     };
-  }, [connection.apiKey, connection.baseUrl, dashboardsLoaded, open]);
+  }, [connection.apiKey, connection.baseUrl, connectionKey, dashboardsLoaded, isActiveConnectionRequest, open]);
 
   const filteredDashboards = useMemo(() => {
     const term = dashboardSearch.trim().toLowerCase();
@@ -523,6 +526,7 @@ function ScheduleFormModal({
 
 export function SchedulesPage() {
   const { connection } = useConnection();
+  const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const [schedules, setSchedules] = useState<OmniSchedule[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
@@ -538,6 +542,7 @@ export function SchedulesPage() {
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
 
   const fetchSchedules = useCallback(async (pageNum: number) => {
+    const requestKey = connectionKey;
     setLoading(true);
     setError('');
     try {
@@ -554,14 +559,22 @@ export function SchedulesPage() {
         '/v1/schedules',
         { queryParams: params },
       );
+      if (!isActiveConnectionRequest(requestKey)) return;
       setSchedules(res.records || []);
       setPageInfo(res.pageInfo || null);
     } catch (err) {
+      if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to load schedules'));
     } finally {
-      setLoading(false);
+      if (isActiveConnectionRequest(requestKey)) setLoading(false);
     }
-  }, [connection.baseUrl, connection.apiKey, search, statusFilter, destFilter, typeFilter]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, destFilter, isActiveConnectionRequest, search, statusFilter, typeFilter]);
+
+  useEffect(() => {
+    setSchedules([]);
+    setPageInfo(null);
+    setPage(1);
+  }, [connectionKey]);
 
   useEffect(() => {
     fetchSchedules(page);

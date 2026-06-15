@@ -28,6 +28,18 @@ jobs:
       - name: Run security regression tests
         run: npm run test:security
 
+      - name: Run fan-out wizard tests
+        run: npm run test:fanout
+
+      - name: Run migration planner tests
+        run: npm run test:migration-planner
+
+      - name: Run model migrator tests
+        run: npm run test:model-migrator
+
+      - name: Run instance dashboard tests
+        run: npm run test:instance-dashboard
+
       - name: Typecheck app
         run: npm run typecheck
 

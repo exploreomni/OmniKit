@@ -24,11 +24,15 @@ export interface InstanceMetricFilter {
 }
 
 export interface PostMigrationAction {
+  kind?: 'webhook' | 'refresh-schema';
   name: string;
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   url: string;
   headers: Record<string, string>;
   body: string;
+  destinationInstanceId?: string;
+  targetModelId?: string;
+  targetModelName?: string;
 }
 
 export interface SavedInstance {
@@ -107,6 +111,11 @@ function touchVault(): void {
   scheduleIdleTimer();
 }
 
+export function touchVaultSession() {
+  requireUnlocked();
+  return vaultStatus();
+}
+
 function enforceIdleTimeout(): void {
   if (!unlockedVault) return;
   const timeout = getVaultIdleTimeoutMs();
@@ -140,6 +149,7 @@ function normalizeActions(actions: unknown): PostMigrationAction[] {
   return actions
     .filter((action): action is Partial<PostMigrationAction> => Boolean(action) && typeof action === 'object' && !Array.isArray(action))
     .map((action) => ({
+      kind: action.kind === 'refresh-schema' ? 'refresh-schema' as const : 'webhook' as const,
       name: typeof action.name === 'string' && action.name.trim() ? action.name.trim() : 'Post-migration action',
       method: normalizeMethod(action.method),
       url: typeof action.url === 'string' ? action.url.trim() : '',
@@ -147,8 +157,11 @@ function normalizeActions(actions: unknown): PostMigrationAction[] {
         ? Object.fromEntries(Object.entries(action.headers).filter((entry): entry is [string, string] => typeof entry[1] === 'string'))
         : {},
       body: typeof action.body === 'string' ? action.body : '',
+      destinationInstanceId: typeof action.destinationInstanceId === 'string' && action.destinationInstanceId.trim() ? action.destinationInstanceId.trim() : undefined,
+      targetModelId: typeof action.targetModelId === 'string' && action.targetModelId.trim() ? action.targetModelId.trim() : undefined,
+      targetModelName: typeof action.targetModelName === 'string' && action.targetModelName.trim() ? action.targetModelName.trim() : undefined,
     }))
-    .filter((action) => action.url);
+    .filter((action) => action.kind === 'refresh-schema' ? Boolean(action.targetModelId) : Boolean(action.url));
 }
 
 function normalizeMethod(value: unknown): PostMigrationAction['method'] {
@@ -185,6 +198,20 @@ function decrypt(blob: Buffer, key: Buffer): string {
   const decipher = createDecipheriv('aes-256-gcm', key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+}
+
+export function decryptVaultBlob(passphrase: string, blob: Buffer): string {
+  if (blob.length < SALT_LEN + IV_LEN + TAG_LEN + 1) {
+    throw new Error('Vault file is too small or malformed.');
+  }
+  const salt = blob.subarray(0, SALT_LEN);
+  const encrypted = blob.subarray(SALT_LEN);
+  const key = deriveKey(passphrase, salt);
+  try {
+    return decrypt(encrypted, key);
+  } finally {
+    key.fill(0);
+  }
 }
 
 function persist(): void {

@@ -219,10 +219,13 @@ export function DataPrivacyPage() {
                 idle auto-lock: {formatDuration(nativeVaultStatus?.idleTimeoutMs)}
               </div>
               <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
-                Non-secret multi-instance migration job history is stored in <span className="font-mono">./data/jobs.json</span>. Job records include status, warnings, retry state, imported document IDs, and post-action results. OmniKit redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing job history.
+                Non-secret multi-instance migration job history is stored only on this device in <span className="font-mono">./data/omnikit.db</span>, or <span className="font-mono">OMNIKIT_DB_PATH</span> when configured. Job records include status, warnings, retry lineage, imported document IDs, and post-action results. OmniKit redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing job history.
               </p>
               <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
                 Post-migration action templates stay in the encrypted vault. Job history stores redacted action metadata only. Actions are HTTPS-only, block private-network targets by default, and can be restricted with <span className="font-mono">OMNIKIT_POST_ACTION_ALLOWLIST</span>.
+              </p>
+              <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
+                Instance Manager can import a compatible legacy <span className="font-mono">omni-multi-instance-tools</span> vault file after this native vault is unlocked. The legacy passphrase is used only for that local import request, imported API keys are re-encrypted into the native vault, and plaintext keys are never returned to the browser.
               </p>
             </div>
           </div>
@@ -252,7 +255,7 @@ export function DataPrivacyPage() {
           <div>
             <h2 className="text-base font-semibold text-content-primary">Browser vault compatibility bridge</h2>
             <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
-              Older Model Migrator target credentials may still exist in <span className="font-mono">localStorage</span> as an AES-GCM encrypted browser vault. Instance Manager can import those records into the native vault after both vaults are unlocked. New saved instance profiles should use the native vault.
+              Older Dashboard Migrator target credentials may still exist in <span className="font-mono">localStorage</span> as an AES-GCM encrypted browser vault. OmniKit no longer decrypts or imports that browser-side vault. Re-add any still-needed browser profiles to the native vault manually, then dismiss the legacy cache from Instance Manager or clear browser cache here. This is separate from the server-side legacy multi-instance <span className="font-mono">.enc</span> vault import available in Instance Manager.
             </p>
             <div className="mt-2 font-mono text-[11px] text-content-tertiary">
               omnikit:instanceVault:v1 · encrypted browser cache compatibility path

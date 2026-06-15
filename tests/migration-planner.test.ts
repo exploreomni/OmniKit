@@ -1,0 +1,126 @@
+import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { afterEach, beforeEach, mock, test } from 'node:test';
+
+import { buildMigrationPlan } from '../server/services/migrationJobs';
+import { OmniClient, type OmniDocumentRecord } from '../server/services/omniClient';
+import {
+  lockVault,
+  resetVault,
+  unlockVault,
+  upsertInstance,
+} from '../server/services/nativeVault';
+
+let tempDir = '';
+
+beforeEach(() => {
+  tempDir = mkdtempSync(path.join(tmpdir(), 'omnikit-planner-'));
+  process.env.OMNIKIT_VAULT_PATH = path.join(tempDir, 'vault.enc');
+  process.env.OMNIKIT_DB_PATH = path.join(tempDir, 'omnikit.db');
+  process.env.OMNIKIT_JOBS_PATH = path.join(tempDir, 'jobs.json');
+  unlockVault('planner passphrase');
+});
+
+afterEach(() => {
+  mock.restoreAll();
+  resetVault();
+  lockVault();
+  rmSync(tempDir, { recursive: true, force: true });
+  delete process.env.OMNIKIT_VAULT_PATH;
+  delete process.env.OMNIKIT_DB_PATH;
+  delete process.env.OMNIKIT_JOBS_PATH;
+});
+
+function clientLabel(client: OmniClient): string {
+  return (client as unknown as { instance: { label: string } }).instance.label;
+}
+
+test('planner replaces same-named dashboards without emptying unrelated target docs', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+
+  const sourceDocs: OmniDocumentRecord[] = [
+    {
+      id: 'source-doc-1',
+      identifier: 'source-doc-1',
+      name: 'Executive Scorecard',
+      folderPath: 'Source Dashboards',
+      baseModelId: 'source-model',
+    },
+  ];
+  const destinationDocs: OmniDocumentRecord[] = [
+    {
+      id: 'dest-existing-1',
+      identifier: 'dest-existing-1',
+      name: 'Executive Scorecard',
+      folderPath: 'Migrated Dashboards',
+    },
+    {
+      id: 'dest-existing-2',
+      identifier: 'dest-existing-2',
+      name: 'Do Not Touch',
+      folderPath: 'Migrated Dashboards',
+    },
+  ];
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source' ? sourceDocs : destinationDocs;
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n',
+  }));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Migrated Dashboards',
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const deletes = plan.steps.filter((step) => step.kind === 'delete');
+
+  assert.equal(deletes.length, 1);
+  assert.equal(deletes[0].documentId, 'dest-existing-1');
+  assert.equal(deletes[0].replacement, true);
+  assert.equal(plan.steps.some((step) => step.documentId === 'dest-existing-2'), false);
+});

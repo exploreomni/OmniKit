@@ -29,6 +29,8 @@ function formatDate(dateStr: string | undefined): string {
 export function UploadsPage() {
   const { connection } = useConnection();
   const navigate = useNavigate();
+  const connectionKey = connection.instanceId || connection.baseUrl;
+  const activeConnectionKeyRef = useRef(connectionKey);
   const [uploads, setUploads] = useState<OmniUpload[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -47,7 +49,12 @@ export function UploadsPage() {
   const [pageInfo, setPageInfo] = useState<PageInfo | null>(null);
   const cursorsRef = useRef<Record<number, string>>({});
 
+  useEffect(() => {
+    activeConnectionKeyRef.current = connectionKey;
+  }, [connectionKey]);
+
   const fetchUploads = useCallback(async (pageNum: number, options?: { keepRows?: boolean }) => {
+    const requestKey = connectionKey;
     if (options?.keepRows) {
       setRefreshing(true);
     } else {
@@ -70,18 +77,22 @@ export function UploadsPage() {
         connection.baseUrl, connection.apiKey, 'GET', '/v1/uploads',
         { queryParams: params }
       );
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setUploads(res.records || []);
       setPageInfo(res.pageInfo || null);
       if (res.pageInfo?.nextCursor) {
         cursorsRef.current = { ...cursorsRef.current, [pageNum + 1]: res.pageInfo.nextCursor };
       }
     } catch (err) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
       setError(err instanceof Error ? err.message : 'Failed to load uploads');
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (activeConnectionKeyRef.current === requestKey) {
+        setLoading(false);
+        setRefreshing(false);
+      }
     }
-  }, [connection.baseUrl, connection.apiKey, appliedSearch, appliedConnectionId, appliedModelId, pageSize, sortDirection, sortField, typeFilter]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, appliedSearch, appliedConnectionId, appliedModelId, pageSize, sortDirection, sortField, typeFilter]);
 
   useEffect(() => {
     fetchUploads(page, { keepRows: page > 1 || uploads.length > 0 });
