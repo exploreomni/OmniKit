@@ -1647,6 +1647,7 @@ export function DeckBuilderPage() {
               onPick={handlePickDashboard}
               selectedDashboardId={dashboard?.id}
               disabled={inspecting}
+              showInlineResults
             />
           </div>
 

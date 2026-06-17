@@ -112,6 +112,7 @@ function SidebarSection({ section, expandOnConnect }: { section: NavSection; exp
             <NavLink
               key={item.to}
               to={item.to}
+              end
               className={({ isActive }) =>
                 `flex items-center gap-2.5 px-3 py-2 rounded-[6px] text-[13px] transition-all duration-150 group ${
                   isActive
