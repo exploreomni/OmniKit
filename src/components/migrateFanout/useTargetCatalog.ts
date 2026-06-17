@@ -19,11 +19,11 @@ function flattenFolders(folders: InstanceFolder[], prefix = ''): InstanceFolder[
 export function useTargetCatalog() {
   const [catalogs, setCatalogs] = useState<Record<string, TargetCatalog>>({});
 
-  const loadCatalog = useCallback(async (instanceId: string) => {
+  const loadCatalog = useCallback(async (instanceId: string, options?: { force?: boolean }) => {
     if (!instanceId) return null;
     const current = catalogs[instanceId];
     if (current?.loading) return null;
-    if (current?.loaded) return current;
+    if (current?.loaded && !options?.force) return current;
     setCatalogs((prev) => ({
       ...prev,
       [instanceId]: {

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Database,
   FileText,
   FolderInput,
@@ -25,6 +26,7 @@ import {
   subscribeMigrationJob,
   unlockNativeVault,
   type InstanceDocument,
+  type MigrationJobInput,
   type MigrationJob,
   type MigrationPlan,
   type PostMigrationAction,
@@ -32,9 +34,11 @@ import {
   type VaultStatus,
 } from '@/services/opsConsole';
 import { SearchInput } from '@/components/ui/SearchInput';
+import { ComboBox } from '@/components/ui/ComboBox';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { ProgressBar } from '@/components/ui/ProgressBar';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { useConfetti } from '@/hooks/useConfetti';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import { FixPanel } from './FixPanel';
@@ -42,6 +46,7 @@ import {
   targetDraftToMigrationTarget,
   type FanoutDraft,
   type FanoutStep,
+  type PreflightTargetRow,
   type TargetDraft,
 } from './fanoutTypes';
 import {
@@ -52,17 +57,53 @@ import {
 import { useTargetCatalog } from './useTargetCatalog';
 import {
   completedItem,
+  combineMigrationPlans,
   estimateDurationSeconds,
+  applySelectedSourceModelFallback,
+  buildTargetFolderOptions,
+  buildTargetModelOptions,
+  canContinueFromSourceStep,
+  cleanFanoutModelMetadata as cleanModelMetadata,
+  fanoutDocumentModelLabel,
+  getFanoutPreflightBlockReason,
   isTerminalJobStatus,
+  preflightRowsFromPlan,
+  preserveSelectedDocumentIds,
+  removeTargetFromMigrationPlan,
   statusClass,
   summarizeJobByDestination,
-  summarizePlanByTarget,
+  TARGET_FOLDER_COMBOBOX_CONFIG,
+  TARGET_MODEL_COMBOBOX_CONFIG,
 } from './fanoutUtils';
 
 const STEP_LABELS = ['Source', 'Targets', 'Preflight', 'Run'];
+const CATALOG_RECHECK_BATCH_SIZE = 5;
+const PREFLIGHT_PREVIEW_TIMEOUT_MS = 30_000;
+
+type ConfirmAction = 'empty-first' | 'cancel' | null;
 
 function errorText(error: unknown, fallback: string) {
   return error instanceof Error ? error.message : fallback;
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    if (timeoutId) clearTimeout(timeoutId);
+  }
+}
+
+function previewMigrationJobWithTimeout(input: MigrationJobInput) {
+  return withTimeout(
+    previewMigrationJob(input),
+    PREFLIGHT_PREVIEW_TIMEOUT_MS,
+    'Compatibility preflight timed out before OmniKit received a response. No changes were applied. Try Re-check all, then run preflight again.',
+  );
 }
 
 function makeTargetId(destinationInstanceId: string) {
@@ -109,13 +150,16 @@ export function FanOutWizard() {
   const [search, setSearch] = useState('');
   const [bulkFolderPath, setBulkFolderPath] = useState('');
   const [plan, setPlan] = useState<MigrationPlan | null>(null);
+  const [preflightRows, setPreflightRows] = useState<PreflightTargetRow[]>([]);
   const [job, setJob] = useState<MigrationJob | null>(null);
   const [loading, setLoading] = useState(true);
   const [unlocking, setUnlocking] = useState(false);
   const [loadingDocuments, setLoadingDocuments] = useState(false);
   const [preflightLoading, setPreflightLoading] = useState(false);
+  const [catalogRefreshing, setCatalogRefreshing] = useState(false);
   const [jobBusy, setJobBusy] = useState(false);
   const [fixPanelOpen, setFixPanelOpen] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const { catalogs, loadCatalog, hydrateTargetFromCatalog } = useTargetCatalog();
@@ -133,10 +177,21 @@ export function FanOutWizard() {
   const passphraseMatches = !creatingVault || passphrase === passphraseConfirm;
   const passphraseMeetsMinimum = !creatingVault || passphrase.trim().length >= 8;
   const canUnlockVault = Boolean(passphrase.trim()) && !unlocking && passphraseMatches && passphraseMeetsMinimum;
-  const sourceModelNameById = useMemo(() => new Map(sourceModels.map((model) => [
-    model.id,
-    model.name || model.identifier || model.id,
-  ])), [sourceModels]);
+  const { sourceModelNameById, sourceModelKeysById } = useMemo(() => {
+    const names = new Map<string, string>();
+    const keysById = new Map<string, Set<string>>();
+    for (const model of sourceModels) {
+      const label = cleanModelMetadata(model.name) || cleanModelMetadata(model.identifier) || model.id;
+      const keys = [model.id, model.identifier, model.baseModelId, model.name]
+        .map(cleanModelMetadata)
+        .filter((value): value is string => Boolean(value));
+      keysById.set(model.id, new Set(keys));
+      for (const key of keys) {
+        if (!names.has(key)) names.set(key, label);
+      }
+    }
+    return { sourceModelNameById: names, sourceModelKeysById: keysById };
+  }, [sourceModels]);
 
   const migrationTargets = useMemo(
     () => targets.map((target) => targetDraftToMigrationTarget(target, instances)),
@@ -146,37 +201,50 @@ export function FanOutWizard() {
   const selectedMetadataMissing = selectedDocuments.filter(metadataMissing);
   const hasLoadingTargets = targets.some((target) => target.destinationInstanceId && catalogs[target.destinationInstanceId]?.loading);
   const hasUnresolvedFolderTargets = targets.some((target) => Boolean(target.targetFolderId && !target.targetFolderPath));
-  const invalidTargets = targets.length === 0
-    || targets.some((target) => !target.destinationInstanceId || !target.targetModelId)
-    || hasLoadingTargets
-    || hasUnresolvedFolderTargets;
-  const canPreflight = Boolean(sourceId && selectedDocumentIds.length > 0 && !invalidTargets && !preflightLoading && !jobBusy);
-  const canRun = Boolean(plan && canPreflight && !jobBusy);
+  const canContinueSource = canContinueFromSourceStep(selectedDocumentIds, fixPanelOpen);
+  const preflightBlockReason = getFanoutPreflightBlockReason({
+    sourceId,
+    selectedDocumentIds,
+    targets: migrationTargets,
+    hasLoadingTargets,
+    hasUnresolvedFolderTargets,
+    preflightLoading,
+    jobBusy,
+  });
+  const canPreflight = !preflightBlockReason;
+  const blockedPreflightRows = preflightRows.filter((row) => row.status === 'blocked');
+  const canRun = Boolean(plan && preflightRows.length > 0 && blockedPreflightRows.length === 0 && !preflightBlockReason && !jobBusy);
   const overSoftCap = targets.length > 10;
   const durationSeconds = estimateDurationSeconds(plan);
-  const targetSummaries = summarizePlanByTarget(plan);
   const destinationProgress = summarizeJobByDestination(job);
   const exportItems = job?.items.filter((item) => item.kind === 'export') || [];
   const exportDocumentIds = [...new Set(exportItems.map((item) => item.documentId).filter((item): item is string => Boolean(item)))];
   const exportDone = exportDocumentIds.filter((documentId) => (
     exportItems.some((item) => item.documentId === documentId && completedItem(item))
   )).length;
+  const plannedDeleteCount = plan?.steps.filter((step) => step.kind === 'delete').length || 0;
 
   const filteredDocuments = useMemo(() => {
     const normalized = search.toLowerCase();
     return documents.filter((document) => {
-      if (sourceModelId && document.baseModelId && document.baseModelId !== sourceModelId) return false;
+      if (sourceModelId) {
+        const allowedKeys = sourceModelKeysById.get(sourceModelId) || new Set([sourceModelId]);
+        const documentKeys = [cleanModelMetadata(document.baseModelId), cleanModelMetadata(document.baseModelName)]
+          .filter((value): value is string => Boolean(value));
+        if (documentKeys.length === 0 || !documentKeys.some((value) => allowedKeys.has(value))) return false;
+      }
       if (metadataOnly && !metadataMissing(document)) return false;
       if (!normalized) return true;
       return [
         document.name,
         document.identifier,
         document.folderPath,
-        document.baseModelId,
+        cleanModelMetadata(document.baseModelName),
+        cleanModelMetadata(document.baseModelId),
         ...(document.labels || []),
       ].some((value) => value?.toLowerCase().includes(normalized));
     });
-  }, [documents, metadataOnly, search, sourceModelId]);
+  }, [documents, metadataOnly, search, sourceModelId, sourceModelKeysById]);
 
   const selectedPostMigrationActions = useMemo(() => {
     const actions: PostMigrationAction[] = [];
@@ -276,6 +344,33 @@ export function FanOutWizard() {
     void loadCatalog(sourceId);
   }, [loadCatalog, sourceId, vaultStatus?.unlocked]);
 
+  const missingDestinationCatalogKey = useMemo(() => {
+    if (!vaultStatus?.unlocked || targets.length === 0) return '';
+    return [...new Set(
+      targets
+        .map((target) => target.destinationInstanceId)
+        .filter((instanceId) => instanceId && !catalogs[instanceId]),
+    )].join('|');
+  }, [catalogs, targets, vaultStatus?.unlocked]);
+
+  useEffect(() => {
+    const missingIds = missingDestinationCatalogKey.split('|').filter(Boolean);
+    if (missingIds.length === 0) return undefined;
+    let canceled = false;
+    void (async () => {
+      for (const instanceId of missingIds) {
+        const catalog = await loadCatalog(instanceId);
+        if (canceled) return;
+        setTargets((prev) => prev.map((target) => (
+          target.destinationInstanceId === instanceId ? hydrateTargetFromCatalog(target, catalog) : target
+        )));
+      }
+    })();
+    return () => {
+      canceled = true;
+    };
+  }, [hydrateTargetFromCatalog, loadCatalog, missingDestinationCatalogKey]);
+
   useEffect(() => {
     const activeJobId = job?.id;
     const activeJobStatus = job?.status;
@@ -327,6 +422,11 @@ export function FanOutWizard() {
     };
   }, [fireConfetti, job?.id, job?.status, logOperation]);
 
+  function resetPreflight() {
+    setPlan(null);
+    setPreflightRows([]);
+  }
+
   async function unlockVault() {
     setUnlocking(true);
     setError('');
@@ -354,7 +454,7 @@ export function FanOutWizard() {
     setDocuments([]);
     setSelectedDocumentIds([]);
     setTargets([]);
-    setPlan(null);
+    resetPreflight();
     setJob(null);
     setMessage(nextSourceId ? 'Source selected. Load dashboards after choosing the source model or use all models.' : '');
     if (nextSourceId) void loadCatalog(nextSourceId);
@@ -371,27 +471,38 @@ export function FanOutWizard() {
     }
     setDocuments([]);
     setSelectedDocumentIds([]);
-    setPlan(null);
+    resetPreflight();
     setJob(null);
   }
 
-  async function loadDocuments(nextSourceId = sourceId) {
+  async function loadDocuments(nextSourceId = sourceId, options: { preserveSelection?: boolean } = {}) {
     if (!nextSourceId) return;
     setLoadingDocuments(true);
     setError('');
     setMessage('');
-    setPlan(null);
+    resetPreflight();
     try {
       const res = await listInstanceDocuments(nextSourceId, {
         folderId: sourceFolderId || undefined,
         folderPath: sourceFolderPath || undefined,
+        includeModelDetails: true,
       });
-      setDocuments(res.documents);
-      setSelectedDocumentIds([]);
-      setMessage(`Loaded ${res.documents.length} dashboard document${res.documents.length === 1 ? '' : 's'} from the source folder.`);
+      const nextDocuments = applySelectedSourceModelFallback(res.documents, {
+        sourceModelId,
+        sourceModels,
+        sourceFolderId,
+        sourceFolderPath,
+      });
+      setDocuments(nextDocuments);
+      if (options.preserveSelection) {
+        setSelectedDocumentIds((prev) => preserveSelectedDocumentIds(prev, nextDocuments));
+      } else {
+        setSelectedDocumentIds([]);
+      }
+      setMessage(`Loaded ${nextDocuments.length} dashboard document${nextDocuments.length === 1 ? '' : 's'} from the source folder.`);
     } catch (err) {
       setDocuments([]);
-      setSelectedDocumentIds([]);
+      if (!options.preserveSelection) setSelectedDocumentIds([]);
       setError(errorText(err, 'Could not load source dashboards.'));
     } finally {
       setLoadingDocuments(false);
@@ -400,21 +511,21 @@ export function FanOutWizard() {
 
   function toggleDocument(identifier: string) {
     setSelectedDocumentIds((prev) => prev.includes(identifier) ? prev.filter((item) => item !== identifier) : [...prev, identifier]);
-    setPlan(null);
+    resetPreflight();
   }
 
   function selectAllVisibleDocuments() {
     setSelectedDocumentIds([...new Set([...selectedDocumentIds, ...filteredDocuments.map((document) => document.identifier)])]);
-    setPlan(null);
+    resetPreflight();
   }
 
   function clearDocumentSelection() {
     setSelectedDocumentIds([]);
-    setPlan(null);
+    resetPreflight();
   }
 
   async function toggleDestination(instance: SavedInstancePublic) {
-    setPlan(null);
+    resetPreflight();
     setJob(null);
     const existing = targets.find((target) => target.destinationInstanceId === instance.id);
     if (existing) {
@@ -457,7 +568,28 @@ export function FanOutWizard() {
       }
       return next;
     }));
-    setPlan(null);
+    resetPreflight();
+  }
+
+  async function hydrateDestinationCatalogs(instanceIds: string[], options?: { force?: boolean }) {
+    const uniqueIds = [...new Set(instanceIds.filter(Boolean))];
+    if (uniqueIds.length === 0) return;
+    setCatalogRefreshing(true);
+    try {
+      for (let index = 0; index < uniqueIds.length; index += CATALOG_RECHECK_BATCH_SIZE) {
+        const chunk = uniqueIds.slice(index, index + CATALOG_RECHECK_BATCH_SIZE);
+        const loaded = await Promise.all(chunk.map(async (instanceId) => ({
+          instanceId,
+          catalog: await loadCatalog(instanceId, options),
+        })));
+        setTargets((prev) => prev.map((target) => {
+          const row = loaded.find((entry) => entry.instanceId === target.destinationInstanceId);
+          return row ? hydrateTargetFromCatalog(target, row.catalog) : target;
+        }));
+      }
+    } finally {
+      setCatalogRefreshing(false);
+    }
   }
 
   async function selectAllDestinations() {
@@ -473,15 +605,23 @@ export function FanOutWizard() {
         selectedActionIndexes: [],
     }));
     setTargets((prev) => [...prev, ...nextAdditions]);
-    setPlan(null);
-    const loaded = await Promise.all(additions.slice(0, 10).map(async (instance) => ({
-      instanceId: instance.id,
-      catalog: await loadCatalog(instance.id),
-    })));
-    setTargets((prev) => prev.map((target) => {
-      const row = loaded.find((entry) => entry.instanceId === target.destinationInstanceId);
-      return row ? hydrateTargetFromCatalog(target, row.catalog) : target;
-    }));
+    resetPreflight();
+    await hydrateDestinationCatalogs(additions.map((instance) => instance.id));
+  }
+
+  async function recheckAllTargets() {
+    resetPreflight();
+    await hydrateDestinationCatalogs(targets.map((target) => target.destinationInstanceId), { force: true });
+  }
+
+  function removeTarget(targetId: string, preservePreflight = false) {
+    setTargets((prev) => prev.filter((target) => target.id !== targetId));
+    if (!preservePreflight) {
+      resetPreflight();
+      return;
+    }
+    setPreflightRows((prev) => prev.filter((row) => row.target.id !== targetId));
+    setPlan((prev) => removeTargetFromMigrationPlan(prev, targetId));
   }
 
   function applyFolderToAll(folderPath: string) {
@@ -493,37 +633,101 @@ export function FanOutWizard() {
         targetFolderPath: folder?.path || folderPath,
       };
     }));
-    setPlan(null);
+    resetPreflight();
   }
 
   async function runPreflight() {
+    if (preflightBlockReason) {
+      setError('');
+      setMessage(preflightBlockReason);
+      return;
+    }
     setPreflightLoading(true);
     setError('');
-    setMessage('');
+    setMessage('Running compatibility preflight. This may take a moment while OmniKit checks the selected destination.');
     setPlan(null);
+    setPreflightRows([]);
+    const baseInput = {
+      sourceId,
+      documentIds: selectedDocumentIds,
+      emptyFirst,
+      replaceSameNamed,
+      sourceFolderId: sourceFolderId || undefined,
+      sourceFolderPath: sourceFolderPath || undefined,
+      postMigrationActions: selectedPostMigrationActions,
+    };
     try {
-      const res = await previewMigrationJob({
-        sourceId,
+      const res = await previewMigrationJobWithTimeout({
+        ...baseInput,
         targets: migrationTargets,
-        documentIds: selectedDocumentIds,
-        emptyFirst,
-        replaceSameNamed,
-        sourceFolderId: sourceFolderId || undefined,
-        sourceFolderPath: sourceFolderPath || undefined,
-        postMigrationActions: selectedPostMigrationActions,
       });
       setPlan(res.plan);
+      setPreflightRows(preflightRowsFromPlan(res.plan));
       setStep(2);
       setMessage('Compatibility preflight matrix is ready. Review warnings before running.');
-    } catch (err) {
-      setError(errorText(err, 'Could not run compatibility preflight.'));
+    } catch (previewError) {
+      const bulkPreviewError = errorText(previewError, 'Bulk compatibility preflight failed.');
+      const successfulPlans: MigrationPlan[] = [];
+      const rows: PreflightTargetRow[] = [];
+      if (migrationTargets.length === 1) {
+        rows.push({
+          target: migrationTargets[0],
+          status: 'blocked',
+          steps: [],
+          warnings: [],
+          warningCount: 0,
+          deleteCount: 0,
+          replaceCount: 0,
+          error: bulkPreviewError,
+        });
+      } else {
+        for (const target of migrationTargets) {
+          try {
+            const res = await previewMigrationJobWithTimeout({
+              ...baseInput,
+              targets: [target],
+            });
+            successfulPlans.push(res.plan);
+            rows.push(...preflightRowsFromPlan(res.plan));
+          } catch (targetError) {
+            rows.push({
+              target,
+              status: 'blocked',
+              steps: [],
+              warnings: [],
+              warningCount: 0,
+              deleteCount: 0,
+              replaceCount: 0,
+              error: errorText(targetError, 'Could not preflight this destination.'),
+            });
+          }
+        }
+      }
+      const mergedPlan = combineMigrationPlans(successfulPlans);
+      setPlan(mergedPlan);
+      setPreflightRows(rows);
+      setStep(2);
+      const blockedCount = rows.filter((row) => row.status === 'blocked').length;
+      if (blockedCount > 0) {
+        const fallbackContext = migrationTargets.length === 1
+          ? bulkPreviewError
+          : `Bulk check fell back to per-target validation: ${bulkPreviewError}`;
+        setMessage(`${blockedCount} target${blockedCount === 1 ? '' : 's'} blocked. Remove or fix blocked targets before starting the job. ${fallbackContext}`);
+      } else if (mergedPlan) {
+        setMessage('Compatibility preflight matrix is ready. Review warnings before running.');
+      } else {
+        setError(`Could not run compatibility preflight for any target. ${bulkPreviewError}`);
+      }
     } finally {
       setPreflightLoading(false);
     }
   }
 
-  async function startJob() {
-    if (emptyFirst && !window.confirm('Emptying target folders will delete existing dashboards in each selected target folder before import. Continue?')) return;
+  async function startJob(confirmedEmptyFirst = false) {
+    if (emptyFirst && !confirmedEmptyFirst) {
+      setConfirmAction('empty-first');
+      return;
+    }
     setJobBusy(true);
     setError('');
     setMessage('');
@@ -549,7 +753,7 @@ export function FanOutWizard() {
   }
 
   async function cancelJob() {
-    if (!job || !window.confirm('Cancel this migration job? In-flight Omni requests may finish, but no new steps will start.')) return;
+    if (!job) return;
     setJobBusy(true);
     setError('');
     try {
@@ -561,6 +765,11 @@ export function FanOutWizard() {
     } finally {
       setJobBusy(false);
     }
+  }
+
+  function requestCancelJob() {
+    if (!job) return;
+    setConfirmAction('cancel');
   }
 
   async function retryDestination(destinationId?: string) {
@@ -579,11 +788,11 @@ export function FanOutWizard() {
   }
 
   async function reloadDocumentsAfterFix() {
-    await loadDocuments(sourceId);
+    await loadDocuments(sourceId, { preserveSelection: true });
   }
 
   function startNewMigration() {
-    setPlan(null);
+    resetPreflight();
     setJob(null);
     setSelectedDocumentIds([]);
     setTargets([]);
@@ -715,7 +924,7 @@ export function FanOutWizard() {
                   onChange={(event) => {
                     setSourceModelId(event.target.value);
                     setSelectedDocumentIds([]);
-                    setPlan(null);
+                    resetPreflight();
                   }}
                   disabled={!sourceId || sourceCatalog?.loading}
                   className="input-field"
@@ -736,8 +945,8 @@ export function FanOutWizard() {
                   className="input-field"
                 >
                   <option value="">{sourceCatalog?.loading ? 'Loading folders...' : 'My Documents/default'}</option>
-                  {sourceFolders.map((folder) => (
-                    <option key={`${folder.id}:${folder.path || folder.identifier || folder.name}`} value={folder.path || folder.identifier || folder.id}>
+                  {sourceFolders.map((folder, index) => (
+                    <option key={`source-folder:${index}:${folder.id}:${folder.path || folder.identifier || folder.name}`} value={folder.path || folder.identifier || folder.id}>
                       {folder.path || folder.identifier || folder.name}
                     </option>
                   ))}
@@ -783,6 +992,7 @@ export function FanOutWizard() {
               {filteredDocuments.map((document) => {
                 const selected = selectedDocumentIds.includes(document.identifier);
                 const missing = metadataMissing(document);
+                const model = fanoutDocumentModelLabel(document, sourceModelNameById);
                 return (
                   <label key={document.identifier} className={`grid gap-3 border-b border-border-subtle px-3 py-3 text-sm last:border-b-0 hover:bg-surface-secondary md:grid-cols-[auto_1fr_0.7fr_0.45fr] ${selected ? 'bg-omni-50/50' : ''}`}>
                     <input type="checkbox" checked={selected} onChange={() => toggleDocument(document.identifier)} className="mt-1 accent-omni-600" />
@@ -791,8 +1001,8 @@ export function FanOutWizard() {
                       <span className="block font-mono text-xs text-content-secondary">{document.identifier}</span>
                       {document.folderPath && <span className="mt-1 block text-xs text-content-secondary">{document.folderPath}</span>}
                     </span>
-                    <span className="text-xs text-content-secondary">
-                      Model: {document.baseModelId ? (sourceModelNameById.get(document.baseModelId) || document.baseModelId) : 'Unknown'}
+                    <span className="text-xs text-content-secondary" title={model.detected ? undefined : 'No model metadata was available from the dashboard export.'}>
+                      Model: {model.label}
                       <br />
                       Updated: {formatDate(document.updatedAt)}
                     </span>
@@ -808,8 +1018,19 @@ export function FanOutWizard() {
                 <div className="p-6 text-sm text-content-secondary">{documents.length === 0 ? 'Load dashboards to begin.' : 'No dashboards match this filter.'}</div>
               )}
             </div>
-            <div className="mt-4 flex justify-end">
-              <button type="button" onClick={() => setStep(1)} disabled={selectedDocumentIds.length === 0} className="btn-primary">Continue to targets</button>
+            <div className="mt-4 flex flex-col items-end gap-2">
+              {fixPanelOpen && (
+                <p className="text-xs text-content-secondary">Apply or cancel metadata fixes before continuing.</p>
+              )}
+              <button
+                type="button"
+                onClick={() => setStep(1)}
+                disabled={!canContinueSource}
+                title={fixPanelOpen ? 'Apply or cancel metadata fixes before continuing.' : undefined}
+                className="btn-primary"
+              >
+                Continue to targets
+              </button>
             </div>
           </div>
         </section>
@@ -821,9 +1042,18 @@ export function FanOutWizard() {
             <h2 className="text-base font-semibold text-content-primary">2. Check destinations</h2>
             <p className="mt-1 text-sm text-content-secondary">Select destination instances once. Defaults fill in from each saved profile.</p>
             <div className="mt-4 flex flex-wrap gap-2">
-              <button type="button" onClick={() => void selectAllDestinations()} disabled={destinationInstances.length === 0} className="btn-secondary text-xs">Select all destinations</button>
-              <button type="button" onClick={() => { setTargets([]); setPlan(null); }} disabled={targets.length === 0} className="btn-secondary text-xs">Clear targets</button>
+              <button type="button" onClick={() => void selectAllDestinations()} disabled={destinationInstances.length === 0 || catalogRefreshing} className="btn-secondary text-xs">Select all destinations</button>
+              <button type="button" onClick={() => void recheckAllTargets()} disabled={targets.length === 0 || catalogRefreshing} className="btn-secondary inline-flex items-center gap-1 text-xs">
+                <RefreshCw size={13} className={catalogRefreshing ? 'animate-spin' : ''} />
+                Re-check all
+              </button>
+              <button type="button" onClick={() => { setTargets([]); resetPreflight(); }} disabled={targets.length === 0} className="btn-secondary text-xs">Clear targets</button>
             </div>
+            {catalogRefreshing && (
+              <div className="mt-3 rounded-card border border-border-subtle bg-surface-secondary px-3 py-2 text-xs text-content-secondary">
+                Refreshing destination model and folder catalogs in small batches.
+              </div>
+            )}
             {overSoftCap && (
               <div className="mt-4 rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
                 More than 10 targets selected. OmniKit will queue extras behind the 10 parallel destination lanes.
@@ -882,6 +1112,8 @@ export function FanOutWizard() {
                 const catalog = catalogs[target.destinationInstanceId];
                 const models = catalog?.models || [];
                 const folders = catalog?.folders || [];
+                const modelOptions = buildTargetModelOptions(models);
+                const folderOptions = buildTargetFolderOptions(folders);
                 return (
                   <div key={target.id} className="rounded-card border border-border-subtle p-4">
                     <div className="mb-3 flex items-start justify-between gap-3">
@@ -889,7 +1121,7 @@ export function FanOutWizard() {
                         <div className="text-sm font-semibold text-content-primary">Target {index + 1}: {destination?.label || target.destinationInstanceId}</div>
                         <div className="text-xs text-content-secondary">{catalog?.loading ? 'Loading model and folder catalog...' : target.targetModelName || 'Choose target model'}</div>
                       </div>
-                      <button type="button" onClick={() => setTargets((prev) => prev.filter((row) => row.id !== target.id))} className="btn-danger inline-flex items-center gap-1 text-xs">
+                      <button type="button" onClick={() => removeTarget(target.id)} className="btn-danger inline-flex items-center gap-1 text-xs">
                         <Trash2 size={13} />
                         Remove
                       </button>
@@ -897,41 +1129,29 @@ export function FanOutWizard() {
                     <div className="grid gap-3 lg:grid-cols-2">
                       <div>
                         <label className="mb-1 flex items-center gap-1 text-xs font-semibold text-content-primary"><Database size={12} /> Target model</label>
-                        <select
+                        <ComboBox
+                          options={modelOptions}
                           value={target.targetModelId}
-                          onFocus={() => void loadCatalog(target.destinationInstanceId)}
-                          onChange={(event) => updateTarget(target.id, { targetModelId: event.target.value })}
+                          onChange={(value) => updateTarget(target.id, { targetModelId: value })}
                           disabled={catalog?.loading}
-                          className="input-field"
-                        >
-                          <option value="">{catalog?.loading ? 'Loading models...' : 'Select model'}</option>
-                          {models.map((model) => (
-                            <option key={model.id} value={model.id}>{model.name || model.identifier || model.id}</option>
-                          ))}
-                          {target.targetModelId && !models.some((model) => model.id === target.targetModelId) && (
-                            <option value={target.targetModelId}>{target.targetModelName || target.targetModelId}</option>
-                          )}
-                        </select>
+                          placeholder={catalog?.loading ? 'Loading models...' : 'Select model'}
+                          emptyLabel={TARGET_MODEL_COMBOBOX_CONFIG.emptyLabel}
+                          allowFreeText={TARGET_MODEL_COMBOBOX_CONFIG.allowFreeText}
+                          ariaLabel={`Target model for ${destination?.label || `target ${index + 1}`}`}
+                        />
                       </div>
                       <div>
                         <label className="mb-1 flex items-center gap-1 text-xs font-semibold text-content-primary"><FolderInput size={12} /> Target folder</label>
-                        <select
+                        <ComboBox
+                          options={folderOptions}
                           value={target.targetFolderPath}
-                          onFocus={() => void loadCatalog(target.destinationInstanceId)}
-                          onChange={(event) => updateTarget(target.id, { targetFolderPath: event.target.value })}
                           disabled={catalog?.loading}
-                          className="input-field"
-                        >
-                          <option value="">My Documents/default</option>
-                          {folders.map((folder) => (
-                            <option key={`${folder.id}:${folder.path || folder.identifier || folder.name}`} value={folder.path || folder.identifier || folder.id}>
-                              {folder.path || folder.identifier || folder.name}
-                            </option>
-                          ))}
-                          {target.targetFolderPath && !folders.some((folder) => folder.path === target.targetFolderPath || folder.identifier === target.targetFolderPath) && (
-                            <option value={target.targetFolderPath}>{target.targetFolderPath}</option>
-                          )}
-                        </select>
+                          onChange={(value) => updateTarget(target.id, { targetFolderPath: value })}
+                          placeholder={catalog?.loading ? 'Loading folders...' : 'My Documents/default'}
+                          emptyLabel={TARGET_FOLDER_COMBOBOX_CONFIG.emptyLabel}
+                          allowFreeText={TARGET_FOLDER_COMBOBOX_CONFIG.allowFreeText}
+                          ariaLabel={`Target folder for ${destination?.label || `target ${index + 1}`}`}
+                        />
                       </div>
                     </div>
                     {target.targetFolderId && !target.targetFolderPath && (
@@ -972,7 +1192,7 @@ export function FanOutWizard() {
             </div>
             <div className="mt-5 grid gap-4 xl:grid-cols-3">
               <label className="flex items-start gap-2 rounded-card border border-border-subtle p-4">
-                <input type="checkbox" checked={emptyFirst} onChange={(event) => { setEmptyFirst(event.target.checked); setPlan(null); }} className="mt-1 accent-omni-600" />
+                <input type="checkbox" checked={emptyFirst} onChange={(event) => { setEmptyFirst(event.target.checked); resetPreflight(); }} className="mt-1 accent-omni-600" />
                 <span>
                   <span className="block text-sm font-semibold text-content-primary">Empty target folders before import</span>
                   <span className="mt-1 block text-xs text-content-secondary">Adds delete steps for dashboards currently in each selected target folder.</span>
@@ -982,7 +1202,7 @@ export function FanOutWizard() {
                 <input
                   type="checkbox"
                   checked={replaceSameNamed}
-                  onChange={(event) => { setReplaceSameNamed(event.target.checked); setPlan(null); }}
+                  onChange={(event) => { setReplaceSameNamed(event.target.checked); resetPreflight(); }}
                   className="mt-1 accent-omni-600"
                 />
                 <span>
@@ -994,7 +1214,7 @@ export function FanOutWizard() {
                 <input
                   type="checkbox"
                   checked={refreshSchemaAfterImport}
-                  onChange={(event) => { setRefreshSchemaAfterImport(event.target.checked); setPlan(null); }}
+                  onChange={(event) => { setRefreshSchemaAfterImport(event.target.checked); resetPreflight(); }}
                   className="mt-1 accent-omni-600"
                 />
                 <span>
@@ -1007,10 +1227,20 @@ export function FanOutWizard() {
             </div>
             <div className="mt-5 flex justify-between gap-3">
               <button type="button" onClick={() => setStep(0)} className="btn-secondary">Back</button>
-              <button type="button" onClick={runPreflight} disabled={!canPreflight} className="btn-primary inline-flex items-center gap-2">
-                {preflightLoading ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
-                Run preflight
-              </button>
+              <div className="flex flex-col items-end gap-2">
+                <button type="button" onClick={runPreflight} disabled={!canPreflight} className="btn-primary inline-flex items-center gap-2">
+                  {preflightLoading ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
+                  Run preflight
+                </button>
+                {preflightLoading && (
+                  <p aria-live="polite" className="max-w-sm text-right text-xs text-content-secondary">
+                    Running compatibility preflight. This should resolve to a matrix or an actionable error.
+                  </p>
+                )}
+                {preflightBlockReason && !preflightLoading && (
+                  <p className="max-w-sm text-right text-xs text-content-secondary">{preflightBlockReason}</p>
+                )}
+              </div>
             </div>
           </div>
         </section>
@@ -1021,14 +1251,19 @@ export function FanOutWizard() {
           <div className="card p-5">
             <h2 className="text-base font-semibold text-content-primary">3. Preflight matrix</h2>
             <p className="mt-1 text-sm text-content-secondary">Review each destination before any dashboard import starts.</p>
-            {!plan ? (
+            {blockedPreflightRows.length > 0 && (
+              <div className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800" role="alert">
+                {blockedPreflightRows.length} target{blockedPreflightRows.length === 1 ? '' : 's'} blocked. Remove blocked rows or return to Targets to fix model, folder, or connection settings before running.
+              </div>
+            )}
+            {preflightRows.length === 0 ? (
               <div className="mt-4 rounded-card border border-dashed border-border-subtle p-6 text-sm text-content-secondary">
                 Run preflight from the Targets step to build the compatibility matrix.
               </div>
             ) : (
               <div className="mt-4 space-y-3">
-                {targetSummaries.map((summary) => (
-                  <div key={summary.target.id} className="rounded-card border border-border-subtle p-4">
+                {preflightRows.map((summary) => (
+                  <div key={summary.target.id} className={`rounded-card border p-4 ${summary.status === 'blocked' ? 'border-red-200 bg-red-50/40' : 'border-border-subtle'}`}>
                     <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
                       <div>
                         <div className="text-sm font-semibold text-content-primary">{summary.target.destinationLabel || summary.target.destinationInstanceId}</div>
@@ -1036,15 +1271,24 @@ export function FanOutWizard() {
                           Model: {summary.target.targetModelName || summary.target.targetModelId} · Folder: {summary.target.targetFolderPath || 'Default'}
                         </div>
                       </div>
-                      <StatusChip status={summary.status} label={summary.status === 'ready' ? 'Preflight ready' : `${summary.warningCount} warnings`} />
+                      <StatusChip
+                        status={summary.status === 'blocked' ? 'failed' : summary.status}
+                        label={summary.status === 'blocked' ? 'Blocked' : summary.status === 'ready' ? 'Preflight ready' : `${summary.warningCount} warnings`}
+                      />
                     </div>
                     <div className="mt-3 grid gap-2 text-xs sm:grid-cols-5">
-                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{selectedDocumentIds.length}</span><br />Dashboards</div>
-                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.steps.length}</span><br />Steps</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.status === 'blocked' ? 'Blocked' : 'Passed'}</span><br />Reachable</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.target.targetModelId ? 'Set' : 'Missing'}</span><br />Model</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.target.targetFolderPath || summary.target.targetFolderId ? 'Resolved' : 'Default'}</span><br />Folder</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.status === 'blocked' ? 'Not checked' : summary.warningCount}</span><br />Field warnings</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.deleteCount}</span><br />Deletes</div>
-                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.replaceCount}</span><br />Replaced</div>
-                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{summary.warningCount}</span><br />Warnings</div>
                     </div>
+                    {summary.error && (
+                      <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
+                        <AlertTriangle size={13} className="mr-1 inline-block" />
+                        {summary.error}
+                      </div>
+                    )}
                     {summary.replaceCount > 0 && (
                       <div className="mt-2 text-xs text-content-secondary">
                         {summary.replaceCount} existing dashboard{summary.replaceCount === 1 ? '' : 's'} will be replaced by name in this target folder.
@@ -1057,6 +1301,16 @@ export function FanOutWizard() {
                         ))}
                       </div>
                     )}
+                    <div className="mt-3 flex flex-wrap gap-2">
+                      {summary.status === 'blocked' && (
+                        <button type="button" onClick={() => { setStep(1); setMessage('Fix the blocked target, then run preflight again.'); }} className="btn-secondary text-xs">
+                          Fix target
+                        </button>
+                      )}
+                      <button type="button" onClick={() => removeTarget(summary.target.id, true)} className="btn-secondary text-xs">
+                        Remove target
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -1079,10 +1333,13 @@ export function FanOutWizard() {
             <div className="card p-5">
               <div className="flex flex-col gap-3">
                 <button type="button" onClick={() => setStep(1)} className="btn-secondary">Back to targets</button>
-                <button type="button" onClick={startJob} disabled={!canRun} className="btn-primary inline-flex items-center justify-center gap-2">
+                <button type="button" onClick={() => void startJob()} disabled={!canRun} className="btn-primary inline-flex items-center justify-center gap-2">
                   {jobBusy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
                   Start fan-out job
                 </button>
+                {blockedPreflightRows.length > 0 && (
+                  <p className="text-xs text-red-700">Remove or fix blocked targets before starting the job.</p>
+                )}
               </div>
             </div>
           </div>
@@ -1099,7 +1356,7 @@ export function FanOutWizard() {
               </div>
               <div className="flex flex-wrap gap-2">
                 {job && !migrationJobDone(job) && (
-                  <button type="button" onClick={cancelJob} disabled={jobBusy} className="btn-secondary inline-flex items-center gap-2 text-red-700">
+                  <button type="button" onClick={requestCancelJob} disabled={jobBusy} className="btn-secondary inline-flex items-center gap-2 text-red-700">
                     <XCircle size={15} />
                     Cancel
                   </button>
@@ -1209,6 +1466,24 @@ export function FanOutWizard() {
         documents={selectedDocuments}
         onClose={() => setFixPanelOpen(false)}
         onApplied={reloadDocumentsAfterFix}
+      />
+      <ConfirmDialog
+        open={confirmAction !== null}
+        title={confirmAction === 'empty-first' ? 'Empty target folders before import?' : 'Cancel migration job?'}
+        message={confirmAction === 'empty-first'
+          ? 'OmniKit will delete existing dashboards from each selected target folder before importing the selected dashboards. This only affects the selected destination folders.'
+          : 'In-flight Omni requests may finish, but OmniKit will stop scheduling new migration steps for this job.'}
+        confirmLabel={confirmAction === 'empty-first' ? 'Empty folders and start' : 'Cancel job'}
+        cancelLabel="Go back"
+        variant={confirmAction === 'empty-first' ? 'danger' : 'primary'}
+        itemCount={confirmAction === 'empty-first' ? plannedDeleteCount : undefined}
+        onCancel={() => setConfirmAction(null)}
+        onConfirm={() => {
+          const action = confirmAction;
+          setConfirmAction(null);
+          if (action === 'empty-first') void startJob(true);
+          if (action === 'cancel') void cancelJob();
+        }}
       />
     </div>
   );

@@ -324,6 +324,7 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
                       onChange={(val) => handleTargetChange(key, val)}
                       placeholder="Select target model..."
                       allowFreeText={false}
+                      ariaLabel={`Target model for ${resolveSourceName(key) || key}`}
                     />
                     {!isUnresolved && bestHints.length > 0 && (
                       <div className="mt-2 space-y-1">

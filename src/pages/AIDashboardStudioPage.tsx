@@ -674,7 +674,7 @@ export function AIDashboardStudioPage() {
   const [excelConversationId, setExcelConversationId] = useState('');
 
   useEffect(() => {
-    const cached = dashboardCache.load(connection.baseUrl);
+    const cached = dashboardCache.load(connectionKey);
     if (cached?.data) {
       setDashboards(cached.data);
       setDashboardsSyncedAt(cached.savedAt);
@@ -688,7 +688,7 @@ export function AIDashboardStudioPage() {
     setInspecting(false);
     setReviewError('');
     setReviewProgress('');
-  }, [connection.baseUrl, connectionKey]);
+  }, [connectionKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -858,6 +858,10 @@ export function AIDashboardStudioPage() {
     };
     setLaneStatus(lane, 'Cancelled.');
     setLaneRunning(lane, false);
+    if (lane === 'review') {
+      setAiJob(null);
+      setReviewProgress('');
+    }
     setTimedOutAiRun((current) => current?.lane === lane ? null : current);
     if (timedOutAiRunRef.current?.lane === lane) timedOutAiRunRef.current = null;
     setActiveAiJobs((current) => {
@@ -953,7 +957,7 @@ export function AIDashboardStudioPage() {
       if (!isActiveConnectionRequest(requestKey)) return;
       setDashboards(next);
       setDashboardsSyncedAt(Date.now());
-      dashboardCache.save(connection.baseUrl, next);
+      dashboardCache.save(connectionKey, next);
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       setReviewError(err instanceof Error ? err.message : 'Failed to load dashboards');
@@ -1362,6 +1366,7 @@ export function AIDashboardStudioPage() {
   }
 
   const aiStatus = normalizeAiState(aiJob?.state || aiJob?.status);
+  const reviewAiStatus = (reviewing || aiMessage) ? aiStatus : '';
   const canRunAi = Boolean(dashboard?.modelId && !reviewing && !inspecting);
   const activeLaneError = studioLane === 'review' ? reviewError : studioLane === 'builder' ? builderError : excelError;
   const activeLaneTimeout = timedOutAiRun && (
@@ -1546,6 +1551,7 @@ export function AIDashboardStudioPage() {
               onPick={inspectDashboard}
               selectedDashboardId={selectedDashboard?.id}
               disabled={inspecting || reviewing}
+              showInlineResults
             />
           </div>
 
@@ -1688,8 +1694,8 @@ export function AIDashboardStudioPage() {
                 <div className="text-sm font-semibold text-content-primary">4. AI review output</div>
                 <div className="text-xs text-content-secondary mt-0.5">{reviewStatus || 'One AI call, then polling starts only after the previous request succeeds.'}</div>
               </div>
-              {aiStatus && (
-                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-chip bg-omni-50 text-omni-700">{aiStatus}</span>
+              {reviewAiStatus && (
+                <span className="text-[10px] font-semibold px-2 py-0.5 rounded-chip bg-omni-50 text-omni-700">{reviewAiStatus}</span>
               )}
             </div>
             <div className="p-4">

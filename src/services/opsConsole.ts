@@ -1,4 +1,5 @@
 import { ApiError } from '@/services/omniApi';
+import type { DashboardDownloadDetails } from '@/services/dashboardDownloads';
 import { emitVaultChanged, emitVaultLocked } from '@/services/vaultEvents';
 
 const defaultHeaders = {
@@ -101,6 +102,7 @@ export interface InstanceDocument {
   folderId?: string;
   folderPath?: string;
   baseModelId?: string;
+  baseModelName?: string;
   description?: string | null;
   labels?: string[];
   updatedAt?: string;
@@ -451,6 +453,36 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   return await res.json() as T;
 }
 
+async function apiFetchBlob(path: string, options?: RequestInit): Promise<{ blob: Blob; filename?: string; contentType?: string }> {
+  const res = await fetch(path, {
+    ...options,
+    headers: {
+      ...(options?.body ? defaultHeaders : {}),
+      ...(options?.headers || {}),
+    },
+  });
+  if (!res.ok) {
+    let message = `${path} failed (HTTP ${res.status})`;
+    let detail = '';
+    try {
+      const body = await res.json() as { error?: string; message?: string; detail?: string };
+      message = body.error || body.message || message;
+      detail = body.detail || '';
+    } catch {
+      detail = await res.text().catch(() => '');
+    }
+    if (res.status === 423) emitVaultLocked(message);
+    throw new ApiError(res.status, message, detail || undefined);
+  }
+  const disposition = res.headers.get('content-disposition') || '';
+  const filename = disposition.match(/filename="([^"]+)"/)?.[1];
+  return {
+    blob: await res.blob(),
+    filename,
+    contentType: res.headers.get('content-type') || undefined,
+  };
+}
+
 export function emptyMetricFilter(): InstanceMetricFilter {
   return {
     connectionDatabaseContains: [],
@@ -568,10 +600,11 @@ export async function connectSavedInstance(id: string) {
   );
 }
 
-export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string } = {}) {
+export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string; includeModelDetails?: boolean } = {}) {
   const params = new URLSearchParams();
   if (options.folderId) params.set('folderId', options.folderId);
   if (options.folderPath) params.set('folderPath', options.folderPath);
+  if (options.includeModelDetails) params.set('includeModelDetails', 'true');
   const query = params.toString();
   return apiFetch<{ documents: InstanceDocument[] }>(
     `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`,
@@ -707,6 +740,46 @@ export async function refreshInstanceSchemaModel(instanceId: string, modelId: st
       method: 'POST',
       body: JSON.stringify({ modelId }),
     },
+  );
+}
+
+export async function getDashboardDownloadDetails(instanceId: string, dashboardId: string) {
+  return apiFetch<{ details: DashboardDownloadDetails }>(
+    `/api/dashboard-downloads/${encodeURIComponent(instanceId)}/dashboards/${encodeURIComponent(dashboardId)}/details`,
+  );
+}
+
+export async function startDashboardDownloadJob(
+  instanceId: string,
+  dashboardId: string,
+  input: { request: Record<string, unknown>; format: string; scope: string },
+) {
+  return apiFetch<{ jobId: string; attached: boolean }>(
+    `/api/dashboard-downloads/${encodeURIComponent(instanceId)}/dashboards/${encodeURIComponent(dashboardId)}/jobs`,
+    {
+      method: 'POST',
+      body: JSON.stringify(input),
+    },
+  );
+}
+
+export async function getDashboardDownloadJobStatus(instanceId: string, dashboardId: string, jobId: string) {
+  return apiFetch<{ status: 'processing' | 'complete' | 'error'; rawStatus?: string; error?: string }>(
+    `/api/dashboard-downloads/${encodeURIComponent(instanceId)}/dashboards/${encodeURIComponent(dashboardId)}/jobs/${encodeURIComponent(jobId)}/status`,
+  );
+}
+
+export async function fetchDashboardDownloadFile(
+  instanceId: string,
+  dashboardId: string,
+  jobId: string,
+  filename: string,
+) {
+  const params = new URLSearchParams();
+  if (filename) params.set('filename', filename);
+  const query = params.toString();
+  return apiFetchBlob(
+    `/api/dashboard-downloads/${encodeURIComponent(instanceId)}/dashboards/${encodeURIComponent(dashboardId)}/jobs/${encodeURIComponent(jobId)}/file${query ? `?${query}` : ''}`,
   );
 }
 

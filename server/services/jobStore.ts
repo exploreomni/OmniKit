@@ -193,12 +193,13 @@ function recoverInterruptedJobs(database: Database.Database): void {
   database.prepare(`
     UPDATE job_items
     SET status = 'failed', error = COALESCE(error, 'Interrupted by server restart.'), ended_at = COALESCE(ended_at, ?)
-    WHERE status = 'running'
+    WHERE status IN ('running', 'pending')
+      AND job_id IN (SELECT id FROM jobs WHERE status IN ('running', 'pending'))
   `).run(now);
   database.prepare(`
     UPDATE jobs
     SET status = 'failed', ended_at = COALESCE(ended_at, ?)
-    WHERE status = 'running'
+    WHERE status IN ('running', 'pending')
   `).run(now);
 }
 

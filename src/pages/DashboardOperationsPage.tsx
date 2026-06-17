@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   AlertTriangle,
-  Bug,
   CheckCircle,
   ChevronDown,
   ChevronRight,
@@ -62,7 +61,7 @@ const ACTIONS: Record<
   move: {
     label: 'Move dashboards',
     shortLabel: 'Move',
-    description: 'Move dashboards to another folder while preserving IDs, permissions, favorites, and embed links.',
+    description: 'Move dashboards to another folder while preserving document IDs and permissions.',
     icon: FolderInput,
     tone: 'text-content-primary bg-white border-border-strong',
     resultVerb: 'moved',
@@ -94,12 +93,6 @@ const ACTIONS: Record<
   },
 };
 
-const STEP_LABELS: Record<string, string> = {
-  move: 'Move In Place',
-};
-
-const STEP_ORDER = ['move'];
-
 function getFolderPath(folder: OmniFolder): string {
   return folder.identifier || folder.path || folder.name;
 }
@@ -110,23 +103,6 @@ function findFolderName(folders: OmniFolder[], id: string | null): string {
     if (folder.id === id) return folder.name;
     const childMatch = findFolderName(folder.children || [], id);
     if (childMatch) return childMatch;
-  }
-  return '';
-}
-
-function getStepStatus(_key: string, data: Record<string, unknown>): 'ok' | 'failed' | 'skipped' | 'unknown' {
-  if (data.skipped) return 'skipped';
-  if (typeof data.ok === 'boolean') return data.ok ? 'ok' : 'failed';
-  return 'unknown';
-}
-
-function getStepDetail(key: string, data: Record<string, unknown>): string {
-  if (data.skipped && typeof data.reason === 'string') return data.reason;
-  if (key === 'move') {
-    const parts: string[] = [];
-    if (typeof data.folder_path === 'string') parts.push(data.folder_path);
-    if (typeof data.status === 'number') parts.push(`HTTP ${data.status}`);
-    return parts.join(' · ');
   }
   return '';
 }
@@ -152,31 +128,39 @@ function FolderNode({
 
   return (
     <div>
-      <button
-        type="button"
-        onClick={() => {
-          onSelect(folder);
-          if (hasChildren) onToggle(folder.id);
-        }}
-        aria-pressed={isSelected}
-          className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
+      <div
+        className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
           isSelected ? selectedTreeRowClass : unselectedTreeRowClass
         }`}
         style={{ paddingLeft: `${depth * 16 + 8}px` }}
       >
         {hasChildren ? (
-          isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
+          <button
+            type="button"
+            onClick={() => onToggle(folder.id)}
+            aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${folder.name}`}
+            className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-button text-content-secondary hover:bg-surface-primary hover:text-content-primary"
+          >
+            {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button>
         ) : (
-          <span className="w-3.5" />
+          <span className="w-5 flex-shrink-0" />
         )}
-        {isExpanded ? (
-          <FolderOpen size={15} className="text-content-secondary flex-shrink-0" />
-        ) : (
-          <Folder size={15} className="text-content-secondary flex-shrink-0" />
-        )}
-        <span className="truncate">{folder.name}</span>
+        <button
+          type="button"
+          onClick={() => onSelect(folder)}
+          aria-pressed={isSelected}
+          className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+        >
+          {isExpanded ? (
+            <FolderOpen size={15} className="text-content-secondary flex-shrink-0" />
+          ) : (
+            <Folder size={15} className="text-content-secondary flex-shrink-0" />
+          )}
+          <span className="truncate">{folder.name}</span>
+        </button>
         {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
-      </button>
+      </div>
       {isExpanded &&
         folder.children?.map((child) => (
           <FolderNode
@@ -220,31 +204,39 @@ function DestinationFolderPicker({
 
     return (
       <div>
-        <button
-          type="button"
-          onClick={() => {
-            onSelect(folder);
-            if (hasChildren) toggleExpanded(folder.id);
-          }}
-          aria-pressed={isSelected}
-            className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
+        <div
+          className={`w-full flex items-center gap-1.5 px-2 py-1.5 text-sm rounded-button transition-all ${
             isSelected ? selectedTreeRowClass : unselectedTreeRowClass
           }`}
           style={{ paddingLeft: `${depth * 16 + 8}px` }}
         >
           {hasChildren ? (
-            isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />
+            <button
+              type="button"
+              onClick={() => toggleExpanded(folder.id)}
+              aria-label={`${isExpanded ? 'Collapse' : 'Expand'} ${folder.name}`}
+              className="flex h-5 w-5 flex-shrink-0 items-center justify-center rounded-button text-content-secondary hover:bg-surface-primary hover:text-content-primary"
+            >
+              {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+            </button>
           ) : (
-            <span className="w-3.5" />
+            <span className="w-5 flex-shrink-0" />
           )}
-          {isExpanded ? (
-            <FolderOpen size={15} className="text-content-secondary flex-shrink-0" />
-          ) : (
-            <Folder size={15} className="text-content-secondary flex-shrink-0" />
-          )}
-          <span className="truncate">{folder.name}</span>
+          <button
+            type="button"
+            onClick={() => onSelect(folder)}
+            aria-pressed={isSelected}
+            className="flex min-w-0 flex-1 items-center gap-1.5 text-left"
+          >
+            {isExpanded ? (
+              <FolderOpen size={15} className="text-content-secondary flex-shrink-0" />
+            ) : (
+              <Folder size={15} className="text-content-secondary flex-shrink-0" />
+            )}
+            <span className="truncate">{folder.name}</span>
+          </button>
           {isSelected && <CheckCircle size={13} className="ml-auto shrink-0 text-omni-700" />}
-        </button>
+        </div>
         {isExpanded && folder.children?.map((child) => <PickerNode key={child.id} folder={child} depth={depth + 1} />)}
       </div>
     );
@@ -255,88 +247,6 @@ function DestinationFolderPicker({
       {folders.map((folder) => (
         <PickerNode key={folder.id} folder={folder} />
       ))}
-    </div>
-  );
-}
-
-function PipelineSteps({ steps }: { steps: Record<string, unknown> }) {
-  const presentKeys = STEP_ORDER.filter((key) => key in steps);
-  if (presentKeys.length === 0) return null;
-
-  return (
-    <div className="px-4 py-2.5 bg-gray-50 border-b border-border/50">
-      <div className="text-[10px] font-semibold uppercase tracking-wider text-content-secondary mb-2">
-        Pipeline Steps
-      </div>
-      <div className="flex flex-col gap-1">
-        {presentKeys.map((key) => {
-          const data = steps[key] as Record<string, unknown>;
-          const status = getStepStatus(key, data);
-          const detail = getStepDetail(key, data);
-          return (
-            <div key={key} className="flex items-center gap-2">
-              <span
-                className={`inline-flex items-center justify-center w-[72px] flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded-full ${
-                  status === 'ok'
-                    ? 'bg-green-100 text-green-700'
-                    : status === 'failed'
-                    ? 'bg-red-100 text-red-700'
-                    : status === 'skipped'
-                    ? 'bg-gray-200 text-gray-500'
-                    : 'bg-gray-100 text-gray-400'
-                }`}
-              >
-                {status === 'ok' ? 'OK' : status === 'failed' ? 'FAILED' : status === 'skipped' ? 'SKIPPED' : '-'}
-              </span>
-              <span className="text-[11px] font-medium text-content-primary w-28 flex-shrink-0">
-                {STEP_LABELS[key] ?? key}
-              </span>
-              {detail && <span className="text-[11px] text-content-secondary font-mono truncate">{detail}</span>}
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-function DebugRow({ result }: { result: BulkOperationResult }) {
-  return (
-    <div className="px-4 py-3 bg-gray-50 border-b border-border/50 space-y-2">
-      <div className="grid md:grid-cols-2 gap-3">
-        <div>
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-content-secondary mb-1">
-            Request Payload
-          </div>
-          <pre className="text-[11px] font-mono text-content-primary bg-white border border-border rounded-md p-2 overflow-x-auto max-h-40 whitespace-pre-wrap">
-            {result.requestPayload ? JSON.stringify(result.requestPayload, null, 2) : 'N/A'}
-          </pre>
-        </div>
-        <div>
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-content-secondary mb-1">
-            Response {result.responseStatus ? `(${result.responseStatus})` : ''}
-          </div>
-          <pre className="text-[11px] font-mono text-content-primary bg-white border border-border rounded-md p-2 overflow-x-auto max-h-40 whitespace-pre-wrap">
-            {result.responseBody != null ? JSON.stringify(result.responseBody, null, 2) : 'N/A'}
-          </pre>
-        </div>
-      </div>
-      {result.verificationBody != null && (
-        <div>
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-content-secondary mb-1">
-            Verification
-          </div>
-          <pre className="text-[11px] font-mono text-content-primary bg-white border border-border rounded-md p-2 overflow-x-auto max-h-40 whitespace-pre-wrap">
-            {JSON.stringify(result.verificationBody, null, 2)}
-          </pre>
-        </div>
-      )}
-      {result.error && (
-        <div>
-          <div className="text-[10px] font-semibold uppercase tracking-wider text-red-600 mb-1">Error</div>
-          <p className="text-xs text-red-700 font-mono">{result.error}</p>
-        </div>
-      )}
     </div>
   );
 }
@@ -365,14 +275,6 @@ export function DashboardOperationsPage() {
   const [summary, setSummary] = useState<BulkOperationSummary | null>(null);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [showFolderPicker, setShowFolderPicker] = useState(false);
-  const [debugMode, setDebugMode] = useState(() => {
-    try {
-      return localStorage.getItem('omni_debug_mode') === '1';
-    } catch {
-      return false;
-    }
-  });
-  const [expandedDebugIds, setExpandedDebugIds] = useState<Set<string>>(new Set());
 
   const actionConfig = ACTIONS[action];
   const needsDestination = action === 'move' || action === 'copy';
@@ -405,6 +307,15 @@ export function DashboardOperationsPage() {
     fetchFolders();
   }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
 
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.length === 0) return prev;
+      const availableIds = new Set(documents.map((doc) => doc.id));
+      const next = prev.filter((doc) => availableIds.has(doc.id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [documents]);
+
   async function loadDocumentsForFolder(folderId: string) {
     const requestKey = connectionKey;
     setLoadingDocs(true);
@@ -427,6 +338,11 @@ export function DashboardOperationsPage() {
   }
 
   async function handleFolderSelect(folder: OmniFolder) {
+    setSelected([]);
+    setResults([]);
+    setSummary(null);
+    setCurrentIndex(0);
+    setShowConfirm(false);
     setSelectedFolderId(folder.id);
     await loadDocumentsForFolder(folder.id);
   }
@@ -440,34 +356,12 @@ export function DashboardOperationsPage() {
     });
   }
 
-  function toggleDebugMode() {
-    setDebugMode((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem('omni_debug_mode', next ? '1' : '0');
-      } catch {
-        // ignore localStorage failures
-      }
-      return next;
-    });
-  }
-
-  function toggleDebugRow(id: string) {
-    setExpandedDebugIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
-  }
-
   function chooseAction(nextAction: DashboardAction) {
     setAction(nextAction);
     setResults([]);
     setSummary(null);
     setCurrentIndex(0);
     setShowConfirm(false);
-    setExpandedDebugIds(new Set());
   }
 
   const filteredDocs = useMemo(() => {
@@ -511,7 +405,6 @@ export function DashboardOperationsPage() {
     setTargetFolderPath('');
     setTargetFolderDisplay('');
     setShowFolderPicker(false);
-    setExpandedDebugIds(new Set());
   }
 
   function applyProgressEvent(event: Record<string, unknown>) {
@@ -569,7 +462,6 @@ export function DashboardOperationsPage() {
     setResults([]);
     setSummary(null);
     setCurrentIndex(0);
-    setExpandedDebugIds(new Set());
 
     try {
       if (action === 'copy') {
@@ -648,6 +540,12 @@ export function DashboardOperationsPage() {
     action === 'delete'
       ? `You are about to permanently delete ${selected.length} dashboard${selected.length !== 1 ? 's' : ''}. This action cannot be undone.`
       : `You are about to ${action} ${selected.length} dashboard${selected.length !== 1 ? 's' : ''} to "${targetFolderDisplay || targetFolderPath}".`;
+  const disabledActionLabel = selected.length === 0
+    ? `Select dashboards to ${action}`
+    : needsDestination && !targetFolderPath.trim()
+      ? 'Choose a destination folder'
+      : `${actionConfig.shortLabel} ${selected.length} Dashboard${selected.length !== 1 ? 's' : ''}`;
+  const actionButtonLabel = running ? `${actionConfig.shortLabel} in progress` : disabledActionLabel;
 
   if (showResults) {
     return (
@@ -656,22 +554,6 @@ export function DashboardOperationsPage() {
           title="Dashboard Operation Results"
           description={`${ACTIONS[action].shortLabel} completed for ${summary?.total ?? selected.length} selected dashboard${(summary?.total ?? selected.length) === 1 ? '' : 's'}.`}
           icon={<Blobby mood="dashboard" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
-          actions={
-            debugMode && action === 'move' && (
-              <button
-                type="button"
-                onClick={toggleDebugMode}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-button border transition-colors ${
-                  debugMode
-                    ? 'bg-amber-50 border-amber-300 text-amber-700'
-                    : 'bg-surface-secondary border-border text-content-secondary hover:text-content-primary'
-                }`}
-              >
-                <Bug size={13} />
-                {debugMode ? 'Debug ON' : 'Debug'}
-              </button>
-            )
-          }
         />
 
         {summary && (
@@ -701,8 +583,7 @@ export function DashboardOperationsPage() {
 
         <div className="card p-0 overflow-hidden">
           <div className="bg-surface-secondary px-4 py-2.5 border-b border-border grid grid-cols-12 gap-2">
-            {debugMode && action === 'move' && <div className="col-span-1" />}
-            <div className={`${debugMode && action === 'move' ? 'col-span-5' : 'col-span-6'} text-xs font-medium text-content-secondary uppercase tracking-wider`}>
+            <div className="col-span-6 text-xs font-medium text-content-secondary uppercase tracking-wider">
               Dashboard
             </div>
             <div className="col-span-3 text-xs font-medium text-content-secondary uppercase tracking-wider">Status</div>
@@ -712,18 +593,7 @@ export function DashboardOperationsPage() {
             {results.map((result, index) => (
               <div key={result.id || `result-${index}`}>
                 <div className="px-4 py-2.5 border-b border-border/50 grid grid-cols-12 gap-2 items-center">
-                  {debugMode && action === 'move' && (
-                    <div className="col-span-1">
-                      <button
-                        type="button"
-                        onClick={() => toggleDebugRow(result.id)}
-                        className="text-content-secondary hover:text-content-primary transition-colors"
-                      >
-                        {expandedDebugIds.has(result.id) ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
-                      </button>
-                    </div>
-                  )}
-                  <div className={`${debugMode && action === 'move' ? 'col-span-5' : 'col-span-6'} text-sm text-content-primary truncate`}>
+                  <div className="col-span-6 text-sm text-content-primary truncate">
                     {result.name}
                   </div>
                   <div className="col-span-3">
@@ -737,8 +607,6 @@ export function DashboardOperationsPage() {
                     ) : null}
                   </div>
                 </div>
-                {action === 'move' && result.steps && <PipelineSteps steps={result.steps} />}
-                {debugMode && action === 'move' && expandedDebugIds.has(result.id) && <DebugRow result={result} />}
               </div>
             ))}
           </div>
@@ -757,27 +625,16 @@ export function DashboardOperationsPage() {
         title="Dashboard Operations"
         description="Select dashboards once, then choose whether to move, copy, or delete them with a clear review step before anything changes."
         icon={<Blobby mood="dashboard" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
-        actions={
-          <button
-            type="button"
-            onClick={() => setShowConfirm(true)}
-            disabled={!canRun || running}
-            className={`${action === 'delete' ? 'btn-danger' : 'btn-primary'} disabled:opacity-40 disabled:cursor-not-allowed`}
-          >
-            {action === 'delete' ? <Trash2 size={14} /> : action === 'copy' ? <Copy size={14} /> : <FolderInput size={14} />}
-            {canRun
-              ? `${actionConfig.shortLabel} ${selected.length} Dashboard${selected.length !== 1 ? 's' : ''}`
-              : actionConfig.shortLabel}
-          </button>
-        }
       />
 
       {error && (
-        <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
+        <div role="alert" className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">{error}</div>
       )}
 
       {running && (
-        <BulkOperationAnimation current={currentIndex} total={selected.length} type={action} />
+        <div aria-live="polite" aria-label={`${actionConfig.shortLabel} operation progress`}>
+          <BulkOperationAnimation current={currentIndex} total={selected.length} type={action} />
+        </div>
       )}
 
       <div className="grid gap-3 lg:grid-cols-3">
@@ -845,13 +702,16 @@ export function DashboardOperationsPage() {
         </div>
 
         <div className="panel-right p-0 overflow-hidden">
-          <div
-            className="px-4 py-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between"
-              style={{ borderBottom: '1px solid rgba(217,222,232,0.95)', background: '#F8F9FD' }}
-          >
+          <div className="border-b border-border bg-surface-secondary px-4 py-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center gap-2">
               {filteredDocs.length > 0 && (
-                <input type="checkbox" checked={allInViewSelected} onChange={toggleSelectAll} className="flex-shrink-0" />
+                <input
+                  type="checkbox"
+                  checked={allInViewSelected}
+                  onChange={toggleSelectAll}
+                  aria-label={`${allInViewSelected ? 'Deselect' : 'Select'} visible dashboards`}
+                  className="flex-shrink-0"
+                />
               )}
               <span className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest">
                 Dashboards
@@ -910,15 +770,17 @@ export function DashboardOperationsPage() {
                       Selected
                     </span>
                   )}
-                  <div className="ml-3 flex-shrink-0">
-                    {!doc.baseModelId && enriching ? (
-                      <Loader2 size={14} className="text-content-secondary animate-spin" />
-                    ) : (
-                      <span className="font-mono text-xs text-content-secondary" title={doc.baseModelId || ''}>
-                        {doc.baseModelId ? (doc.baseModelId.length > 16 ? `${doc.baseModelId.slice(0, 16)}...` : doc.baseModelId) : '-'}
-                      </span>
-                    )}
-                  </div>
+                  {action === 'copy' && (
+                    <div className="ml-3 max-w-[180px] flex-shrink-0">
+                      {!doc.baseModelId && enriching ? (
+                        <Loader2 size={14} className="text-content-secondary animate-spin" />
+                      ) : (
+                        <span className="block truncate text-xs text-content-secondary" title={doc.baseModelName || doc.baseModelId || 'Model unknown'}>
+                          {doc.baseModelName || doc.baseModelId || 'Model unknown'}
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </label>
               ))
             )}
@@ -926,130 +788,146 @@ export function DashboardOperationsPage() {
         </div>
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <div className="card space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <h3 className="text-sm font-semibold text-content-primary">Operation Settings</h3>
-              <p className="text-xs text-content-secondary mt-0.5">{actionConfig.description}</p>
-            </div>
-            <span className={`inline-flex items-center gap-1.5 text-xs font-semibold border rounded-full px-2.5 py-1 ${actionConfig.tone}`}>
-              <ActionIcon size={13} />
-              {actionConfig.shortLabel}
-            </span>
-          </div>
-
-          {needsDestination ? (
-            <div className="space-y-3">
-              <div className="flex items-center justify-between">
-                <div>
-                  <h4 className="text-xs font-semibold text-content-primary">Destination Folder</h4>
-                  <p className="text-xs text-content-secondary mt-0.5">
-                    Choose where to {action} the selected dashboard{selected.length === 1 ? '' : 's'}.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setShowFolderPicker(!showFolderPicker)}
-                  className="text-xs text-content-secondary hover:text-content-primary font-medium transition-colors"
-                >
-                  {showFolderPicker ? 'Type folder path' : 'Browse folders'}
-                </button>
+      <div className="sticky bottom-3 z-20 max-h-[44vh] overflow-y-auto overscroll-contain rounded-card border border-border bg-white/95 p-3 shadow-dropdown backdrop-blur">
+        <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_340px]">
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-content-primary">Operation settings</h3>
+                <p className="mt-0.5 line-clamp-1 text-xs text-content-secondary">{actionConfig.description}</p>
               </div>
+              <span className={`inline-flex items-center gap-1.5 text-xs font-semibold border rounded-full px-2.5 py-1 ${actionConfig.tone}`}>
+                <ActionIcon size={13} />
+                {actionConfig.shortLabel}
+              </span>
+            </div>
 
-              {showFolderPicker ? (
-                <div className="border border-border rounded-card p-3 max-h-[220px] overflow-y-auto bg-surface-secondary">
-                  {folders.length === 0 ? (
-                    <p className="text-xs text-content-secondary py-2">No folders available.</p>
-                  ) : (
-                    <DestinationFolderPicker
-                      folders={folders}
-                      selectedId={targetFolderId}
-                      onSelect={(folder) => {
-                        setTargetFolderId(folder.id);
-                        setTargetFolderPath(getFolderPath(folder));
-                        setTargetFolderDisplay(folder.name);
-                      }}
-                    />
-                  )}
+            {needsDestination ? (
+              <div className="space-y-2.5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <h4 className="text-xs font-semibold text-content-primary">Destination Folder</h4>
+                    <p className="mt-0.5 line-clamp-1 text-xs text-content-secondary">
+                      Choose where to {action} the selected dashboard{selected.length === 1 ? '' : 's'}.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowFolderPicker(!showFolderPicker)}
+                    className="text-xs text-content-secondary hover:text-content-primary font-medium transition-colors"
+                  >
+                    {showFolderPicker ? 'Type folder path' : 'Browse folders'}
+                  </button>
                 </div>
-              ) : (
-                <input
-                  type="text"
-                  value={targetFolderPath}
-                  onChange={(event) => {
-                    setTargetFolderPath(event.target.value);
-                    setTargetFolderId('');
-                    setTargetFolderDisplay(event.target.value);
-                  }}
-                  placeholder="Paste a folder path (e.g. team-dashboards)"
-                  className="input w-full"
-                />
-              )}
 
-              {action === 'copy' && (
-                <div>
-                  <label className="text-xs font-medium text-content-secondary">Rename suffix</label>
+                {showFolderPicker ? (
+                  <div className="max-h-40 overflow-y-auto rounded-card border border-border bg-surface-secondary p-2.5">
+                    {folders.length === 0 ? (
+                      <p className="text-xs text-content-secondary py-2">No folders available.</p>
+                    ) : (
+                      <DestinationFolderPicker
+                        folders={folders}
+                        selectedId={targetFolderId}
+                        onSelect={(folder) => {
+                          setTargetFolderId(folder.id);
+                          setTargetFolderPath(getFolderPath(folder));
+                          setTargetFolderDisplay(folder.name);
+                        }}
+                      />
+                    )}
+                  </div>
+                ) : (
                   <input
                     type="text"
-                    value={renameSuffix}
-                    onChange={(event) => setRenameSuffix(event.target.value)}
-                    placeholder=" (Copy)"
-                    className="input w-full mt-1"
+                    value={targetFolderPath}
+                    onChange={(event) => {
+                      setTargetFolderPath(event.target.value);
+                      setTargetFolderId('');
+                      setTargetFolderDisplay(event.target.value);
+                    }}
+                    placeholder="Paste a folder path (e.g. team-dashboards)"
+                    className="input w-full"
                   />
-                  <p className="text-[11px] text-content-tertiary mt-1">
-                    Leave blank to keep original dashboard names.
-                  </p>
-                </div>
-              )}
+                )}
 
-              {targetFolderPath && (
-                <div className="flex items-center gap-2 text-xs text-content-secondary">
-                  {action === 'copy' ? <Copy size={13} className="text-content-secondary" /> : <FolderInput size={13} className="text-content-secondary" />}
-                  {action === 'copy' ? 'Copying to:' : 'Moving to:'}{' '}
-                  <span className="font-mono font-medium text-content-primary">{targetFolderDisplay || targetFolderPath}</span>
-                  {targetFolderDisplay && targetFolderDisplay !== targetFolderPath && (
-                    <span className="font-mono text-[10px] text-content-secondary/60">({targetFolderPath})</span>
-                  )}
-                </div>
-              )}
-            </div>
-          ) : (
-            <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-card">
-              <AlertTriangle size={14} className="text-red-600 mt-0.5 flex-shrink-0" />
-              <p className="text-xs text-red-800 leading-relaxed">{actionConfig.safetyCopy}</p>
-            </div>
-          )}
-        </div>
+                {action === 'copy' && (
+                  <div>
+                    <label className="text-xs font-medium text-content-secondary">Rename suffix</label>
+                    <input
+                      type="text"
+                      value={renameSuffix}
+                      onChange={(event) => setRenameSuffix(event.target.value)}
+                      placeholder=" (Copy)"
+                      className="input w-full mt-1"
+                    />
+                    <p className="text-[11px] text-content-tertiary mt-1">
+                      Leave blank to keep original dashboard names.
+                    </p>
+                  </div>
+                )}
 
-        <div className="card space-y-3">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-semibold text-content-primary">Review</h3>
-            <button type="button" onClick={handleReset} className="text-xs text-content-secondary hover:text-content-primary inline-flex items-center gap-1">
-              <RefreshCcw size={12} />
-              Reset
-            </button>
-          </div>
-          <div className="space-y-2 text-xs">
-            <div className="flex items-center justify-between">
-              <span className="text-content-secondary">Action</span>
-              <span className="font-semibold text-content-primary">{actionConfig.shortLabel}</span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-content-secondary">Selected</span>
-              <span className="font-semibold text-content-primary">{selected.length}</span>
-            </div>
-            {needsDestination && (
-              <div className="flex items-center justify-between gap-4">
-                <span className="text-content-secondary">Destination</span>
-                <span className="font-mono font-semibold text-content-primary truncate">
-                  {targetFolderDisplay || targetFolderPath || 'Not selected'}
-                </span>
+                {targetFolderPath && (
+                  <div className="flex min-w-0 items-center gap-2 text-xs text-content-secondary">
+                    {action === 'copy' ? <Copy size={13} className="text-content-secondary" /> : <FolderInput size={13} className="text-content-secondary" />}
+                    {action === 'copy' ? 'Copying to:' : 'Moving to:'}{' '}
+                    <span className="truncate font-mono font-medium text-content-primary">{targetFolderDisplay || targetFolderPath}</span>
+                    {targetFolderDisplay && targetFolderDisplay !== targetFolderPath && (
+                      <span className="hidden shrink-0 font-mono text-[10px] text-content-secondary/60 sm:inline">({targetFolderPath})</span>
+                    )}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div className="flex items-start gap-2 px-4 py-3 bg-red-50 border border-red-200 rounded-card">
+                <AlertTriangle size={14} className="text-red-600 mt-0.5 flex-shrink-0" />
+                <p className="text-xs text-red-800 leading-relaxed">{actionConfig.safetyCopy}</p>
               </div>
             )}
           </div>
-          <div className={`rounded-card border px-3 py-2 text-xs leading-relaxed ${action === 'delete' ? 'bg-red-50 border-red-200 text-red-800' : 'bg-surface-secondary border-border text-content-secondary'}`}>
-            {actionConfig.safetyCopy}
+
+          <div className="flex flex-col justify-between gap-3 border-t border-border pt-3 xl:border-l xl:border-t-0 xl:pl-3 xl:pt-0">
+            <div className="space-y-2.5">
+              <div className="flex items-center justify-between">
+                <h3 className="text-sm font-semibold text-content-primary">Ready check</h3>
+                <button type="button" onClick={handleReset} className="text-xs text-content-secondary hover:text-content-primary inline-flex items-center gap-1">
+                  <RefreshCcw size={12} />
+                  Reset
+                </button>
+              </div>
+              <div className="grid gap-2 text-xs">
+                <div className="flex items-center justify-between">
+                  <span className="text-content-secondary">Action</span>
+                  <span className="font-semibold text-content-primary">{actionConfig.shortLabel}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-content-secondary">Selected</span>
+                  <span className="font-semibold text-content-primary">{selected.length}</span>
+                </div>
+                {needsDestination && (
+                  <div className="flex items-center justify-between gap-4">
+                    <span className="text-content-secondary">Destination</span>
+                    <span className="font-mono font-semibold text-content-primary truncate">
+                      {targetFolderDisplay || targetFolderPath || 'Not selected'}
+                    </span>
+                  </div>
+                )}
+              </div>
+              {needsDestination && (
+                <div className="line-clamp-2 rounded-card border border-border bg-surface-secondary px-3 py-2 text-xs leading-relaxed text-content-secondary">
+                  {actionConfig.safetyCopy}
+                </div>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setShowConfirm(true)}
+              disabled={!canRun || running}
+              className={`${action === 'delete' ? 'btn-danger' : 'btn-primary'} w-full justify-center disabled:opacity-40 disabled:cursor-not-allowed`}
+            >
+              {action === 'delete' ? <Trash2 size={14} /> : action === 'copy' ? <Copy size={14} /> : <FolderInput size={14} />}
+              {actionButtonLabel}
+            </button>
           </div>
         </div>
       </div>

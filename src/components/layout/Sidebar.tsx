@@ -40,30 +40,30 @@ interface NavSection {
 
 const sections: NavSection[] = [
   {
-    label: 'Dashboard AI & Delivery',
+    label: 'Dashboard Workflows',
     items: [
       { to: '/dashboards/ai-studio', icon: <Sparkles size={15} />, label: 'AI Dashboard Studio' },
       { to: '/dashboards/migrate', icon: <ArrowRightLeft size={15} />, label: 'Dashboard Migrator' },
-      { to: '/models/migrate', icon: <GitBranch size={15} />, label: 'Model Migrator' },
       { to: '/dashboards/operations', icon: <FolderCog size={15} />, label: 'Dashboard Operations' },
       { to: '/dashboards/downloads', icon: <Download size={15} />, label: 'Dashboard Downloads' },
       { to: '/deck-builder', icon: <Presentation size={15} />, label: 'Deck Builder' },
     ],
   },
   {
-    label: 'Data & AI Readiness',
+    label: 'Semantic Layer',
     items: [
-      { to: '/instances', icon: <Server size={15} />, label: 'Instance Manager' },
-      { to: '/connections', icon: <Cable size={15} />, label: 'Connection Health' },
-      { to: '/uploads', icon: <FileUp size={15} />, label: 'Upload Governance' },
+      { to: '/models/migrate', icon: <GitBranch size={15} />, label: 'Model Migrator' },
       { to: '/models', icon: <Database size={15} />, label: 'Model & Topic Health' },
-      { to: '/content-health', icon: <FileSearch size={15} />, label: 'Content Health' },
       { to: '/topics', icon: <BookOpen size={15} />, label: 'AI Semantic Studio' },
     ],
   },
   {
-    label: 'Governance',
+    label: 'Admin & Governance',
     items: [
+      { to: '/instances', icon: <Server size={15} />, label: 'Instance Manager' },
+      { to: '/connections', icon: <Cable size={15} />, label: 'Connection Health' },
+      { to: '/uploads', icon: <FileUp size={15} />, label: 'Upload Governance' },
+      { to: '/content-health', icon: <FileSearch size={15} />, label: 'Content Health' },
       { to: '/labels', icon: <Tag size={15} />, label: 'Labels' },
       { to: '/schedules', icon: <Calendar size={15} />, label: 'Schedules' },
       { to: '/users', icon: <Users size={15} />, label: 'User Management' },

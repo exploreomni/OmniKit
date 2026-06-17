@@ -1,3 +1,4 @@
+import { lazy, Suspense } from 'react';
 import { BrowserRouter, Routes, Route, Navigate, Outlet } from 'react-router-dom';
 import { ConnectionProvider } from '@/contexts/ConnectionContext';
 import { OperationLogProvider } from '@/contexts/OperationLogContext';
@@ -9,18 +10,7 @@ import { usePreloadBlobby } from '@/components/ui/Blobby';
 import { WalkthroughProvider } from '@/contexts/WalkthroughContext';
 import { ConnectPage } from '@/pages/ConnectPage';
 import { VaultSessionProvider } from '@/hooks/useVaultSession';
-
-function PaddedLayout() {
-  return (
-    <div className="flex-1 min-h-full flex items-start justify-center py-6">
-      <div className="w-full max-w-[1560px] 2xl:max-w-[1680px] px-4 sm:px-6 my-auto">
-        <Outlet />
-      </div>
-    </div>
-  );
-}
 import { MigratePage } from '@/pages/MigratePage';
-import { ModelMigratorPage } from '@/pages/ModelMigratorPage';
 import { UserManagementPage } from '@/pages/UserManagementPage';
 import { ModelsPage } from '@/pages/ModelsPage';
 import { TopicsPage } from '@/pages/TopicsPage';
@@ -38,6 +28,28 @@ import { ContentHealthPage } from '@/pages/ContentHealthPage';
 import { AIDashboardStudioPage } from '@/pages/AIDashboardStudioPage';
 import { InstancesPage } from '@/pages/InstancesPage';
 
+const ModelMigratorPage = lazy(() => (
+  import('@/pages/ModelMigratorPage').then((module) => ({ default: module.ModelMigratorPage }))
+));
+
+function LazyPageFallback() {
+  return (
+    <div className="card flex items-center justify-center p-8 text-sm text-content-secondary">
+      Loading workflow
+    </div>
+  );
+}
+
+function PaddedLayout() {
+  return (
+    <div className="flex-1 min-h-full flex items-start justify-center py-6">
+      <div className="w-full max-w-[1560px] 2xl:max-w-[1680px] px-4 sm:px-6 my-auto">
+        <Outlet />
+      </div>
+    </div>
+  );
+}
+
 function AppLayout() {
   return (
     <div className="flex h-screen overflow-hidden bg-surface-secondary">
@@ -54,7 +66,16 @@ function AppLayout() {
           <Route path="/connect" element={<Navigate to="/" replace />} />
           <Route element={<PaddedLayout />}>
             <Route path="/dashboards/migrate" element={<MigratePage />} />
-            <Route path="/models/migrate" element={<ModelMigratorPage />} />
+            <Route
+              path="/models/migrate"
+              element={(
+                <RequireConnection>
+                  <Suspense fallback={<LazyPageFallback />}>
+                    <ModelMigratorPage />
+                  </Suspense>
+                </RequireConnection>
+              )}
+            />
             <Route
               path="/dashboards/ai-studio"
               element={<RequireConnection><AIDashboardStudioPage /></RequireConnection>}

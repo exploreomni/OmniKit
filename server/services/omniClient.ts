@@ -131,6 +131,47 @@ export interface OmniCreateWorkbookResult {
   raw: unknown;
 }
 
+export interface OmniDashboardDownloadTile {
+  id: string;
+  name: string;
+  queryId?: string;
+  queryIdentifierMapKey?: string;
+  section?: string;
+  order: number;
+  tileType?: string;
+  markdown?: string;
+}
+
+export interface OmniDashboardDownloadFilter {
+  field: string;
+  label?: string;
+  kind?: string;
+  type?: string;
+  values: unknown[];
+  isNegative?: boolean;
+  topic?: string;
+  view?: string;
+  source?: 'dashboard-picker' | 'tile';
+}
+
+export interface OmniDashboardDownloadDetails {
+  id: string;
+  name: string;
+  filters: OmniDashboardDownloadFilter[];
+  tiles: OmniDashboardDownloadTile[];
+}
+
+export interface OmniDashboardDownloadStartResult {
+  jobId: string;
+  raw: unknown;
+}
+
+export interface OmniDashboardDownloadStatus {
+  status: string;
+  error?: string;
+  raw: unknown;
+}
+
 export interface OmniAiJobResult {
   id: string;
   status?: string;
@@ -207,6 +248,222 @@ function extractPageInfo(data: unknown): { hasNextPage?: boolean; nextCursor?: s
   return pageInfo as { hasNextPage?: boolean; nextCursor?: string };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function humanizeField(field: string): string {
+  return field
+    .split('.')
+    .pop()
+    ?.replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase())
+    || field;
+}
+
+function fieldViewName(field: string): string | undefined {
+  if (!field.includes('.')) return undefined;
+  return field.split('.')[0];
+}
+
+function pickDashboardName(data: unknown, fallbackId: string): string {
+  const record = isRecord(data) ? data : {};
+  const document = isRecord(record.document) ? record.document : {};
+  const dashboard = isRecord(record.dashboard) ? record.dashboard : {};
+  return firstString(
+    record.name,
+    record.title,
+    record.displayName,
+    record.display_name,
+    document.name,
+    document.title,
+    document.displayName,
+    document.display_name,
+    dashboard.name,
+    dashboard.title,
+    dashboard.displayName,
+    dashboard.display_name,
+  ) || `Dashboard ${fallbackId}`;
+}
+
+function readDashboardFilterEntries(data: unknown): OmniDashboardDownloadFilter[] {
+  const out: OmniDashboardDownloadFilter[] = [];
+  if (!isRecord(data)) return out;
+
+  const filters = data.filters;
+  if (isRecord(filters)) {
+    for (const [field, raw] of Object.entries(filters)) {
+      if (!isRecord(raw)) continue;
+      const values = Array.isArray(raw.values)
+        ? raw.values.slice()
+        : Array.isArray(raw.defaultValues)
+          ? raw.defaultValues.slice()
+          : Array.isArray(raw.default_values)
+            ? raw.default_values.slice()
+            : [];
+      out.push({
+        field,
+        label: firstString(raw.label, raw.name) || humanizeField(field),
+        kind: firstString(raw.kind),
+        type: firstString(raw.type),
+        values,
+        isNegative: raw.is_negative === true || raw.isNegative === true,
+        topic: firstString(raw.topic, raw.topic_name, raw.topicName),
+        view: fieldViewName(field),
+        source: 'dashboard-picker',
+      });
+    }
+  }
+
+  if (Array.isArray(data.controls)) {
+    for (const control of data.controls) {
+      if (!isRecord(control)) continue;
+      const field = firstString(control.field, control.id);
+      if (!field) continue;
+      const options = Array.isArray(control.options)
+        ? control.options
+            .map((option) => (isRecord(option) ? option.value ?? option.label : option))
+            .filter((value) => value !== undefined && value !== null)
+        : [];
+      out.push({
+        field,
+        label: firstString(control.label, control.name) || humanizeField(field),
+        kind: firstString(control.kind),
+        type: firstString(control.type),
+        values: options,
+        isNegative: false,
+        view: fieldViewName(field),
+        source: 'dashboard-picker',
+      });
+    }
+  }
+
+  return out;
+}
+
+function readDocFilterEntries(data: unknown): OmniDashboardDownloadFilter[] {
+  const out: OmniDashboardDownloadFilter[] = [];
+  const record = isRecord(data) ? data : {};
+  const candidates = [
+    record.filters,
+    isRecord(record.document) ? record.document.filters : undefined,
+    isRecord(record.dashboard) ? record.dashboard.filters : undefined,
+  ];
+  const pushEntry = (field: string | undefined, meta: Record<string, unknown>) => {
+    if (!field) return;
+    const values = Array.isArray(meta.values)
+      ? meta.values.slice()
+      : Array.isArray(meta.defaultValues)
+        ? meta.defaultValues.slice()
+        : Array.isArray(meta.default_values)
+          ? meta.default_values.slice()
+          : [];
+    out.push({
+      field,
+      label: firstString(meta.label, meta.title, meta.displayName, meta.display_name, meta.name) || humanizeField(field),
+      kind: firstString(meta.kind),
+      type: firstString(meta.type),
+      values,
+      isNegative: meta.is_negative === true || meta.isNegative === true,
+      topic: firstString(meta.topic, meta.topic_name, meta.topicName),
+      view: fieldViewName(field),
+      source: 'dashboard-picker',
+    });
+  };
+
+  for (const candidate of candidates) {
+    if (Array.isArray(candidate)) {
+      for (const item of candidate) {
+        if (!isRecord(item)) continue;
+        pushEntry(firstString(item.field, item.fieldRef, item.field_ref, item.id), item);
+      }
+    } else if (isRecord(candidate)) {
+      for (const [field, meta] of Object.entries(candidate)) {
+        if (isRecord(meta)) pushEntry(field, meta);
+      }
+    }
+  }
+  return out;
+}
+
+function readDashboardDownloadTiles(data: unknown): OmniDashboardDownloadTile[] {
+  const record = isRecord(data) ? data : {};
+  const rawTiles = Array.isArray(record.queries)
+    ? record.queries
+    : Array.isArray(record.tiles)
+      ? record.tiles
+      : extractArray(data, ['queries', 'tiles', 'records', 'data', 'items']);
+
+  const tiles = rawTiles
+    .filter(isRecord)
+    .map((row, index) => {
+      const id = firstString(row.id, row.queryId, row.query_id) || `tile-${index}`;
+      return {
+        id,
+        queryId: firstString(row.queryId, row.query_id, row.id),
+        queryIdentifierMapKey: firstString(row.queryIdentifierMapKey, row.query_identifier_map_key),
+        name: firstString(row.displayTitle, row.display_name, row.title, row.name, row.query_name, row.queryName) || `Tile ${index + 1}`,
+        section: firstString(row.section, row.group_name),
+        order: typeof row.position === 'number' ? row.position : typeof row.order === 'number' ? row.order : index,
+        tileType: firstString(row.type, row.tileType, row.kind),
+        markdown: firstString(row.markdown, row.body, row.text),
+      };
+    });
+
+  return tiles.sort((a, b) => a.order - b.order);
+}
+
+function readTileFilters(tiles: OmniDashboardDownloadTile[], data: unknown): OmniDashboardDownloadFilter[] {
+  const record = isRecord(data) ? data : {};
+  const rawTiles = Array.isArray(record.queries)
+    ? record.queries
+    : Array.isArray(record.tiles)
+      ? record.tiles
+      : [];
+  const out: OmniDashboardDownloadFilter[] = [];
+  for (let index = 0; index < rawTiles.length; index += 1) {
+    const raw = rawTiles[index];
+    if (!isRecord(raw)) continue;
+    const queryBody = isRecord(raw.query) ? raw.query : raw;
+    if (!isRecord(queryBody.filters)) continue;
+    for (const [field, meta] of Object.entries(queryBody.filters)) {
+      if (!isRecord(meta)) continue;
+      out.push({
+        field,
+        label: humanizeField(field),
+        kind: firstString(meta.kind),
+        type: firstString(meta.type),
+        values: Array.isArray(meta.values) ? meta.values.slice() : [],
+        isNegative: meta.is_negative === true || meta.isNegative === true,
+        topic: firstString(queryBody.topic, queryBody.topicName, queryBody.topic_name),
+        view: fieldViewName(field),
+        source: 'tile',
+      });
+    }
+  }
+  void tiles;
+  return out;
+}
+
+function mergeDashboardDownloadFilters(...groups: OmniDashboardDownloadFilter[][]): OmniDashboardDownloadFilter[] {
+  const seen = new Map<string, OmniDashboardDownloadFilter>();
+  for (const filters of groups) {
+    for (const filter of filters) {
+      const existing = seen.get(filter.field);
+      if (existing) {
+        seen.set(filter.field, {
+          ...existing,
+          ...Object.fromEntries(Object.entries(filter).filter(([, value]) => value !== undefined && value !== '')),
+          values: existing.values.length > 0 ? existing.values : filter.values,
+        });
+      } else {
+        seen.set(filter.field, filter);
+      }
+    }
+  }
+  return Array.from(seen.values()).sort((a, b) => (a.label || a.field).localeCompare(b.label || b.field));
+}
+
 export class OmniClient {
   constructor(private readonly instance: Pick<SavedInstance, 'baseUrl' | 'apiKey' | 'label'>) {
     const urlError = validateBaseUrl(instance.baseUrl);
@@ -225,11 +482,12 @@ export class OmniClient {
   private async request(method: string, path: string, options: {
     query?: Record<string, string | number | boolean | undefined>;
     body?: unknown;
+    accept?: string;
   } = {}): Promise<Response> {
     const url = this.buildUrl(path, options.query);
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.instance.apiKey}`,
-      Accept: 'application/json',
+      Accept: options.accept || 'application/json',
     };
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
 
@@ -485,6 +743,68 @@ export class OmniClient {
     }).filter((document) => document.id && document.name);
   }
 
+  async getDashboardDownloadDetails(dashboardId: string): Promise<OmniDashboardDownloadDetails> {
+    const queryResponse = await this.request('GET', `/api/v1/documents/${encodeURIComponent(dashboardId)}/queries`);
+    const queryData = await queryResponse.json();
+    let name = pickDashboardName(queryData, dashboardId);
+
+    if (name === `Dashboard ${dashboardId}`) {
+      try {
+        const metaResponse = await this.request('GET', `/api/v1/documents/${encodeURIComponent(dashboardId)}`);
+        const metaData = await metaResponse.json();
+        name = pickDashboardName(metaData, dashboardId);
+      } catch {
+        // Metadata fallback is best-effort; query payload is enough for downloads.
+      }
+    }
+
+    const tiles = readDashboardDownloadTiles(queryData);
+    let apiFilters: OmniDashboardDownloadFilter[] = [];
+    try {
+      const filterResponse = await this.request('GET', `/api/v1/dashboards/${encodeURIComponent(dashboardId)}/filters`);
+      apiFilters = readDashboardFilterEntries(await filterResponse.json());
+    } catch {
+      apiFilters = [];
+    }
+
+    return {
+      id: dashboardId,
+      name,
+      tiles,
+      filters: mergeDashboardDownloadFilters(
+        readDocFilterEntries(queryData),
+        apiFilters,
+        readTileFilters(tiles, queryData),
+      ),
+    };
+  }
+
+  async startDashboardDownload(dashboardId: string, body: Record<string, unknown>): Promise<OmniDashboardDownloadStartResult> {
+    const response = await this.request('POST', `/api/v1/dashboards/${encodeURIComponent(dashboardId)}/download`, { body });
+    const raw = await response.json();
+    const record = isRecord(raw) ? raw : {};
+    const jobId = firstString(record.job_id, record.jobId, record.id, record.download_job_id);
+    if (!jobId) throw new Error('No job ID returned from Omni.');
+    return { jobId, raw };
+  }
+
+  async getDashboardDownloadStatus(dashboardId: string, jobId: string): Promise<OmniDashboardDownloadStatus> {
+    const response = await this.request('GET', `/api/v1/dashboards/${encodeURIComponent(dashboardId)}/download/${encodeURIComponent(jobId)}/status`);
+    const raw = await response.json();
+    const record = isRecord(raw) ? raw : {};
+    return {
+      status: firstString(record.status, record.state) || 'processing',
+      error: firstString(record.error, record.message, record.detail),
+      raw,
+    };
+  }
+
+  async getDashboardDownloadFile(dashboardId: string, jobId: string): Promise<Response> {
+    return this.request('GET', `/api/v1/dashboards/${encodeURIComponent(dashboardId)}/download/${encodeURIComponent(jobId)}`, {
+      accept: '*/*',
+    });
+  }
+
   async listLabels(): Promise<OmniLabelRecord[]> {
     const response = await this.request('GET', '/api/v1/labels');
     const data = await response.json();
@@ -548,6 +868,18 @@ export class OmniClient {
     const name = firstString(raw.name, raw.modelName, raw.model_name, raw.branchName, raw.branch_name, nested(raw, 'model', 'name'), nested(raw, 'branch', 'name')) ?? input.branchName;
     if (!id) throw new Error('Omni did not return a branch model id.');
     return { id, name, raw };
+  }
+
+  async findModelBranch(baseModelId: string, branchName: string): Promise<OmniModelBranchResult | null> {
+    const branches = await this.listModels('BRANCH');
+    const normalizedBranchName = branchName.trim().toLowerCase();
+    const match = branches.find((branch) => (
+      branch.baseModelId === baseModelId
+      && [branch.name, branch.identifier, branch.id]
+        .filter(Boolean)
+        .some((value) => value?.trim().toLowerCase() === normalizedBranchName)
+    ));
+    return match ? { id: match.id, name: match.name || branchName, raw: match } : null;
   }
 
   async updateModelYamlFile(input: {

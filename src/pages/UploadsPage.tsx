@@ -7,6 +7,7 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniUpload, PageInfo } from '@/types';
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -29,7 +30,7 @@ function formatDate(dateStr: string | undefined): string {
 export function UploadsPage() {
   const { connection } = useConnection();
   const navigate = useNavigate();
-  const connectionKey = connection.instanceId || connection.baseUrl;
+  const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const [uploads, setUploads] = useState<OmniUpload[]>([]);
   const [loading, setLoading] = useState(false);

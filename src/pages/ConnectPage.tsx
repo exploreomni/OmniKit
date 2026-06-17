@@ -40,6 +40,7 @@ import {
   saveSavedInstance,
   type InstanceRole,
 } from '@/services/opsConsole';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 
 type CapabilityIcon = typeof Sparkles;
 
@@ -390,7 +391,7 @@ export function ConnectPage() {
   const [newVaultInstance, setNewVaultInstance] = useState<NewVaultInstanceForm>(EMPTY_VAULT_INSTANCE_FORM);
   const [showAddVaultInstance, setShowAddVaultInstance] = useState(false);
 
-  const connectionKey = `${connection.baseUrl.trim()}|${connection.instanceId || (connection.apiKey ? 'manual-key-present' : 'no-key')}`;
+  const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const selectedInstance = savedInstances.find((instance) => instance.id === selectedInstanceId) || savedInstances[0] || null;
 
@@ -782,7 +783,7 @@ export function ConnectPage() {
                     </div>
                     <div className="mt-2 inline-flex items-center gap-1.5 rounded-full bg-omni-50 px-2.5 py-1 text-[11px] font-semibold text-omni-700">
                       <ShieldCheck size={12} />
-                      {isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Legacy session key'}
+                      {isVaultConnected ? `Vault key ${connection.apiKeyMasked || 'masked'}` : 'Saved instance required'}
                     </div>
                   </div>
                 </div>
@@ -1018,7 +1019,7 @@ export function ConnectPage() {
             <TrustRow
               icon={<ShieldCheck size={14} />}
               title="Your data stays private"
-              body="Credentials are masked, never stored, and used only by the OmniKit API proxy to reach your configured Omni instance."
+              body="Credentials are encrypted in the native vault. The browser only receives a masked key and a non-secret reference."
             />
             <TrustRow
               icon={<Lock size={14} />}

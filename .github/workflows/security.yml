@@ -40,6 +40,12 @@ jobs:
       - name: Run instance dashboard tests
         run: npm run test:instance-dashboard
 
+      - name: Run dashboard downloads tests
+        run: npm run test:dashboard-downloads
+
+      - name: Run deck builder tests
+        run: npm run test:deck-builder
+
       - name: Typecheck app
         run: npm run typecheck
 

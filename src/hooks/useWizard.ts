@@ -1,7 +1,7 @@
 import { useReducer, useCallback } from 'react';
 import type { WizardState, WizardAction, WizardStep } from '@/types';
 
-const initialState: WizardState = {
+export const initialWizardState: WizardState = {
   currentStep: 0,
   source: { baseUrl: '', apiKey: '', status: 'untested', errorMessage: '' },
   target: { baseUrl: '', apiKey: '', status: 'untested', errorMessage: '' },
@@ -33,7 +33,7 @@ function resetPlanState(state: WizardState): WizardState {
   };
 }
 
-function wizardReducer(state: WizardState, action: WizardAction): WizardState {
+export function wizardReducer(state: WizardState, action: WizardAction): WizardState {
   switch (action.type) {
     case 'SET_STEP':
       return { ...state, currentStep: action.step };
@@ -156,7 +156,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
     }
 
     case 'RESET_ALL':
-      return { ...initialState };
+      return { ...initialWizardState };
 
     default:
       return state;
@@ -164,7 +164,7 @@ function wizardReducer(state: WizardState, action: WizardAction): WizardState {
 }
 
 export function useWizard() {
-  const [state, dispatch] = useReducer(wizardReducer, initialState);
+  const [state, dispatch] = useReducer(wizardReducer, initialWizardState);
 
   const goToStep = useCallback((step: WizardStep) => {
     dispatch({ type: 'SET_STEP', step });

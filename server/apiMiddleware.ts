@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import bulkCopyDocuments from './handlers/bulk-copy-documents';
 import bulkDeleteDocuments from './handlers/bulk-delete-documents';
 import bulkMoveDocuments from './handlers/bulk-move-documents';
+import dashboardDownloads from './handlers/dashboard-downloads';
 import enrichDocuments from './handlers/enrich-documents';
 import generateEmbedUrl from './handlers/generate-embed-url';
 import inspectExport from './handlers/inspect-export';
@@ -28,12 +29,13 @@ import { getInstance } from './services/nativeVault';
 type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator', 'dashboard-downloads']);
 
 const routes: Record<string, Handler> = {
   'bulk-copy-documents': bulkCopyDocuments,
   'bulk-delete-documents': bulkDeleteDocuments,
   'bulk-move-documents': bulkMoveDocuments,
+  'dashboard-downloads': dashboardDownloads,
   'enrich-documents': enrichDocuments,
   'generate-embed-url': generateEmbedUrl,
   'inspect-export': inspectExport,

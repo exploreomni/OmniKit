@@ -4,6 +4,7 @@ import type {
   InstanceModel,
   MigrationJob,
   MigrationPlan,
+  MigrationPlanStep,
   MigrationTarget,
   SavedInstancePublic,
 } from '@/services/opsConsole';
@@ -63,6 +64,17 @@ export interface DestinationProgress {
   running: number;
   status: 'pending' | 'running' | 'succeeded' | 'warning' | 'failed' | 'canceled';
   currentItem?: string;
+}
+
+export interface PreflightTargetRow {
+  target: MigrationTarget;
+  status: 'ready' | 'warning' | 'blocked';
+  steps: MigrationPlanStep[];
+  warnings: string[];
+  warningCount: number;
+  deleteCount: number;
+  replaceCount: number;
+  error?: string;
 }
 
 export function targetDraftToMigrationTarget(

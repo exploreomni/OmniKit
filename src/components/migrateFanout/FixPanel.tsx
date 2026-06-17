@@ -28,7 +28,8 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
   const [labels, setLabels] = useState<InstanceLabel[]>([]);
   const [loadingLabels, setLoadingLabels] = useState(false);
   const [descriptions, setDescriptions] = useState<Record<string, string>>({});
-  const [labelText, setLabelText] = useState<Record<string, string>>({});
+  const [selectedLabelNames, setSelectedLabelNames] = useState<Record<string, string[]>>({});
+  const [newLabelText, setNewLabelText] = useState<Record<string, string>>({});
   const [clearDrafts, setClearDrafts] = useState(true);
   const [applying, setApplying] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -46,7 +47,8 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
   useEffect(() => {
     if (!open || !instanceId) return;
     setDescriptions(Object.fromEntries(rows.map((document) => [document.identifier, document.description || ''])));
-    setLabelText(Object.fromEntries(rows.map((document) => [document.identifier, labelsFor(document).join(', ')])));
+    setSelectedLabelNames(Object.fromEntries(rows.map((document) => [document.identifier, labelsFor(document)])));
+    setNewLabelText(Object.fromEntries(rows.map((document) => [document.identifier, ''])));
   }, [open, instanceId, rows]);
 
   useEffect(() => {
@@ -74,10 +76,11 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
     try {
       for (let index = 0; index < rows.length; index += 1) {
         const document = rows[index];
-        const nextLabels = (labelText[document.identifier] || '')
+        const typedLabels = (newLabelText[document.identifier] || '')
           .split(',')
           .map((label) => label.trim())
           .filter(Boolean);
+        const nextLabels = [...new Set([...(selectedLabelNames[document.identifier] || []), ...typedLabels])];
         const existingNames = new Set(labels.map((label) => label.name));
         const createLabels = nextLabels.filter((label) => !existingNames.has(label));
         await updateInstanceDocumentMetadata(instanceId, document.identifier, {
@@ -96,6 +99,15 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
     } finally {
       if (activeRef.current) setApplying(false);
     }
+  }
+
+  function toggleLabel(documentId: string, labelName: string) {
+    setSelectedLabelNames((prev) => {
+      const current = new Set(prev[documentId] || []);
+      if (current.has(labelName)) current.delete(labelName);
+      else current.add(labelName);
+      return { ...prev, [documentId]: [...current].sort((a, b) => a.localeCompare(b)) };
+    });
   }
 
   return (
@@ -122,7 +134,7 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
         </div>
 
         <div className="space-y-4 p-5">
-          {error && <div className="rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
+          {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</div>}
           {rows.length === 0 ? (
             <div className="rounded-card border border-green-200 bg-green-50 p-4 text-sm text-green-800">
               <CheckCircle2 size={17} className="mr-2 inline-block" />
@@ -131,7 +143,7 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
           ) : (
             <>
               <div className="rounded-card border border-border-subtle bg-surface-secondary px-3 py-2 text-xs text-content-secondary">
-                {loadingLabels ? 'Loading existing labels...' : `${labels.length} existing labels available. Enter comma-separated labels; new labels are created as needed.`}
+                {loadingLabels ? 'Loading existing labels...' : `${labels.length} existing labels available. Choose existing labels or add new ones by name.`}
               </div>
               {applying && <ProgressBar current={progress} total={rows.length} label="Applying metadata fixes" tone="brand" />}
               <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3 text-sm">
@@ -167,11 +179,29 @@ export function FixPanel({ open, instanceId, documents, onClose, onApplied }: Fi
                       placeholder="Add a short dashboard description"
                     />
                     <label className="mt-3 block text-xs font-semibold text-content-primary">Labels</label>
+                    {labels.length > 0 && (
+                      <div className="mt-2 grid max-h-40 gap-2 overflow-auto rounded-card border border-border-subtle bg-surface-secondary p-2 sm:grid-cols-2">
+                        {labels.map((label) => {
+                          const checked = (selectedLabelNames[document.identifier] || []).includes(label.name);
+                          return (
+                            <label key={`${document.identifier}:${label.name}`} className="flex min-w-0 items-center gap-2 rounded-chip bg-white px-2 py-1 text-xs text-content-secondary">
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={() => toggleLabel(document.identifier, label.name)}
+                                className="accent-omni-600"
+                              />
+                              <span className="truncate">{label.name}</span>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    )}
                     <input
-                      value={labelText[document.identifier] || ''}
-                      onChange={(event) => setLabelText((prev) => ({ ...prev, [document.identifier]: event.target.value }))}
+                      value={newLabelText[document.identifier] || ''}
+                      onChange={(event) => setNewLabelText((prev) => ({ ...prev, [document.identifier]: event.target.value }))}
                       className="input-field mt-1"
-                      placeholder="Executive, Revenue Ops, Migrated"
+                      placeholder="New labels, comma-separated"
                     />
                   </div>
                 ))}

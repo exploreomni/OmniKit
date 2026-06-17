@@ -8,7 +8,6 @@ import {
   GitBranch,
   Layers3,
   Loader2,
-  Lock,
   PlayCircle,
   RefreshCw,
   Server,
@@ -17,8 +16,9 @@ import {
   Workflow,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { Blobby } from '@/components/ui/Blobby';
-import { PassphraseInput } from '@/components/ui/PassphraseInput';
+import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import {
   cancelOpsMigrationJob,
@@ -34,7 +34,6 @@ import {
   retryOpsMigrationJob,
   subscribeMigrationJob,
   translateModelMigratorYaml,
-  unlockNativeVault,
   type InstanceModel,
   type ModelMigratorConnection,
   type ModelMigratorInventoryDocument,
@@ -54,6 +53,7 @@ import {
 
 const MODEL_MIGRATOR_DRAFT_KEY = 'omnikit:modelMigratorDraft:v1';
 const WIZARD_STEPS = ['Source', 'Target', 'Model translate/review', 'Apply & validate', 'Content scope', 'Run/results'];
+const WORKBOOK_FIDELITY_DISCLOSURE = 'Workbook migration ports query presentations, tab names, descriptions, and visConfig where Omni APIs expose them. Schedules, alerts, permissions, sharing, favorites, workbook-level filters or parameters, and unexposed workbook artifacts are not moved automatically.';
 
 type ModelPath = 'fast' | 'translate';
 
@@ -235,7 +235,9 @@ function LoadingLine({ label }: { label: string }) {
 
 export function ModelMigratorPage() {
   const navigate = useNavigate();
+  const { connection } = useConnection();
   const logOperation = useLogOperation();
+  const activeVaultInstanceId = connection.connectionMode === 'vault' ? connection.instanceId || '' : '';
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const [instances, setInstances] = useState<SavedInstancePublic[]>([]);
   const [sourceInstanceId, setSourceInstanceId] = useState('');
@@ -249,10 +251,7 @@ export function ModelMigratorPage() {
   const [selectedSourceModelIds, setSelectedSourceModelIds] = useState<string[]>([]);
   const [targetModelBySourceId, setTargetModelBySourceId] = useState<Record<string, string>>({});
   const [inventory, setInventory] = useState<ModelMigratorInventoryRow[]>([]);
-  const [passphrase, setPassphrase] = useState('');
-  const [confirmPassphrase, setConfirmPassphrase] = useState('');
   const [loadingVault, setLoadingVault] = useState(true);
-  const [unlocking, setUnlocking] = useState(false);
   const [loadingInstances, setLoadingInstances] = useState(false);
   const [loadingSource, setLoadingSource] = useState(false);
   const [loadingTarget, setLoadingTarget] = useState(false);
@@ -282,6 +281,7 @@ export function ModelMigratorPage() {
   const [job, setJob] = useState<MigrationJob | null>(null);
   const loggedTerminalJobs = useRef(new Set<string>());
   const loggedItemEvents = useRef(new Set<string>());
+  const jobActive = job?.status === 'pending' || job?.status === 'running';
 
   const sourceInstances = useMemo(() => instances.filter(canUseAsSource), [instances]);
   const targetInstances = useMemo(() => instances.filter(canUseAsTarget), [instances]);
@@ -312,7 +312,7 @@ export function ModelMigratorPage() {
     const accepted = acceptedFilesByModelId[model.id] || {};
     const skipped = new Set(skippedFilesByModelId[model.id] || []);
     return Object.keys(accepted).length > 0
-      && translation.files.every((file) => accepted[file.fileName] !== undefined || skipped.has(file.fileName));
+      && translation.files.every((file) => file.blocked === true || accepted[file.fileName] !== undefined || skipped.has(file.fileName));
   });
   const targetInstance = targetInstances.find((instance) => instance.id === targetInstanceId);
   const selectedPostMigrationActions = useMemo(() => {
@@ -351,12 +351,8 @@ export function ModelMigratorPage() {
     && selectedSourceModels.every((model) => pathByModelId[model.id] !== 'fast' || (modelSupportsFastPath(model) && fastPathConfirmedByModelId[model.id] === true))
     && translateReviewComplete
     && workbookBlockerCount === 0
+    && !jobActive
     && !startingJob;
-  const vaultExists = vaultStatus?.exists !== false;
-  const unlockDisabled = unlocking
-    || !passphrase.trim()
-    || (!vaultExists && (passphrase.length < 8 || passphrase !== confirmPassphrase));
-
   async function refreshVault() {
     setLoadingVault(true);
     setError('');
@@ -383,31 +379,37 @@ export function ModelMigratorPage() {
     }
   }
 
-  async function unlockVault() {
-    if (unlockDisabled) return;
-    const creatingVault = !vaultExists;
-    setUnlocking(true);
-    setError('');
-    setMessage('');
-    try {
-      const result = await unlockNativeVault(passphrase);
-      setVaultStatus(result.status);
-      setPassphrase('');
-      setConfirmPassphrase('');
-      setMessage(creatingVault ? 'Vault created. Add saved Omni instances before migrating models.' : 'Vault unlocked. Choose source and target instances.');
-      await refreshInstances();
-    } catch (err) {
-      setError(errorText(err, 'Could not unlock the vault.'));
-    } finally {
-      setUnlocking(false);
-    }
+  function clearModelScopedWorkflowState() {
+    setSelectedSourceModelIds([]);
+    setTargetModelBySourceId({});
+    setInventory([]);
+    setSelectedContentKeys([]);
+    setPathByModelId({});
+    setBranchNameByModelId({});
+    setGitRefByModelId({});
+    setFastPathConfirmedByModelId({});
+    setTranslationsByModelId({});
+    setAcceptedFilesByModelId({});
+    setSkippedFilesByModelId({});
+    setWorkbookPreflights([]);
+  }
+
+  function clearTargetScopedWorkflowState() {
+    setTargetModelBySourceId({});
+    setWorkbookPreflights([]);
   }
 
   useEffect(() => {
+    if (!activeVaultInstanceId) {
+      setVaultStatus(null);
+      setInstances([]);
+      setLoadingVault(false);
+      return;
+    }
     void refreshVault();
-    // Runs once when the workflow opens.
+    // Runs when the workflow opens or the active saved instance changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [activeVaultInstanceId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -474,8 +476,7 @@ export function ModelMigratorPage() {
     setSourceConnections([]);
     setSourceConnectionId('');
     setSourceModels([]);
-    setSelectedSourceModelIds([]);
-    setInventory([]);
+    clearModelScopedWorkflowState();
     if (!sourceInstanceId) return () => { active = false; };
     setLoadingSource(true);
     listModelMigratorConnections(sourceInstanceId)
@@ -498,7 +499,7 @@ export function ModelMigratorPage() {
     setTargetConnections([]);
     setTargetConnectionId('');
     setTargetModels([]);
-    setTargetModelBySourceId({});
+    clearTargetScopedWorkflowState();
     if (!targetInstanceId) return () => { active = false; };
     setLoadingTarget(true);
     listModelMigratorConnections(targetInstanceId)
@@ -519,8 +520,7 @@ export function ModelMigratorPage() {
   useEffect(() => {
     let active = true;
     setSourceModels([]);
-    setSelectedSourceModelIds([]);
-    setInventory([]);
+    clearModelScopedWorkflowState();
     if (!sourceInstanceId || !sourceConnectionId) return () => { active = false; };
     setLoadingSource(true);
     listModelMigratorModels(sourceInstanceId, { connectionId: sourceConnectionId })
@@ -540,7 +540,7 @@ export function ModelMigratorPage() {
   useEffect(() => {
     let active = true;
     setTargetModels([]);
-    setTargetModelBySourceId({});
+    clearTargetScopedWorkflowState();
     if (!targetInstanceId || !targetConnectionId) return () => { active = false; };
     setLoadingTarget(true);
     listModelMigratorModels(targetInstanceId, { connectionId: targetConnectionId })
@@ -613,20 +613,24 @@ export function ModelMigratorPage() {
   }, [sourceInstanceId, selectedSourceModelIds]);
 
   function toggleSourceModel(modelId: string) {
+    if (jobActive) return;
     setSelectedSourceModelIds((current) => (
       current.includes(modelId) ? current.filter((id) => id !== modelId) : [...current, modelId]
     ));
   }
 
   function selectAllSourceModels() {
+    if (jobActive) return;
     setSelectedSourceModelIds(sourceModels.map((model) => model.id));
   }
 
   function clearSourceModels() {
+    if (jobActive) return;
     setSelectedSourceModelIds([]);
   }
 
   function toggleContent(document: ModelMigratorInventoryDocument) {
+    if (jobActive) return;
     const key = contentKey(document);
     setSelectedContentKeys((current) => (
       current.includes(key) ? current.filter((item) => item !== key) : [...current, key]
@@ -634,6 +638,7 @@ export function ModelMigratorPage() {
   }
 
   function selectVisibleContent(kind?: 'dashboard' | 'workbook') {
+    if (jobActive) return;
     const keys = visibleDocuments
       .filter((document) => !kind || document.kind === kind)
       .map(contentKey);
@@ -641,10 +646,12 @@ export function ModelMigratorPage() {
   }
 
   function clearContentSelection() {
+    if (jobActive) return;
     setSelectedContentKeys([]);
   }
 
   async function translateSelectedModels() {
+    if (jobActive) return;
     setTranslating(true);
     setError('');
     setMessage('');
@@ -679,6 +686,7 @@ export function ModelMigratorPage() {
   }
 
   async function preflightWorkbooks() {
+    if (jobActive) return;
     setPreflighting(true);
     setError('');
     try {
@@ -870,6 +878,15 @@ export function ModelMigratorPage() {
     return unsubscribe;
   }, [activeJobId, logOperation]);
 
+  if (!activeVaultInstanceId) {
+    return (
+      <SavedInstanceRequiredEmptyState
+        toolName="Model Migrator"
+        description="Model Migrator runs through saved Omni instances only. Unlock Home, then choose and test the saved Omni instance this workflow should use."
+      />
+    );
+  }
+
   if (loadingVault) {
     return (
       <div className="card flex items-center justify-center gap-2 p-8 text-content-secondary">
@@ -880,6 +897,15 @@ export function ModelMigratorPage() {
   }
 
   const unlocked = Boolean(vaultStatus?.unlocked);
+
+  if (!unlocked) {
+    return (
+      <>
+        {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
+        <SavedInstanceRequiredEmptyState toolName="Model Migrator" />
+      </>
+    );
+  }
 
   return (
     <div className="space-y-5 pb-12">
@@ -904,54 +930,7 @@ export function ModelMigratorPage() {
         ))}
       </div>
 
-      {!unlocked ? (
-        <div className="card p-5">
-          <div className="mb-4 flex items-start gap-3">
-            <span className="flex h-10 w-10 flex-shrink-0 items-center justify-center rounded-card bg-omni-50 text-omni-700">
-              <Lock size={18} />
-            </span>
-            <div>
-              <h2 className="text-base font-semibold text-content-primary">{vaultExists ? 'Unlock the native vault' : 'Create the native vault'}</h2>
-              <p className="mt-1 text-sm text-content-secondary">
-                Model Migrator uses saved Omni instances only. Plaintext API keys stay encrypted in the local native vault.
-              </p>
-            </div>
-          </div>
-          <div className="max-w-md space-y-3">
-            {!vaultExists && (
-              <div className="rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                This passphrase cannot be recovered. Store it in your password manager.
-              </div>
-            )}
-            <PassphraseInput
-              value={passphrase}
-              onChange={setPassphrase}
-              placeholder={vaultExists ? 'Vault passphrase' : 'Create vault passphrase'}
-              autoComplete={vaultExists ? 'current-password' : 'new-password'}
-              onSubmit={unlockVault}
-            />
-            {!vaultExists && (
-              <PassphraseInput
-                value={confirmPassphrase}
-                onChange={setConfirmPassphrase}
-                placeholder="Confirm passphrase"
-                autoComplete="new-password"
-                onSubmit={unlockVault}
-              />
-            )}
-            {!vaultExists && passphrase && passphrase.length < 8 && (
-              <div className="text-xs text-amber-700">Use at least 8 characters.</div>
-            )}
-            {!vaultExists && confirmPassphrase && passphrase !== confirmPassphrase && (
-              <div className="text-xs text-red-700">Passphrases do not match.</div>
-            )}
-            <button type="button" onClick={unlockVault} disabled={unlockDisabled} className="btn-primary inline-flex items-center gap-2 disabled:cursor-not-allowed disabled:opacity-60">
-              {unlocking ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-              {vaultExists ? 'Unlock vault' : 'Create vault'}
-            </button>
-          </div>
-        </div>
-      ) : loadingInstances ? (
+      {loadingInstances ? (
         <LoadingLine label="Loading saved instances" />
       ) : instances.length === 0 ? (
         <div className="card p-5">
@@ -987,13 +966,13 @@ export function ModelMigratorPage() {
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <SelectField label="Source instance" value={sourceInstanceId} onChange={setSourceInstanceId}>
+                <SelectField label="Source instance" value={sourceInstanceId} onChange={setSourceInstanceId} disabled={jobActive}>
                   <EmptyValue>Choose source instance</EmptyValue>
                   {sourceInstances.map((instance) => (
                     <option key={instance.id} value={instance.id}>{instance.label} · {roleLabel(instance.role)} · {hostLabel(instance.baseUrl)}</option>
                   ))}
                 </SelectField>
-                <SelectField label="Source connection" value={sourceConnectionId} onChange={setSourceConnectionId} disabled={!sourceInstanceId || sourceConnections.length === 0}>
+                <SelectField label="Source connection" value={sourceConnectionId} onChange={setSourceConnectionId} disabled={jobActive || !sourceInstanceId || sourceConnections.length === 0}>
                   <EmptyValue>{sourceConnections.length === 0 ? 'No connections loaded' : 'Choose connection'}</EmptyValue>
                   {sourceConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>
@@ -1006,8 +985,8 @@ export function ModelMigratorPage() {
                   {sourceModels.length} models loaded · {selectedSourceModelIds.length} selected
                 </div>
                 <div className="flex items-center gap-2">
-                  <button type="button" onClick={selectAllSourceModels} disabled={sourceModels.length === 0} className="btn-secondary text-xs disabled:opacity-50">Select all</button>
-                  <button type="button" onClick={clearSourceModels} disabled={selectedSourceModelIds.length === 0} className="btn-secondary text-xs disabled:opacity-50">Clear</button>
+                  <button type="button" onClick={selectAllSourceModels} disabled={jobActive || sourceModels.length === 0} className="btn-secondary text-xs disabled:opacity-50">Select all</button>
+                  <button type="button" onClick={clearSourceModels} disabled={jobActive || selectedSourceModelIds.length === 0} className="btn-secondary text-xs disabled:opacity-50">Clear</button>
                 </div>
               </div>
 
@@ -1022,6 +1001,7 @@ export function ModelMigratorPage() {
                       type="button"
                       key={model.id}
                       onClick={() => toggleSourceModel(model.id)}
+                      disabled={jobActive}
                       aria-pressed={selected}
                       className={`block w-full border-l-4 px-4 py-3 text-left transition ${selected ? 'border-l-omni-500 bg-omni-50' : 'border-l-transparent hover:bg-surface-secondary'}`}
                     >
@@ -1065,13 +1045,13 @@ export function ModelMigratorPage() {
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <SelectField label="Target instance" value={targetInstanceId} onChange={setTargetInstanceId}>
+                <SelectField label="Target instance" value={targetInstanceId} onChange={setTargetInstanceId} disabled={jobActive}>
                   <EmptyValue>Choose target instance</EmptyValue>
                   {targetInstances.map((instance) => (
                     <option key={instance.id} value={instance.id}>{instance.label} · {roleLabel(instance.role)} · {hostLabel(instance.baseUrl)}</option>
                   ))}
                 </SelectField>
-                <SelectField label="Target connection" value={targetConnectionId} onChange={setTargetConnectionId} disabled={!targetInstanceId || targetConnections.length === 0}>
+                <SelectField label="Target connection" value={targetConnectionId} onChange={setTargetConnectionId} disabled={jobActive || !targetInstanceId || targetConnections.length === 0}>
                   <EmptyValue>{targetConnections.length === 0 ? 'No connections loaded' : 'Choose connection'}</EmptyValue>
                   {targetConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>
@@ -1096,7 +1076,7 @@ export function ModelMigratorPage() {
                     <select
                       value={targetModelBySourceId[sourceModel.id] || ''}
                       onChange={(event) => setTargetModelBySourceId((current) => ({ ...current, [sourceModel.id]: event.target.value }))}
-                      disabled={targetModels.length === 0}
+                      disabled={jobActive || targetModels.length === 0}
                       className="input-field"
                     >
                       <option value="">{targetModels.length === 0 ? 'No target models loaded' : 'Choose target model'}</option>
@@ -1111,6 +1091,7 @@ export function ModelMigratorPage() {
                           value={pathByModelId[sourceModel.id] || 'translate'}
                           onChange={(event) => setPathByModelId((current) => ({ ...current, [sourceModel.id]: event.target.value as ModelPath }))}
                           className="input-field"
+                          disabled={jobActive}
                         >
                           <option value="translate">Translate pipeline</option>
                           <option value="fast" disabled={!modelSupportsFastPath(sourceModel)}>Fast path {modelSupportsFastPath(sourceModel) ? '' : '(git required)'}</option>
@@ -1122,6 +1103,7 @@ export function ModelMigratorPage() {
                           value={branchNameByModelId[sourceModel.id] || ''}
                           onChange={(event) => setBranchNameByModelId((current) => ({ ...current, [sourceModel.id]: event.target.value }))}
                           className="input-field"
+                          disabled={jobActive}
                           placeholder={defaultBranchName(sourceModel)}
 	                        />
 	                      </label>
@@ -1134,6 +1116,7 @@ export function ModelMigratorPage() {
 	                            className="mt-0.5"
 	                            checked={fastPathConfirmedByModelId[sourceModel.id] === true}
 	                            onChange={(event) => setFastPathConfirmedByModelId((current) => ({ ...current, [sourceModel.id]: event.target.checked }))}
+                              disabled={jobActive}
 	                          />
 	                          <span>I confirm the source and target schemas are identical enough for Omni's fast path. OmniKit will still validate before merge.</span>
 	                        </label>
@@ -1143,6 +1126,7 @@ export function ModelMigratorPage() {
 	                            value={gitRefByModelId[sourceModel.id] || ''}
 	                            onChange={(event) => setGitRefByModelId((current) => ({ ...current, [sourceModel.id]: event.target.value }))}
 	                            className="input-field bg-white"
+                              disabled={jobActive}
 	                            placeholder="Optional source git ref"
 	                          />
 	                        </label>
@@ -1186,11 +1170,14 @@ export function ModelMigratorPage() {
                 placeholder="Search content by name, folder, or kind"
               />
               <div className="flex flex-wrap items-center gap-2">
-                <button type="button" onClick={() => selectVisibleContent()} className="btn-secondary text-xs">Select visible</button>
-                <button type="button" onClick={() => selectVisibleContent('workbook')} className="btn-secondary text-xs">Workbooks</button>
-                <button type="button" onClick={() => selectVisibleContent('dashboard')} className="btn-secondary text-xs">Dashboards</button>
-                <button type="button" onClick={clearContentSelection} className="btn-secondary text-xs">Clear</button>
+                <button type="button" onClick={() => selectVisibleContent()} disabled={jobActive} className="btn-secondary text-xs disabled:opacity-50">Select visible</button>
+                <button type="button" onClick={() => selectVisibleContent('workbook')} disabled={jobActive} className="btn-secondary text-xs disabled:opacity-50">Workbooks</button>
+                <button type="button" onClick={() => selectVisibleContent('dashboard')} disabled={jobActive} className="btn-secondary text-xs disabled:opacity-50">Dashboards</button>
+                <button type="button" onClick={clearContentSelection} disabled={jobActive} className="btn-secondary text-xs disabled:opacity-50">Clear</button>
               </div>
+            </div>
+            <div className="mb-4 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+              {WORKBOOK_FIDELITY_DISCLOSURE}
             </div>
 
             {selectedSourceModelIds.length === 0 ? (
@@ -1224,6 +1211,7 @@ export function ModelMigratorPage() {
                                 className="mt-1"
                                 checked={selectedContentKeys.includes(contentKey(document))}
                                 onChange={() => toggleContent(document)}
+                                disabled={jobActive}
                               />
                               <div className="flex items-start justify-between gap-3">
                                 <div className="min-w-0">
@@ -1264,9 +1252,9 @@ export function ModelMigratorPage() {
                     <Layers3 size={16} />
                     Model translate/review
                   </div>
-                  <p className="mt-1 text-xs text-content-secondary">Apply deterministic schema rewrites, generate review prompts, and choose accepted files for branch-only writes.</p>
+                  <p className="mt-1 text-xs text-content-secondary">Apply deterministic schema rewrites, generate review prompts, and choose accepted files for branch-only writes. Main branches are never written by this step.</p>
                 </div>
-	                <button type="button" onClick={translateSelectedModels} disabled={translating || selectedSourceModels.length === 0} className="btn-primary inline-flex items-center gap-2 text-xs disabled:opacity-60">
+	                <button type="button" onClick={translateSelectedModels} disabled={jobActive || translating || selectedSourceModels.length === 0} className="btn-primary inline-flex items-center gap-2 text-xs disabled:opacity-60">
 	                  {translating ? <Loader2 size={13} className="animate-spin" /> : <Workflow size={13} />}
 	                  Translate
 	                </button>
@@ -1277,6 +1265,7 @@ export function ModelMigratorPage() {
 	                  className="mt-0.5"
 	                  checked={runAiDialectPass}
 	                  onChange={(event) => setRunAiDialectPass(event.target.checked)}
+                    disabled={jobActive}
 	                />
 	                <span>Run Omni AI dialect pass after deterministic schema rewrites. AI output is a reviewed draft and never writes until accepted.</span>
 	              </label>
@@ -1286,6 +1275,7 @@ export function ModelMigratorPage() {
                   value={schemaMapText}
                   onChange={(event) => setSchemaMapText(event.target.value)}
                   className="input-field min-h-[88px]"
+                  disabled={jobActive}
                   placeholder="ANALYTICS.PUBLIC -> main.analytics"
                 />
               </label>
@@ -1312,7 +1302,14 @@ export function ModelMigratorPage() {
 	                              <details key={file.fileName} className="rounded-card border border-border-subtle bg-white">
 	                                <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs font-semibold text-content-primary">
 	                                  <span>{file.fileName}</span>
-	                                  <span className={file.blocked ? 'text-red-700' : skipped ? 'text-content-secondary' : accepted ? 'text-green-700' : 'text-amber-700'}>{decision}</span>
+                                    <span className="flex flex-wrap items-center justify-end gap-2">
+                                      {file.aiDraft && !skipped && (
+                                        <span className="rounded-chip bg-amber-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
+                                          AI draft needs review
+                                        </span>
+                                      )}
+	                                    <span className={file.blocked ? 'text-red-700' : skipped ? 'text-content-secondary' : accepted ? 'text-green-700' : 'text-amber-700'}>{decision}</span>
+                                    </span>
 	                                </summary>
 	                                <div className="border-t border-border-subtle p-3">
 	                                  {file.warnings.map((warning) => <div key={warning} className="mb-2 rounded-card bg-amber-50 px-2 py-1 text-xs text-amber-800">{warning}</div>)}
@@ -1461,28 +1458,28 @@ export function ModelMigratorPage() {
                     <ShieldCheck size={16} />
                     Preflight and run
                   </div>
-                  <p className="mt-1 text-xs text-content-secondary">Validate workbook query portability, then run the unified branch/workbook job.</p>
+                  <p className="mt-1 text-xs text-content-secondary">Validate workbook query portability, then run the unified branch/workbook job. Apply and validate writes only to target dev branches; use Merge validated later to merge.</p>
                 </div>
-                <button type="button" onClick={preflightWorkbooks} disabled={preflighting || selectedWorkbookDocs.length === 0} className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-60">
+                <button type="button" onClick={preflightWorkbooks} disabled={jobActive || preflighting || selectedWorkbookDocs.length === 0} className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-60">
                   {preflighting ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
                   Preflight
                 </button>
               </div>
               <div className="grid gap-2 text-xs text-content-secondary sm:grid-cols-2">
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
-	                  <input type="checkbox" checked={replaceSameNamed} onChange={(event) => setReplaceSameNamed(event.target.checked)} />
+	                  <input type="checkbox" checked={replaceSameNamed} onChange={(event) => setReplaceSameNamed(event.target.checked)} disabled={jobActive} />
 	                  <span>Replace same-named workbook docs in the target folder.</span>
 	                </label>
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
-	                  <input type="checkbox" checked={publishDrafts} onChange={(event) => setPublishDrafts(event.target.checked)} />
+	                  <input type="checkbox" checked={publishDrafts} onChange={(event) => setPublishDrafts(event.target.checked)} disabled={jobActive} />
 	                  <span>Publish drafts when you later merge validated branches.</span>
 	                </label>
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
-		                  <input type="checkbox" checked={deleteBranch} onChange={(event) => setDeleteBranch(event.target.checked)} />
+		                  <input type="checkbox" checked={deleteBranch} onChange={(event) => setDeleteBranch(event.target.checked)} disabled={jobActive} />
 		                  <span>Delete branch after merge.</span>
 		                </label>
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
-	                  <input type="checkbox" checked={refreshSchemaAfterMigration} onChange={(event) => setRefreshSchemaAfterMigration(event.target.checked)} />
+	                  <input type="checkbox" checked={refreshSchemaAfterMigration} onChange={(event) => setRefreshSchemaAfterMigration(event.target.checked)} disabled={jobActive} />
 	                  <span>Refresh target schema models after the run.</span>
 	                </label>
 	              </div>
@@ -1492,9 +1489,10 @@ export function ModelMigratorPage() {
 	                  <div className="space-y-2">
 	                    {targetInstance.postMigrationActions.map((action, actionIndex) => (
 	                      <label key={`${action.name}:${actionIndex}`} className="flex items-start gap-2 text-xs text-content-secondary">
-	                        <input
-	                          type="checkbox"
+	                          <input
+	                            type="checkbox"
 	                          checked={selectedPostActionIndexes.includes(actionIndex)}
+                            disabled={jobActive}
 	                          onChange={(event) => setSelectedPostActionIndexes((current) => (
 	                            event.target.checked
 	                              ? [...new Set([...current, actionIndex])]
@@ -1553,7 +1551,7 @@ export function ModelMigratorPage() {
                 </div>
               </div>
               <div className="mb-4 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
-                Model Migrator ports semantic YAML, dashboards, and workbook query presentations where Omni APIs expose them. Schedules, alerts, permissions, sharing, favorites, and workbook-level artifacts not returned by the document query API are not moved automatically and should be checked in Omni after validation.
+                Model Migrator ports semantic YAML and dashboard metadata where Omni APIs expose them. {WORKBOOK_FIDELITY_DISCLOSURE}
               </div>
               <div className="max-h-[420px] overflow-auto rounded-card border border-border-subtle">
                 {job.items.map((item) => (

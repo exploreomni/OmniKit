@@ -4,6 +4,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { migrate } from '@/services/omniApi';
 import type { WizardState, WizardAction, MigrationResult } from '@/types';
+import { canApplyModelRemapAfterPreflight } from './reviewPreflight';
 
 interface DiagnosticEntry {
   phase: string;
@@ -97,6 +98,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
     setDryRunAttempted(false);
     setDiagnostics({});
     setExpandedDiag(new Set());
+    dispatch({ type: 'SET_DRY_RUN_COMPLETED', value: false });
     const results: MigrationResult[] = [];
     const diagMap: DiagnosticsMap = {};
 
@@ -165,10 +167,13 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
       const allMigratable = results.length > 0 && results.every((r) => r.status === 'ready' || r.status === 'warning');
       if (allMigratable) {
         dispatch({ type: 'SET_DRY_RUN_COMPLETED', value: true });
+      } else {
+        dispatch({ type: 'SET_DRY_RUN_COMPLETED', value: false });
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Compatibility preflight failed. Check your credentials and try again.';
       setDryRunError(msg);
+      dispatch({ type: 'SET_DRY_RUN_COMPLETED', value: false });
     }
 
     setDryRunAttempted(true);
@@ -284,6 +289,8 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
 
   const showPreflightWarning = !state.dryRunCompleted && !dryRunAttempted;
   const hasPreflightWarnings = dryRunResults?.some((r) => r.status === 'warning') ?? false;
+  const sameInstanceApplyReady = canApplyModelRemapAfterPreflight(state.selectedDashboards, dryRunResults);
+  const applyDisabled = runningDryRun || (state.sameInstance && !sameInstanceApplyReady);
 
   return (
     <div className="space-y-5">
@@ -606,7 +613,8 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
           </button>
           <button
             onClick={() => setShowConfirm(true)}
-            disabled={runningDryRun}
+            disabled={applyDisabled}
+            title={state.sameInstance && !sameInstanceApplyReady ? 'Run Compatibility Preflight before applying.' : undefined}
             className="btn-primary text-sm"
           >
             <Zap size={14} />
@@ -614,6 +622,11 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
           </button>
         </div>
       </div>
+      {state.sameInstance && !sameInstanceApplyReady && (
+        <p className="text-right text-xs text-content-secondary">
+          Run Compatibility Preflight before applying.
+        </p>
+      )}
 
       <ConfirmDialog
         open={showConfirm}

@@ -11,8 +11,9 @@ import {
   type PostMigrationAction,
   type SavedInstance,
 } from '../services/nativeVault';
-import { OmniClient } from '../services/omniClient';
+import { OmniClient, type OmniDocumentRecord, type OmniModelRecord } from '../services/omniClient';
 import { importLegacyVault } from '../services/legacyVaultImport';
+import { validatePostMigrationActionTarget } from '../services/postMigrationActions';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
@@ -38,6 +39,131 @@ function cleanString(value: unknown): string | undefined {
 
 function normalizeFolderPath(value: string | undefined): string {
   return (value || '').trim().replace(/^\/+|\/+$/g, '').toLowerCase();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function nestedString(obj: unknown, ...path: string[]): string | undefined {
+  let current: unknown = obj;
+  for (const key of path) {
+    if (!isRecord(current)) return undefined;
+    current = current[key];
+  }
+  return typeof current === 'string' && current.trim() ? current : undefined;
+}
+
+const MODEL_PLACEHOLDER_VALUES = new Set([
+  'unknown',
+  'model unknown',
+  'model not detected',
+  'not detected',
+  'n/a',
+  'none',
+  '-',
+]);
+
+function cleanModelMetadata(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return MODEL_PLACEHOLDER_VALUES.has(trimmed.toLowerCase()) ? undefined : trimmed;
+}
+
+function findStringByKey(obj: unknown, keys: string[], maxDepth = 6): string | undefined {
+  if (maxDepth <= 0) return undefined;
+  if (Array.isArray(obj)) {
+    for (const value of obj) {
+      const found = findStringByKey(value, keys, maxDepth - 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!isRecord(obj)) return undefined;
+  for (const key of keys) {
+    const value = obj[key];
+    if (typeof value === 'string' && value.trim()) return value;
+  }
+  for (const value of Object.values(obj)) {
+    const found = findStringByKey(value, keys, maxDepth - 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function modelLabel(model: OmniModelRecord): string {
+  return model.name || model.identifier || model.id;
+}
+
+function modelNameByKey(models: OmniModelRecord[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const model of models) {
+    const label = modelLabel(model);
+    for (const key of [model.id, model.identifier, model.baseModelId, model.name]) {
+      if (key && !names.has(key)) names.set(key, label);
+    }
+  }
+  return names;
+}
+
+function extractModelDetails(payload: unknown): { baseModelId?: string; baseModelName?: string } {
+  const baseModelId = cleanModelMetadata(nestedString(payload, 'dashboard', 'sharedModelId')
+    || nestedString(payload, 'dashboard', 'model', 'baseModelId')
+    || nestedString(payload, 'dashboard', 'model', 'id')
+    || nestedString(payload, 'dashboard', 'baseModel', 'id')
+    || nestedString(payload, 'dashboard', 'baseModelId')
+    || nestedString(payload, 'document', 'sharedModelId')
+    || nestedString(payload, 'document', 'baseModel', 'id')
+    || nestedString(payload, 'document', 'baseModelId')
+    || nestedString(payload, 'document', 'model', 'id')
+    || nestedString(payload, 'model', 'id')
+    || findStringByKey(payload, [
+      'sharedModelId',
+      'shared_model_id',
+      'baseModelId',
+      'base_model_id',
+      'modelId',
+      'model_id',
+    ]));
+  const baseModelName = cleanModelMetadata(nestedString(payload, 'document', 'baseModel', 'name')
+    || nestedString(payload, 'dashboard', 'baseModel', 'name')
+    || nestedString(payload, 'dashboard', 'model', 'name')
+    || nestedString(payload, 'document', 'model', 'name')
+    || nestedString(payload, 'model', 'name')
+    || findStringByKey(payload, ['modelName', 'model_name'], 4));
+  return { baseModelId, baseModelName };
+}
+
+async function enrichDocumentModelDetails(client: OmniClient, documents: OmniDocumentRecord[]): Promise<Array<OmniDocumentRecord & { baseModelName?: string }>> {
+  const models = await client.listModels('SHARED').catch(() => [] as OmniModelRecord[]);
+  const namesByKey = modelNameByKey(models);
+  const enriched: Array<OmniDocumentRecord & { baseModelName?: string }> = [];
+
+  for (const document of documents) {
+    const documentWithModel = document as OmniDocumentRecord & { baseModelName?: string };
+    let baseModelId = cleanModelMetadata(documentWithModel.baseModelId);
+    let baseModelName = cleanModelMetadata(documentWithModel.baseModelName) || (baseModelId ? namesByKey.get(baseModelId) : undefined);
+    if (!baseModelId || !baseModelName) {
+      try {
+        const details = extractModelDetails(await client.exportDocument(document.identifier));
+        baseModelId ||= details.baseModelId;
+        baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
+      } catch {
+        // Best-effort enrichment; preflight still validates migrations before imports run.
+      }
+    }
+    const documentWithoutModelPlaceholders = { ...documentWithModel };
+    delete documentWithoutModelPlaceholders.baseModelId;
+    delete documentWithoutModelPlaceholders.baseModelName;
+    enriched.push({
+      ...documentWithoutModelPlaceholders,
+      ...(baseModelId ? { baseModelId } : {}),
+      ...(baseModelName ? { baseModelName } : {}),
+    });
+  }
+
+  return enriched;
 }
 
 function parseStringArray(value: unknown): string[] {
@@ -117,6 +243,12 @@ function validateInstanceInput(input: Partial<SavedInstance> & { apiKey?: string
   }
   if (!updating && (!input.apiKey || !input.apiKey.trim())) {
     throw new Error('Instance API key is required.');
+  }
+  for (const action of input.postMigrationActions || []) {
+    const actionError = validatePostMigrationActionTarget(action);
+    if (actionError) {
+      throw Object.assign(new Error(`Post-migration action "${action.name}" is invalid: ${actionError}`), { statusCode: 400 });
+    }
   }
 }
 
@@ -216,6 +348,7 @@ export default async function handler(req: Request): Promise<Response> {
       const client = new OmniClient(secret);
       const folderId = cleanString(url.searchParams.get('folderId')) || secret.defaultFolderId;
       const folderPath = cleanString(url.searchParams.get('folderPath')) || secret.defaultFolderPath;
+      const includeModelDetails = url.searchParams.get('includeModelDetails') === 'true';
       let documents = await client.listFolderDocuments(folderId, true);
       if (!folderId && folderPath) {
         const requestedPath = normalizeFolderPath(folderPath);
@@ -224,6 +357,7 @@ export default async function handler(req: Request): Promise<Response> {
           return actualPath === requestedPath || actualPath.endsWith(`/${requestedPath}`);
         });
       }
+      if (includeModelDetails) documents = await enrichDocumentModelDetails(client, documents);
       return json({ documents });
     }
 

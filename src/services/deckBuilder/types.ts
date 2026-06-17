@@ -220,6 +220,8 @@ export interface SlideInsight {
 export interface DeckRecipe {
   version: 1;
   dashboardUrl: string;
+  dashboardId?: string;
+  dashboardName?: string;
   selectedTileIds: string[];
   insights: Record<string, string>;
   brand: BrandConfig;

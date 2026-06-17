@@ -4,14 +4,7 @@ import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck, Unloc
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
-
-function hostFromUrl(value: string): string {
-  try {
-    return new URL(/^https?:\/\//i.test(value) ? value : `https://${value}`).host;
-  } catch {
-    return value.replace(/^https?:\/\//, '').replace(/\/+$/, '');
-  }
-}
+import { hasSavedVaultConnection } from '@/services/connectionGuards';
 
 function formatRemaining(ms: number): string {
   const seconds = Math.max(0, Math.ceil(ms / 1000));
@@ -25,8 +18,22 @@ function roleLabel(role: string): string {
   return role === 'source' ? 'Source' : 'Destination';
 }
 
+function isRecentlyValidated(value?: string): boolean {
+  if (!value) return false;
+  const validatedAt = Date.parse(value);
+  if (!Number.isFinite(validatedAt)) return false;
+  return Date.now() - validatedAt < 24 * 60 * 60 * 1000;
+}
+
+function validationLabel(value?: string): string {
+  if (!value) return 'Not tested recently';
+  const validatedAt = Date.parse(value);
+  if (!Number.isFinite(validatedAt)) return 'Validation age unknown';
+  return isRecentlyValidated(value) ? 'Tested in the last 24h' : 'Test again recommended';
+}
+
 export function InstanceSwitcher() {
-  const { connection, isConnected } = useConnection();
+  const { connection } = useConnection();
   const {
     status,
     vaultStatus,
@@ -61,10 +68,14 @@ export function InstanceSwitcher() {
     ? vaultStatus.lastActivityAt + vaultStatus.idleTimeoutMs - now
     : null;
   const showIdleWarning = remainingMs !== null && remainingMs > 0 && remainingMs < 5 * 60 * 1000;
-  const manualHost = connection.baseUrl ? hostFromUrl(connection.baseUrl) : '';
   const canUnlockVault = Boolean(passphrase.trim()) && Boolean(vaultStatus?.exists) && !busy;
+  const hasSavedConnection = hasSavedVaultConnection(connection);
 
   async function handleConnect(instanceId: string) {
+    if (instanceId === connection.instanceId) {
+      setOpen(false);
+      return;
+    }
     setBusy(true);
     setError('');
     try {
@@ -118,13 +129,13 @@ export function InstanceSwitcher() {
           </span>
           <span className="min-w-0 flex-1">
             <span className="block truncate">
-              {activeInstance?.label || connection.instanceLabel || (isConnected ? 'One-time connection' : 'Instance vault')}
+              {activeInstance?.label || connection.instanceLabel || (hasSavedConnection ? 'Saved instance' : 'Instance vault')}
             </span>
             <span className="block truncate text-[10px] font-medium text-content-secondary">
               {activeInstance
                 ? `${roleLabel(activeInstance.role)} · ${activeInstance.apiKeyMasked}`
-                : isConnected && manualHost
-                  ? manualHost
+                : hasSavedConnection
+                  ? `${connection.apiKeyMasked || 'Vault key masked'} · saved profile`
                   : status === 'unlocked'
                     ? `${instances.length} saved instance${instances.length === 1 ? '' : 's'}`
                     : status === 'no-vault'
@@ -206,19 +217,52 @@ export function InstanceSwitcher() {
                   </Link>
                 ) : (
                   <>
-                    <select
-                      value={connection.instanceId || ''}
-                      onChange={(event) => void handleConnect(event.target.value)}
-                      disabled={busy}
-                      className="input-field h-9 text-xs"
-                    >
-                      <option value="">Choose an instance</option>
-                      {instances.map((instance) => (
-                        <option key={instance.id} value={instance.id}>
-                          {instance.label} · {roleLabel(instance.role)}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="max-h-56 overflow-auto rounded-[7px] border border-border-subtle" role="listbox" aria-label="Saved Omni instances">
+                      {instances.map((instance) => {
+                        const active = instance.id === connection.instanceId;
+                        const recent = isRecentlyValidated(instance.lastValidatedAt);
+                        return (
+                          <button
+                            key={instance.id}
+                            type="button"
+                            onClick={() => void handleConnect(instance.id)}
+                            disabled={busy}
+                            className={`flex w-full items-start gap-2 border-b border-border-subtle px-2.5 py-2 text-left last:border-b-0 transition ${
+                              active
+                                ? 'border-l-4 border-l-omni-500 bg-omni-50 text-omni-900 hover:bg-omni-100'
+                                : 'border-l-4 border-l-transparent hover:bg-surface-secondary'
+                            } disabled:cursor-wait disabled:opacity-70`}
+                            role="option"
+                            aria-selected={active}
+                          >
+                            <span
+                              className={`mt-1.5 h-2.5 w-2.5 shrink-0 rounded-full ${recent ? 'bg-emerald-500' : 'bg-slate-300'}`}
+                              title={validationLabel(instance.lastValidatedAt)}
+                              aria-hidden="true"
+                            />
+                            <span className="min-w-0 flex-1">
+                              <span className="block truncate font-semibold text-content-primary">{instance.label}</span>
+                              <span className="mt-1 flex min-w-0 flex-wrap items-center gap-1.5">
+                                <span className="shrink-0 rounded-full bg-surface-tertiary px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em] text-content-secondary">
+                                  {roleLabel(instance.role)}
+                                </span>
+                                {active && (
+                                  <span className="shrink-0 rounded-full bg-white px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-[0.08em] text-omni-700 ring-1 ring-omni-100">
+                                    Active
+                                  </span>
+                                )}
+                              </span>
+                              <span className="mt-0.5 block truncate text-[10px] text-content-secondary">
+                                {instance.apiKeyMasked}
+                              </span>
+                              <span className="mt-0.5 block truncate text-[10px] text-content-tertiary">
+                                {validationLabel(instance.lastValidatedAt)}
+                              </span>
+                            </span>
+                          </button>
+                        );
+                      })}
+                    </div>
                     <Link to="/instances" className="btn-secondary flex w-full items-center justify-center gap-2 text-xs">
                       <Server size={13} />
                       Manage instances

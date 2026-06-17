@@ -33,7 +33,7 @@ export function EmbedsPage() {
   const [recentUrls, setRecentUrls] = useState<Array<{ path: string; url: string; time: string }>>([]);
 
   useEffect(() => {
-    const cached = dashboardCache.load(connection.baseUrl);
+    const cached = dashboardCache.load(connectionKey);
     if (cached?.data) {
       setDashboards(cached.data);
       setDashboardsSyncedAt(cached.savedAt);
@@ -49,7 +49,7 @@ export function EmbedsPage() {
     setLoading(false);
     setLoadingDashboards(false);
     setRecentUrls([]);
-  }, [connection.baseUrl, connectionKey]);
+  }, [connectionKey]);
 
   async function refreshDashboards() {
     const requestKey = connectionKey;
@@ -60,7 +60,7 @@ export function EmbedsPage() {
       if (!isActiveConnectionRequest(requestKey)) return;
       setDashboards(next);
       setDashboardsSyncedAt(Date.now());
-      dashboardCache.save(connection.baseUrl, next);
+      dashboardCache.save(connectionKey, next);
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       setError(friendlyApiError(err, 'Failed to load dashboards'));

@@ -6,6 +6,7 @@ import { listModels, omniProxy } from '@/services/omniApi';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { Blobby } from '@/components/ui/Blobby';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniConnection, OmniModel } from '@/types';
 
 const DIALECT_COLORS: Record<string, string> = {
@@ -30,7 +31,7 @@ interface ConnectionDetail {
 export function ConnectionsPage() {
   const { connection } = useConnection();
   const navigate = useNavigate();
-  const connectionKey = connection.instanceId || connection.baseUrl;
+  const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const [connections, setConnections] = useState<OmniConnection[]>([]);
   const [loading, setLoading] = useState(false);

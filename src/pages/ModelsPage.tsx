@@ -8,6 +8,7 @@ import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { Blobby } from '@/components/ui/Blobby';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniModel } from '@/types';
 
 const READINESS_SCAN_DELAY_MS = 1500;
@@ -102,7 +103,7 @@ function isRateLimitError(message: string) {
 export function ModelsPage() {
   const navigate = useNavigate();
   const { connection } = useConnection();
-  const connectionKey = connection.instanceId || connection.baseUrl;
+  const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const [models, setModels] = useState<OmniModel[]>([]);
   const [loading, setLoading] = useState(false);

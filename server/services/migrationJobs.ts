@@ -28,12 +28,10 @@ import {
   preflightWorkbookQueryFields,
   rewriteQueryModelReferences,
 } from './modelMigration/helpers';
+import { validatePostMigrationActionTarget } from './postMigrationActions';
 
 export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
 
-const PRIVATE_HOST_RE =
-  /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|0\.0\.0\.0|::1$|fc00:|fd[0-9a-f]{2}:)/i;
-const LOOPBACK_NAMES = new Set(['localhost', '0.0.0.0']);
 const DEFAULT_DESTINATION_CONCURRENCY = 10;
 
 export type JobStatus = 'pending' | 'running' | 'succeeded' | 'partial' | 'failed' | 'canceled';
@@ -1106,6 +1104,35 @@ function detailBoolean(details: Record<string, unknown> | undefined, key: string
   return details?.[key] === true;
 }
 
+function nestedString(value: unknown, path: string[]): string {
+  let current = value;
+  for (const key of path) {
+    if (!current || typeof current !== 'object' || Array.isArray(current)) return '';
+    current = (current as Record<string, unknown>)[key];
+  }
+  return typeof current === 'string' ? current : '';
+}
+
+function branchFromMigrationResult(result: Record<string, unknown>, fallbackName: string): { branchId: string; branchName: string } | null {
+  const branchId = [
+    result.branchId,
+    result.branch_id,
+    result.modelId,
+    result.model_id,
+    nestedString(result, ['branch', 'id']),
+    nestedString(result, ['model', 'id']),
+  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+  const branchName = [
+    result.branchName,
+    result.branch_name,
+    result.modelName,
+    result.model_name,
+    nestedString(result, ['branch', 'name']),
+    nestedString(result, ['model', 'name']),
+  ].find((value): value is string => typeof value === 'string' && Boolean(value.trim())) || fallbackName;
+  return branchId ? { branchId, branchName } : null;
+}
+
 async function executeModelJob(job: MigrationJob): Promise<void> {
   const source = requireInstance(job.sourceId);
   const targetId = typeof job.details?.targetId === 'string' ? job.details.targetId : job.destinationIds[0];
@@ -1200,15 +1227,23 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
       markAndPersistItem(item, 'running');
       if (item.kind === 'model_fast_path') {
         if (detailBoolean(details, 'fastPathSchemaConfirmed') !== true) throw new Error('Fast path requires explicit schema identity confirmation.');
-        await sourceClient.migrateModel({
+        const migrated = await sourceClient.migrateModel({
           sourceModelId,
           targetModelId,
           gitRef: detailString(details, 'gitRef') || undefined,
           branchName,
           commitMessage: `OmniKit Model Migrator fast path for ${item.targetModelName || targetModelId}`,
         });
-        branchByTargetModel.set(targetModelId, { branchId: '', branchName });
-        markAndPersistItem(item, 'succeeded', { details: { ...details, branchName } });
+        let branch = branchFromMigrationResult(migrated, branchName);
+        if (!branch) {
+          const resolvedBranch = await targetClient.findModelBranch(targetModelId, branchName);
+          branch = resolvedBranch ? { branchId: resolvedBranch.id, branchName: resolvedBranch.name } : null;
+        }
+        if (!branch?.branchId) {
+          throw new Error('Fast path completed but OmniKit could not resolve the target branch id for validation. Open the branch in Omni or retry after the branch is visible.');
+        }
+        branchByTargetModel.set(targetModelId, branch);
+        markAndPersistItem(item, 'succeeded', { details: { ...details, branchId: branch.branchId, branchName: branch.branchName } });
       } else if (item.kind === 'model_translate') {
         const acceptedFileCount = typeof details.acceptedFileCount === 'number' ? details.acceptedFileCount : 0;
         if (acceptedFileCount === 0) {
@@ -1541,7 +1576,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
   }
 
-  async function runExportStage(): Promise<void> {
+  function exportItemsByDocument(): Map<string, MigrationJobItem[]> {
     const exportItemsByDocument = new Map<string, MigrationJobItem[]>();
     for (const item of job.items) {
       if (item.kind !== 'export' || !item.documentId) continue;
@@ -1549,22 +1584,25 @@ async function executeJob(job: MigrationJob): Promise<void> {
       rows.push(item);
       exportItemsByDocument.set(item.documentId, rows);
     }
+    return exportItemsByDocument;
+  }
 
-    for (const [documentId, exportItems] of exportItemsByDocument.entries()) {
-      if (canceledJobs.has(job.id)) break;
-      for (const item of exportItems) {
-        if (item.status === 'pending') markAndPersistItem(item, 'running');
-      }
-      try {
-        const payload = await sourceClient.exportDocument(documentId);
-        const cached = { payload, hash: hashPayload(payload) };
-        exports.set(documentId, cached);
-        for (const item of exportItems) markAndPersistItem(item, 'succeeded', { exportHash: cached.hash });
-      } catch (error) {
-        const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
-        for (const item of exportItems) markAndPersistItem(item, 'failed', { error: message });
-        skipDependentItems(documentId, `Export failed; dependent step skipped. ${message}`);
-      }
+  async function exportDocumentOnce(documentId: string, exportItems: MigrationJobItem[]): Promise<boolean> {
+    if (canceledJobs.has(job.id)) return false;
+    for (const item of exportItems) {
+      if (item.status === 'pending') markAndPersistItem(item, 'running');
+    }
+    try {
+      const payload = await sourceClient.exportDocument(documentId);
+      const cached = { payload, hash: hashPayload(payload) };
+      exports.set(documentId, cached);
+      for (const item of exportItems) markAndPersistItem(item, 'succeeded', { exportHash: cached.hash });
+      return true;
+    } catch (error) {
+      const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+      for (const item of exportItems) markAndPersistItem(item, 'failed', { error: message });
+      skipDependentItems(documentId, `Export failed; dependent step skipped. ${message}`);
+      return false;
     }
   }
 
@@ -1690,14 +1728,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
   }
 
-  async function runDestinationStage(): Promise<void> {
-    for (const item of job.items) {
-      if (item.kind === 'import' && item.status === 'pending' && item.documentId) {
-        importConsumers.set(item.documentId, (importConsumers.get(item.documentId) || 0) + 1);
-      }
-    }
+  async function runGroupedDestinationItems(itemsToRun: MigrationJobItem[]): Promise<void> {
     const groups = new Map<string, MigrationJobItem[]>();
-    for (const item of job.items) {
+    for (const item of itemsToRun) {
       if (item.kind === 'export' || item.status !== 'pending') continue;
       const rows = groups.get(item.destinationId) || [];
       rows.push(item);
@@ -1715,8 +1748,51 @@ async function executeJob(job: MigrationJob): Promise<void> {
     });
   }
 
-  await runExportStage();
-  if (!canceledJobs.has(job.id)) await runDestinationStage();
+  async function runDeleteStage(): Promise<void> {
+    await runGroupedDestinationItems(job.items.filter((item) => item.kind === 'delete' && item.status === 'pending'));
+  }
+
+  async function runDocumentStage(documentId: string, exportItems: MigrationJobItem[]): Promise<void> {
+    const exported = await exportDocumentOnce(documentId, exportItems);
+    if (!exported) return;
+    if (canceledJobs.has(job.id)) {
+      exports.delete(documentId);
+      return;
+    }
+
+    const pendingImports = job.items.filter((item) => (
+      item.kind === 'import'
+      && item.status === 'pending'
+      && item.documentId === documentId
+    ));
+    if (pendingImports.length > 0) importConsumers.set(documentId, pendingImports.length);
+
+    const documentItems = job.items.filter((item) => (
+      item.status === 'pending'
+      && item.documentId === documentId
+      && item.kind !== 'export'
+      && item.kind !== 'delete'
+    ));
+    await runGroupedDestinationItems(documentItems);
+    importConsumers.delete(documentId);
+    exports.delete(documentId);
+  }
+
+  async function runRemainingDestinationStage(): Promise<void> {
+    await runGroupedDestinationItems(job.items.filter((item) => (
+      item.status === 'pending'
+      && item.kind !== 'export'
+      && item.kind !== 'delete'
+    )));
+  }
+
+  await runDeleteStage();
+  const exportsByDocument = exportItemsByDocument();
+  for (const [documentId, exportItems] of exportsByDocument.entries()) {
+    if (canceledJobs.has(job.id)) break;
+    await runDocumentStage(documentId, exportItems);
+  }
+  if (!canceledJobs.has(job.id)) await runRemainingDestinationStage();
 
   if (canceledJobs.has(job.id)) {
     markPendingItemsSkipped(job, 'Canceled by user.');
@@ -1787,27 +1863,10 @@ async function runSchemaRefreshAction(action: PostMigrationAction): Promise<{ ok
 
 export async function runPostMigrationAction(action: PostMigrationAction): Promise<{ ok: boolean; error?: string; warning?: string }> {
   if (action.kind === 'refresh-schema') return runSchemaRefreshAction(action);
-  let url: URL;
-  try {
-    url = new URL(action.url);
-  } catch {
-    return { ok: false, error: 'Post-migration action URL is invalid.' };
-  }
-  if (url.protocol !== 'https:') {
-    return { ok: false, error: 'Post-migration actions must use HTTPS.' };
-  }
-  const allowPrivate = process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS === 'true';
-  const hostname = url.hostname.toLowerCase();
-  if (!allowPrivate && (LOOPBACK_NAMES.has(hostname) || PRIVATE_HOST_RE.test(hostname))) {
-    return { ok: false, error: 'Private-network post-migration actions are blocked by default.' };
-  }
-  const allowlist = (process.env.OMNIKIT_POST_ACTION_ALLOWLIST || '')
-    .split(',')
-    .map((entry) => entry.trim().toLowerCase())
-    .filter(Boolean);
-  if (allowlist.length > 0 && !allowlist.some((entry) => hostname === entry || hostname.endsWith(`.${entry}`))) {
-    return { ok: false, error: `Post-migration action host is not allowlisted: ${hostname}.` };
-  }
+  const validationError = validatePostMigrationActionTarget(action);
+  if (validationError) return { ok: false, error: validationError };
+
+  const url = new URL(action.url);
   try {
     const response = await fetch(url, {
       method: action.method,

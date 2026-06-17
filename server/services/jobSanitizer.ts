@@ -4,6 +4,7 @@ import type { MigrationJob, MigrationJobItem, MigrationTarget } from './migratio
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
 const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
+const OMNI_TOKEN_PATTERN = /\bomni_[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;
 const SENSITIVE_KEY_PATTERN = /^(api[_-]?key|authorization|token|secret|password|passphrase)$/i;
 const PHONE_PATTERN = /\b(?:\+?1[-.\s]?)?(?:\(?\d{3}\)?[-.\s]?)\d{3}[-.\s]?\d{4}\b/g;
@@ -29,6 +30,7 @@ function isLuhnValid(value: string): boolean {
 export function redactSensitiveText(value: string): string {
   return value
     .replace(TOKEN_PATTERN, `$1${REDACTED}`)
+    .replace(OMNI_TOKEN_PATTERN, REDACTED)
     .replace(SECRET_ASSIGNMENT_PATTERN, `$1$2${REDACTED}`)
     .replace(EMAIL_PATTERN, '[redacted-email]')
     .replace(PHONE_PATTERN, '[redacted-phone]')

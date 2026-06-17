@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
 
+import instancesHandler from '../server/handlers/instances';
 import { buildMigrationPlan } from '../server/services/migrationJobs';
 import { OmniClient, type OmniDocumentRecord } from '../server/services/omniClient';
 import {
@@ -123,4 +124,99 @@ test('planner replaces same-named dashboards without emptying unrelated target d
   assert.equal(deletes[0].documentId, 'dest-existing-1');
   assert.equal(deletes[0].replacement, true);
   assert.equal(plan.steps.some((step) => step.documentId === 'dest-existing-2'), false);
+});
+
+test('saved-instance document listing enriches missing dashboard model details on request', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+    id: 'dash-1',
+    identifier: 'dash-1',
+    name: 'Coffee Shop Demo',
+    folderPath: 'Source Dashboards',
+    baseModelId: 'Unknown',
+    baseModelName: 'Unknown',
+    description: 'Demo dashboard',
+    labels: [],
+  }]);
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'model-1',
+    name: 'Coffee Model',
+    identifier: 'coffee-model',
+  }]);
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    dashboard: {
+      sharedModelId: 'model-1',
+    },
+  }));
+
+  const response = await instancesHandler(new Request('http://localhost/api/instances/source-1/documents?includeModelDetails=true'));
+  assert.equal(response.status, 200);
+  const body = await response.json() as { documents: Array<{ baseModelId?: string; baseModelName?: string }> };
+
+  assert.equal(body.documents[0].baseModelId, 'model-1');
+  assert.equal(body.documents[0].baseModelName, 'Coffee Model');
+});
+
+test('saved-instance document listing extracts model details from nested document model payloads', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+    id: 'dash-1',
+    identifier: 'dash-1',
+    name: 'Nested Model Dashboard',
+    folderPath: 'Source Dashboards',
+    baseModelId: 'Unknown',
+    baseModelName: 'Unknown',
+    description: 'Demo dashboard',
+    labels: [],
+  }]);
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'model-2',
+    name: 'Nested Model',
+    identifier: 'nested-model',
+  }]);
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    document: {
+      model: {
+        id: 'model-2',
+        name: 'Nested Model',
+      },
+    },
+  }));
+
+  const response = await instancesHandler(new Request('http://localhost/api/instances/source-1/documents?includeModelDetails=true'));
+  assert.equal(response.status, 200);
+  const body = await response.json() as { documents: Array<{ baseModelId?: string; baseModelName?: string }> };
+
+  assert.equal(body.documents[0].baseModelId, 'model-2');
+  assert.equal(body.documents[0].baseModelName, 'Nested Model');
 });

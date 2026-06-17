@@ -1,12 +1,12 @@
-import { useState, useRef, useEffect, useCallback } from 'react';
+import { useState, useRef, useEffect, useCallback, useId } from 'react';
 import { CheckCircle2, ChevronDown, Search } from 'lucide-react';
 import { selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
-
-interface ComboBoxOption {
-  value: string;
-  label: string;
-  subtitle?: string;
-}
+import {
+  comboBoxEmptyText,
+  filterComboBoxOptions,
+  resolveComboBoxDisplay,
+  type ComboBoxOption,
+} from './comboBoxUtils';
 
 interface ComboBoxProps {
   options: ComboBoxOption[];
@@ -14,6 +14,9 @@ interface ComboBoxProps {
   onChange: (value: string) => void;
   placeholder?: string;
   allowFreeText?: boolean;
+  ariaLabel?: string;
+  disabled?: boolean;
+  emptyLabel?: string;
 }
 
 export function ComboBox({
@@ -22,6 +25,9 @@ export function ComboBox({
   onChange,
   placeholder = 'Select or type...',
   allowFreeText = true,
+  ariaLabel,
+  disabled = false,
+  emptyLabel = 'No options found',
 }: ComboBoxProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -29,16 +35,12 @@ export function ComboBox({
   const containerRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const listboxId = useId();
 
-  const filtered = options.filter(
-    (o) =>
-      o.label.toLowerCase().includes(search.toLowerCase()) ||
-      o.value.toLowerCase().includes(search.toLowerCase())
-  );
-
-  const selectedOption = options.find((o) => o.value === value);
-  const selectedLabel = selectedOption?.label || value;
-  const showIdBelowLabel = !!selectedOption && selectedOption.label !== selectedOption.value;
+  const filtered = filterComboBoxOptions(options, search);
+  const { selectedLabel, showIdBelowLabel } = resolveComboBoxDisplay(options, value);
+  const customValue = search.trim();
+  const showCustomOption = allowFreeText && customValue && filtered.length === 0;
 
   useEffect(() => {
     setHighlightedIndex(-1);
@@ -62,6 +64,7 @@ export function ComboBox({
   }, []);
 
   function handleSelect(val: string) {
+    if (disabled) return;
     onChange(val);
     setIsOpen(false);
     setSearch('');
@@ -69,6 +72,7 @@ export function ComboBox({
   }
 
   function handleInputChange(val: string) {
+    if (disabled) return;
     setSearch(val);
     if (!isOpen) setIsOpen(true);
     if (allowFreeText) {
@@ -77,6 +81,7 @@ export function ComboBox({
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
+    if (disabled) return;
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       const next = highlightedIndex < filtered.length - 1 ? highlightedIndex + 1 : 0;
@@ -103,17 +108,32 @@ export function ComboBox({
     }
   }
 
+  function openMenu() {
+    if (disabled) return;
+    setIsOpen(true);
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }
+
   return (
     <div ref={containerRef} className="relative">
       <div
-        className="input-field cursor-pointer flex items-center justify-between gap-2"
-        onClick={() => {
-          setIsOpen(true);
-          setTimeout(() => inputRef.current?.focus(), 0);
+        className={`input-field flex items-center justify-between gap-2 ${
+          disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'
+        }`}
+        onClick={openMenu}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowDown') {
+            event.preventDefault();
+            openMenu();
+          }
         }}
         role="combobox"
         aria-expanded={isOpen}
         aria-haspopup="listbox"
+        aria-controls={isOpen ? listboxId : undefined}
+        aria-label={ariaLabel || placeholder}
+        aria-disabled={disabled}
+        tabIndex={disabled ? -1 : 0}
       >
         {isOpen ? (
           <div className="flex items-center gap-2 flex-1">
@@ -127,6 +147,8 @@ export function ComboBox({
               placeholder={placeholder}
               className="bg-transparent outline-none flex-1 text-sm"
               aria-autocomplete="list"
+              aria-label={ariaLabel || placeholder}
+              disabled={disabled}
             />
           </div>
         ) : (
@@ -150,17 +172,38 @@ export function ComboBox({
       {isOpen && (
         <div
           ref={listRef}
+          id={listboxId}
           role="listbox"
           className="absolute z-50 w-full mt-1 bg-white border border-border rounded-button shadow-dropdown max-h-60 overflow-y-auto"
         >
           {filtered.length === 0 ? (
+            showCustomOption ? (
+              <button
+                type="button"
+                data-combobox-option
+                onClick={() => handleSelect(customValue)}
+                onMouseEnter={() => setHighlightedIndex(0)}
+                role="option"
+                aria-selected={customValue === value}
+                className={`w-full text-left px-3 py-2 text-sm transition-all ${
+                  customValue === value
+                    ? selectedRowClass
+                    : highlightedIndex === 0
+                      ? 'border-l-4 border-l-omni-300 bg-omni-100 text-omni-700'
+                      : unselectedRowClass
+                }`}
+              >
+                Use "{customValue}" as custom value
+              </button>
+            ) : (
             <div className="px-3 py-2 text-sm text-content-secondary">
-              {allowFreeText && search ? `Use "${search}" as custom value` : 'No options found'}
+              {comboBoxEmptyText({ allowFreeText, search, emptyLabel })}
             </div>
+            )
           ) : (
             filtered.map((option, index) => (
               <button
-                key={option.value}
+                key={`${option.value}:${index}`}
                 data-combobox-option
                 onClick={() => handleSelect(option.value)}
                 onMouseEnter={() => setHighlightedIndex(index)}
