@@ -298,7 +298,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
         <h2 className="text-2xl font-semibold text-content-primary">Review & Confirm</h2>
         <p className="text-sm text-content-secondary mt-1">
           {state.sameInstance
-            ? 'Review your model remap before applying it. Dashboards will not be duplicated — only their model linkage will be updated.'
+            ? 'Review your same-instance model / connection remap before applying it. Dashboards will not be duplicated or moved — only their model linkage will be updated.'
             : 'Review your cross-instance dashboard copy and run compatibility preflight before executing.'}
         </p>
       </div>
@@ -315,7 +315,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
           <div>
             <div className="text-xs text-content-secondary uppercase tracking-wider mb-1">Target</div>
             <div className="font-medium text-content-primary truncate">
-              {state.sameInstance ? 'Same instance' : targetConn.baseUrl.replace(/https?:\/\//, '')}
+              {state.sameInstance ? 'Same instance (location unchanged)' : targetConn.baseUrl.replace(/https?:\/\//, '')}
             </div>
           </div>
         </div>
@@ -324,6 +324,12 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
             <span className="text-content-secondary">Dashboards:</span>{' '}
             <span className="font-medium">{state.selectedDashboards.length}</span>
           </div>
+          {state.sameInstance && (
+            <div>
+              <span className="text-content-secondary">Dashboard location:</span>{' '}
+              <span className="font-medium">Unchanged</span>
+            </div>
+          )}
           {!state.sameInstance && (
             <div>
               <span className="text-content-secondary">Target folder:</span>{' '}
@@ -618,7 +624,7 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
             className="btn-primary text-sm"
           >
             <Zap size={14} />
-            {state.sameInstance ? 'Apply Model Remap' : 'Copy Dashboards'}
+            {state.sameInstance ? 'Apply Model / Connection Remap' : 'Copy Dashboards'}
           </button>
         </div>
       </div>
@@ -630,19 +636,19 @@ export function ReviewStep({ state, dispatch, onBack }: ReviewStepProps) {
 
       <ConfirmDialog
         open={showConfirm}
-        title={state.sameInstance ? 'Confirm Model Remap' : 'Confirm Dashboard Copy'}
+        title={state.sameInstance ? 'Confirm Model / Connection Remap' : 'Confirm Dashboard Copy'}
         message={
           showPreflightWarning
             ? state.sameInstance
-              ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running compatibility preflight first. We recommend running preflight to check payload and field compatibility. Continue anyway?`
+              ? `You are about to change the model or connection attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} without running compatibility preflight first. We recommend running preflight to check payload and field compatibility. Continue anyway?`
               : `You are about to copy ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} into another Omni instance without running compatibility preflight first. We recommend running preflight to check payload and field compatibility. Continue anyway?`
             : hasPreflightWarnings
-              ? `Compatibility preflight found warnings. You can continue, but review the impacted dashboards in Omni after ${state.sameInstance ? 'the model remap' : 'the dashboard copy'} and expect possible tile or filter cleanup. Continue?`
+              ? `Compatibility preflight found warnings. You can continue, but review the impacted dashboards in Omni after ${state.sameInstance ? 'the model / connection remap' : 'the dashboard copy'} and expect possible tile or filter cleanup. Continue?`
             : state.sameInstance
-              ? `You are about to change the model attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''}. No dashboard copy will be created. Continue?`
+              ? `You are about to change the model or connection attached to ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} inside the current Omni instance. No dashboard copy or folder move will be created. Continue?`
               : `You are about to copy ${state.selectedDashboards.length} dashboard${state.selectedDashboards.length !== 1 ? 's' : ''} into the target instance. Originals are not modified or deleted. Continue?`
         }
-        confirmLabel={state.sameInstance ? 'Apply Model Remap' : 'Copy Dashboards'}
+        confirmLabel={state.sameInstance ? 'Apply Model / Connection Remap' : 'Copy Dashboards'}
         cancelLabel="Cancel"
         variant={showPreflightWarning ? 'danger' : 'primary'}
         onConfirm={() => {

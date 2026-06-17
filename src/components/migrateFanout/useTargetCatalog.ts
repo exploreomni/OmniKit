@@ -4,6 +4,7 @@ import {
   listInstanceModels,
   type InstanceFolder,
 } from '@/services/opsConsole';
+import { compareCatalogText, folderDisplayLabel, sortModels } from '../../utils/catalogSort';
 import type { TargetCatalog, TargetDraft } from './fanoutTypes';
 
 function flattenFolders(folders: InstanceFolder[], prefix = ''): InstanceFolder[] {
@@ -40,8 +41,9 @@ export function useTargetCatalog() {
         listInstanceFolders(instanceId),
       ]);
       const next = {
-        models: modelsRes.models,
-        folders: flattenFolders(foldersRes.folders),
+        models: sortModels(modelsRes.models),
+        folders: flattenFolders(foldersRes.folders)
+          .sort((a, b) => compareCatalogText(folderDisplayLabel(a), folderDisplayLabel(b))),
         loading: false,
         loaded: true,
         error: '',

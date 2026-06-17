@@ -4,6 +4,9 @@
   "version": "1.0.0",
   "type": "module",
   "description": "OmniKit — a self-contained, local-first Omni admin workspace that runs in your browser.",
+  "engines": {
+    "node": ">=24"
+  },
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -24,9 +27,7 @@
     "security:check": "npm run security:audit && npm run test:security && npm run test:fanout && npm run test:migration-planner && npm run test:model-migrator && npm run test:instance-dashboard && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
-    "@types/better-sqlite3": "^7.6.13",
     "apache-arrow": "^21.1.0",
-    "better-sqlite3": "^12.10.0",
     "jszip": "^3.10.1",
     "lucide-react": "^0.344.0",
     "pptxgenjs": "^4.0.1",
@@ -37,7 +38,7 @@
   "devDependencies": {
     "@eslint/js": "^9.9.1",
     "@tailwindcss/forms": "^0.5.11",
-    "@types/node": "^20.12.12",
+    "@types/node": "^24.0.0",
     "@types/react": "^18.3.5",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",

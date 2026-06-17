@@ -84,14 +84,14 @@ export function MigratePage() {
     <div className="space-y-5">
       <PageHeader
         title="Dashboard Migrator"
-        description="Pick the migration path first: remap dashboards inside the active instance, or copy dashboards to one or many saved destination instances."
+        description="Pick whether dashboards should stay in this Omni instance and point to another model/connection, or be copied into a different saved Omni instance."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
       <div className="card p-5">
         <div className="mb-4">
-          <h2 className="text-base font-semibold text-content-primary">Where are you migrating to?</h2>
+          <h2 className="text-base font-semibold text-content-primary">What kind of dashboard migration is this?</h2>
           <p className="mt-1 text-sm text-content-secondary">
-            Same-instance remap uses the active Connect session. Fan-out copy/import uses saved profiles from the native encrypted vault.
+            Use same-instance remap when UAT and PROD are separate models or connections inside one Omni instance. Use cross-instance copy only when the destination is another saved Omni instance.
           </p>
         </div>
         <div className="grid gap-3 md:grid-cols-2">
@@ -102,9 +102,9 @@ export function MigratePage() {
               mode === 'remap' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
-            <div className="text-sm font-semibold">Within this instance</div>
+            <div className="text-sm font-semibold">Same instance: model / connection remap</div>
             <div className={`mt-1 text-xs ${mode === 'remap' ? 'text-white/80' : 'text-content-secondary'}`}>
-              Remap selected dashboards from one model to another inside the connected Omni instance.
+              Point selected dashboards at another model in this Omni instance. No dashboard copy, folder move, or new instance is created.
             </div>
           </button>
           <button
@@ -114,9 +114,9 @@ export function MigratePage() {
               mode === 'copy' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
             }`}
           >
-            <div className="text-sm font-semibold">To other saved instances</div>
+            <div className="text-sm font-semibold">Different instance: copy / import</div>
             <div className={`mt-1 text-xs ${mode === 'copy' ? 'text-white/80' : 'text-content-secondary'}`}>
-              Copy dashboards from one vault source into many destination instances, models, and folders.
+              Copy dashboards from one saved source profile into one or many saved destination instances, models, and folders.
             </div>
           </button>
         </div>

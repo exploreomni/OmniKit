@@ -143,7 +143,7 @@ export function MigrationAnimation({
             </div>
             <div className="text-[13px] text-content-secondary mt-1">
               {mode === 'remap'
-                ? `${total} dashboard${total !== 1 ? 's' : ''} finished remapping.`
+                ? `${total} dashboard${total !== 1 ? 's' : ''} updated to the target model. Location unchanged.`
                 : `${total} dashboard${total !== 1 ? 's are' : ' is'} settled in at ${total !== 1 ? 'their' : 'its'} new home.`}
             </div>
           </div>

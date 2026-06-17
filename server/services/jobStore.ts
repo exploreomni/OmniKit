@@ -1,4 +1,3 @@
-import Database from 'better-sqlite3';
 import {
   chmodSync,
   existsSync,
@@ -8,6 +7,8 @@ import {
   statSync,
 } from 'node:fs';
 import { dirname } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
+import type { SQLInputValue } from 'node:sqlite';
 
 import type {
   JobItemKind,
@@ -23,7 +24,9 @@ import type { PostMigrationAction } from './nativeVault';
 const DEFAULT_DB_PATH = './data/omnikit.db';
 const DEFAULT_LEGACY_JOBS_PATH = './data/jobs.json';
 
-let db: Database.Database | null = null;
+type SqlParams = Record<string, SQLInputValue>;
+
+let db: DatabaseSync | null = null;
 let dbPath = '';
 
 interface JobRow {
@@ -80,17 +83,17 @@ export function getLegacyJobsPath(): string {
   return process.env.OMNIKIT_JOBS_PATH || DEFAULT_LEGACY_JOBS_PATH;
 }
 
-function getDb(): Database.Database {
+function getDb(): DatabaseSync {
   const nextPath = getJobsDbPath();
   if (db && dbPath === nextPath) return db;
   if (db) db.close();
 
   mkdirSync(dirname(nextPath), { recursive: true });
   const fileExisted = existsSync(nextPath);
-  db = new Database(nextPath);
+  db = new DatabaseSync(nextPath);
   dbPath = nextPath;
-  db.pragma('journal_mode = WAL');
-  db.pragma('foreign_keys = ON');
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA foreign_keys = ON');
   initializeSchema(db);
   secureDbFiles(nextPath);
   if (!fileExisted || statSync(nextPath).size === 0) secureDbFiles(nextPath);
@@ -106,7 +109,7 @@ function secureDbFiles(pathname = getJobsDbPath()): void {
   }
 }
 
-function initializeSchema(database: Database.Database): void {
+function initializeSchema(database: DatabaseSync): void {
   database.exec(`
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY,
@@ -164,13 +167,24 @@ function initializeSchema(database: Database.Database): void {
   ensureColumn(database, 'job_items', 'details', 'TEXT');
 }
 
-function ensureColumn(database: Database.Database, tableName: string, columnName: string, definition: string): void {
+function ensureColumn(database: DatabaseSync, tableName: string, columnName: string, definition: string): void {
   const rows = database.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
   if (rows.some((row) => row.name === columnName)) return;
   database.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${definition}`);
 }
 
-function importLegacyJobsIfNeeded(database: Database.Database): void {
+function runTransaction(database: DatabaseSync, callback: () => void): void {
+  database.exec('BEGIN');
+  try {
+    callback();
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function importLegacyJobsIfNeeded(database: DatabaseSync): void {
   const count = database.prepare('SELECT COUNT(*) AS count FROM jobs').get() as { count: number };
   const legacyPath = getLegacyJobsPath();
   if (count.count > 0 || !existsSync(legacyPath)) return;
@@ -178,17 +192,17 @@ function importLegacyJobsIfNeeded(database: Database.Database): void {
     const parsed = JSON.parse(readFileSync(legacyPath, 'utf8')) as unknown;
     if (!Array.isArray(parsed)) return;
     const jobs = sanitizeJobHistory(parsed.filter(isJob));
-    const insert = database.transaction((rows: MigrationJob[]) => {
+    runTransaction(database, () => {
+      const rows = jobs;
       for (const job of rows) insertJobRows(database, job);
     });
-    insert(jobs);
     renameSync(legacyPath, `${legacyPath}.bak`);
   } catch {
     // A corrupt legacy job file should not stop OmniKit from starting.
   }
 }
 
-function recoverInterruptedJobs(database: Database.Database): void {
+function recoverInterruptedJobs(database: DatabaseSync): void {
   const now = Date.now();
   database.prepare(`
     UPDATE job_items
@@ -270,7 +284,7 @@ function rowToItem(row: JobItemRow): MigrationJobItem {
   };
 }
 
-function insertJobRows(database: Database.Database, job: MigrationJob): void {
+function insertJobRows(database: DatabaseSync, job: MigrationJob): void {
   upsertJobRow(database, job);
   const insertItem = database.prepare(`
     INSERT INTO job_items (
@@ -307,8 +321,28 @@ function insertJobRows(database: Database.Database, job: MigrationJob): void {
   for (const item of job.items) insertItem.run(itemParams(item));
 }
 
-function upsertJobRow(database: Database.Database, job: MigrationJob): void {
+function upsertJobRow(database: DatabaseSync, job: MigrationJob): void {
   const sanitized = sanitizeJob(job);
+  const params: SqlParams = {
+    id: sanitized.id,
+    workflow: sanitized.workflow || 'dashboard',
+    source_id: sanitized.sourceId,
+    source_label: sanitized.sourceLabel,
+    destination_ids: JSON.stringify(sanitized.destinationIds),
+    targets: JSON.stringify(sanitized.targets || []),
+    document_ids: JSON.stringify(sanitized.documentIds),
+    empty_first: sanitized.emptyFirst ? 1 : 0,
+    replace_same_named: sanitized.replaceSameNamed === false ? 0 : 1,
+    source_folder_id: sanitized.sourceFolderId || null,
+    source_folder_path: sanitized.sourceFolderPath || null,
+    post_migration_actions: JSON.stringify(sanitized.postMigrationActions),
+    status: sanitized.status,
+    parent_job_id: sanitized.parentJobId || null,
+    created_at: sanitized.createdAt,
+    started_at: sanitized.startedAt || null,
+    ended_at: sanitized.endedAt || null,
+    details: JSON.stringify(sanitized.details || {}),
+  };
   database.prepare(`
     INSERT INTO jobs (
       id, workflow, source_id, source_label, destination_ids, targets, document_ids, empty_first,
@@ -336,29 +370,10 @@ function upsertJobRow(database: Database.Database, job: MigrationJob): void {
       started_at = excluded.started_at,
       ended_at = excluded.ended_at,
       details = excluded.details
-  `).run({
-    id: sanitized.id,
-    workflow: sanitized.workflow || 'dashboard',
-    source_id: sanitized.sourceId,
-    source_label: sanitized.sourceLabel,
-    destination_ids: JSON.stringify(sanitized.destinationIds),
-    targets: JSON.stringify(sanitized.targets || []),
-    document_ids: JSON.stringify(sanitized.documentIds),
-    empty_first: sanitized.emptyFirst ? 1 : 0,
-    replace_same_named: sanitized.replaceSameNamed === false ? 0 : 1,
-    source_folder_id: sanitized.sourceFolderId || null,
-    source_folder_path: sanitized.sourceFolderPath || null,
-    post_migration_actions: JSON.stringify(sanitized.postMigrationActions),
-    status: sanitized.status,
-    parent_job_id: sanitized.parentJobId || null,
-    created_at: sanitized.createdAt,
-    started_at: sanitized.startedAt || null,
-    ended_at: sanitized.endedAt || null,
-    details: JSON.stringify(sanitized.details || {}),
-  });
+  `).run(params);
 }
 
-function itemParams(item: MigrationJobItem): Record<string, unknown> {
+function itemParams(item: MigrationJobItem): SqlParams {
   const sanitized = sanitizeJobItem(item);
   return {
     id: sanitized.id,
@@ -388,7 +403,7 @@ function itemParams(item: MigrationJobItem): Record<string, unknown> {
 
 export function insertJob(job: MigrationJob): void {
   const database = getDb();
-  database.transaction((row: MigrationJob) => insertJobRows(database, sanitizeJob(row)))(job);
+  runTransaction(database, () => insertJobRows(database, sanitizeJob(job)));
   secureDbFiles();
 }
 
@@ -425,17 +440,17 @@ export function updateJobItem(item: MigrationJobItem): void {
 
 export function getJob(id: string): MigrationJob | undefined {
   const database = getDb();
-  const row = database.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
+  const row = database.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as unknown as JobRow | undefined;
   if (!row) return undefined;
-  const items = database.prepare('SELECT * FROM job_items WHERE job_id = ? ORDER BY rowid ASC').all(id) as JobItemRow[];
+  const items = database.prepare('SELECT * FROM job_items WHERE job_id = ? ORDER BY rowid ASC').all(id) as unknown as JobItemRow[];
   return rowToJob(row, items);
 }
 
 export function listJobs(limit = 100, offset = 0): MigrationJob[] {
   const database = getDb();
-  const rows = database.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset) as JobRow[];
+  const rows = database.prepare('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?').all(limit, offset) as unknown as JobRow[];
   const itemStmt = database.prepare('SELECT * FROM job_items WHERE job_id = ? ORDER BY rowid ASC');
-  return rows.map((row) => rowToJob(row, itemStmt.all(row.id) as JobItemRow[]));
+  return rows.map((row) => rowToJob(row, itemStmt.all(row.id) as unknown as JobItemRow[]));
 }
 
 export function clearJobs(): void {

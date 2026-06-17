@@ -50,8 +50,8 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
   const total = state.migrationResults.length;
   const hasFailures = (state.migrationSummary?.failed ?? 0) > 0;
   const currentItemName = state.migrationResults.find((r) => r.status === 'in_progress')?.name;
-  const operationLabel = state.sameInstance ? 'Model Remap' : 'Dashboard Copy';
-  const operationLabelLower = state.sameInstance ? 'model remap' : 'dashboard copy';
+  const operationLabel = state.sameInstance ? 'Model / Connection Remap' : 'Dashboard Copy';
+  const operationLabelLower = state.sameInstance ? 'model / connection remap' : 'dashboard copy';
 
   function hostnameFromUrl(url: string | undefined): string | undefined {
     if (!url) return undefined;
@@ -87,6 +87,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
       sourceUrl: state.source.baseUrl,
       targetUrl: state.sameInstance ? state.source.baseUrl : state.target.baseUrl,
       targetFolder: state.targetFolder || null,
+      dashboardLocationChanged: state.sameInstance ? false : null,
       dryRun: false,
       summary: state.migrationSummary,
       modelMappings: state.modelMappings,
@@ -117,7 +118,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
             {operationLabel} In Progress
           </h2>
           <p className="text-sm text-content-secondary mt-1">
-            Your dashboards are being {state.sameInstance ? 'remapped' : 'copied into the target instance'}. Do not close this tab.
+            Your dashboards are being {state.sameInstance ? 'updated to the target model inside this Omni instance' : 'copied into the target instance'}. Do not close this tab.
           </p>
         </div>
       )}
@@ -136,7 +137,7 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
       )}
 
       {completed && state.migrationSummary && (
-        <div className="card bg-surface-secondary animate-fadeIn">
+        <div className="card bg-surface-secondary animate-fadeIn space-y-3">
           <div className="flex items-center gap-6 text-sm">
             <div className="flex items-center gap-2">
               <CheckCircle size={18} className="text-success" />
@@ -155,6 +156,11 @@ export function ResultsStep({ state, onReset }: ResultsStepProps) {
               </div>
             )}
           </div>
+          {state.sameInstance && (
+            <div className="rounded-card border border-border bg-white px-3 py-2 text-xs text-content-secondary">
+              Same-instance remap updated dashboard model references only. Dashboard copies and folder moves were not created.
+            </div>
+          )}
         </div>
       )}
 

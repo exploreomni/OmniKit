@@ -16,6 +16,8 @@ import {
 import { listFolders, listDocuments, enrichDocuments } from '@/services/omniApi';
 import { SkeletonRow } from '@/components/ui/SkeletonRow';
 import { InspectExportModal } from '@/components/ui/InspectExportModal';
+import { SearchInput } from '@/components/ui/SearchInput';
+import { dashboardMatchesSearch, filterFolderTree, sortDocuments, sortFolders } from '../../utils/catalogSort';
 import type { WizardState, WizardAction, OmniFolder, OmniDocument } from '@/types';
 
 interface FolderNodeProps {
@@ -25,11 +27,12 @@ interface FolderNodeProps {
   expandedIds: Set<string>;
   onToggle: (id: string) => void;
   onSelect: (folder: OmniFolder) => void;
+  forceExpanded?: boolean;
   depth?: number;
 }
 
-function FolderNode({ folder, nodeKey, selectedFolderId, expandedIds, onToggle, onSelect, depth = 0 }: FolderNodeProps) {
-  const isExpanded = expandedIds.has(folder.id);
+function FolderNode({ folder, nodeKey, selectedFolderId, expandedIds, onToggle, onSelect, forceExpanded = false, depth = 0 }: FolderNodeProps) {
+  const isExpanded = forceExpanded || expandedIds.has(folder.id);
   const isSelected = selectedFolderId === folder.id;
   const hasChildren = folder.children && folder.children.length > 0;
 
@@ -75,6 +78,7 @@ function FolderNode({ folder, nodeKey, selectedFolderId, expandedIds, onToggle, 
           expandedIds={expandedIds}
           onToggle={onToggle}
           onSelect={onSelect}
+          forceExpanded={forceExpanded}
           depth={depth + 1}
         />
       ))}
@@ -98,6 +102,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
   const [selectedFolderName, setSelectedFolderName] = useState<string | null>(null);
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [search, setSearch] = useState('');
+  const [folderSearch, setFolderSearch] = useState('');
   const [inspectDoc, setInspectDoc] = useState<OmniDocument | null>(null);
 
   const selectedIds = useMemo(
@@ -117,7 +122,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
           setError(`API error: ${res.error}${res.detail ? ` — ${res.detail}` : ''}`);
           return;
         }
-        const folders = Array.isArray(res.folders) ? res.folders : [];
+        const folders: OmniFolder[] = Array.isArray(res.folders) ? sortFolders(res.folders as OmniFolder[]) : [];
         if (folders.length === 0 && res.rawResponse !== undefined) {
           setError(`No folders found. Unexpected API response shape: ${JSON.stringify(res.rawResponse).slice(0, 200)}`);
           return;
@@ -143,7 +148,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
         setError(`API error loading documents: ${res.error}`);
         return;
       }
-      const docs: OmniDocument[] = Array.isArray(res.documents) ? res.documents : [];
+      const docs: OmniDocument[] = Array.isArray(res.documents) ? sortDocuments(res.documents) : [];
       dispatch({ type: 'SET_DOCUMENTS', documents: docs });
 
       const idsToEnrich = docs.filter((d) => !d.baseModelId).map((d) => d.id);
@@ -175,12 +180,14 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
   }
 
   const filteredDocs = useMemo(() => {
-    if (!search) return state.documents;
-    const q = search.toLowerCase();
-    return state.documents.filter(
-      (d) => d.name.toLowerCase().includes(q) || d.id.toLowerCase().includes(q)
-    );
+    const sortedDocs = sortDocuments(state.documents);
+    return sortedDocs.filter((document) => dashboardMatchesSearch(document, search));
   }, [state.documents, search]);
+
+  const visibleFolders = useMemo(
+    () => filterFolderTree(state.folders, folderSearch),
+    [folderSearch, state.folders]
+  );
 
   const toggleDashboard = useCallback((doc: OmniDocument) => {
     if (selectedIds.has(doc.id)) {
@@ -253,7 +260,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
             Select Dashboards
           </h2>
           <p className="text-[13px] text-content-secondary mt-1 leading-relaxed max-w-xl">
-            Pick dashboards from the connected instance for same-instance model remap. Use saved-instance copy/import when you need native-vault cross-instance migration.
+            Pick dashboards from the connected instance for same-instance model / connection remap. Use saved-instance copy/import when you need native-vault cross-instance migration.
           </p>
         </div>
 
@@ -323,6 +330,16 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
               </span>
             )}
           </div>
+          {state.folders.length > 0 && (
+            <div className="border-b border-border/60 p-2">
+              <SearchInput
+                value={folderSearch}
+                onChange={setFolderSearch}
+                placeholder="Search folders..."
+                ariaLabel="Search source folders"
+              />
+            </div>
+          )}
           <div className="p-2 overflow-y-auto max-h-[440px] flex-1">
             {loadingFolders ? (
               <div className="flex flex-col items-center justify-center py-10 gap-2">
@@ -339,8 +356,18 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                 />
                 <p className="text-xs text-content-secondary">No folders found.</p>
               </div>
+            ) : visibleFolders.length === 0 ? (
+              <div className="text-center py-8 px-3">
+                <img
+                  src="/blobby-no-results.png"
+                  alt=""
+                  className="w-12 h-12 mx-auto object-contain mb-2 opacity-80"
+                  aria-hidden
+                />
+                <p className="text-xs text-content-secondary">No folders match this search.</p>
+              </div>
             ) : (
-              state.folders.map((folder, index) => (
+              visibleFolders.map((folder, index) => (
                 <FolderNode
                   key={`${folder.id || folder.name}/${index}`}
                   folder={folder}
@@ -349,6 +376,7 @@ export function SelectStep({ state, dispatch, onNext, onBack }: SelectStepProps)
                   expandedIds={expandedIds}
                   onToggle={toggleExpanded}
                   onSelect={handleFolderSelect}
+                  forceExpanded={Boolean(folderSearch.trim())}
                 />
               ))
             )}
