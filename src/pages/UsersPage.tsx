@@ -8,6 +8,7 @@ import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Blobby } from '@/components/ui/Blobby';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { friendlyApiError } from '@/utils/apiErrors';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniUser } from '@/types';
 
 type MultiCreateUserRow = {
@@ -284,7 +285,7 @@ function mapScimUser(user: Record<string, unknown>): OmniUser {
 
 export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { connection } = useConnection();
-  const connectionKey = connection.instanceId || connection.baseUrl;
+  const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const [users, setUsers] = useState<OmniUser[]>([]);
   const [loading, setLoading] = useState(false);

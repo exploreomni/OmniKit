@@ -69,9 +69,11 @@ function AppLayout() {
             <Route
               path="/models/migrate"
               element={(
-                <Suspense fallback={<LazyPageFallback />}>
-                  <ModelMigratorPage />
-                </Suspense>
+                <RequireConnection>
+                  <Suspense fallback={<LazyPageFallback />}>
+                    <ModelMigratorPage />
+                  </Suspense>
+                </RequireConnection>
               )}
             />
             <Route

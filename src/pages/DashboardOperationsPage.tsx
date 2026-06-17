@@ -307,6 +307,15 @@ export function DashboardOperationsPage() {
     fetchFolders();
   }, [connection.baseUrl, connection.apiKey, connectionKey, isActiveConnectionRequest]);
 
+  useEffect(() => {
+    setSelected((prev) => {
+      if (prev.length === 0) return prev;
+      const availableIds = new Set(documents.map((doc) => doc.id));
+      const next = prev.filter((doc) => availableIds.has(doc.id));
+      return next.length === prev.length ? prev : next;
+    });
+  }, [documents]);
+
   async function loadDocumentsForFolder(folderId: string) {
     const requestKey = connectionKey;
     setLoadingDocs(true);
@@ -329,6 +338,11 @@ export function DashboardOperationsPage() {
   }
 
   async function handleFolderSelect(folder: OmniFolder) {
+    setSelected([]);
+    setResults([]);
+    setSummary(null);
+    setCurrentIndex(0);
+    setShowConfirm(false);
     setSelectedFolderId(folder.id);
     await loadDocumentsForFolder(folder.id);
   }
@@ -691,7 +705,13 @@ export function DashboardOperationsPage() {
           <div className="border-b border-border bg-surface-secondary px-4 py-3 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
             <div className="flex items-center gap-2">
               {filteredDocs.length > 0 && (
-                <input type="checkbox" checked={allInViewSelected} onChange={toggleSelectAll} className="flex-shrink-0" />
+                <input
+                  type="checkbox"
+                  checked={allInViewSelected}
+                  onChange={toggleSelectAll}
+                  aria-label={`${allInViewSelected ? 'Deselect' : 'Select'} visible dashboards`}
+                  className="flex-shrink-0"
+                />
               )}
               <span className="text-[10px] font-bold text-content-tertiary uppercase tracking-widest">
                 Dashboards

@@ -32,6 +32,8 @@ import {
 } from '../server/services/jobStore';
 import migrationJobsHandler from '../server/handlers/migration-jobs';
 import modelMigratorHandler from '../server/handlers/model-migrator';
+import instancesHandler from '../server/handlers/instances';
+import instanceDashboardHandler from '../server/handlers/instance-dashboard';
 import {
   publishMigrationJobEvent,
   subscribeMigrationJobEvents,
@@ -43,12 +45,53 @@ import {
   sanitizeFanoutDraftForStorage,
 } from '../src/components/migrateFanout/fanoutStorage';
 import {
+  getConnectionCacheKey,
+  hasActiveSavedVaultConnection,
+  hasSavedVaultConnection,
+} from '../src/services/connectionGuards';
+import {
   modelMigratorDraftContainsForbiddenKeys,
   sanitizeModelMigratorDraftForStorage,
 } from '../src/services/modelMigratorDraft';
+import { buildRecipe } from '../src/services/deckBuilder/deckRecipe';
+import {
+  RECIPE_STORAGE_KEY,
+  recipeRecordContainsForbiddenKeys,
+  saveRecipe,
+} from '../src/services/deckBuilder/recipeStore';
+import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
 import { OmniClient } from '../server/services/omniClient';
+import { sanitizeHistoryExportPayload } from '../src/services/historyExport';
 
 let tempDir = '';
+
+class MemoryStorage {
+  private readonly values = new Map<string, string>();
+
+  get length(): number {
+    return this.values.size;
+  }
+
+  clear(): void {
+    this.values.clear();
+  }
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  key(index: number): string | null {
+    return Array.from(this.values.keys())[index] ?? null;
+  }
+
+  removeItem(key: string): void {
+    this.values.delete(key);
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+}
 
 function makeStoredJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
   const createdAt = Date.now();
@@ -138,6 +181,7 @@ afterEach(() => {
   delete process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS;
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
+  delete (globalThis as typeof globalThis & { window?: unknown }).window;
 });
 
 test('native vault stores encrypted secrets, masks API keys, and uses 0600 permissions', () => {
@@ -201,6 +245,67 @@ test('vault-backed browser connections hydrate server-side without exposing plai
   assert.equal(hydrated.source.base_url, 'https://hydration.example.omniapp.co');
   assert.equal(hydrated.source.api_key, apiKey);
   assert.equal(hydrated.api_key, 'manual_key_should_stay_manual');
+});
+
+test('workflow connection guard rejects manual and plaintext sessions', () => {
+  assert.equal(hasSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: 'omni_live_plaintext_key_123',
+    connectionMode: 'manual',
+    instanceId: undefined,
+  }), false);
+
+  assert.equal(hasSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: 'omni_live_plaintext_key_123',
+    connectionMode: 'vault',
+    instanceId: 'inst-1',
+  }), false);
+
+  assert.equal(hasSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-1',
+    connectionMode: 'vault',
+    instanceId: 'inst-1',
+  }), true);
+
+  assert.equal(hasActiveSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-1',
+    connectionMode: 'vault',
+    instanceId: 'inst-1',
+    status: 'untested',
+  }), false);
+
+  assert.equal(hasActiveSavedVaultConnection({
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-1',
+    connectionMode: 'vault',
+    instanceId: 'inst-1',
+    status: 'success',
+  }), true);
+});
+
+test('connection cache key isolates saved instances that share one base URL', () => {
+  const first = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-1',
+    instanceId: 'inst-1',
+  });
+  const second = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co',
+    apiKey: '__omnikit_vault_instance__:inst-2',
+    instanceId: 'inst-2',
+  });
+  const manualFallback = getConnectionCacheKey({
+    baseUrl: 'https://shared.example.omniapp.co',
+    apiKey: '',
+  });
+
+  assert.notEqual(first, second);
+  assert.equal(first, 'inst-1|key-present');
+  assert.equal(second, 'inst-2|key-present');
+  assert.equal(manualFallback, 'https://shared.example.omniapp.co|no-key');
 });
 
 test('native vault enforces idle auto-lock on the next status check', async () => {
@@ -460,6 +565,42 @@ test('model migrator review draft stores translation state without plaintext sec
   assert.match(raw, /\[redacted\]/);
 });
 
+test('deck recipe storage removes secret-shaped keys before persisting locally', () => {
+  const localStorage = new MemoryStorage();
+  (globalThis as typeof globalThis & { window: { localStorage: MemoryStorage } }).window = { localStorage };
+  const recipe = {
+    ...buildRecipe({
+      dashboardUrl: 'https://example.omniapp.co/dashboards/dash-1',
+      dashboardId: 'dash-1',
+      dashboardName: 'Security Dashboard',
+      selectedTileIds: ['tile-1'],
+      insights: {},
+      brand: DEFAULT_BRAND,
+      includeAppendix: true,
+      generatedFrom: 'https://example.omniapp.co',
+    }),
+    apiKey: 'omni_live_recipe_secret_123456',
+    token: 'session-token',
+    brand: {
+      ...DEFAULT_BRAND,
+      secret: 'brand-secret',
+    },
+  };
+
+  saveRecipe({
+    name: 'Security recipe',
+    savedForHost: 'Example Omni (example.omniapp.co)',
+    recipe,
+  });
+
+  const stored = localStorage.getItem(RECIPE_STORAGE_KEY);
+  assert.ok(stored);
+  assert.equal(stored.includes('omni_live_recipe_secret_123456'), false);
+  assert.equal(stored.includes('session-token'), false);
+  assert.equal(stored.includes('brand-secret'), false);
+  assert.equal(recipeRecordContainsForbiddenKeys(JSON.parse(stored)), false);
+});
+
 test('job history sanitizer removes secrets and common sensitive data', () => {
   const job: MigrationJob = {
     id: 'job-1',
@@ -651,6 +792,33 @@ test('model migration job reload preserves details and retry lineage', () => {
   ]);
 });
 
+test('job store recovery fails interrupted pending jobs and items after restart', () => {
+  const job = makeStoredJob({
+    id: 'pending-recovery',
+    status: 'pending',
+    startedAt: undefined,
+    items: [{
+      id: 'pending-recovery-item',
+      jobId: 'pending-recovery',
+      targetId: 'target-1',
+      destinationId: 'dest-1',
+      destinationLabel: 'Destination',
+      targetModelId: 'model-1',
+      kind: 'import',
+      documentId: 'doc-1',
+      documentName: 'Dashboard',
+      status: 'pending',
+    }],
+  });
+  insertJob(job);
+  closeJobStoreForTests();
+
+  const reloaded = getJob(job.id);
+  assert.equal(reloaded?.status, 'failed');
+  assert.equal(reloaded?.items[0].status, 'failed');
+  assert.match(reloaded?.items[0].error || '', /Interrupted by server restart/);
+});
+
 test('migration job cancel works while vault is locked but retry still requires unlock', async () => {
   const job = makeStoredJob({ id: 'cancel-while-locked' });
   insertJob(job);
@@ -699,6 +867,36 @@ test('migration job SSE item events redact bare errors without item payloads', (
   assert.match(received.error || '', /\[redacted-email\]/);
 });
 
+test('migration job SSE post-migration events redact nested result payloads', () => {
+  let received: MigrationJobEvent | null = null;
+  const unsubscribe = subscribeMigrationJobEvents('post-redaction-event-job', (event) => {
+    received = event;
+  });
+  try {
+    publishMigrationJobEvent({
+      type: 'post-migration',
+      jobId: 'post-redaction-event-job',
+      results: {
+        action: 'Notify admin@corp.com',
+        error: 'Bearer abc123 failed for admin@corp.com with apiKey=omni_live_secret_123456',
+        nested: { token: 'plain-token-value', phone: '212-555-0199' },
+      },
+      at: Date.now(),
+    });
+  } finally {
+    unsubscribe();
+  }
+
+  assert.ok(received);
+  assert.equal(received.type, 'post-migration');
+  const serialized = JSON.stringify(received.results);
+  assert.equal(serialized.includes('abc123'), false);
+  assert.equal(serialized.includes('admin@corp.com'), false);
+  assert.equal(serialized.includes('omni_live_secret_123456'), false);
+  assert.equal(serialized.includes('plain-token-value'), false);
+  assert.equal(serialized.includes('212-555-0199'), false);
+});
+
 test('post-migration actions block unsafe targets before network execution', async () => {
   const baseAction = {
     name: 'Unsafe',
@@ -721,6 +919,184 @@ test('post-migration actions block unsafe targets before network execution', asy
     (await runPostMigrationAction({ ...baseAction, url: 'https://evil.example/hook' })).error || '',
     /not allowlisted/,
   );
+});
+
+test('instance save rejects unsafe post-migration webhook targets before vault persistence', async () => {
+  unlockVault('native passphrase');
+  const createResponse = await instancesHandler(new Request('http://localhost/api/instances', {
+    method: 'POST',
+    body: JSON.stringify({
+      label: 'Unsafe Hook',
+      role: 'both',
+      baseUrl: 'https://unsafe-hook.example.omniapp.co',
+      apiKey: 'omni_live_unsafe_hook_secret_123456',
+      metricFilter: {
+        connectionDatabaseContains: [],
+        connectionDatabaseExact: [],
+        embedExternalIdContains: [],
+        embedExternalIdExact: [],
+      },
+      postMigrationActions: [{
+        name: 'Notify',
+        method: 'POST',
+        url: 'http://hooks.example.com/migration-complete',
+        headers: {},
+        body: '',
+      }],
+    }),
+  }));
+  assert.equal(createResponse.status, 400);
+  const createBody = await createResponse.json() as { error?: string };
+  assert.match(createBody.error || '', /HTTPS/);
+  assert.equal(listInstances().some((instance) => instance.label === 'Unsafe Hook'), false);
+
+  const saved = upsertInstance({
+    id: 'safe-existing-instance',
+    label: 'Safe Existing',
+    role: 'both',
+    baseUrl: 'https://safe-existing.example.omniapp.co',
+    apiKey: 'omni_live_safe_existing_secret_123456',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const updateResponse = await instancesHandler(new Request(`http://localhost/api/instances/${saved.id}`, {
+    method: 'PUT',
+    body: JSON.stringify({
+      label: saved.label,
+      role: saved.role,
+      baseUrl: saved.baseUrl,
+      metricFilter: saved.metricFilter,
+      postMigrationActions: [{
+        name: 'Private notify',
+        method: 'POST',
+        url: 'https://127.0.0.1/migration-complete',
+        headers: {},
+        body: '',
+      }],
+    }),
+  }));
+  assert.equal(updateResponse.status, 400);
+  const updateBody = await updateResponse.json() as { error?: string };
+  assert.match(updateBody.error || '', /Private-network/);
+  assert.deepEqual(listInstances().find((instance) => instance.id === saved.id)?.postMigrationActions, []);
+});
+
+test('refresh-schema endpoint requires unlocked vault, saved instance ownership, and model id', async () => {
+  const locked = await instanceDashboardHandler(new Request('http://localhost/api/instance-dashboard/missing/refresh-schema', {
+    method: 'POST',
+    body: JSON.stringify({ modelId: 'model-1' }),
+  }));
+  assert.equal(locked.status, 423);
+
+  unlockVault('native passphrase');
+  const missing = await instanceDashboardHandler(new Request('http://localhost/api/instance-dashboard/missing/refresh-schema', {
+    method: 'POST',
+    body: JSON.stringify({ modelId: 'model-1' }),
+  }));
+  assert.equal(missing.status, 404);
+
+  const saved = upsertInstance({
+    id: 'refresh-instance',
+    label: 'Refresh Instance',
+    role: 'both',
+    baseUrl: 'https://refresh.example.omniapp.co',
+    apiKey: 'omni_live_refresh_secret_123456',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  const missingModel = await instanceDashboardHandler(new Request(`http://localhost/api/instance-dashboard/${saved.id}/refresh-schema`, {
+    method: 'POST',
+    body: JSON.stringify({}),
+  }));
+  assert.equal(missingModel.status, 400);
+
+  const originalRefreshModel = OmniClient.prototype.refreshModel;
+  const refreshedModels: string[] = [];
+  OmniClient.prototype.refreshModel = async (modelId: string) => {
+    refreshedModels.push(modelId);
+    return { jobId: 'refresh-job-1', status: 'queued', raw: {} };
+  };
+  try {
+    const response = await instanceDashboardHandler(new Request(`http://localhost/api/instance-dashboard/${saved.id}/refresh-schema`, {
+      method: 'POST',
+      body: JSON.stringify({ modelId: 'model-1' }),
+    }));
+    assert.equal(response.status, 200);
+    const body = await response.json() as { ok?: boolean; instanceId?: string; modelId?: string; jobId?: string; status?: string };
+    assert.deepEqual(body, {
+      ok: true,
+      instanceId: saved.id,
+      modelId: 'model-1',
+      jobId: 'refresh-job-1',
+      status: 'queued',
+    });
+    assert.deepEqual(refreshedModels, ['model-1']);
+  } finally {
+    OmniClient.prototype.refreshModel = originalRefreshModel;
+  }
+});
+
+test('history JSON export redacts operations, jobs, actions, and nested details', () => {
+  const payload = sanitizeHistoryExportPayload({
+    operations: [{
+      id: 'op-1',
+      type: 'migration',
+      description: 'Sent migration summary for owner@example.com with Bearer history-secret-token at 212-555-0199',
+      timestamp: Date.now(),
+      itemCount: 1,
+      successCount: 1,
+      failureCount: 0,
+      durationMs: 42,
+    }],
+    migrationJobs: [makeStoredJob({
+      id: 'history-export-job',
+      sourceLabel: 'owner@example.com',
+      postMigrationActions: [{
+        name: 'Notify owner@example.com',
+        method: 'POST',
+        url: 'https://hooks.example.com/notify?api_key=omni_live_export_secret_123456',
+        headers: { Authorization: 'Bearer export-secret-token' },
+        body: '{"apiKey":"omni_live_export_secret_123456"}',
+      }],
+      details: {
+        apiKey: 'omni_live_export_secret_123456',
+        nested: {
+          token: 'plain-export-token',
+          note: 'Finance Dashboard remains useful',
+        },
+      },
+      items: [{
+        id: 'history-export-item',
+        jobId: 'history-export-job',
+        destinationId: 'dest-1',
+        destinationLabel: 'owner@example.com',
+        targetModelId: 'model-1',
+        kind: 'import',
+        documentName: 'Finance Dashboard',
+        status: 'failed',
+        error: 'Bearer export-secret-token failed for owner@example.com at 212-555-0199',
+      }],
+    })],
+  });
+
+  const serialized = JSON.stringify(payload);
+  assert.equal(serialized.includes('owner@example.com'), false);
+  assert.equal(serialized.includes('history-secret-token'), false);
+  assert.equal(serialized.includes('export-secret-token'), false);
+  assert.equal(serialized.includes('omni_live_export_secret_123456'), false);
+  assert.equal(serialized.includes('plain-export-token'), false);
+  assert.equal(serialized.includes('212-555-0199'), false);
+  assert.equal(serialized.includes('Finance Dashboard'), true);
 });
 
 test('redactSensitiveText keeps non-sensitive text useful', () => {

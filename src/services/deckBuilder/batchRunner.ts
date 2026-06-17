@@ -15,7 +15,7 @@ import type {
 
 export interface BatchClientStatus {
   value: string;
-  status: 'pending' | 'running' | 'done' | 'failed';
+  status: 'pending' | 'running' | 'done' | 'failed' | 'cancelled';
   succeededTiles: number;
   failedTiles: number;
   message?: string;
@@ -79,8 +79,7 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
 
   for (const value of opts.values) {
     if (opts.signal?.aborted) {
-      opts.onClientUpdate({ value, status: 'failed', succeededTiles: 0, failedTiles: 0, error: 'Cancelled' });
-      failed += 1;
+      opts.onClientUpdate({ value, status: 'cancelled', succeededTiles: 0, failedTiles: 0, message: 'Cancelled' });
       continue;
     }
 
@@ -211,6 +210,16 @@ export async function runBatchDecks(opts: BatchRunOptions): Promise<BatchRunResu
         message: usedFallback ? 'Done (fallback image)' : usedFullDashboardImage ? 'Done (full dashboard image)' : 'Ready',
       });
     } catch (err) {
+      if (opts.signal?.aborted) {
+        opts.onClientUpdate({
+          value,
+          status: 'cancelled',
+          succeededTiles: 0,
+          failedTiles: 0,
+          message: 'Cancelled',
+        });
+        continue;
+      }
       failed += 1;
       const msg = err instanceof Error ? err.message : 'Failed';
       deckLog.error('batch', `[${value}] failed`, { error: msg });

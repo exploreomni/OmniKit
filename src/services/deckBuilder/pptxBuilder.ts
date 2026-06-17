@@ -1,4 +1,5 @@
-import PptxGenJS from 'pptxgenjs';
+import PptxGenJSImport from 'pptxgenjs';
+import type { default as PptxGenTypes } from 'pptxgenjs';
 import { deckLog } from './log';
 import { layoutForRole, resolveKitOrDefault } from './templateStore';
 import type {
@@ -14,6 +15,15 @@ import type {
   TileRenderKind,
   TileResult,
 } from './types';
+
+const PptxGenJS = (
+  typeof PptxGenJSImport === 'function'
+    ? PptxGenJSImport
+    : (PptxGenJSImport as unknown as { default: typeof PptxGenJSImport }).default
+) as typeof PptxGenJSImport;
+
+type PptxSlide = PptxGenTypes.Slide;
+type PptxTextPropsOptions = PptxGenTypes.TextPropsOptions;
 
 export interface DeckTileEntry {
   tile: DashboardTile;
@@ -38,6 +48,8 @@ export interface BuildDeckInput {
 const SLIDE_W = 13.333;
 const SLIDE_H = 7.5;
 const NUMERIC_TYPES = new Set(['number', 'integer', 'float', 'double', 'decimal', 'numeric', 'bigint', 'long']);
+
+export const TRANSPARENT_PPTX_FILL = { color: 'FFFFFF', transparency: 100 } as const;
 
 function hex(input: string | undefined): string {
   return (input || '').replace(/^#/, '').toUpperCase() || '000000';
@@ -113,13 +125,13 @@ function formatKpi(v: unknown): string {
 }
 
 interface RenderCtx {
-  slide: PptxGenJS.Slide;
+  slide: PptxSlide;
   brand: BrandConfig;
   layout: SlideLayout;
   body: { x: number; y: number; w: number; h: number };
 }
 
-function paintLayoutChrome(slide: PptxGenJS.Slide, brand: BrandConfig, layout: SlideLayout, logoDataUrl?: string) {
+function paintLayoutChrome(slide: PptxSlide, brand: BrandConfig, layout: SlideLayout, logoDataUrl?: string) {
   if (layout.backgroundImageDataUrl) {
     slide.background = { data: layout.backgroundImageDataUrl };
   } else {
@@ -137,7 +149,7 @@ function paintLayoutChrome(slide: PptxGenJS.Slide, brand: BrandConfig, layout: S
       } else if (dec.type === 'rect') {
         slide.addShape('rect', {
           x: dec.x, y: dec.y, w: dec.w, h: dec.h,
-          fill: dec.fill ? { color: hex(dec.fill) } : { type: 'none' },
+          fill: dec.fill ? { color: hex(dec.fill) } : TRANSPARENT_PPTX_FILL,
           line: dec.line ? { color: hex(dec.line), width: 0.75 } : { type: 'none' },
         });
       } else if (dec.type === 'text') {
@@ -173,7 +185,7 @@ function paintLayoutChrome(slide: PptxGenJS.Slide, brand: BrandConfig, layout: S
   }
 }
 
-function addTitle(slide: PptxGenJS.Slide, brand: BrandConfig, layout: SlideLayout, title: string) {
+function addTitle(slide: PptxSlide, brand: BrandConfig, layout: SlideLayout, title: string) {
   const box = layout.titleBox || { x: 0.5, y: 0.3, w: SLIDE_W - 1, h: 0.7 };
   slide.addText(title || 'Untitled', {
     x: box.x, y: box.y, w: box.w, h: box.h,
@@ -257,7 +269,7 @@ function addInsightPanel(
   });
 }
 
-function addOverlays(slide: PptxGenJS.Slide, brand: BrandConfig, overlays: SlideOverlay[] | undefined) {
+function addOverlays(slide: PptxSlide, brand: BrandConfig, overlays: SlideOverlay[] | undefined) {
   if (!overlays || overlays.length === 0) return;
   for (const overlay of overlays) {
     const color = hex(overlay.color || brand.accentColor);
@@ -277,7 +289,7 @@ function addOverlays(slide: PptxGenJS.Slide, brand: BrandConfig, overlays: Slide
         w: overlay.w,
         h: overlay.h,
         rotate: overlay.rotation,
-        fill: { type: 'none' },
+        fill: TRANSPARENT_PPTX_FILL,
         line: { color, width: 1.75 },
       });
     } else if (overlay.type === 'symbol') {
@@ -324,7 +336,7 @@ function addOverlays(slide: PptxGenJS.Slide, brand: BrandConfig, overlays: Slide
   }
 }
 
-function addFooter(slide: PptxGenJS.Slide, brand: BrandConfig, layout: SlideLayout, dashboardName: string, dateLabel: string) {
+function addFooter(slide: PptxSlide, brand: BrandConfig, layout: SlideLayout, dashboardName: string, dateLabel: string) {
   const fb = layout.footerBox;
   if (!fb) return;
   slide.addText(`${dashboardName}  •  ${dateLabel}`, {
@@ -638,7 +650,7 @@ export async function buildDeck(input: BuildDeckInput): Promise<Blob> {
     paintLayoutChrome(appendix, brand, appendixLayout);
     addTitle(appendix, brand, appendixLayout, 'Source & Audit');
 
-    const lines: Array<{ text: string; options?: PptxGenJS.TextPropsOptions }> = [
+    const lines: Array<{ text: string; options?: PptxTextPropsOptions }> = [
       { text: 'Dashboard: ', options: { bold: true } },
       { text: `${input.dashboardName}\n` },
       { text: 'URL: ', options: { bold: true } },

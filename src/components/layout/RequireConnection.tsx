@@ -1,6 +1,7 @@
 import { ArrowRight, LockKeyhole, Plug, ShieldCheck, Sparkles } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLocation, useNavigate } from 'react-router-dom';
+import { hasActiveSavedVaultConnection } from '@/services/connectionGuards';
 
 const protectedToolNames: Record<string, string> = {
   '/dashboards/ai-studio': 'AI Dashboard Studio',
@@ -119,12 +120,17 @@ export function SavedInstanceRequiredEmptyState({
 }
 
 export function RequireConnection({ children }: { children: React.ReactNode }) {
-  const { isConnected } = useConnection();
+  const { connection } = useConnection();
   const location = useLocation();
   const toolName = protectedToolNames[location.pathname] || 'this OmniKit workflow';
 
-  if (!isConnected) {
-    return <SavedInstanceRequiredEmptyState toolName={toolName} />;
+  if (!hasActiveSavedVaultConnection(connection)) {
+    return (
+      <SavedInstanceRequiredEmptyState
+        toolName={toolName}
+        description="Unlock your local vault on Home, then choose and test the saved Omni instance this workflow should use."
+      />
+    );
   }
 
   return <>{children}</>;

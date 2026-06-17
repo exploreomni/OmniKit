@@ -17,10 +17,10 @@ PNG exports include the same filter override request body as PDF exports, but Om
 
 ## Row Limits
 
-Row-limit override is opt-in. The request body sends `overrideRowLimit` and `maxRowLimit` only when the override is enabled and the row limit is a valid positive integer. Otherwise both fields are omitted.
+Row-limit override is opt-in. The request body sends `overrideRowLimit` and `maxRowLimit` only when the override is enabled and the row limit is a valid positive integer. Otherwise both fields are omitted. XLSX row-limit overrides require single-tile mode with a tile `queryIdentifierMapKey`; whole-dashboard XLSX row-limit overrides are blocked before the job starts.
 
 ## Queue And Recent Downloads
 
 Whole-dashboard batch downloads run sequentially to avoid Omni download-job conflicts. A 409 response with an existing job ID attaches to the already-running job and continues polling it. Failed items do not stop later queued dashboards.
 
-Recent downloads are session convenience state only. They store sanitized metadata, format/scope, filename, dashboard/tile labels, and the original sanitized request body so re-run uses the original request instead of current UI state. They do not store API keys or unredacted upstream errors.
+Recent downloads are session convenience state only. They store sanitized metadata, format/scope, filename, dashboard/tile labels, a concise filter summary, and the original sanitized request body so re-run uses the original request instead of current UI state. They do not store API keys or unredacted upstream errors.

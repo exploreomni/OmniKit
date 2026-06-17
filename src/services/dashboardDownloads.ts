@@ -69,6 +69,7 @@ export interface RecentDashboardDownload {
   scope: DashboardDownloadScope;
   tileName?: string;
   filename: string;
+  filterSummary?: string;
   createdAt: number;
   request: Record<string, unknown>;
 }
@@ -141,6 +142,45 @@ export function buildDashboardDownloadFilterConfig(
     };
   }
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function cleanSummaryText(value: unknown): string {
+  return Array.from(String(value ?? ''), (char) => {
+    const code = char.charCodeAt(0);
+    return code < 32 || code === 127 ? ' ' : char;
+  }).join('')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 80);
+}
+
+function summarizeFilterField(field: string): string {
+  const label = field.split('.').pop() || field;
+  return label
+    .replace(/[_-]+/g, ' ')
+    .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+export function summarizeDashboardDownloadFilters(request: unknown, maxFilters = 3): string {
+  if (!isRecord(request) || !isRecord(request.filterConfig)) return '';
+  const entries = Object.entries(request.filterConfig)
+    .map(([fieldKey, raw]) => {
+      if (!isRecord(raw)) return '';
+      const field = cleanSummaryText(raw.field || fieldKey);
+      const values = Array.isArray(raw.values)
+        ? raw.values.map(cleanSummaryText).filter(Boolean)
+        : [];
+      if (!field || values.length === 0) return '';
+      return `${summarizeFilterField(field)}: ${values.slice(0, 3).join(', ')}${values.length > 3 ? ` +${values.length - 3} more` : ''}`;
+    })
+    .filter(Boolean);
+  if (entries.length === 0) return '';
+  const visible = entries.slice(0, maxFilters);
+  return `${visible.join('; ')}${entries.length > maxFilters ? `; +${entries.length - maxFilters} more` : ''}`;
 }
 
 export function parseDashboardDownloadJobId(value: unknown): string {
@@ -217,6 +257,9 @@ export function buildDashboardDownloadRequest(input: DashboardDownloadBuildInput
     if (options.hideHiddenFields) body.hideHiddenFields = true;
     const maxRows = Number.parseInt(options.maxRowLimit, 10);
     if (options.overrideRowLimit && Number.isFinite(maxRows) && maxRows > 0) {
+      if (options.format === 'xlsx' && options.scope !== 'tile') {
+        throw new Error('XLSX row-limit overrides require single-tile mode with a downloadable tile.');
+      }
       body.overrideRowLimit = true;
       body.maxRowLimit = maxRows;
     }

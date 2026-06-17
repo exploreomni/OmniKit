@@ -3,6 +3,8 @@ import { DEFAULT_BRAND } from './types';
 
 export function buildRecipe(input: {
   dashboardUrl: string;
+  dashboardId?: string;
+  dashboardName?: string;
   selectedTileIds: string[];
   insights: Record<string, string>;
   brand: BrandConfig;
@@ -17,6 +19,8 @@ export function buildRecipe(input: {
   return {
     version: 1,
     dashboardUrl: input.dashboardUrl,
+    dashboardId: input.dashboardId,
+    dashboardName: input.dashboardName,
     selectedTileIds: input.selectedTileIds,
     insights: input.insights,
     brand: input.brand,
@@ -95,6 +99,8 @@ export function validateRecipe(payload: unknown): DeckRecipe {
   return {
     version: 1,
     dashboardUrl: obj.dashboardUrl,
+    dashboardId: typeof obj.dashboardId === 'string' && obj.dashboardId.trim() ? obj.dashboardId.trim().slice(0, 160) : undefined,
+    dashboardName: typeof obj.dashboardName === 'string' && obj.dashboardName.trim() ? obj.dashboardName.trim().slice(0, 160) : undefined,
     selectedTileIds: obj.selectedTileIds.map(String),
     insights: (obj.insights && typeof obj.insights === 'object') ? obj.insights as Record<string, string> : {},
     brand: validateBrand(obj.brand) || DEFAULT_BRAND,

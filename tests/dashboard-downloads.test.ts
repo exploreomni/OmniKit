@@ -19,6 +19,7 @@ import {
   buildDashboardDownloadRequest,
   cleanDashboardDownloadFilename,
   parseDashboardDownloadJobId,
+  summarizeDashboardDownloadFilters,
   type DashboardDownloadDetails,
   type DashboardDownloadOptions,
 } from '../src/services/dashboardDownloads';
@@ -209,10 +210,50 @@ test('row limit override only sends max rows when the override is enabled', () =
   assert.equal(withOverride.body.overrideRowLimit, true);
 });
 
+test('xlsx row limit override requires single-tile mode', () => {
+  assert.throws(() => buildDashboardDownloadRequest({
+    dashboardId: 'dash-a',
+    dashboardName: 'Dashboard A',
+    details: detailsA,
+    filterValues: {},
+    options: options({ format: 'xlsx', scope: 'dashboard', maxRowLimit: '500000', overrideRowLimit: true }),
+    total: 1,
+  }), /XLSX row-limit overrides require single-tile mode/);
+
+  const singleTile = buildDashboardDownloadRequest({
+    dashboardId: 'dash-a',
+    dashboardName: 'Dashboard A',
+    details: detailsA,
+    filterValues: {},
+    options: options({
+      format: 'xlsx',
+      scope: 'tile',
+      selectedTileKey: 'query-map-a',
+      maxRowLimit: '500000',
+      overrideRowLimit: true,
+    }),
+    total: 1,
+  });
+
+  assert.equal(singleTile.body.queryIdentifierMapKey, 'query-map-a');
+  assert.equal(singleTile.body.maxRowLimit, 500000);
+  assert.equal(singleTile.body.overrideRowLimit, true);
+});
+
 test('filename cleanup and custom filename limits are deterministic', () => {
   assert.equal(cleanDashboardDownloadFilename(' Revenue / West: Q4 * '), 'Revenue - West- Q4 -');
   assert.equal(buildDashboardDownloadFilename('Dashboard/One', 'pdf', '', 1), 'Dashboard-One.pdf');
   assert.equal(buildDashboardDownloadFilename('Dashboard One', 'xlsx', 'Executive Export', 3), 'Executive Export - Dashboard One.xlsx');
+});
+
+test('filter summaries are concise and derived from the stored request body', () => {
+  assert.equal(summarizeDashboardDownloadFilters({
+    filterConfig: {
+      'orders.region': { field: 'orders.region', values: ['West', 'East'] },
+      'orders.segment': { field: 'orders.segment', values: ['Enterprise'] },
+    },
+  }), 'Region: West, East; Segment: Enterprise');
+  assert.equal(summarizeDashboardDownloadFilters({}), '');
 });
 
 test('png request discloses the filter caveat when overrides are present', () => {
@@ -315,6 +356,25 @@ test('dashboard downloads handler redacts Omni errors', async () => {
   assert.equal(response.status, 500);
   assert.equal(JSON.stringify(body).includes('omni_live_download_secret_123456'), false);
   assert.match(String(body.error), /REDACTED|redacted|secret/i);
+});
+
+test('dashboard downloads handler normalizes status polling and redacts status errors', async () => {
+  const saved = saveInstance();
+  mock.method(OmniClient.prototype, 'getDashboardDownloadStatus', async (_dashboardId: string, jobId: string) => {
+    if (jobId === 'complete-job') return { status: 'succeeded', raw: {} };
+    if (jobId === 'failed-job') return { status: 'FAILED', error: 'bad token omni_live_download_secret_123456', raw: {} };
+    return { status: 'running', raw: {} };
+  });
+
+  const processing = await jsonBody(await dashboardDownloadsHandler(new Request(`http://localhost/api/dashboard-downloads/${saved.id}/dashboards/dash-a/jobs/running-job/status`)));
+  const complete = await jsonBody(await dashboardDownloadsHandler(new Request(`http://localhost/api/dashboard-downloads/${saved.id}/dashboards/dash-a/jobs/complete-job/status`)));
+  const failed = await jsonBody(await dashboardDownloadsHandler(new Request(`http://localhost/api/dashboard-downloads/${saved.id}/dashboards/dash-a/jobs/failed-job/status`)));
+
+  assert.equal(processing.status, 'processing');
+  assert.equal(complete.status, 'complete');
+  assert.equal(failed.status, 'error');
+  assert.equal(JSON.stringify(failed).includes('omni_live_download_secret_123456'), false);
+  assert.match(String(failed.error), /redacted/);
 });
 
 test('dashboard downloads handler streams blob responses with safe metadata headers', async () => {

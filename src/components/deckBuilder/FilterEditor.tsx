@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Save, RotateCcw, Plus, X, Link2, Eraser } from 'lucide-react';
-import type { DashboardFilter, FilterOverride, TopicFieldRef } from '@/services/deckBuilder/types';
+import type { DashboardFilter, DashboardTile, FilterOverride, TopicFieldRef } from '@/services/deckBuilder/types';
 import type { SavedFilterSet } from '@/services/deckBuilder/localCache';
 import { normalizeFilterType } from '@/services/deckBuilder/queryRunner';
 import { MultiSelectCombo } from './MultiSelectCombo';
@@ -10,6 +10,7 @@ interface Props {
   topicFields: TopicFieldRef[];
   overrides: Record<string, FilterOverride>;
   dashboardDefaults?: Record<string, FilterOverride>;
+  selectedTiles?: DashboardTile[];
   onChange: (next: Record<string, FilterOverride>) => void;
   savedSets: SavedFilterSet[];
   onSaveSet: (name: string) => void;
@@ -32,11 +33,36 @@ function valuesToStrings(values: unknown[]): string[] {
   return values.map((v) => (v == null ? '' : String(v))).filter((v) => v !== '');
 }
 
+function tileMentionsField(tile: DashboardTile, field: string): boolean {
+  if (!tile.rawQuery) return false;
+  const candidates = new Set([
+    field,
+    field.split('.').pop() || field,
+    field.replace(/\./g, '_'),
+  ].filter(Boolean));
+  const raw = JSON.stringify(tile.rawQuery).toLowerCase();
+  return Array.from(candidates).some((candidate) => raw.includes(candidate.toLowerCase()));
+}
+
+function impactLabel(filter: DashboardFilter, selectedTiles: DashboardTile[] | undefined): string {
+  const total = selectedTiles?.length || 0;
+  if (total === 0) return 'No selected slide exports yet';
+  const exactMatches = selectedTiles?.filter((tile) => tileMentionsField(tile, filter.field)).length || 0;
+  if (exactMatches > 0) {
+    return `Affects ${exactMatches}/${total} selected slide export${total === 1 ? '' : 's'}`;
+  }
+  if (filter.source === 'topic' || filter.source === 'tile' || filter.topic || filter.view) {
+    return `May affect up to ${total} selected slide export${total === 1 ? '' : 's'}`;
+  }
+  return `Applies to ${total} selected slide export${total === 1 ? '' : 's'}`;
+}
+
 export function FilterEditor({
   filters,
   topicFields,
   overrides,
   dashboardDefaults,
+  selectedTiles,
   onChange,
   savedSets,
   onSaveSet,
@@ -188,6 +214,9 @@ export function FilterEditor({
                   </div>
                   <div className="text-[10px] text-content-tertiary uppercase tracking-wider truncate">
                     {filter.field} · {filter.kind || 'EQUALS'} · {filter.type || 'string'}
+                  </div>
+                  <div className="text-[10px] text-content-tertiary truncate">
+                    {impactLabel(filter, selectedTiles)}
                   </div>
                 </div>
                 {isUserEdited && inherited && (

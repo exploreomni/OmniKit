@@ -59,6 +59,7 @@ interface Props {
 }
 
 type DragMode = 'move' | 'resize';
+type ControlSection = 'layout' | 'source' | 'insights' | 'notes' | 'callouts';
 
 interface DragState {
   tileId: string;
@@ -181,6 +182,22 @@ function overlayDefaults(type: SlideOverlayType, brand: BrandConfig): SlideOverl
   return { id, type, x: 6.7, y: 1.4, w: 2.2, h: 0.7, text: 'Key takeaway', color: brand.primaryColor };
 }
 
+function keyboardNudgeBox(box: SlideBox, key: string, shiftKey: boolean, mode: DragMode): SlideBox {
+  const delta = shiftKey ? GRID * 10 : GRID;
+  if (mode === 'resize') {
+    if (key === 'ArrowLeft') return clampBox({ ...box, w: box.w - delta });
+    if (key === 'ArrowRight') return clampBox({ ...box, w: box.w + delta });
+    if (key === 'ArrowUp') return clampBox({ ...box, h: box.h - delta });
+    if (key === 'ArrowDown') return clampBox({ ...box, h: box.h + delta });
+    return box;
+  }
+  if (key === 'ArrowLeft') return clampBox({ ...box, x: box.x - delta });
+  if (key === 'ArrowRight') return clampBox({ ...box, x: box.x + delta });
+  if (key === 'ArrowUp') return clampBox({ ...box, y: box.y - delta });
+  if (key === 'ArrowDown') return clampBox({ ...box, y: box.y + delta });
+  return box;
+}
+
 function visualSourceFor(
   tile: DashboardTile,
   tileVisualSources: Record<string, TileVisualSource>,
@@ -194,6 +211,13 @@ function sourceLabel(source: TileVisualSource): string {
   if (source === 'full-dashboard') return 'Dashboard';
   if (source === 'skip') return 'Skipped';
   return 'Native';
+}
+
+function sourceDescription(source: TileVisualSource): string {
+  if (source === 'tile-image') return 'Uses Omni-rendered tile images for visual fidelity; text and marks are not editable in PowerPoint.';
+  if (source === 'full-dashboard') return 'Uses the full dashboard image as a fallback when tile-level exports are incomplete.';
+  if (source === 'skip') return 'Leaves this tile out of the generated deck.';
+  return 'Builds editable PowerPoint shapes when the tile result can be translated safely.';
 }
 
 function tileKindLabel(tile: DashboardTile): string {
@@ -419,9 +443,11 @@ export function SlideLayoutPreview({
 }: Props) {
   const [activeId, setActiveId] = useState(() => tiles[0]?.id || '');
   const [slideRailHeight, setSlideRailHeight] = useState<number | null>(null);
+  const [controlSection, setControlSection] = useState<ControlSection>('layout');
   const dragRef = useRef<DragState | null>(null);
   const canvasRef = useRef<HTMLDivElement>(null);
   const previewColumnRef = useRef<HTMLDivElement>(null);
+  const slideButtonRefs = useRef<Record<string, HTMLButtonElement | null>>({});
   const contentLayout = useMemo(() => layoutForRole(template, 'content'), [template]);
   const defaultBox = contentLayout.bodyBox || { x: 0.5, y: 1.1, w: 8.6, h: 5.6 };
   const activeTile = tiles.find((tile) => tile.id === activeId) || tiles[0];
@@ -471,6 +497,14 @@ export function SlideLayoutPreview({
       : activePreview?.status && activePreview.status !== 'pending'
       ? 'bg-omni-50 text-omni-700 border-omni-200'
       : 'bg-surface-secondary text-content-tertiary border-border';
+  const activeSourceDescription = sourceDescription(activeSource);
+  const controlSections: Array<{ id: ControlSection; label: string }> = [
+    { id: 'layout', label: 'Layout' },
+    { id: 'source', label: 'Source' },
+    { id: 'insights', label: 'Insights' },
+    { id: 'notes', label: 'Notes' },
+    { id: 'callouts', label: 'Callouts' },
+  ];
 
   useEffect(() => {
     const column = previewColumnRef.current;
@@ -487,6 +521,11 @@ export function SlideLayoutPreview({
     observer.observe(canvas);
     return () => observer.disconnect();
   }, [activeTile?.id, previewError]);
+
+  useEffect(() => {
+    if (!activeId) return;
+    slideButtonRefs.current[activeId]?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [activeId]);
 
   function setBox(tileId: string, box: SlideBox) {
     const clean = clampBox(box);
@@ -611,6 +650,29 @@ export function SlideLayoutPreview({
     }
   }
 
+  function handleBoxKeyDown(
+    e: React.KeyboardEvent<HTMLDivElement>,
+    tileId: string,
+    target: DragState['target'],
+    mode: DragMode,
+    overlayId?: string,
+  ) {
+    if (!['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setActiveId(tileId);
+    const current =
+      target === 'insight'
+        ? clampBox(overrides[tileId]?.insightBox || activeInsightBox)
+        : target === 'overlay'
+          ? clampBox((overrides[tileId]?.overlays || []).find((overlay) => overlay.id === overlayId) || { x: 0, y: 0, w: 1, h: 1 })
+          : clampBox(overrides[tileId]?.bodyBox || defaultBox);
+    const next = keyboardNudgeBox(current, e.key, e.shiftKey, mode);
+    if (target === 'insight') setInsightBox(tileId, next);
+    else if (target === 'overlay' && overlayId) updateOverlay(tileId, overlayId, next);
+    else setBox(tileId, next);
+  }
+
   if (!activeTile) {
     return (
       <div className="text-xs text-content-tertiary p-4 bg-surface-secondary rounded-card">
@@ -648,6 +710,9 @@ export function SlideLayoutPreview({
               return (
                 <button
                   key={tile.id}
+                  ref={(node) => {
+                    slideButtonRefs.current[tile.id] = node;
+                  }}
                   type="button"
                   onClick={() => setActiveId(tile.id)}
                   className={`w-full text-left px-2 py-2 rounded-card border transition ${
@@ -762,7 +827,11 @@ export function SlideLayoutPreview({
           <div
             className="absolute rounded-[6px] border-2 border-omni-500 bg-surface-secondary cursor-move"
             style={boxStyle(activeBox)}
+            tabIndex={0}
+            role="button"
+            aria-label={`Move ${activeTitle || 'slide visual'} with arrow keys. Hold Shift for larger steps.`}
             onPointerDown={(e) => beginDrag(e, activeTile.id, 'body', 'move')}
+            onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'body', 'move')}
           >
             <div className="absolute inset-0 p-2 pointer-events-none">
               <TilePreview tile={activeTile} source={activeSource} fit={activeFit} preview={activePreview} />
@@ -773,7 +842,11 @@ export function SlideLayoutPreview({
             </div>
             <div
               className="absolute -right-2 -bottom-2 w-5 h-5 rounded-full bg-omni-600 border-2 border-white shadow cursor-nwse-resize"
+              tabIndex={0}
+              role="button"
+              aria-label={`Resize ${activeTitle || 'slide visual'} with arrow keys. Hold Shift for larger steps.`}
               onPointerDown={(e) => beginDrag(e, activeTile.id, 'body', 'resize')}
+              onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'body', 'resize')}
               title="Resize"
             />
           </div>
@@ -781,7 +854,11 @@ export function SlideLayoutPreview({
             <div
               className="absolute rounded-[6px] border-2 border-omni-300 bg-white shadow-sm cursor-move overflow-hidden"
               style={boxStyle(activeInsightBox)}
+              tabIndex={0}
+              role="button"
+              aria-label="Move insight panel with arrow keys. Hold Shift for larger steps."
               onPointerDown={(e) => beginDrag(e, activeTile.id, 'insight', 'move')}
+              onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'insight', 'move')}
             >
               <div className="h-[20%] min-h-[18px] bg-omni-50 px-2 flex items-center text-[10px] font-semibold text-omni-700 pointer-events-none">
                 Insights
@@ -804,7 +881,11 @@ export function SlideLayoutPreview({
               </div>
               <div
                 className="absolute -right-2 -bottom-2 w-5 h-5 rounded-full bg-omni-400 border-2 border-white shadow cursor-nwse-resize"
+                tabIndex={0}
+                role="button"
+                aria-label="Resize insight panel with arrow keys. Hold Shift for larger steps."
                 onPointerDown={(e) => beginDrag(e, activeTile.id, 'insight', 'resize')}
+                onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'insight', 'resize')}
                 title="Resize insights"
               />
             </div>
@@ -814,7 +895,11 @@ export function SlideLayoutPreview({
               key={overlay.id}
               className="absolute cursor-move"
               style={{ ...boxStyle(clampBox(overlay)), color: hex(overlay.color || brand.accentColor) }}
+              tabIndex={0}
+              role="button"
+              aria-label={`Move ${overlay.type} callout with arrow keys. Hold Shift for larger steps.`}
               onPointerDown={(e) => beginDrag(e, activeTile.id, 'overlay', 'move', overlay.id)}
+              onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'overlay', 'move', overlay.id)}
             >
               {overlay.type === 'arrow' || overlay.type === 'line' ? (
                 <svg
@@ -878,7 +963,11 @@ export function SlideLayoutPreview({
               )}
               <div
                 className="absolute -right-1.5 -bottom-1.5 w-4 h-4 rounded-full bg-slate-700 border-2 border-white cursor-nwse-resize"
+                tabIndex={0}
+                role="button"
+                aria-label={`Resize ${overlay.type} callout with arrow keys. Hold Shift for larger steps.`}
                 onPointerDown={(e) => beginDrag(e, activeTile.id, 'overlay', 'resize', overlay.id)}
+                onKeyDown={(e) => handleBoxKeyDown(e, activeTile.id, 'overlay', 'resize', overlay.id)}
                 title="Resize overlay"
               />
             </div>
@@ -895,22 +984,90 @@ export function SlideLayoutPreview({
 
       </div>
 
-      <div className="xl:col-span-2 grid grid-cols-1 lg:grid-cols-[minmax(240px,0.8fr)_minmax(0,2.2fr)] gap-3 items-stretch min-w-0">
-        <div className="rounded-card border border-border bg-white p-3 space-y-3 min-w-0 h-full">
-          <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
-            <Maximize2 size={13} /> Slide setup
+      <div className="xl:col-span-2 rounded-card border border-border bg-white p-3 space-y-3 min-w-0">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
+              <Maximize2 size={13} /> Slide controls
+            </div>
+            <p className="text-[11px] text-content-tertiary truncate">
+              {activeTitle || 'Selected slide'}
+            </p>
           </div>
-          <label className="block text-[11px] font-medium text-content-secondary">
-            Title
-            <input
-              type="text"
-              value={activeTitle}
-              onChange={(e) => setTitle(activeTile.id, e.target.value)}
-              className="input-field mt-1 text-xs"
-            />
-          </label>
-          <div className="grid grid-cols-1 sm:grid-cols-3 2xl:grid-cols-1 gap-2">
-            <div className="sm:col-span-2 2xl:col-span-1">
+          <div role="tablist" aria-label="Slide control sections" className="grid w-full grid-cols-2 gap-1.5 sm:w-auto sm:grid-cols-5">
+            {controlSections.map((section) => {
+              const active = controlSection === section.id;
+              return (
+                <button
+                  key={section.id}
+                  type="button"
+                  role="tab"
+                  aria-selected={active}
+                  onClick={() => setControlSection(section.id)}
+                  className={`btn-sm justify-center ${active ? 'btn-secondary' : 'btn-ghost'}`}
+                >
+                  {section.id === 'layout' && <Maximize2 size={12} />}
+                  {section.id === 'source' && <ImageIcon size={12} />}
+                  {section.id === 'insights' && <StickyNote size={12} />}
+                  {section.id === 'notes' && <StickyNote size={12} />}
+                  {section.id === 'callouts' && <Shapes size={12} />}
+                  {section.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {controlSection === 'layout' && (
+          <div className="grid grid-cols-1 lg:grid-cols-[minmax(220px,0.85fr)_minmax(0,1.15fr)] gap-3 items-start">
+            <label className="block text-[11px] font-medium text-content-secondary">
+              Title
+              <input
+                type="text"
+                value={activeTitle}
+                onChange={(e) => setTitle(activeTile.id, e.target.value)}
+                className="input-field mt-1 text-xs"
+              />
+            </label>
+            <div className="space-y-2">
+              <div className="text-[11px] font-medium text-content-secondary">Visual position</div>
+              <div className="grid grid-cols-4 gap-2">
+                {(['x', 'y', 'w', 'h'] as const).map((key) => (
+                  <label key={key} className="text-[11px] text-content-secondary">
+                    {key.toUpperCase()}
+                    <input
+                      type="number"
+                      min={key === 'w' ? 1 : 0}
+                      max={key === 'x' || key === 'w' ? SLIDE_W : SLIDE_H}
+                      step={0.1}
+                      value={Number(activeBox[key].toFixed(2))}
+                      onChange={(e) => setBox(activeTile.id, { ...activeBox, [key]: Number(e.target.value) })}
+                      className="input-field mt-1 text-xs"
+                    />
+                  </label>
+                ))}
+              </div>
+              <div className="flex items-center gap-1.5">
+                <button type="button" className="btn-ghost btn-sm flex-1 justify-center" onClick={() => setBox(activeTile.id, { ...activeBox, x: defaultBox.x })} title="Align left">
+                  <AlignLeft size={12} />
+                </button>
+                <button type="button" className="btn-ghost btn-sm flex-1 justify-center" onClick={() => setBox(activeTile.id, { ...activeBox, x: (SLIDE_W - activeBox.w) / 2 })} title="Align center">
+                  <AlignCenter size={12} />
+                </button>
+                <button type="button" className="btn-ghost btn-sm flex-1 justify-center" onClick={() => setBox(activeTile.id, { ...activeBox, x: SLIDE_W - defaultBox.x - activeBox.w })} title="Align right">
+                  <AlignRight size={12} />
+                </button>
+                <button type="button" onClick={() => resetLayout(activeTile.id)} className="btn-ghost btn-sm flex-1 justify-center">
+                  <RotateCcw size={12} /> Reset
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {controlSection === 'source' && (
+          <div className="grid grid-cols-1 lg:grid-cols-[minmax(240px,0.9fr)_minmax(0,1.1fr)] gap-3 items-start">
+            <div>
               <div className="text-[11px] font-medium text-content-secondary mb-1">All slides</div>
               <div className="grid grid-cols-3 gap-1.5">
                 {([
@@ -923,90 +1080,53 @@ export function SlideLayoutPreview({
                     type="button"
                     onClick={() => onApplyVisualSourceToAll(source)}
                     className={`btn-sm justify-center ${tiles.length > 0 && selectedSourceCounts[source] === tiles.length ? 'btn-secondary' : 'btn-ghost'}`}
-                    title={`Apply ${label} to every selected slide`}
+                    title={`${label}: ${sourceDescription(source)}`}
                   >
                     {label}
                   </button>
                 ))}
               </div>
             </div>
-            <label className="block text-[11px] text-content-secondary">
-              This slide
-              <select
-                value={activeSource}
-                onChange={(e) => onTileVisualSourceChange(activeTile.id, e.target.value as TileVisualSource)}
-                className="input-field mt-1 text-xs"
-              >
-                <option value="native">Native</option>
-                <option value="tile-image">Omni image</option>
-                <option value="full-dashboard">Full dashboard</option>
-                <option value="skip">Skip</option>
-              </select>
-            </label>
-            <label className="block text-[11px] text-content-secondary">
-              Image fit
-              <select
-                value={activeFit}
-                onChange={(e) => setFit(activeTile.id, e.target.value as SlideFitMode)}
-                className="input-field mt-1 text-xs"
-              >
-                <option value="contain">Contain</option>
-                <option value="cover">Cover</option>
-                <option value="stretch">Stretch</option>
-              </select>
-            </label>
-          </div>
-          <div className="border-t border-border pt-3 space-y-2">
-            <div className="text-[11px] font-medium text-content-secondary">Visual position</div>
-            <div className="grid grid-cols-4 2xl:grid-cols-2 gap-2">
-              {(['x', 'y', 'w', 'h'] as const).map((key) => (
-                <label key={key} className="text-[11px] text-content-secondary">
-                  {key.toUpperCase()}
-                  <input
-                    type="number"
-                    min={key === 'w' ? 1 : 0}
-                    max={key === 'x' || key === 'w' ? SLIDE_W : SLIDE_H}
-                    step={0.1}
-                    value={Number(activeBox[key].toFixed(2))}
-                    onChange={(e) => setBox(activeTile.id, { ...activeBox, [key]: Number(e.target.value) })}
-                    className="input-field mt-1 text-xs"
-                  />
-                </label>
-              ))}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <label className="block text-[11px] text-content-secondary" title={activeSourceDescription}>
+                This slide
+                <select
+                  value={activeSource}
+                  onChange={(e) => onTileVisualSourceChange(activeTile.id, e.target.value as TileVisualSource)}
+                  className="input-field mt-1 text-xs"
+                >
+                  <option value="native">Native</option>
+                  <option value="tile-image">Omni image</option>
+                  <option value="full-dashboard">Full dashboard</option>
+                  <option value="skip">Skip</option>
+                </select>
+              </label>
+              <label className="block text-[11px] text-content-secondary">
+                Image fit
+                <select
+                  value={activeFit}
+                  onChange={(e) => setFit(activeTile.id, e.target.value as SlideFitMode)}
+                  className="input-field mt-1 text-xs"
+                >
+                  <option value="contain">Contain</option>
+                  <option value="cover">Cover</option>
+                  <option value="stretch">Stretch</option>
+                </select>
+              </label>
+              <div className="sm:col-span-2 rounded-card border border-border bg-surface-secondary px-3 py-2 text-[11px] text-content-secondary">
+                {activeSourceDescription}
+              </div>
             </div>
-            <div className="flex items-center gap-1.5">
-              <button type="button" className="btn-ghost btn-sm flex-1 justify-center" onClick={() => setBox(activeTile.id, { ...activeBox, x: defaultBox.x })}>
-                <AlignLeft size={12} />
-              </button>
-              <button type="button" className="btn-ghost btn-sm flex-1 justify-center" onClick={() => setBox(activeTile.id, { ...activeBox, x: (SLIDE_W - activeBox.w) / 2 })}>
-                <AlignCenter size={12} />
-              </button>
-              <button type="button" className="btn-ghost btn-sm flex-1 justify-center" onClick={() => setBox(activeTile.id, { ...activeBox, x: SLIDE_W - defaultBox.x - activeBox.w })}>
-                <AlignRight size={12} />
-              </button>
-            </div>
-            <button type="button" onClick={() => resetLayout(activeTile.id)} className="btn-ghost btn-sm w-full justify-center">
-              <RotateCcw size={12} /> Reset layout
-            </button>
           </div>
-        </div>
+        )}
 
-        <div className="space-y-3 min-w-0 h-full">
-        <div className="rounded-card border border-border bg-white p-3 space-y-3 min-w-0">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
-              <StickyNote size={13} /> Narration
+        {controlSection === 'insights' && (
+          <div className="space-y-3 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
+                <StickyNote size={13} /> Insights
+              </div>
             </div>
-            <label className="flex items-center gap-2 text-[11px] text-content-secondary">
-              <input
-                type="checkbox"
-                checked={includeAppendix}
-                onChange={(e) => onIncludeAppendixChange(e.target.checked)}
-              />
-              Appendix
-            </label>
-          </div>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-3 items-start">
             <div className="grid grid-rows-[24px_32px_auto] gap-2">
               <div className="flex h-6 items-center justify-between gap-2">
                 <label className="flex items-center gap-2 text-[11px] font-medium text-content-secondary">
@@ -1041,6 +1161,24 @@ export function SlideLayoutPreview({
                 placeholder="Add insight here..."
                 className="input-field text-sm min-h-[128px] h-full"
               />
+            </div>
+          </div>
+        )}
+
+        {controlSection === 'notes' && (
+          <div className="space-y-3 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
+                <StickyNote size={13} /> Notes
+              </div>
+              <label className="flex items-center gap-2 text-[11px] text-content-secondary">
+                <input
+                  type="checkbox"
+                  checked={includeAppendix}
+                  onChange={(e) => onIncludeAppendixChange(e.target.checked)}
+                />
+                Appendix
+              </label>
             </div>
             <div className="grid grid-rows-[24px_32px_auto] gap-2">
               <div className="flex h-6 items-center justify-between gap-2">
@@ -1078,92 +1216,93 @@ export function SlideLayoutPreview({
               />
             </div>
           </div>
-        </div>
+        )}
 
-        <div className="rounded-card border border-border bg-white p-3 space-y-3 min-w-0">
-          <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
-              <Shapes size={13} /> Callouts
-            </div>
-            <span className="text-[10px] text-content-tertiary">{activeOverlays.length}</span>
-          </div>
-          <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
-            <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'text')}>
-              <Type size={12} /> Text
-            </button>
-            <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'arrow')}>
-              <ArrowUpRight size={12} /> Arrow
-            </button>
-            <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'line')}>
-              <Minus size={12} /> Line
-            </button>
-            <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'box')}>
-              <Square size={12} /> Box
-            </button>
-            <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'symbol')}>
-              <Shapes size={12} /> Mark
-            </button>
-          </div>
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-2 max-h-72 overflow-y-auto">
-            {activeOverlays.length === 0 && (
-              <div className="text-[10px] text-content-tertiary">
-                Add callouts to highlight key points on this slide.
+        {controlSection === 'callouts' && (
+          <div className="space-y-3 min-w-0">
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
+                <Shapes size={13} /> Callouts
               </div>
-            )}
-            {activeOverlays.map((overlay) => (
-              <div key={overlay.id} className="rounded border border-border p-2 space-y-1.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[11px] font-medium capitalize text-content-secondary">{overlay.type}</span>
-                  <button type="button" className="btn-ghost btn-sm" onClick={() => removeOverlay(activeTile.id, overlay.id)}>
-                    Remove
-                  </button>
+              <span className="text-[10px] text-content-tertiary">{activeOverlays.length}</span>
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-1.5">
+              <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'text')}>
+                <Type size={12} /> Text
+              </button>
+              <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'arrow')}>
+                <ArrowUpRight size={12} /> Arrow
+              </button>
+              <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'line')}>
+                <Minus size={12} /> Line
+              </button>
+              <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'box')}>
+                <Square size={12} /> Box
+              </button>
+              <button type="button" className="btn-ghost btn-sm justify-center" onClick={() => addOverlay(activeTile.id, 'symbol')}>
+                <Shapes size={12} /> Mark
+              </button>
+            </div>
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-2 max-h-72 overflow-y-auto">
+              {activeOverlays.length === 0 && (
+                <div className="text-[10px] text-content-tertiary">
+                  Add callouts to highlight key points on this slide.
                 </div>
-                <input
-                  type="color"
-                  value={hex(overlay.color || brand.accentColor)}
-                  onChange={(e) => updateOverlay(activeTile.id, overlay.id, { color: e.target.value.replace(/^#/, '') })}
-                  className="h-8 w-full rounded border border-border bg-white"
-                  title="Overlay color"
-                />
-                {(overlay.type === 'text' || overlay.type === 'symbol') && (
+              )}
+              {activeOverlays.map((overlay) => (
+                <div key={overlay.id} className="rounded border border-border p-2 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-medium capitalize text-content-secondary">{overlay.type}</span>
+                    <button type="button" className="btn-ghost btn-sm" onClick={() => removeOverlay(activeTile.id, overlay.id)}>
+                      Remove
+                    </button>
+                  </div>
                   <input
-                    type="text"
-                    value={overlay.text || ''}
-                    onChange={(e) => updateOverlay(activeTile.id, overlay.id, { text: e.target.value })}
-                    placeholder={overlay.type === 'symbol' ? '!' : 'Key takeaway'}
-                    className="input-field text-xs"
+                    type="color"
+                    value={hex(overlay.color || brand.accentColor)}
+                    onChange={(e) => updateOverlay(activeTile.id, overlay.id, { color: e.target.value.replace(/^#/, '') })}
+                    className="h-8 w-full rounded border border-border bg-white"
+                    title="Overlay color"
                   />
-                )}
-                <label className="block text-[10px] text-content-tertiary">
-                  <span className="mb-1 flex items-center justify-between gap-2">
-                    <span className="flex items-center gap-1">
-                      <RotateCcw size={10} /> Rotation
+                  {(overlay.type === 'text' || overlay.type === 'symbol') && (
+                    <input
+                      type="text"
+                      value={overlay.text || ''}
+                      onChange={(e) => updateOverlay(activeTile.id, overlay.id, { text: e.target.value })}
+                      placeholder={overlay.type === 'symbol' ? '!' : 'Key takeaway'}
+                      className="input-field text-xs"
+                    />
+                  )}
+                  <label className="block text-[10px] text-content-tertiary">
+                    <span className="mb-1 flex items-center justify-between gap-2">
+                      <span className="flex items-center gap-1">
+                        <RotateCcw size={10} /> Rotation
+                      </span>
+                      <input
+                        type="number"
+                        min={-180}
+                        max={180}
+                        step={5}
+                        value={overlayRotation(overlay)}
+                        onChange={(e) => updateOverlay(activeTile.id, overlay.id, { rotation: Number(e.target.value) })}
+                        className="h-7 w-16 appearance-none rounded border border-border bg-white px-1.5 text-center text-[11px] text-content-primary [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                      />
                     </span>
                     <input
-                      type="number"
+                      type="range"
                       min={-180}
                       max={180}
                       step={5}
                       value={overlayRotation(overlay)}
                       onChange={(e) => updateOverlay(activeTile.id, overlay.id, { rotation: Number(e.target.value) })}
-                      className="h-7 w-16 appearance-none rounded border border-border bg-white px-1.5 text-center text-[11px] text-content-primary [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
+                      className="w-full"
                     />
-                  </span>
-                  <input
-                    type="range"
-                    min={-180}
-                    max={180}
-                    step={5}
-                    value={overlayRotation(overlay)}
-                    onChange={(e) => updateOverlay(activeTile.id, overlay.id, { rotation: Number(e.target.value) })}
-                    className="w-full"
-                  />
-                </label>
-              </div>
-            ))}
+                  </label>
+                </div>
+              ))}
+            </div>
           </div>
-        </div>
-        </div>
+        )}
       </div>
     </div>
   );

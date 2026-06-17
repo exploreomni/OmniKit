@@ -102,6 +102,7 @@ export interface InstanceDocument {
   folderId?: string;
   folderPath?: string;
   baseModelId?: string;
+  baseModelName?: string;
   description?: string | null;
   labels?: string[];
   updatedAt?: string;
@@ -599,10 +600,11 @@ export async function connectSavedInstance(id: string) {
   );
 }
 
-export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string } = {}) {
+export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string; includeModelDetails?: boolean } = {}) {
   const params = new URLSearchParams();
   if (options.folderId) params.set('folderId', options.folderId);
   if (options.folderPath) params.set('folderPath', options.folderPath);
+  if (options.includeModelDetails) params.set('includeModelDetails', 'true');
   const query = params.toString();
   return apiFetch<{ documents: InstanceDocument[] }>(
     `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`,

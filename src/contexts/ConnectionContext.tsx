@@ -1,6 +1,7 @@
 import { createContext, useContext, useReducer, useCallback, useEffect, type ReactNode } from 'react';
 import type { ConnectionConfig, ConnectionStatus } from '@/types';
 import { isVaultApiKeyReference } from '@/services/opsConsole';
+import { hasSavedVaultConnection } from '@/services/connectionGuards';
 
 interface ConnectionState {
   connection: ConnectionConfig;
@@ -34,11 +35,14 @@ function readSessionConnection(): ConnectionConfig {
     const instanceId = typeof parsed.instanceId === 'string' ? parsed.instanceId : undefined;
     const connectionMode = parsed.connectionMode === 'vault' && instanceId ? 'vault' : 'manual';
     const isVaultReference = connectionMode === 'vault' && apiKey && isVaultApiKeyReference(apiKey);
+    if (connectionMode !== 'vault' || !isVaultReference || !baseUrl || !instanceId) {
+      return { ...initialConnection };
+    }
     const status = parsed.status === 'success' && baseUrl && (apiKey || instanceId) ? 'success' : 'untested';
 
     return {
       baseUrl,
-      apiKey: connectionMode === 'vault' && !isVaultReference ? '' : apiKey,
+      apiKey,
       status,
       errorMessage: '',
       connectionMode,
@@ -60,19 +64,21 @@ function writeSessionConnection(connection: ConnectionConfig) {
       return;
     }
 
-    const isVaultConnection = connection.connectionMode === 'vault' && connection.instanceId;
+    const isVaultConnection = hasSavedVaultConnection(connection);
+    if (!isVaultConnection) {
+      window.sessionStorage.removeItem(SESSION_CONNECTION_KEY);
+      return;
+    }
     window.sessionStorage.setItem(
       SESSION_CONNECTION_KEY,
       JSON.stringify({
         baseUrl: connection.baseUrl,
-        apiKey: isVaultConnection
-          ? (isVaultApiKeyReference(connection.apiKey) ? connection.apiKey : '')
-          : connection.apiKey,
+        apiKey: connection.apiKey,
         status: connection.status,
-        connectionMode: isVaultConnection ? 'vault' : 'manual',
-        instanceId: isVaultConnection ? connection.instanceId : undefined,
-        instanceLabel: isVaultConnection ? connection.instanceLabel : undefined,
-        apiKeyMasked: isVaultConnection ? connection.apiKeyMasked : undefined,
+        connectionMode: 'vault',
+        instanceId: connection.instanceId,
+        instanceLabel: connection.instanceLabel,
+        apiKeyMasked: connection.apiKeyMasked,
       }),
     );
   } catch {

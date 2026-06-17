@@ -387,7 +387,7 @@ export function DataPrivacyPage() {
         ) : (
           <div className="space-y-3">
             <p className="text-[13px] text-content-secondary leading-relaxed">
-              Session storage can include the active connection for this browser tab. It is excluded from backups and cleared by Clear all local data.
+              Session storage can include the active saved-instance reference for this browser tab. It stores masked metadata and a non-secret vault reference, not plaintext API keys, and is cleared by Clear all local data.
             </p>
             <div className="divide-y divide-border">
               {sessionSummary.map((row) => (

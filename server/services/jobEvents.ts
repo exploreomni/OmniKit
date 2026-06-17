@@ -42,5 +42,19 @@ function sanitizeEvent(event: MigrationJobEvent): MigrationJobEvent {
       item: event.item ? sanitizeJobItem(event.item) : undefined,
     };
   }
+  if (event.type === 'post-migration') {
+    return { ...event, results: sanitizeEventPayload(event.results) };
+  }
   return event;
+}
+
+function sanitizeEventPayload(value: unknown): unknown {
+  if (typeof value === 'string') return redactSensitiveText(value);
+  try {
+    const serialized = JSON.stringify(value);
+    if (!serialized) return value;
+    return JSON.parse(redactSensitiveText(serialized)) as unknown;
+  } catch {
+    return value;
+  }
 }

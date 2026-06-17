@@ -31,6 +31,7 @@ import {
   dashboardDownloadStatusVariant,
   DASHBOARD_DOWNLOAD_MIME_TYPES,
   formatDashboardDownloadLabel,
+  summarizeDashboardDownloadFilters,
   type DashboardDownloadDetails,
   type DashboardDownloadFilterState,
   type DashboardDownloadFormat,
@@ -100,6 +101,10 @@ function readRecentDownloads(): RecentDashboardDownload[] {
     const parsed = JSON.parse(window.sessionStorage.getItem(RECENT_DOWNLOADS_KEY) || '[]') as RecentDashboardDownload[];
     return Array.isArray(parsed)
       ? parsed.filter((item) => item && typeof item.dashboardId === 'string' && typeof item.filename === 'string').slice(0, 8)
+          .map((item) => ({
+            ...item,
+            filterSummary: item.filterSummary || summarizeDashboardDownloadFilters(item.request),
+          }))
       : [];
   } catch {
     return [];
@@ -260,9 +265,16 @@ export function DownloadsPage() {
   const isPdfPng = format === 'pdf' || format === 'png';
   const isDataFormat = format === 'csv' || format === 'xlsx' || format === 'json';
   const configuredFilterCount = selectedDocIds.filter((id) => hasConfiguredFilters(filterValuesByDashboard[id])).length;
+  const parsedMaxRows = Number.parseInt(maxRowLimit, 10);
+  const xlsxRowLimitBlocked = format === 'xlsx'
+    && overrideRowLimit
+    && Number.isFinite(parsedMaxRows)
+    && parsedMaxRows > 0
+    && scope !== 'tile';
   const canDownload = selectedDocs.length > 0
     && !downloading
     && Boolean(instanceId)
+    && !xlsxRowLimitBlocked
     && (scope === 'dashboard' || (selectedDocs.length === 1 && Boolean(selectedTile?.queryIdentifierMapKey)));
 
   const visibleDocuments = useMemo(() => {
@@ -499,6 +511,7 @@ export function DownloadsPage() {
       scope: runScope,
       tileName,
       filename,
+      filterSummary: summarizeDashboardDownloadFilters(requestBody),
       createdAt: Date.now(),
       request: requestBody,
     };
@@ -566,7 +579,13 @@ export function DownloadsPage() {
 
   async function handleDownload() {
     if (!canDownload) {
-      setError(scope === 'tile' ? 'Choose one dashboard and one downloadable tile before exporting.' : 'Choose at least one dashboard.');
+      setError(
+        xlsxRowLimitBlocked
+          ? 'XLSX row-limit overrides require single-tile mode. Switch to Single tile or turn off the row-limit override.'
+          : scope === 'tile'
+            ? 'Choose one dashboard and one downloadable tile before exporting.'
+            : 'Choose at least one dashboard.',
+      );
       return;
     }
     await runDownloadQueue(selectedDocs, currentOptions, filterValuesByDashboard);
@@ -831,11 +850,16 @@ export function DownloadsPage() {
               </div>
               <p className="text-xs text-content-secondary">
                 {format === 'xlsx'
-                  ? 'Large XLSX row limits require the override toggle and are most reliable for single-tile exports.'
+                  ? 'Large XLSX row limits require single-tile mode and a downloadable tile.'
                   : format === 'csv'
                     ? 'CSV exports download as a ZIP containing one CSV per tile.'
                     : 'JSON exports are available for single-tile downloads only.'}
               </p>
+              {xlsxRowLimitBlocked && (
+                <div role="alert" className="rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  XLSX row-limit overrides require single-tile mode. Switch to Single tile or disable the override before exporting.
+                </div>
+              )}
               <div className="grid gap-3 sm:grid-cols-2">
                 <label className="text-xs font-medium text-content-secondary">
                   Max Row Limit
@@ -981,6 +1005,11 @@ export function DownloadsPage() {
                   <div className="text-xs text-content-secondary">
                     {formatDashboardDownloadLabel(download.format)} · {download.scope === 'tile' ? download.tileName || 'Tile' : 'Whole dashboard'} · {new Date(download.createdAt).toLocaleTimeString()}
                   </div>
+                  {download.filterSummary && (
+                    <div className="mt-0.5 truncate text-[11px] text-content-tertiary" title={download.filterSummary}>
+                      Filters: {download.filterSummary}
+                    </div>
+                  )}
                 </div>
                 <button type="button" onClick={() => void rerunDownload(download)} disabled={downloading} className="btn-secondary text-xs disabled:opacity-50">
                   Re-run

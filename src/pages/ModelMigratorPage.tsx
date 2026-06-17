@@ -18,6 +18,7 @@ import {
 import { PageHeader } from '@/components/layout/PageHeader';
 import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { Blobby } from '@/components/ui/Blobby';
+import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import {
   cancelOpsMigrationJob,
@@ -234,7 +235,9 @@ function LoadingLine({ label }: { label: string }) {
 
 export function ModelMigratorPage() {
   const navigate = useNavigate();
+  const { connection } = useConnection();
   const logOperation = useLogOperation();
+  const activeVaultInstanceId = connection.connectionMode === 'vault' ? connection.instanceId || '' : '';
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const [instances, setInstances] = useState<SavedInstancePublic[]>([]);
   const [sourceInstanceId, setSourceInstanceId] = useState('');
@@ -397,10 +400,16 @@ export function ModelMigratorPage() {
   }
 
   useEffect(() => {
+    if (!activeVaultInstanceId) {
+      setVaultStatus(null);
+      setInstances([]);
+      setLoadingVault(false);
+      return;
+    }
     void refreshVault();
-    // Runs once when the workflow opens.
+    // Runs when the workflow opens or the active saved instance changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [activeVaultInstanceId]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -868,6 +877,15 @@ export function ModelMigratorPage() {
     );
     return unsubscribe;
   }, [activeJobId, logOperation]);
+
+  if (!activeVaultInstanceId) {
+    return (
+      <SavedInstanceRequiredEmptyState
+        toolName="Model Migrator"
+        description="Model Migrator runs through saved Omni instances only. Unlock Home, then choose and test the saved Omni instance this workflow should use."
+      />
+    );
+  }
 
   if (loadingVault) {
     return (

@@ -7,6 +7,7 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniDocument, OmniFolder } from '@/types';
 
 interface FolderOption {
@@ -44,7 +45,7 @@ function contentSignals(doc: OmniDocument): Array<{ label: string; className: st
 export function ContentHealthPage() {
   const { connection } = useConnection();
   const navigate = useNavigate();
-  const connectionKey = connection.instanceId || connection.baseUrl;
+  const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
   const [folders, setFolders] = useState<OmniFolder[]>([]);
   const [selectedFolderId, setSelectedFolderId] = useState('');

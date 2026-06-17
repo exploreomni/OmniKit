@@ -24,6 +24,8 @@ import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
+import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { StatusChip } from '@/components/ui/StatusChip';
 import {
   selectedBadgeClass,
   selectedCardClass,
@@ -90,6 +92,22 @@ import {
   isBuiltin,
   makeLayoutKit,
 } from '@/services/deckBuilder/templateStore';
+import {
+  deleteRecipe,
+  duplicateRecipe,
+  getRecipe,
+  hostFromBaseUrl,
+  listRecipes,
+  renameRecipe,
+  saveRecipe as saveRecipeRecord,
+  type RecipeRecord,
+} from '@/services/deckBuilder/recipeStore';
+import {
+  clearDeckDraft,
+  loadDeckDraft,
+  saveDeckDraft,
+  type DeckBuilderDraft,
+} from '@/services/deckBuilder/deckDraftStorage';
 import { ingestPptxTemplate } from '@/services/deckBuilder/pptxTemplateIngest';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { FilterEditor } from '@/components/deckBuilder/FilterEditor';
@@ -97,6 +115,28 @@ import { BatchSetup } from '@/components/deckBuilder/BatchSetup';
 import { SlideLayoutPreview } from '@/components/deckBuilder/SlideLayoutPreview';
 
 type StepId = 'inspect' | 'select' | 'filters' | 'brand' | 'layout' | 'generate';
+
+type ConfirmDialogState = {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  cancelLabel?: string;
+  variant?: 'primary' | 'danger';
+  requireTypedConfirmation?: boolean;
+  confirmationPhrase?: string;
+  onConfirm: () => void;
+};
+
+type TextPromptState = {
+  title: string;
+  label: string;
+  initialValue: string;
+  secondaryLabel?: string;
+  initialSecondaryValue?: string;
+  secondaryPlaceholder?: string;
+  confirmLabel: string;
+  onConfirm: (value: string, secondaryValue?: string) => void;
+};
 
 const STEPS: Array<{ id: StepId; label: string; description: string }> = [
   { id: 'inspect', label: 'Inspect', description: 'Pick a dashboard' },
@@ -145,6 +185,37 @@ function strategyForTileExports(renderStrategy: RenderStrategy): RenderStrategy 
   return renderStrategy === 'full-dashboard' ? 'native' : renderStrategy;
 }
 
+function safeRecipeFileName(name: string): string {
+  const stem = name.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'deck-recipe';
+  return `${stem}.recipe.json`;
+}
+
+function dashboardIdFromRecipeUrl(dashboardUrl: string): string | undefined {
+  try {
+    const pathname = new URL(dashboardUrl).pathname;
+    return pathname.match(/\/dashboards\/([^/?#]+)/)?.[1];
+  } catch {
+    return dashboardUrl.match(/\/dashboards\/([^/?#]+)/)?.[1];
+  }
+}
+
+function stepAfterRecipeLoad(recipe: ReturnType<typeof validateRecipe>, validTileCount: number): StepId {
+  if (validTileCount === 0) return 'select';
+  return recipe.slideOverrides && Object.keys(recipe.slideOverrides).length > 0 ? 'generate' : 'layout';
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value >= 10 || unitIndex === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unitIndex]}`;
+}
+
 export function DeckBuilderPage() {
   const { connection } = useConnection();
   const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
@@ -167,12 +238,20 @@ export function DeckBuilderPage() {
   const [filterOverrides, setFilterOverrides] = useState<Record<string, FilterOverride>>({});
   const [dashboardDefaults, setDashboardDefaults] = useState<Record<string, FilterOverride>>({});
   const [savedSets, setSavedSets] = useState<SavedFilterSet[]>([]);
+  const [filterSyncing, setFilterSyncing] = useState(false);
+  const [filterSyncMessage, setFilterSyncMessage] = useState('');
+  const [filterSyncError, setFilterSyncError] = useState('');
 
   const [batchEnabled, setBatchEnabled] = useState(false);
   const [batchField, setBatchField] = useState<string | null>(null);
   const [batchValues, setBatchValues] = useState<string[]>([]);
   const [batchHistory, setBatchHistory] = useState<BatchHistoryEntry[]>([]);
   const [batchClientStates, setBatchClientStates] = useState<Record<string, BatchClientStatus>>({});
+
+  const [recipes, setRecipes] = useState<RecipeRecord[]>(() => listRecipes());
+  const [recipeLibraryMessage, setRecipeLibraryMessage] = useState('');
+  const [recipeLibraryError, setRecipeLibraryError] = useState('');
+  const [pendingDraft, setPendingDraft] = useState<DeckBuilderDraft | null>(null);
 
   const [topicFields, setTopicFields] = useState<TopicFieldRef[]>([]);
   const [topicCatalogLoading, setTopicCatalogLoading] = useState(false);
@@ -194,8 +273,11 @@ export function DeckBuilderPage() {
   const [slideOverrides, setSlideOverrides] = useState<Record<string, SlideOverride>>({});
   const [templateImportError, setTemplateImportError] = useState<string | null>(null);
   const [templateImportWarnings, setTemplateImportWarnings] = useState<string[]>([]);
+  const [templateWarningsDismissed, setTemplateWarningsDismissed] = useState(false);
   const [templateImporting, setTemplateImporting] = useState(false);
   const [splitMastersOnImport, setSplitMastersOnImport] = useState(true);
+  const [brandImportError, setBrandImportError] = useState<string | null>(null);
+  const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
 
   const [insights, setInsights] = useState<Record<string, string>>({});
   const [includeAppendix, setIncludeAppendix] = useState(true);
@@ -207,6 +289,8 @@ export function DeckBuilderPage() {
   const [generating, setGenerating] = useState(false);
   const [generationError, setGenerationError] = useState('');
   const [generationSuccess, setGenerationSuccess] = useState('');
+  const [generationPhase, setGenerationPhase] = useState('');
+  const [generatedFileSize, setGeneratedFileSize] = useState<number | null>(null);
   const skipFailed = true;
   const allowFullDashboardFallback = false;
   const [renderStrategy, setRenderStrategy] = useState<'native' | 'tile-image' | 'full-dashboard'>('native');
@@ -217,9 +301,16 @@ export function DeckBuilderPage() {
   const brandFileInput = useRef<HTMLInputElement | null>(null);
   const logoFileInput = useRef<HTMLInputElement | null>(null);
   const pptxTemplateInput = useRef<HTMLInputElement | null>(null);
+  const [confirmDialog, setConfirmDialog] = useState<ConfirmDialogState | null>(null);
+  const [textPrompt, setTextPrompt] = useState<TextPromptState | null>(null);
 
   const stepIndex = STEPS.findIndex((s) => s.id === step);
   const isWorkspaceStep = step === 'layout' || step === 'generate';
+  const recipeHostLabel = useMemo(() => {
+    const host = hostFromBaseUrl(connection.baseUrl);
+    if (connection.instanceLabel) return host ? `${connection.instanceLabel} (${host})` : connection.instanceLabel;
+    return host;
+  }, [connection.baseUrl, connection.instanceLabel]);
 
   const selectedTiles = useMemo(() => {
     if (!dashboard) return [];
@@ -291,6 +382,54 @@ export function DeckBuilderPage() {
     };
   }, [selectedTiles, slideOverrides, insights, tileVisualSources, renderStrategy, batchEnabled, batchField, batchValues.length]);
 
+  const batchProgressSummary = useMemo(() => {
+    const states = batchValues.map((value) => batchClientStates[value] || {
+      value,
+      status: 'pending' as const,
+      succeededTiles: 0,
+      failedTiles: 0,
+    });
+    const completedDecks = states.filter((s) => ['done', 'failed', 'cancelled'].includes(s.status)).length;
+    const succeededDecks = states.filter((s) => s.status === 'done').length;
+    const failedDecks = states.filter((s) => s.status === 'failed').length;
+    const cancelledDecks = states.filter((s) => s.status === 'cancelled').length;
+    const succeededTiles = states.reduce((sum, s) => sum + s.succeededTiles, 0);
+    const failedTiles = states.reduce((sum, s) => sum + s.failedTiles, 0);
+    return {
+      completedDecks,
+      succeededDecks,
+      failedDecks,
+      cancelledDecks,
+      succeededTiles,
+      failedTiles,
+      totalDecks: batchValues.length,
+      totalTiles: batchValues.length * selectedTiles.length,
+    };
+  }, [batchClientStates, batchValues, selectedTiles.length]);
+
+  const generationProgress = useMemo(() => {
+    const batchActive = batchEnabled && batchField && batchValues.length > 0;
+    if (batchActive) {
+      const completedTiles = Math.min(
+        batchProgressSummary.totalTiles,
+        batchProgressSummary.succeededTiles + batchProgressSummary.failedTiles,
+      );
+      return {
+        completed: completedTiles,
+        total: batchProgressSummary.totalTiles,
+        label: `${completedTiles}/${batchProgressSummary.totalTiles} tile exports`,
+      };
+    }
+    const states = Object.values(exportStates);
+    const completed = states.filter((state) => ['done', 'failed', 'skipped'].includes(state.status)).length;
+    const total = selectedTiles.length;
+    return {
+      completed,
+      total,
+      label: `${completed}/${total} slide exports`,
+    };
+  }, [batchEnabled, batchField, batchValues.length, batchProgressSummary, exportStates, selectedTiles.length]);
+
   const renderModeLabel = useMemo(() => {
     const activeSourceCount = [
       exportReadiness.sourceCounts.native,
@@ -310,7 +449,7 @@ export function DeckBuilderPage() {
 
   useEffect(() => {
     if (!connection.baseUrl) return;
-    const cached = dashboardCache.load(connection.baseUrl);
+    const cached = dashboardCache.load(connectionKey);
     if (cached) {
       setDashboards(cached.data);
       setDashboardsSyncedAt(cached.savedAt);
@@ -318,8 +457,53 @@ export function DeckBuilderPage() {
       setDashboards([]);
       setDashboardsSyncedAt(null);
     }
-    setBatchHistory(batchHistoryCache.load(connection.baseUrl));
-  }, [connection.baseUrl]);
+    setBatchHistory(batchHistoryCache.load(connectionKey));
+    setRecipes(listRecipes());
+    setPendingDraft(loadDeckDraft(connectionKey));
+  }, [connection.baseUrl, connectionKey]);
+
+  const refreshRecipes = useCallback(() => {
+    setRecipes(listRecipes());
+  }, []);
+
+  useEffect(() => {
+    if (!connection.baseUrl || !dashboard) return;
+    saveDeckDraft(connectionKey, {
+      step,
+      dashboard,
+      dashboardUrl: dashboard.url,
+      selectedTileIds: selectedIds,
+      insights,
+      brand,
+      includeAppendix,
+      generatedFrom: connection.baseUrl,
+      filterOverrides: Object.keys(filterOverrides).length > 0 ? filterOverrides : undefined,
+      dashboardDefaults,
+      batch: batchEnabled && batchField ? { filterField: batchField, values: batchValues } : undefined,
+      templateId: currentTemplate?.id,
+      tileVisualSources: Object.keys(tileVisualSources).length > 0 ? tileVisualSources : undefined,
+      slideOverrides: Object.keys(slideOverrides).length > 0 ? slideOverrides : undefined,
+      renderStrategy,
+    });
+  }, [
+    connection.baseUrl,
+    connectionKey,
+    dashboard,
+    step,
+    selectedIds,
+    insights,
+    brand,
+    includeAppendix,
+    filterOverrides,
+    dashboardDefaults,
+    batchEnabled,
+    batchField,
+    batchValues,
+    currentTemplate?.id,
+    tileVisualSources,
+    slideOverrides,
+    renderStrategy,
+  ]);
 
   const refreshDashboardList = useCallback(async () => {
     if (!connection.baseUrl || !connection.apiKey) return;
@@ -330,7 +514,7 @@ export function DeckBuilderPage() {
       if (!isActiveConnectionRequest(requestKey)) return;
       setDashboards(list);
       setDashboardsSyncedAt(Date.now());
-      dashboardCache.save(connection.baseUrl, list);
+      dashboardCache.save(connectionKey, list);
     } catch (err) {
       if (!isActiveConnectionRequest(requestKey)) return;
       deckLog.warn('inspect', 'Failed to fetch dashboard list', { error: err instanceof Error ? err.message : String(err) });
@@ -349,8 +533,8 @@ export function DeckBuilderPage() {
 
   const loadSavedFilterSets = useCallback((dashboardId: string) => {
     if (!connection.baseUrl) return;
-    setSavedSets(filterSetCache.load(connection.baseUrl, dashboardId));
-  }, [connection.baseUrl]);
+    setSavedSets(filterSetCache.load(connectionKey, dashboardId));
+  }, [connection.baseUrl, connectionKey]);
 
   const resolveFieldContext = useCallback(
     (field: string): { modelId?: string; topic?: string; candidateTopics: string[]; templateBody?: Record<string, unknown> } => {
@@ -380,7 +564,7 @@ export function DeckBuilderPage() {
   const loadFieldOptions = useCallback(
     async (field: string): Promise<string[]> => {
       if (!dashboard || !connection.baseUrl || !connection.apiKey) return [];
-      const cached = filterValuesCache.load(connection.baseUrl, dashboard.id, field);
+      const cached = filterValuesCache.load(connectionKey, dashboard.id, field);
       if (filterValuesCache.isFresh(cached) && cached) return cached.values;
       const ctx = resolveFieldContext(field);
       if (!ctx.modelId) {
@@ -395,14 +579,14 @@ export function DeckBuilderPage() {
           candidateTopics: ctx.candidateTopics,
           templateBody: ctx.templateBody,
         });
-        filterValuesCache.save(connection.baseUrl, dashboard.id, field, values);
+        filterValuesCache.save(connectionKey, dashboard.id, field, values);
         return values;
       } catch (err) {
         if (cached) return cached.values;
         throw err;
       }
     },
-    [dashboard, connection.baseUrl, connection.apiKey, resolveFieldContext]
+    [dashboard, connection.baseUrl, connection.apiKey, connectionKey, resolveFieldContext]
   );
 
   const refreshFieldOptions = useCallback(
@@ -417,10 +601,10 @@ export function DeckBuilderPage() {
         candidateTopics: ctx.candidateTopics,
         templateBody: ctx.templateBody,
       });
-      filterValuesCache.save(connection.baseUrl, dashboard.id, field, values);
+      filterValuesCache.save(connectionKey, dashboard.id, field, values);
       return values;
     },
-    [dashboard, connection.baseUrl, connection.apiKey, resolveFieldContext]
+    [dashboard, connection.baseUrl, connection.apiKey, connectionKey, resolveFieldContext]
   );
 
   const loadTopicCatalog = useCallback(
@@ -431,7 +615,7 @@ export function DeckBuilderPage() {
         setTopicCatalogError('No model id detected on this dashboard.');
         return;
       }
-      const cached = topicCatalogCache.load(connection.baseUrl, modelId);
+      const cached = topicCatalogCache.load(connectionKey, modelId);
       if (!force && topicCatalogCache.isFresh(cached) && cached) {
         setTopicFields(cached.fields);
         return;
@@ -446,7 +630,7 @@ export function DeckBuilderPage() {
           dashboard.topics.length > 0 ? dashboard.topics : undefined
         );
         setTopicFields(result.fields);
-        topicCatalogCache.save(connection.baseUrl, modelId, {
+        topicCatalogCache.save(connectionKey, modelId, {
           modelId: result.modelId,
           topics: result.topics,
           fields: result.fields,
@@ -463,7 +647,7 @@ export function DeckBuilderPage() {
         setTopicCatalogLoading(false);
       }
     },
-    [dashboard, connection.baseUrl, connection.apiKey]
+    [dashboard, connection.baseUrl, connection.apiKey, connectionKey]
   );
 
   useEffect(() => {
@@ -497,12 +681,12 @@ export function DeckBuilderPage() {
       const liveSeed = seedOverridesFromDashboardFilters(next.filters);
       let resolvedSeed = liveSeed;
       if (Object.keys(liveSeed).length === 0) {
-        const remote = await fetchDeckFilterDefaults(connection.baseUrl, dashboardId);
+        const remote = await fetchDeckFilterDefaults(connectionKey, dashboardId);
         if (remote && remote.defaults && typeof remote.defaults === 'object') {
           resolvedSeed = remote.defaults as Record<string, FilterOverride>;
         }
       } else {
-        void upsertDeckFilterDefaults(connection.baseUrl, dashboardId, summary.name, liveSeed);
+        void upsertDeckFilterDefaults(connectionKey, dashboardId, summary.name, liveSeed);
       }
       setDashboardDefaults(resolvedSeed);
       setFilterOverrides(resolvedSeed);
@@ -512,6 +696,7 @@ export function DeckBuilderPage() {
       setSlideOverrides({});
       setPreviewStates({});
       setPreviewError('');
+      setPendingDraft(null);
       loadSavedFilterSets(dashboardId);
       setStep('select');
     } catch (err) {
@@ -519,7 +704,7 @@ export function DeckBuilderPage() {
     } finally {
       setInspecting(false);
     }
-  }, [connection.baseUrl, connection.apiKey, loadSavedFilterSets]);
+  }, [connection.baseUrl, connection.apiKey, connectionKey, loadSavedFilterSets]);
 
   const handlePickDashboard = useCallback(
     (d: CachedDashboard) => {
@@ -540,6 +725,54 @@ export function DeckBuilderPage() {
     }
   }, [url, connection.baseUrl, inspectByIdAndName]);
 
+  const handleResyncFilters = useCallback(async () => {
+    if (!dashboard || !connection.baseUrl || !connection.apiKey) return;
+    setFilterSyncing(true);
+    setFilterSyncError('');
+    setFilterSyncMessage('');
+    try {
+      const summary = await fetchDashboardSummary(connection.baseUrl, connection.apiKey, dashboard.id);
+      const nextDashboard: InspectedDashboard = {
+        url: dashboard.url,
+        id: dashboard.id,
+        name: summary.name,
+        tiles: summary.tiles,
+        filters: summary.filters,
+        topics: summary.topics,
+        modelId: summary.modelId,
+      };
+      const validIds = new Set(summary.tiles.map((tile) => tile.id));
+      const currentOverridesEdited = JSON.stringify(filterOverrides) !== JSON.stringify(dashboardDefaults);
+      const liveSeed = seedOverridesFromDashboardFilters(nextDashboard.filters);
+      setDashboard(nextDashboard);
+      setSelectedIds((ids) => ids.filter((id) => validIds.has(id)));
+      setDashboardDefaults(liveSeed);
+      if (!currentOverridesEdited) {
+        setFilterOverrides(liveSeed);
+      }
+      void upsertDeckFilterDefaults(connectionKey, dashboard.id, summary.name, liveSeed);
+      loadSavedFilterSets(dashboard.id);
+      const selectedCount = selectedIds.filter((id) => validIds.has(id)).length;
+      setFilterSyncMessage(
+        `${summary.filters.length} filter${summary.filters.length === 1 ? '' : 's'} refreshed for ${selectedCount} selected tile${selectedCount === 1 ? '' : 's'}.` +
+          (currentOverridesEdited ? ' Edited overrides were preserved.' : ''),
+      );
+    } catch (err) {
+      setFilterSyncError(err instanceof Error ? err.message : 'Failed to re-sync dashboard filters.');
+    } finally {
+      setFilterSyncing(false);
+    }
+  }, [
+    connection.baseUrl,
+    connection.apiKey,
+    connectionKey,
+    dashboard,
+    dashboardDefaults,
+    filterOverrides,
+    loadSavedFilterSets,
+    selectedIds,
+  ]);
+
   const toggleTile = useCallback((id: string) => {
     setSelectedIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
@@ -559,8 +792,9 @@ export function DeckBuilderPage() {
   }, []);
 
   const handleLogoUpload = useCallback(async (file: File) => {
+    setLogoUploadError(null);
     if (!file.type.startsWith('image/')) {
-      alert('Logo must be an image file.');
+      setLogoUploadError('Logo must be an image file.');
       return;
     }
     const dataUrl = await fileToDataUrl(file);
@@ -568,13 +802,14 @@ export function DeckBuilderPage() {
   }, []);
 
   const handleBrandImport = useCallback(async (file: File) => {
+    setBrandImportError(null);
     try {
       const data = await readJsonFile(file);
       const next = validateBrand(data);
       if (!next) throw new Error('Brand JSON is missing required fields.');
       setBrand(next);
     } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to import brand JSON.');
+      setBrandImportError(err instanceof Error ? err.message : 'Failed to import brand JSON.');
     }
   }, []);
 
@@ -585,6 +820,7 @@ export function DeckBuilderPage() {
   const handlePptxTemplateUpload = useCallback(async (file: File) => {
     setTemplateImportError(null);
     setTemplateImportWarnings([]);
+    setTemplateWarningsDismissed(false);
     setTemplateImporting(true);
     try {
       const { kits, warnings } = await ingestPptxTemplate(file, { splitMasters: splitMastersOnImport });
@@ -605,12 +841,18 @@ export function DeckBuilderPage() {
   }, [refreshTemplates, splitMastersOnImport]);
 
   const handleSaveAsTemplate = useCallback(() => {
-    const name = window.prompt('Template name?', brand.name || 'My template');
-    if (!name) return;
-    const kit = makeLayoutKit(`user-${Date.now()}`, name, brand, 'json');
-    saveTemplate(kit);
-    refreshTemplates();
-    setSelectedTemplateId(kit.id);
+    setTextPrompt({
+      title: 'Save Template',
+      label: 'Template name',
+      initialValue: brand.name || 'My template',
+      confirmLabel: 'Save template',
+      onConfirm: (name) => {
+        const kit = makeLayoutKit(`user-${Date.now()}`, name, brand, 'json');
+        saveTemplate(kit);
+        refreshTemplates();
+        setSelectedTemplateId(kit.id);
+      },
+    });
   }, [brand, refreshTemplates]);
 
   const handleUpdateTemplate = useCallback(() => {
@@ -622,10 +864,19 @@ export function DeckBuilderPage() {
 
   const handleDeleteTemplate = useCallback(() => {
     if (!currentTemplate || isBuiltin(currentTemplate.id)) return;
-    if (!window.confirm(`Delete template "${currentTemplate.name}"?`)) return;
-    deleteTemplate(currentTemplate.id);
-    refreshTemplates();
-    setSelectedTemplateId('builtin-omnikit');
+    setConfirmDialog({
+      title: 'Delete Template',
+      message: `Delete "${currentTemplate.name}" from your local template library?`,
+      confirmLabel: 'Delete template',
+      variant: 'danger',
+      requireTypedConfirmation: true,
+      confirmationPhrase: currentTemplate.name,
+      onConfirm: () => {
+        deleteTemplate(currentTemplate.id);
+        refreshTemplates();
+        setSelectedTemplateId('builtin-omnikit');
+      },
+    });
   }, [currentTemplate, refreshTemplates]);
 
   const handleSetDefaultTemplate = useCallback(() => {
@@ -654,10 +905,7 @@ export function DeckBuilderPage() {
     setPreviewError('');
   }, [renderStrategy, tileVisualSources, filterOverrides, batchEnabled, batchField, batchValues]);
 
-  const handleRecipeImport = useCallback(async (file: File) => {
-    try {
-      const data = await readJsonFile(file);
-      const recipe = validateRecipe(data);
+  const applyRecipe = useCallback(async (recipe: ReturnType<typeof validateRecipe>, label: string) => {
       setUrl(recipe.dashboardUrl);
       setBrand(recipe.brand);
       setInsights(recipe.insights);
@@ -688,7 +936,8 @@ export function DeckBuilderPage() {
         };
         setDashboard(next);
         const validIds = new Set(summary.tiles.map((t) => t.id));
-        setSelectedIds(recipe.selectedTileIds.filter((id) => validIds.has(id)));
+        const validSelectedIds = recipe.selectedTileIds.filter((id) => validIds.has(id));
+        setSelectedIds(validSelectedIds);
         const liveSeed = seedOverridesFromDashboardFilters(next.filters);
         setDashboardDefaults(liveSeed);
         setFilterOverrides(
@@ -706,14 +955,70 @@ export function DeckBuilderPage() {
           setBatchValues([]);
         }
         loadSavedFilterSets(parsed.dashboardId);
-        setStep('select');
+        setRecipeLibraryError('');
+        setRecipeLibraryMessage(
+          validSelectedIds.length > 0
+            ? `Loaded "${label}".`
+            : `Loaded "${label}", but its saved tiles were not found on this dashboard.`,
+        );
+        setStep(stepAfterRecipeLoad(recipe, validSelectedIds.length));
       } finally {
         setInspecting(false);
       }
-    } catch (err) {
-      alert(err instanceof Error ? err.message : 'Failed to load deck recipe.');
-    }
   }, [connection.baseUrl, connection.apiKey, loadSavedFilterSets]);
+
+  const handleRecipeImport = useCallback(async (file: File) => {
+    try {
+      const data = await readJsonFile(file);
+      const recipe = validateRecipe(data);
+      await applyRecipe(recipe, file.name.replace(/\.json$/i, ''));
+    } catch (err) {
+      setRecipeLibraryMessage('');
+      setRecipeLibraryError(err instanceof Error ? err.message : 'Failed to load deck recipe.');
+    }
+  }, [applyRecipe]);
+
+  const handleResumeDraft = useCallback(() => {
+    if (!pendingDraft) return;
+    const recipe = pendingDraft.recipe;
+    const nextDashboard = pendingDraft.dashboard || null;
+    setUrl(recipe.dashboardUrl);
+    setDashboard(nextDashboard);
+    setBrand(recipe.brand);
+    setInsights(recipe.insights);
+    setIncludeAppendix(recipe.includeAppendix);
+    if (recipe.templateId) {
+      const kit = getTemplate(recipe.templateId);
+      if (kit) setSelectedTemplateId(kit.id);
+    }
+    const validIds = new Set(nextDashboard?.tiles.map((tile) => tile.id) || []);
+    setSelectedIds(nextDashboard ? recipe.selectedTileIds.filter((id) => validIds.has(id)) : recipe.selectedTileIds);
+    setFilterOverrides(recipe.filterOverrides || pendingDraft.dashboardDefaults || {});
+    setDashboardDefaults(pendingDraft.dashboardDefaults || {});
+    setTileVisualSources(recipe.tileVisualSources || {});
+    setSlideOverrides(recipe.slideOverrides || {});
+    setRenderStrategy(pendingDraft.renderStrategy);
+    if (recipe.batch) {
+      setBatchEnabled(true);
+      setBatchField(recipe.batch.filterField);
+      setBatchValues(recipe.batch.values);
+    } else {
+      setBatchEnabled(false);
+      setBatchField(null);
+      setBatchValues([]);
+    }
+    if (nextDashboard) loadSavedFilterSets(nextDashboard.id);
+    setRecipeLibraryError('');
+    setRecipeLibraryMessage(`Resumed "${nextDashboard?.name || 'deck draft'}".`);
+    setPendingDraft(null);
+    setStep(nextDashboard ? pendingDraft.step : 'inspect');
+  }, [loadSavedFilterSets, pendingDraft]);
+
+  const handleDiscardDraft = useCallback(() => {
+    if (!connection.baseUrl) return;
+    clearDeckDraft(connectionKey);
+    setPendingDraft(null);
+  }, [connection.baseUrl, connectionKey]);
 
   const handleSaveFilterSet = useCallback((name: string) => {
     if (!dashboard || !connection.baseUrl) return;
@@ -725,14 +1030,16 @@ export function DeckBuilderPage() {
     };
     const next = [set, ...savedSets].slice(0, 20);
     setSavedSets(next);
-    filterSetCache.save(connection.baseUrl, dashboard.id, next);
-  }, [dashboard, connection.baseUrl, filterOverrides, savedSets]);
+    filterSetCache.save(connectionKey, dashboard.id, next);
+  }, [dashboard, connection.baseUrl, connectionKey, filterOverrides, savedSets]);
 
   const handleSingleGenerate = useCallback(async () => {
     if (!dashboard || selectedTiles.length === 0) return;
     setGenerating(true);
     setGenerationError('');
     setGenerationSuccess('');
+    setGenerationPhase('Preparing deck export');
+    setGeneratedFileSize(null);
     setExportStates({});
     abortRef.current = new AbortController();
     const start = Date.now();
@@ -746,6 +1053,7 @@ export function DeckBuilderPage() {
       const exportTiles = selectedTiles.filter((tile) => sourceFor(tile) !== 'full-dashboard');
 
       if (fullDashboardTiles.length > 0) {
+        setGenerationPhase('Exporting full-dashboard image');
         for (const tile of fullDashboardTiles) {
           workingStates[tile.id] = { tileId: tile.id, status: 'exporting', message: 'Awaiting full dashboard' };
           setExportStates((prev) => ({ ...prev, [tile.id]: workingStates[tile.id] }));
@@ -771,6 +1079,7 @@ export function DeckBuilderPage() {
       }
 
       if (exportTiles.length > 0) {
+        setGenerationPhase('Exporting selected slide visuals');
         const perTileSource = Object.fromEntries(
           exportTiles.map((tile) => [tile.id, sourceFor(tile)] as const)
         ) as Record<string, TileVisualSource>;
@@ -789,6 +1098,7 @@ export function DeckBuilderPage() {
 
         const initialSuccess = exportTiles.filter((t) => states[t.id]?.status === 'done');
         if (initialSuccess.length === 0 && fullDashboardTiles.length === 0 && allowFullDashboardFallback) {
+          setGenerationPhase('Rendering full-dashboard fallback');
           const fallbackBlob = await exportFullDashboardAsPng(
             connection.baseUrl,
             connection.apiKey,
@@ -826,6 +1136,7 @@ export function DeckBuilderPage() {
       }
 
       const generatedAt = new Date();
+      setGenerationPhase('Building PowerPoint file');
       const blob = await buildDeck({
         dashboardName: dashboard.name,
         dashboardUrl: dashboard.url,
@@ -847,6 +1158,8 @@ export function DeckBuilderPage() {
         includeAppendix,
       });
 
+      setGeneratedFileSize(blob.size);
+      setGenerationPhase('Downloading PowerPoint file');
       const fileName = deckFileName(dashboard.name, generatedAt);
       const downloadUrl = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -857,15 +1170,18 @@ export function DeckBuilderPage() {
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(downloadUrl), 500);
 
+      const fileSizeLabel = formatBytes(blob.size);
       setGenerationSuccess(
         usedFallback
-          ? `Deck downloaded as "${fileName}" using full-dashboard fallback.`
+          ? `Deck downloaded as "${fileName}" (${fileSizeLabel}) using full-dashboard fallback.`
           : usedFullDashboardImage
-          ? `Deck downloaded as "${fileName}" with full-dashboard image slide(s).`
+          ? `Deck downloaded as "${fileName}" (${fileSizeLabel}) with full-dashboard image slide(s).`
           : failedCount > 0
-          ? `Deck downloaded as "${fileName}". ${failedCount} tile(s) skipped.`
-          : `Deck downloaded as "${fileName}".`
+          ? `Deck downloaded as "${fileName}" (${fileSizeLabel}). ${failedCount} tile(s) skipped.`
+          : `Deck downloaded as "${fileName}" (${fileSizeLabel}).`
       );
+      clearDeckDraft(connectionKey);
+      setPendingDraft(null);
       logOp('download', `Deck "${dashboard.name}" with ${successful.length} tiles`, {
         durationMs: Date.now() - start,
         itemCount: selectedTiles.length,
@@ -876,15 +1192,18 @@ export function DeckBuilderPage() {
       setGenerationError(err instanceof Error ? err.message : 'Deck generation failed.');
     } finally {
       setGenerating(false);
+      setGenerationPhase('');
       abortRef.current = null;
     }
-  }, [dashboard, selectedTiles, connection, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, slideOverrides, logOp]);
+  }, [dashboard, selectedTiles, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, skipFailed, allowFullDashboardFallback, renderStrategy, filterOverrides, tileVisualSources, slideOverrides, logOp]);
 
   const handleBatchGenerate = useCallback(async () => {
     if (!dashboard || selectedTiles.length === 0 || !batchField || batchValues.length === 0) return;
     setGenerating(true);
     setGenerationError('');
     setGenerationSuccess('');
+    setGenerationPhase('Preparing batch export');
+    setGeneratedFileSize(null);
     setBatchClientStates({});
     abortRef.current = new AbortController();
     const start = Date.now();
@@ -897,6 +1216,7 @@ export function DeckBuilderPage() {
 
     try {
       const filterMeta = dashboard.filters.find((f) => f.field === batchField);
+      setGenerationPhase('Generating client decks');
       const result = await runBatchDecks({
         baseUrl: connection.baseUrl,
         apiKey: connection.apiKey,
@@ -926,6 +1246,7 @@ export function DeckBuilderPage() {
       }
 
       const generatedAt = new Date();
+      setGenerationPhase('Building ZIP bundle');
       const zipBlob = await bundleAsZip(result.files, {
         dashboard: dashboard.name,
         dashboardUrl: dashboard.url,
@@ -936,7 +1257,11 @@ export function DeckBuilderPage() {
         generatedAt: generatedAt.toISOString(),
       });
 
-      const zipName = `${dashboard.name.replace(/[^a-z0-9-]+/gi, '_')}_batch_${generatedAt.toISOString().slice(0, 10)}.zip`;
+      const safeDashboardName = dashboard.name.replace(/[^a-z0-9-]+/gi, '_').replace(/^_+|_+$/g, '') || 'dashboard';
+      const safeBatchField = batchField.replace(/[^a-z0-9-]+/gi, '_').replace(/^_+|_+$/g, '') || 'batch';
+      const zipName = `${safeDashboardName}_${safeBatchField}_batch_${generatedAt.toISOString().slice(0, 10)}.zip`;
+      setGeneratedFileSize(zipBlob.size);
+      setGenerationPhase('Downloading ZIP bundle');
       const downloadUrl = URL.createObjectURL(zipBlob);
       const a = document.createElement('a');
       a.href = downloadUrl;
@@ -946,8 +1271,10 @@ export function DeckBuilderPage() {
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(downloadUrl), 500);
 
-      const summary = `Batch zip "${zipName}" downloaded · ${result.succeeded}/${batchValues.length} decks succeeded.`;
+      const summary = `Batch zip "${zipName}" downloaded (${formatBytes(zipBlob.size)}) · ${result.succeeded}/${batchValues.length} decks succeeded.`;
       setGenerationSuccess(summary);
+      clearDeckDraft(connectionKey);
+      setPendingDraft(null);
 
       const entry: BatchHistoryEntry = {
         id: `batch_${Date.now()}`,
@@ -959,8 +1286,8 @@ export function DeckBuilderPage() {
         succeeded: result.succeeded,
         failed: result.failed,
       };
-      batchHistoryCache.push(connection.baseUrl, entry);
-      setBatchHistory(batchHistoryCache.load(connection.baseUrl));
+      batchHistoryCache.push(connectionKey, entry);
+      setBatchHistory(batchHistoryCache.load(connectionKey));
 
       logOp('download', `Batch deck "${dashboard.name}" × ${batchValues.length}`, {
         durationMs: Date.now() - start,
@@ -972,9 +1299,10 @@ export function DeckBuilderPage() {
       setGenerationError(err instanceof Error ? err.message : 'Batch generation failed.');
     } finally {
       setGenerating(false);
+      setGenerationPhase('');
       abortRef.current = null;
     }
-  }, [dashboard, selectedTiles, batchField, batchValues, connection, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, slideOverrides, allowFullDashboardFallback, logOp]);
+  }, [dashboard, selectedTiles, batchField, batchValues, connection, connectionKey, brand, currentTemplate, insights, includeAppendix, filterOverrides, renderStrategy, tileVisualSources, slideOverrides, allowFullDashboardFallback, logOp]);
 
   const handleGenerate = batchEnabled && batchField && batchValues.length > 0
     ? handleBatchGenerate
@@ -1076,10 +1404,12 @@ export function DeckBuilderPage() {
     tileVisualSources,
   ]);
 
-  const handleSaveRecipe = useCallback(() => {
+  const buildCurrentRecipe = useCallback(() => {
     if (!dashboard) return;
-    const recipe = buildRecipe({
+    return buildRecipe({
       dashboardUrl: dashboard.url,
+      dashboardId: dashboard.id,
+      dashboardName: dashboard.name,
       selectedTileIds: selectedIds,
       insights,
       brand,
@@ -1091,9 +1421,103 @@ export function DeckBuilderPage() {
       tileVisualSources: Object.keys(tileVisualSources).length > 0 ? tileVisualSources : undefined,
       slideOverrides: Object.keys(slideOverrides).length > 0 ? slideOverrides : undefined,
     });
+  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, slideOverrides]);
+
+  const handleExportRecipe = useCallback(() => {
+    if (!dashboard) return;
+    const recipe = buildCurrentRecipe();
+    if (!recipe) return;
     const filename = `${deckFileName(dashboard.name, new Date()).replace(/\.pptx$/, '')}.recipe.json`;
     downloadJson(filename, recipe);
-  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, slideOverrides]);
+  }, [buildCurrentRecipe, dashboard]);
+
+  const handleSaveRecipeToLibrary = useCallback((name: string, description?: string) => {
+    if (!dashboard) return;
+    const recipe = buildCurrentRecipe();
+    if (!recipe) return;
+    const record = saveRecipeRecord({
+      name,
+      description: description?.trim() || dashboard.name,
+      savedForHost: recipeHostLabel,
+      savedForInstanceLabel: connection.instanceLabel,
+      savedForBaseUrlHost: hostFromBaseUrl(connection.baseUrl),
+      recipe,
+    });
+    refreshRecipes();
+    setRecipeLibraryError('');
+    setRecipeLibraryMessage(`Saved "${record.name}" to your local recipe library.`);
+  }, [buildCurrentRecipe, connection.baseUrl, connection.instanceLabel, dashboard, recipeHostLabel, refreshRecipes]);
+
+  const openSaveRecipeDialog = useCallback(() => {
+    setTextPrompt({
+      title: 'Save Recipe',
+      label: 'Recipe name',
+      initialValue: dashboard ? `${dashboard.name} deck` : 'My deck recipe',
+      secondaryLabel: 'Description',
+      initialSecondaryValue: dashboard ? `Dashboard: ${dashboard.name}` : '',
+      secondaryPlaceholder: 'Optional context for this saved setup',
+      confirmLabel: 'Save recipe',
+      onConfirm: handleSaveRecipeToLibrary,
+    });
+  }, [dashboard, handleSaveRecipeToLibrary]);
+
+  const handleLoadRecipeRecord = useCallback(async (record: RecipeRecord) => {
+    const current = getRecipe(record.id);
+    if (!current) {
+      setRecipeLibraryError('That saved recipe is no longer available.');
+      refreshRecipes();
+      return;
+    }
+    try {
+      await applyRecipe(current.recipe, current.name);
+    } catch (err) {
+      setRecipeLibraryMessage('');
+      setRecipeLibraryError(err instanceof Error ? err.message : 'Failed to load saved recipe.');
+    }
+  }, [applyRecipe, refreshRecipes]);
+
+  const handleRenameRecipe = useCallback((record: RecipeRecord) => {
+    setTextPrompt({
+      title: 'Rename Recipe',
+      label: 'Recipe name',
+      initialValue: record.name,
+      confirmLabel: 'Rename',
+      onConfirm: (name) => {
+        const updated = renameRecipe(record.id, name);
+        refreshRecipes();
+        setRecipeLibraryError('');
+        setRecipeLibraryMessage(updated ? `Renamed recipe to "${updated.name}".` : 'That recipe is no longer available.');
+      },
+    });
+  }, [refreshRecipes]);
+
+  const handleDuplicateRecipe = useCallback((record: RecipeRecord) => {
+    const duplicated = duplicateRecipe(record.id);
+    refreshRecipes();
+    setRecipeLibraryError('');
+    setRecipeLibraryMessage(duplicated ? `Duplicated "${record.name}".` : 'That recipe is no longer available.');
+  }, [refreshRecipes]);
+
+  const handleDeleteRecipe = useCallback((record: RecipeRecord) => {
+    setConfirmDialog({
+      title: 'Delete Recipe',
+      message: `Delete "${record.name}" from your local recipe library?`,
+      confirmLabel: 'Delete recipe',
+      variant: 'danger',
+      requireTypedConfirmation: true,
+      confirmationPhrase: record.name,
+      onConfirm: () => {
+        deleteRecipe(record.id);
+        refreshRecipes();
+        setRecipeLibraryError('');
+        setRecipeLibraryMessage(`Deleted "${record.name}".`);
+      },
+    });
+  }, [refreshRecipes]);
+
+  const handleExportRecipeRecord = useCallback((record: RecipeRecord) => {
+    downloadJson(safeRecipeFileName(record.name), record.recipe);
+  }, []);
 
   const handleSaveBrand = useCallback(() => {
     const filename = `${(brand.name || 'brand').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.brand.json`;
@@ -1102,13 +1526,20 @@ export function DeckBuilderPage() {
 
   const handleClearLocalCache = useCallback(() => {
     if (!connection.baseUrl) return;
-    if (!window.confirm('Clear all locally cached dashboards, filter sets, and batch history for this Omni instance?')) return;
-    clearAllDeckCache(connection.baseUrl);
-    setDashboards([]);
-    setDashboardsSyncedAt(null);
-    setSavedSets([]);
-    setBatchHistory([]);
-  }, [connection.baseUrl]);
+    setConfirmDialog({
+      title: 'Clear Local Cache',
+      message: 'Clear locally cached dashboards, filter sets, and batch history for this Omni instance?',
+      confirmLabel: 'Clear cache',
+      variant: 'danger',
+      onConfirm: () => {
+        clearAllDeckCache(connectionKey);
+        setDashboards([]);
+        setDashboardsSyncedAt(null);
+        setSavedSets([]);
+        setBatchHistory([]);
+      },
+    });
+  }, [connection.baseUrl, connectionKey]);
 
   function gotoStep(target: StepId) {
     const targetIdx = STEPS.findIndex((s) => s.id === target);
@@ -1118,6 +1549,7 @@ export function DeckBuilderPage() {
   }
 
   return (
+    <>
     <div className={isWorkspaceStep ? 'space-y-5' : 'space-y-6'}>
       <PageHeader
         title="Deck Builder"
@@ -1182,6 +1614,25 @@ export function DeckBuilderPage() {
         </div>
       </div>
 
+      {pendingDraft && !dashboard && (
+        <div className="card flex flex-col gap-3 border-omni-200 bg-omni-50/60 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <div className="text-sm font-semibold text-content-primary">Resume your in-progress deck?</div>
+            <p className="text-[11px] text-content-secondary">
+              {pendingDraft.dashboard?.name || 'Unsaved deck draft'} · saved {new Date(pendingDraft.savedAt).toLocaleString()}
+            </p>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            <button type="button" className="btn-primary btn-sm" onClick={handleResumeDraft}>
+              Resume
+            </button>
+            <button type="button" className="btn-ghost btn-sm" onClick={handleDiscardDraft}>
+              Discard
+            </button>
+          </div>
+        </div>
+      )}
+
       {step === 'inspect' && (
         <div className="card space-y-4">
           <div>
@@ -1230,17 +1681,25 @@ export function DeckBuilderPage() {
           )}
 
           {inspectError && (
-            <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">
+            <div role="alert" className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">
               <AlertCircle size={16} />
               {inspectError}
             </div>
           )}
 
-          <div className="flex items-center gap-3 pt-3 border-t border-border">
-            <button onClick={() => recipeFileInput.current?.click()} className="btn-secondary" type="button">
-              <Upload size={14} />
-              Load deck recipe
-            </button>
+          <div className="pt-3 border-t border-border space-y-3">
+            <div className="flex items-start justify-between gap-3 flex-wrap">
+              <div>
+                <h2 className="text-sm font-semibold text-content-primary">Recipes</h2>
+                <p className="text-[11px] text-content-tertiary">
+                  Save repeat deck setups locally, or import/export JSON recipes for sharing.
+                </p>
+              </div>
+              <button onClick={() => recipeFileInput.current?.click()} className="btn-secondary" type="button">
+                <Upload size={14} />
+                Import JSON
+              </button>
+            </div>
             <input
               ref={recipeFileInput}
               type="file"
@@ -1252,9 +1711,81 @@ export function DeckBuilderPage() {
                 e.target.value = '';
               }}
             />
-            <span className="text-[11px] text-content-tertiary">
-              Or import a previously saved JSON recipe to skip ahead.
-            </span>
+
+            {recipeLibraryError && (
+              <div role="alert" className="flex items-center gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">
+                <AlertCircle size={14} />
+                {recipeLibraryError}
+              </div>
+            )}
+            {recipeLibraryMessage && (
+              <div aria-live="polite" className="flex items-center gap-2 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-[12px] text-green-700">
+                <CheckCircle size={14} />
+                {recipeLibraryMessage}
+              </div>
+            )}
+
+            {recipes.length === 0 ? (
+              <div className="rounded-card border border-dashed border-border bg-surface-secondary px-4 py-5 text-center">
+                <div className="text-[13px] font-medium text-content-primary">No saved recipes yet</div>
+                <p className="text-[11px] text-content-tertiary mt-1">
+                  Build a deck once, then save the setup from Generate for the next run.
+                </p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 xl:grid-cols-2 gap-2">
+                {recipes.map((record) => {
+                  const dashboardLabel = record.recipe.dashboardName || dashboardIdFromRecipeUrl(record.recipe.dashboardUrl) || 'Dashboard';
+                  const hostLabel = record.savedForInstanceLabel
+                    ? `${record.savedForInstanceLabel}${record.savedForBaseUrlHost ? ` (${record.savedForBaseUrlHost})` : ''}`
+                    : record.savedForHost || record.savedForBaseUrlHost || 'Any instance';
+                  return (
+                    <div key={record.id} className="rounded-card border border-border bg-white p-3 space-y-2">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <div className="text-[13px] font-semibold text-content-primary truncate">{record.name}</div>
+                          <div className="text-[10px] text-content-tertiary truncate">
+                            {record.description || 'Deck recipe'}
+                          </div>
+                        </div>
+                        <span className="text-[10px] text-content-tertiary flex-shrink-0">
+                          {new Date(record.updatedAt).toLocaleDateString()}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-1 gap-1 text-[10px] text-content-tertiary">
+                        <div className="truncate">
+                          <span className="font-medium text-content-secondary">Dashboard:</span> {dashboardLabel}
+                        </div>
+                        <div className="truncate">
+                          <span className="font-medium text-content-secondary">Saved for:</span> {hostLabel}
+                        </div>
+                        <div className="truncate">
+                          {record.recipe.selectedTileIds.length} tile(s)
+                          {record.recipe.batch ? ` · batch by ${record.recipe.batch.filterField}` : ''}
+                        </div>
+                      </div>
+                      <div className="flex flex-wrap gap-1.5">
+                        <button onClick={() => void handleLoadRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting}>
+                          Load
+                        </button>
+                        <button onClick={() => handleRenameRecipe(record)} className="btn-ghost btn-sm" type="button">
+                          Rename
+                        </button>
+                        <button onClick={() => handleDuplicateRecipe(record)} className="btn-ghost btn-sm" type="button">
+                          Duplicate
+                        </button>
+                        <button onClick={() => handleExportRecipeRecord(record)} className="btn-ghost btn-sm" type="button">
+                          Export
+                        </button>
+                        <button onClick={() => handleDeleteRecipe(record)} className="btn-ghost btn-sm text-red-600 hover:text-red-700" type="button">
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
 
           {batchHistory.length > 0 && (
@@ -1415,18 +1946,44 @@ export function DeckBuilderPage() {
 
       {step === 'filters' && dashboard && (
         <div className="card space-y-4">
-          <div>
-            <h2 className="text-sm font-semibold text-content-primary">Filters</h2>
-            <p className="text-[11px] text-content-tertiary">
-              Override the values used when running each tile&apos;s query. Saved sets stay in your browser only.
-            </p>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <div>
+              <h2 className="text-sm font-semibold text-content-primary">Filters</h2>
+              <p className="text-[11px] text-content-tertiary">
+                Override the values used when running each tile&apos;s query. Saved sets stay in your browser only.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleResyncFilters}
+              disabled={filterSyncing}
+              className="btn-secondary btn-sm flex-shrink-0"
+              title="Pull the latest dashboard filters and defaults from Omni"
+            >
+              {filterSyncing ? <Loader2 size={12} className="animate-spin" /> : <RefreshCcw size={12} />}
+              Re-sync from dashboard
+            </button>
           </div>
+
+          {filterSyncError && (
+            <div role="alert" className="flex items-center gap-2 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-[12px] text-red-700">
+              <AlertCircle size={14} />
+              {filterSyncError}
+            </div>
+          )}
+          {filterSyncMessage && (
+            <div aria-live="polite" className="flex items-center gap-2 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-[12px] text-green-700">
+              <CheckCircle size={14} />
+              {filterSyncMessage}
+            </div>
+          )}
 
           <FilterEditor
             filters={dashboard.filters}
             topicFields={topicFields}
             overrides={filterOverrides}
             dashboardDefaults={dashboardDefaults}
+            selectedTiles={selectedTiles}
             onChange={setFilterOverrides}
             savedSets={savedSets}
             onSaveSet={handleSaveFilterSet}
@@ -1558,6 +2115,15 @@ export function DeckBuilderPage() {
               <button onClick={() => brandFileInput.current?.click()} className="btn-ghost btn-sm w-full justify-center" type="button">
                 <Upload size={12} /> Import brand JSON
               </button>
+              {brandImportError && (
+                <div role="alert" className="flex items-start gap-1.5 rounded-card border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
+                  <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+                  <span className="flex-1">{brandImportError}</span>
+                  <button type="button" onClick={() => setBrandImportError(null)} className="text-red-500 hover:text-red-700" aria-label="Dismiss brand import error">
+                    <XCircle size={12} />
+                  </button>
+                </div>
+              )}
               <input
                 ref={brandFileInput}
                 type="file"
@@ -1574,13 +2140,23 @@ export function DeckBuilderPage() {
               </button>
             </div>
             {templateImportError && (
-              <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-card p-2">
+              <div role="alert" className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-card p-2">
                 {templateImportError}
               </div>
             )}
-            {templateImportWarnings.length > 0 && (
-              <div className="text-[11px] text-yellow-800 bg-yellow-50 border border-yellow-200 rounded-card p-2 space-y-0.5">
-                {templateImportWarnings.map((w, i) => <div key={i}>{w}</div>)}
+            {templateImportWarnings.length > 0 && !templateWarningsDismissed && (
+              <div className="flex items-start gap-2 text-[11px] text-yellow-800 bg-yellow-50 border border-yellow-200 rounded-card p-2">
+                <div className="min-w-0 flex-1 space-y-0.5">
+                  {templateImportWarnings.map((w, i) => <div key={i}>{w}</div>)}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTemplateWarningsDismissed(true)}
+                  className="text-yellow-700 hover:text-yellow-900"
+                  aria-label="Dismiss template import warnings"
+                >
+                  <XCircle size={12} />
+                </button>
               </div>
             )}
           </div>
@@ -1724,6 +2300,15 @@ export function DeckBuilderPage() {
                 <Save size={12} /> Export brand JSON
               </button>
             </div>
+            {logoUploadError && (
+              <div role="alert" className="flex items-start gap-1.5 rounded-card border border-red-200 bg-red-50 p-2 text-[11px] text-red-700">
+                <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+                <span className="flex-1">{logoUploadError}</span>
+                <button type="button" onClick={() => setLogoUploadError(null)} className="text-red-500 hover:text-red-700" aria-label="Dismiss logo upload error">
+                  <XCircle size={12} />
+                </button>
+              </div>
+            )}
 
             {currentTemplate && currentTemplate.layouts.length > 0 && (
               <div>
@@ -1805,18 +2390,23 @@ export function DeckBuilderPage() {
                   : 'Generate a PowerPoint deck using the formatting, notes, and callouts from Preview.'}
               </p>
             </div>
-            <button
-              onClick={handleGenerate}
-              disabled={generating || selectedTiles.length === 0 || (batchEnabled && (!batchField || batchValues.length === 0))}
-              className="btn-primary flex-shrink-0"
-            >
-              {generating ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
-              {generating
-                ? 'Generating…'
-                : batchEnabled && batchValues.length > 0
-                ? `Generate ${batchValues.length} decks (.zip)`
-                : 'Generate & download .pptx'}
-            </button>
+            <div className="flex flex-wrap justify-end gap-2">
+              <button onClick={openSaveRecipeDialog} className="btn-secondary flex-shrink-0" type="button" disabled={generating || !dashboard}>
+                <Save size={13} /> Save current as recipe
+              </button>
+              <button
+                onClick={handleGenerate}
+                disabled={generating || selectedTiles.length === 0 || (batchEnabled && (!batchField || batchValues.length === 0))}
+                className="btn-primary flex-shrink-0"
+              >
+                {generating ? <Loader2 size={14} className="animate-spin" /> : <PlayCircle size={14} />}
+                {generating
+                  ? 'Generating…'
+                  : batchEnabled && batchValues.length > 0
+                  ? `Generate ${batchValues.length} decks (.zip)`
+                  : 'Generate & download .pptx'}
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
@@ -1834,15 +2424,36 @@ export function DeckBuilderPage() {
           </div>
 
           {generating && (
-            <DownloadAnimation
-              format={batchEnabled && batchField && batchValues.length > 0 ? 'zip' : 'pptx'}
-              success={false}
-              status={
-                batchEnabled && batchField && batchValues.length > 0
-                  ? 'Blobby is packing your deck bundle'
-                  : 'Blobby is parachuting your PowerPoint package'
-              }
-            />
+            <div aria-live="polite" className="space-y-3">
+              <DownloadAnimation
+                format={batchEnabled && batchField && batchValues.length > 0 ? 'zip' : 'pptx'}
+                success={false}
+                status={
+                  generationPhase ||
+                  (batchEnabled && batchField && batchValues.length > 0
+                    ? 'Blobby is packing your deck bundle'
+                    : 'Blobby is parachuting your PowerPoint package')
+                }
+              />
+              <div className="rounded-card border border-border bg-white p-3">
+                <div className="flex items-center justify-between gap-3 text-[12px]">
+                  <span className="font-medium text-content-primary">{generationPhase || 'Generating export'}</span>
+                  <span className="text-content-tertiary">
+                    {generationProgress.total > 0 ? generationProgress.label : 'Preparing'}
+                  </span>
+                </div>
+                <div className="mt-2 h-2 overflow-hidden rounded-full bg-surface-secondary">
+                  <div
+                    className="h-full rounded-full bg-omni-500 transition-all"
+                    style={{
+                      width: generationProgress.total > 0
+                        ? `${Math.max(4, Math.min(100, (generationProgress.completed / generationProgress.total) * 100))}%`
+                        : '8%',
+                    }}
+                  />
+                </div>
+              </div>
+            </div>
           )}
 
           <div className="rounded-card border border-border bg-white p-3 space-y-3">
@@ -1875,6 +2486,10 @@ export function DeckBuilderPage() {
                 <div className="flex items-center justify-between gap-3">
                   <span className="text-content-tertiary">Appendix</span>
                   <span className="font-medium text-content-primary">{includeAppendix ? 'Included' : 'Off'}</span>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-content-tertiary">Last file size</span>
+                  <span className="font-medium text-content-primary">{generatedFileSize ? formatBytes(generatedFileSize) : 'Not generated'}</span>
                 </div>
               </div>
             </div>
@@ -1917,19 +2532,19 @@ export function DeckBuilderPage() {
                 <XCircle size={12} /> Cancel
               </button>
             )}
-            <button onClick={handleSaveRecipe} className="btn-secondary" type="button" disabled={!dashboard}>
-              <Download size={13} /> Save deck recipe
+            <button onClick={handleExportRecipe} className="btn-secondary" type="button" disabled={!dashboard || generating}>
+              <Download size={13} /> Export recipe JSON
             </button>
           </div>
 
           {generationError && (
-            <div className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">
+            <div role="alert" className="flex items-center gap-2 bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-card">
               <AlertCircle size={16} />
               {generationError}
             </div>
           )}
           {generationSuccess && (
-            <div className="space-y-2">
+            <div className="space-y-2" aria-live="polite">
               <DownloadAnimation
                 format={batchEnabled && batchField && batchValues.length > 0 ? 'zip' : 'pptx'}
                 success
@@ -1943,7 +2558,40 @@ export function DeckBuilderPage() {
           )}
 
           {batchEnabled && batchField && batchValues.length > 0 && (generating || Object.keys(batchClientStates).length > 0) ? (
-            <div className="space-y-1.5">
+            <div className="space-y-2" aria-live="polite">
+              <div className="rounded-card border border-border bg-white p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
+                      Batch progress
+                    </div>
+                    <div className="text-[13px] font-semibold text-content-primary">
+                      {batchProgressSummary.succeededTiles}/{batchProgressSummary.totalTiles} tiles across {batchProgressSummary.totalDecks} deck(s)
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5 text-[11px]">
+                    <span className="rounded-full bg-green-50 px-2 py-1 font-medium text-green-700">
+                      {batchProgressSummary.succeededDecks} done
+                    </span>
+                    {batchProgressSummary.failedDecks > 0 && (
+                      <span className="rounded-full bg-red-50 px-2 py-1 font-medium text-red-700">
+                        {batchProgressSummary.failedDecks} failed
+                      </span>
+                    )}
+                    {batchProgressSummary.cancelledDecks > 0 && (
+                      <span className="rounded-full bg-surface-secondary px-2 py-1 font-medium text-content-secondary">
+                        {batchProgressSummary.cancelledDecks} cancelled
+                      </span>
+                    )}
+                  </div>
+                </div>
+                {batchProgressSummary.failedTiles > 0 && (
+                  <div className="mt-1 text-[11px] text-content-tertiary">
+                    {batchProgressSummary.failedTiles} tile export(s) reported failures; successful decks remain downloadable.
+                  </div>
+                )}
+              </div>
+
               <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
                 Per-client status
               </div>
@@ -1965,7 +2613,7 @@ export function DeckBuilderPage() {
               })}
             </div>
           ) : (generating || Object.keys(exportStates).length > 0) ? (
-            <div className="space-y-1.5">
+            <div className="space-y-1.5" aria-live="polite">
               <div className="text-[11px] font-medium uppercase tracking-wider text-content-tertiary">
                 Slide export status
               </div>
@@ -2035,6 +2683,32 @@ export function DeckBuilderPage() {
         </div>
       )}
     </div>
+    <ConfirmDialog
+      open={Boolean(confirmDialog)}
+      title={confirmDialog?.title || ''}
+      message={confirmDialog?.message || ''}
+      confirmLabel={confirmDialog?.confirmLabel}
+      cancelLabel={confirmDialog?.cancelLabel}
+      variant={confirmDialog?.variant}
+      requireTypedConfirmation={confirmDialog?.requireTypedConfirmation}
+      confirmationPhrase={confirmDialog?.confirmationPhrase}
+      onCancel={() => setConfirmDialog(null)}
+      onConfirm={() => {
+        const action = confirmDialog?.onConfirm;
+        setConfirmDialog(null);
+        action?.();
+      }}
+    />
+    <TextPromptDialog
+      prompt={textPrompt}
+      onCancel={() => setTextPrompt(null)}
+      onConfirm={(value, secondaryValue) => {
+        const action = textPrompt?.onConfirm;
+        setTextPrompt(null);
+        action?.(value, secondaryValue);
+      }}
+    />
+    </>
   );
 }
 
@@ -2061,50 +2735,100 @@ function ColorField({ label, value, onChange }: { label: string; value: string; 
 }
 
 function StatusBadge({ status, message, error }: { status: string; message?: string; error?: string }) {
-  const map: Record<string, { color: string; bg: string; label: string }> = {
-    pending: { color: '#9B3065', bg: 'rgba(255,71,148,0.10)', label: 'Pending' },
-    queued: { color: '#9B3065', bg: 'rgba(255,71,148,0.10)', label: 'Queued' },
-    exporting: { color: '#C8186A', bg: 'rgba(255,71,148,0.18)', label: message || 'Exporting' },
-    polling: { color: '#C8186A', bg: 'rgba(255,71,148,0.18)', label: message || 'Polling' },
-    fetching: { color: '#C8186A', bg: 'rgba(255,71,148,0.18)', label: message || 'Fetching' },
-    done: { color: '#106E3E', bg: 'rgba(52,211,153,0.18)', label: 'Ready' },
-    failed: { color: '#B91C1C', bg: 'rgba(220,38,38,0.12)', label: error || 'Failed' },
-    skipped: { color: '#4B5563', bg: 'rgba(107,114,128,0.15)', label: 'Skipped' },
+  const map: Record<string, { variant: string; label: string }> = {
+    pending: { variant: 'pending', label: 'Pending' },
+    queued: { variant: 'pending', label: 'Queued' },
+    exporting: { variant: 'in_progress', label: message || 'Exporting' },
+    polling: { variant: 'in_progress', label: message || 'Polling' },
+    fetching: { variant: 'in_progress', label: message || 'Fetching' },
+    done: { variant: 'success', label: 'Ready' },
+    failed: { variant: 'error', label: error || 'Failed' },
+    skipped: { variant: 'skipped', label: 'Skipped' },
   };
   const conf = map[status] || map.pending;
-  const animated = ['exporting', 'polling', 'fetching'].includes(status);
-  return (
-    <span
-      className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[11px] font-medium max-w-[260px] truncate"
-      style={{ color: conf.color, background: conf.bg }}
-      title={error || message}
-    >
-      {animated && <Loader2 size={11} className="animate-spin flex-shrink-0" />}
-      {status === 'done' && <CheckCircle size={11} className="flex-shrink-0" />}
-      {status === 'failed' && <AlertCircle size={11} className="flex-shrink-0" />}
-      <span className="truncate">{conf.label}</span>
-    </span>
-  );
+  return <StatusChip status={conf.variant} label={conf.label} title={error || message || conf.label} className="max-w-[260px]" />;
 }
 
 function BatchStatusBadge({ status, message, error }: { status: string; message?: string; error?: string }) {
-  const map: Record<string, { color: string; bg: string; label: string }> = {
-    pending: { color: '#9B3065', bg: 'rgba(255,71,148,0.10)', label: 'Waiting' },
-    running: { color: '#C8186A', bg: 'rgba(255,71,148,0.18)', label: message || 'Running' },
-    done: { color: '#106E3E', bg: 'rgba(52,211,153,0.18)', label: message || 'Ready' },
-    failed: { color: '#B91C1C', bg: 'rgba(220,38,38,0.12)', label: error || 'Failed' },
+  const map: Record<string, { variant: string; label: string }> = {
+    pending: { variant: 'pending', label: 'Waiting' },
+    running: { variant: 'in_progress', label: message || 'Running' },
+    done: { variant: 'success', label: message || 'Ready' },
+    failed: { variant: 'error', label: error || 'Failed' },
+    cancelled: { variant: 'skipped', label: 'Cancelled' },
   };
   const conf = map[status] || map.pending;
+  return <StatusChip status={conf.variant} label={conf.label} title={error || message || conf.label} className="max-w-[260px]" />;
+}
+
+function TextPromptDialog({
+  prompt,
+  onCancel,
+  onConfirm,
+}: {
+  prompt: TextPromptState | null;
+  onCancel: () => void;
+  onConfirm: (value: string, secondaryValue?: string) => void;
+}) {
+  const [value, setValue] = useState('');
+  const [secondaryValue, setSecondaryValue] = useState('');
+  const inputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    if (!prompt) return;
+    setValue(prompt.initialValue);
+    setSecondaryValue(prompt.initialSecondaryValue || '');
+    setTimeout(() => inputRef.current?.focus(), 0);
+  }, [prompt]);
+
+  if (!prompt) return null;
+
+  const trimmed = value.trim();
   return (
-    <span
-      className="inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[11px] font-medium max-w-[260px] truncate"
-      style={{ color: conf.color, background: conf.bg }}
-      title={error || message}
-    >
-      {status === 'running' && <Loader2 size={11} className="animate-spin flex-shrink-0" />}
-      {status === 'done' && <CheckCircle size={11} className="flex-shrink-0" />}
-      {status === 'failed' && <AlertCircle size={11} className="flex-shrink-0" />}
-      <span className="truncate">{conf.label}</span>
-    </span>
+    <div className="fixed inset-0 z-50 flex items-center justify-center" role="dialog" aria-modal="true" aria-labelledby="text-prompt-title">
+      <div className="absolute inset-0 bg-black/40" onClick={onCancel} />
+      <form
+        className="relative bg-white rounded-card shadow-dropdown p-6 max-w-md w-full mx-4 animate-fadeIn"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (trimmed) onConfirm(trimmed, secondaryValue.trim() || undefined);
+        }}
+      >
+        <h3 id="text-prompt-title" className="text-lg font-semibold text-content-primary">{prompt.title}</h3>
+        <label className="block text-xs font-medium text-content-secondary mt-4 mb-1.5" htmlFor="text-prompt-input">
+          {prompt.label}
+        </label>
+        <input
+          ref={inputRef}
+          id="text-prompt-input"
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          className="input-field"
+        />
+        {prompt.secondaryLabel && (
+          <>
+            <label className="block text-xs font-medium text-content-secondary mt-4 mb-1.5" htmlFor="text-prompt-secondary">
+              {prompt.secondaryLabel}
+            </label>
+            <textarea
+              id="text-prompt-secondary"
+              value={secondaryValue}
+              onChange={(e) => setSecondaryValue(e.target.value)}
+              placeholder={prompt.secondaryPlaceholder}
+              rows={3}
+              className="input-field resize-none"
+            />
+          </>
+        )}
+        <div className="flex justify-end gap-3 mt-6">
+          <button type="button" onClick={onCancel} className="btn-secondary text-sm">
+            Cancel
+          </button>
+          <button type="submit" disabled={!trimmed} className="btn-primary text-sm">
+            {prompt.confirmLabel}
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }

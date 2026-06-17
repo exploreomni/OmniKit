@@ -11,6 +11,7 @@ interface Props {
   onPick: (d: CachedDashboard) => void;
   selectedDashboardId?: string;
   disabled?: boolean;
+  showInlineResults?: boolean;
 }
 
 function timeAgo(ts: number | null): string {
@@ -24,7 +25,7 @@ function timeAgo(ts: number | null): string {
   return `${Math.floor(h / 24)}d ago`;
 }
 
-export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, onPick, selectedDashboardId, disabled }: Props) {
+export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, onPick, selectedDashboardId, disabled, showInlineResults = false }: Props) {
   const [query, setQuery] = useState('');
   const [open, setOpen] = useState(false);
   const [highlight, setHighlight] = useState(0);
@@ -112,8 +113,8 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
         </span>
       </div>
 
-      {open && filtered.length > 0 && (
-        <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-border rounded-card shadow-dropdown max-h-80 overflow-y-auto">
+      {(open || showInlineResults) && filtered.length > 0 && (
+        <div className={`${showInlineResults ? 'mt-2' : 'absolute z-30 left-0 right-0 mt-1 shadow-dropdown'} bg-white border border-border rounded-card max-h-80 overflow-y-auto`}>
           {filtered.map((d, idx) => {
             const selected = selectedDashboardId === d.id;
             return (
@@ -152,8 +153,8 @@ export function DashboardSearch({ dashboards, loading, lastSyncedAt, onRefresh, 
           })}
         </div>
       )}
-      {open && !loading && filtered.length === 0 && dashboards.length > 0 && (
-        <div className="absolute z-30 left-0 right-0 mt-1 bg-white border border-border rounded-card shadow-dropdown px-3 py-3 text-sm text-content-tertiary">
+      {(open || showInlineResults) && !loading && filtered.length === 0 && dashboards.length > 0 && (
+        <div className={`${showInlineResults ? 'mt-2' : 'absolute z-30 left-0 right-0 mt-1 shadow-dropdown'} bg-white border border-border rounded-card px-3 py-3 text-sm text-content-tertiary`}>
           No dashboards match.
         </div>
       )}

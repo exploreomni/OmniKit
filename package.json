@@ -19,8 +19,9 @@
     "test:model-migrator": "tsx --test tests/model-migrator.test.ts",
     "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:security": "tsx --test tests/security-regression.test.ts",
+    "test:deck-builder": "tsx --test tests/deck-builder.test.ts",
     "security:audit": "npm audit --audit-level=moderate",
-    "security:check": "npm run security:audit && npm run test:security && npm run test:fanout && npm run test:migration-planner && npm run test:model-migrator && npm run test:instance-dashboard && npm run test:dashboard-downloads && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
+    "security:check": "npm run security:audit && npm run test:security && npm run test:fanout && npm run test:migration-planner && npm run test:model-migrator && npm run test:instance-dashboard && npm run test:dashboard-downloads && npm run test:deck-builder && npm run typecheck && npm run typecheck:node && npm run lint && npm run build"
   },
   "dependencies": {
     "@types/better-sqlite3": "^7.6.13",

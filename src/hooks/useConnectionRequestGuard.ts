@@ -1,11 +1,9 @@
 import { useCallback, useEffect, useRef } from 'react';
 import type { ConnectionConfig } from '@/types';
+import { getConnectionCacheKey } from '@/services/connectionGuards';
 
 export function getConnectionRequestKey(connection: Pick<ConnectionConfig, 'apiKey' | 'baseUrl' | 'instanceId'>) {
-  return [
-    connection.instanceId || connection.baseUrl.trim(),
-    connection.apiKey ? 'key-present' : 'no-key',
-  ].join('|');
+  return getConnectionCacheKey(connection);
 }
 
 export function useConnectionRequestGuard(connection: Pick<ConnectionConfig, 'apiKey' | 'baseUrl' | 'instanceId'>) {

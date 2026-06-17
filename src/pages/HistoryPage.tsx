@@ -27,6 +27,7 @@ import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Blobby } from '@/components/ui/Blobby';
 import { clearMigrationJobs, listMigrationJobs, type JobStatus, type MigrationJob } from '@/services/opsConsole';
+import { sanitizeHistoryExportPayload } from '@/services/historyExport';
 import type { OperationLogEntry, OperationType } from '@/types';
 
 const TYPE_CONFIG: Record<OperationType, { icon: typeof Clock; label: string; color: string }> = {
@@ -263,7 +264,10 @@ export function HistoryPage() {
             {totalItems > 0 && (
               <>
                 <button
-                  onClick={() => downloadJson(`omnikit-history-${new Date().toISOString().slice(0, 10)}.json`, { operations: entries, migrationJobs: jobs })}
+                  onClick={() => downloadJson(
+                    `omnikit-history-${new Date().toISOString().slice(0, 10)}.json`,
+                    sanitizeHistoryExportPayload({ operations: entries, migrationJobs: jobs }),
+                  )}
                   className="btn-secondary inline-flex items-center gap-2 text-sm"
                 >
                   <FileJson size={14} />
