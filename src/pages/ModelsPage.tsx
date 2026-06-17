@@ -12,6 +12,7 @@ import { getConnectionCacheKey } from '@/services/connectionGuards';
 import type { OmniModel } from '@/types';
 
 const READINESS_SCAN_DELAY_MS = 1500;
+const MODEL_LAYER_GROUP_KINDS = new Set(['SCHEMA', 'SHARED', 'SHARED_EXTENSION']);
 
 type ValidationIssue = {
   message?: string;
@@ -45,6 +46,18 @@ function formatDate(dateStr: string | undefined | null): string {
 
 function modelKindLabel(kind: string | undefined): string {
   return kind?.replace(/_/g, ' ') || 'Unknown';
+}
+
+function isTopicHealthApplicable(model: OmniModel): boolean {
+  return model.kind === 'SHARED' || model.kind === 'SHARED_EXTENSION';
+}
+
+function isSchemaFoundation(model: OmniModel): boolean {
+  return model.kind === 'SCHEMA';
+}
+
+function isProductionModelLayer(model: OmniModel): boolean {
+  return isSchemaFoundation(model) || isTopicHealthApplicable(model);
 }
 
 function issueSeverity(issue: ValidationIssue) {
@@ -81,7 +94,8 @@ function readinessStatus(issues: ValidationIssue[] | undefined) {
   return { label: `${warnings} warnings`, className: 'text-amber-700', icon: <AlertTriangle size={13} /> };
 }
 
-function topicHealthStatus(summary: TopicHealthSummary | undefined) {
+function topicHealthStatus(model: OmniModel, summary: TopicHealthSummary | undefined) {
+  if (!isTopicHealthApplicable(model)) return { label: 'Not applicable', className: 'text-content-secondary', icon: null };
   if (!summary) return { label: 'Not Scanned', className: 'text-content-secondary', icon: null };
   if (summary.error) return { label: 'Topic scan failed', className: 'text-red-700', icon: <AlertTriangle size={13} /> };
   if (summary.topics === 0) return { label: 'No topics', className: 'text-amber-700', icon: <AlertTriangle size={13} /> };
@@ -110,7 +124,7 @@ export function ModelsPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
-  const [kindFilter, setKindFilter] = useState<string>('production');
+  const [kindFilter, setKindFilter] = useState<string>('topic-serving');
   const [connectionFilter, setConnectionFilter] = useState<string>('all');
   const [includeDeleted, setIncludeDeleted] = useState(false);
   const [validatingId, setValidatingId] = useState<string | null>(null);
@@ -188,6 +202,8 @@ export function ModelsPage() {
   }
 
   async function scanTopicHealth(model: OmniModel) {
+    if (!isTopicHealthApplicable(model)) return;
+
     const requestKey = connectionKey;
     try {
       const topics = await listTopics(connection.baseUrl, connection.apiKey, model.id);
@@ -220,7 +236,13 @@ export function ModelsPage() {
 
   async function handleReadinessScan() {
     const scanTargets = filteredModels
-      .filter((model) => !model.deletedAt && (!validationResults[model.id] || !topicHealthResults[model.id]))
+      .filter((model) => (
+        !model.deletedAt
+        && (
+          !validationResults[model.id]
+          || (isTopicHealthApplicable(model) && !topicHealthResults[model.id])
+        )
+      ))
       .slice(0, scanBatchSize);
 
     if (scanTargets.length === 0) {
@@ -267,25 +289,29 @@ export function ModelsPage() {
       model.name.toLowerCase().includes(needle) ||
       model.id.toLowerCase().includes(needle) ||
       model.connectionId?.toLowerCase().includes(needle);
-    const productionKinds = ['SCHEMA', 'SHARED', 'SHARED_EXTENSION'];
     const matchesKind =
       kindFilter === 'all' ||
-      (kindFilter === 'production' && productionKinds.includes(model.kind || '')) ||
+      (kindFilter === 'topic-serving' && isTopicHealthApplicable(model)) ||
+      (kindFilter === 'schema-foundations' && isSchemaFoundation(model)) ||
+      (kindFilter === 'production' && isProductionModelLayer(model)) ||
       (model.kind || '').toLowerCase() === kindFilter.toLowerCase();
     const matchesConnection = connectionFilter === 'all' || model.connectionId === connectionFilter;
     return matchesSearch && matchesKind && matchesConnection;
   });
 
   const kinds = [...new Set(models.map((model) => model.kind).filter(Boolean))].sort();
+  const individualKindOptions = kinds.filter((kind) => kind && !MODEL_LAYER_GROUP_KINDS.has(kind));
   const connectionIds = [...new Set(models.map((model) => model.connectionId).filter(Boolean))].sort();
   const activeModels = models.filter((model) => !model.deletedAt);
   const schemaCount = activeModels.filter((model) => model.kind === 'SCHEMA').length;
   const sharedCount = activeModels.filter((model) => model.kind === 'SHARED' || model.kind === 'SHARED_EXTENSION').length;
   const branchCount = activeModels.filter((model) => model.kind === 'BRANCH').length;
   const scannedModels = Object.keys(validationResults).length;
-  const topicScannedModels = Object.keys(topicHealthResults).length;
-  const totalTopicsScanned = Object.values(topicHealthResults).reduce((sum, result) => sum + result.topics, 0);
+  const topicEligibleModels = models.filter((model) => isTopicHealthApplicable(model));
+  const topicScannedModels = topicEligibleModels.filter((model) => topicHealthResults[model.id]).length;
+  const totalTopicsScanned = topicEligibleModels.reduce((sum, model) => sum + (topicHealthResults[model.id]?.topics || 0), 0);
   const topicGapModels = models.filter((model) => {
+    if (!isTopicHealthApplicable(model)) return false;
     const result = topicHealthResults[model.id];
     return Boolean(result?.error || result?.topics === 0 || (result?.missingDescription.length || 0) > 0);
   }).length;
@@ -295,8 +321,23 @@ export function ModelsPage() {
     return issues.length > 0 && issues.every((issue) => issue.is_warning);
   }).length;
   const readyModels = models.filter((model) => validationResults[model.id]?.length === 0).length;
-  const visibleUnscannedCount = filteredModels.filter((model) => !model.deletedAt && (!validationResults[model.id] || !topicHealthResults[model.id])).length;
+  const visibleUnscannedCount = filteredModels.filter((model) => (
+    !model.deletedAt
+    && (
+      !validationResults[model.id]
+      || (isTopicHealthApplicable(model) && !topicHealthResults[model.id])
+    )
+  )).length;
   const nextScanCount = Math.min(scanBatchSize, visibleUnscannedCount);
+  const topicHealthCardValue = topicScannedModels === 0 ? '-' : topicGapModels;
+  const topicHealthCardClass = topicScannedModels === 0
+    ? 'text-content-primary'
+    : topicGapModels > 0
+      ? 'text-amber-700'
+      : 'text-green-700';
+  const topicHealthCardDetail = topicScannedModels === 0
+    ? `${topicEligibleModels.length} topic model layer${topicEligibleModels.length === 1 ? '' : 's'} ready to scan`
+    : `${totalTopicsScanned} topics across ${topicScannedModels}/${topicEligibleModels.length} topic model layers`;
 
   return (
     <div className="space-y-5">
@@ -311,7 +352,7 @@ export function ModelsPage() {
             className="btn-primary text-sm"
           >
             {scanRunning ? <Loader2 size={14} className="animate-spin" /> : <ShieldCheck size={14} />}
-            {scanRunning ? 'Scanning...' : `Scan Health ${nextScanCount || scanBatchSize}`}
+            {scanRunning ? 'Scanning...' : visibleUnscannedCount === 0 ? 'All Visible Scanned' : `Scan Health ${nextScanCount}`}
           </button>
         }
       />
@@ -338,8 +379,8 @@ export function ModelsPage() {
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Topic Health</div>
-          <div className="mt-2 text-2xl font-semibold text-amber-700">{topicGapModels}</div>
-          <div className="mt-1 text-xs text-content-secondary">{totalTopicsScanned} topics across {topicScannedModels} models</div>
+          <div className={`mt-2 text-2xl font-semibold ${topicHealthCardClass}`}>{topicHealthCardValue}</div>
+          <div className="mt-1 text-xs text-content-secondary">{topicHealthCardDetail}</div>
         </div>
         <div className="card p-4">
           <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Ready</div>
@@ -352,7 +393,7 @@ export function ModelsPage() {
         <div className="grid grid-cols-1 xl:grid-cols-4 gap-3 text-sm">
           <div>
             <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Inventory</div>
-            <div className="mt-1 text-content-primary">{schemaCount} schema / {sharedCount} shared / {branchCount} branches</div>
+            <div className="mt-1 text-content-primary">{sharedCount} topic-serving / {schemaCount} schema / {branchCount} branches</div>
           </div>
           <div>
             <div className="text-xs font-medium text-content-secondary uppercase tracking-wider">Next Action</div>
@@ -388,9 +429,11 @@ export function ModelsPage() {
             <SearchInput value={search} onChange={setSearch} placeholder="Search model name, ID, or connection ID..." />
           </div>
           <select value={kindFilter} onChange={(e) => setKindFilter(e.target.value)} className="input-field">
-            <option value="production">Production model layers</option>
+            <option value="topic-serving">Topic-serving layers</option>
+            <option value="schema-foundations">Schema foundations</option>
+            <option value="production">All production layers</option>
             <option value="all">All model kinds</option>
-            {kinds.map((kind) => (
+            {individualKindOptions.map((kind) => (
               <option key={kind} value={kind!}>{modelKindLabel(kind)}</option>
             ))}
           </select>
@@ -429,6 +472,9 @@ export function ModelsPage() {
             </select>
           </label>
           <span className="text-xs text-content-secondary">{filteredModels.length.toLocaleString()} visible of {models.length.toLocaleString()} loaded</span>
+          <span className="text-xs text-content-tertiary">
+            Topic-serving hides schema foundations that share the same display name; switch filters to inspect those base model layers.
+          </span>
         </div>
       </div>
 
@@ -489,15 +535,13 @@ export function ModelsPage() {
                             {readinessStatus(issues).label}
                           </span>
                         </div>
-                        {topicHealth && (
-                          <div className="border-t border-border/60 pt-2">
-                            <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">Topic</div>
-                            <span className={`inline-flex items-center gap-1 ${topicHealthStatus(topicHealth).className}`}>
-                              {topicHealthStatus(topicHealth).icon}
-                              {topicHealthStatus(topicHealth).label}
-                            </span>
-                          </div>
-                        )}
+                        <div className="border-t border-border/60 pt-2">
+                          <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wider text-content-tertiary">Topic</div>
+                          <span className={`inline-flex items-center gap-1 ${topicHealthStatus(model, topicHealth).className}`}>
+                            {topicHealthStatus(model, topicHealth).icon}
+                            {topicHealthStatus(model, topicHealth).label}
+                          </span>
+                        </div>
                       </div>
                       <div className="col-span-1 flex justify-end">
                         <button
@@ -529,7 +573,7 @@ export function ModelsPage() {
                         )}
                       </div>
                     )}
-                    {topicHealth && (topicHealth.error || topicHealth.topics === 0 || topicHealth.missingDescription.length > 0) && (
+                    {isTopicHealthApplicable(model) && topicHealth && (topicHealth.error || topicHealth.topics === 0 || topicHealth.missingDescription.length > 0) && (
                       <div className="px-4 pb-3 pl-12 text-xs text-content-secondary">
                         <div className="rounded-button border border-amber-100 bg-amber-50 px-3 py-2 text-amber-800">
                           <span className="font-semibold">Topic health:</span>{' '}
