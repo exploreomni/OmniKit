@@ -265,6 +265,15 @@ export function DownloadsPage() {
   const isPdfPng = format === 'pdf' || format === 'png';
   const isDataFormat = format === 'csv' || format === 'xlsx' || format === 'json';
   const configuredFilterCount = selectedDocIds.filter((id) => hasConfiguredFilters(filterValuesByDashboard[id])).length;
+  const queueStatusHint = scope === 'tile'
+    ? selectedDocIds.length !== 1
+      ? 'Single-tile downloads require exactly one dashboard.'
+      : activeState?.loading
+        ? 'Loading tile details...'
+        : selectedTile?.queryIdentifierMapKey
+          ? 'Ready for a single-tile export.'
+          : 'Choose a tile to continue.'
+    : 'Queued downloads run sequentially to avoid Omni job conflicts.';
   const parsedMaxRows = Number.parseInt(maxRowLimit, 10);
   const xlsxRowLimitBlocked = format === 'xlsx'
     && overrideRowLimit
@@ -716,7 +725,7 @@ export function DownloadsPage() {
               )}
             </div>
             <div className="text-xs text-content-secondary">
-              {selectedDocIds.length} dashboard{selectedDocIds.length === 1 ? '' : 's'} queued. Filters configured: {configuredFilterCount}/{selectedDocIds.length}. {scope === 'tile' ? 'Single-tile downloads require exactly one dashboard.' : 'Queued downloads run sequentially to avoid Omni job conflicts.'}
+              {selectedDocIds.length} dashboard{selectedDocIds.length === 1 ? '' : 's'} queued. Filters configured: {configuredFilterCount}/{selectedDocIds.length}. {queueStatusHint}
             </div>
           </div>
         </div>
@@ -991,12 +1000,16 @@ export function DownloadsPage() {
         </section>
       )}
 
-      {recentDownloads.length > 0 && (
-        <section className="card space-y-3">
-          <div className="flex items-center gap-2">
-            <RefreshCcw size={15} className="text-content-secondary" />
-            <h2 className="text-base font-semibold text-content-primary">Recent downloads</h2>
+      <section className="card space-y-3">
+        <div className="flex items-center gap-2">
+          <RefreshCcw size={15} className="text-content-secondary" />
+          <h2 className="text-base font-semibold text-content-primary">Recent downloads</h2>
+        </div>
+        {recentDownloads.length === 0 ? (
+          <div className="rounded-card border border-dashed border-border px-4 py-5 text-sm text-content-secondary">
+            Completed downloads will appear here with their original request settings for one-click re-run.
           </div>
+        ) : (
           <div className="grid gap-2">
             {recentDownloads.map((download) => (
               <div key={download.id} className="flex flex-wrap items-center justify-between gap-3 rounded-card border border-border px-3 py-2">
@@ -1017,8 +1030,8 @@ export function DownloadsPage() {
               </div>
             ))}
           </div>
-        </section>
-      )}
+        )}
+      </section>
     </div>
   );
 }
