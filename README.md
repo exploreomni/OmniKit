@@ -44,8 +44,8 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 
 | Tool | Version | Notes |
 | --- | --- | --- |
-| Node.js | 24 or newer | Required for the built-in `node:sqlite` job-history store. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
-| npm | 11 or newer (bundled with current Node 24) | Yarn or pnpm also work. |
+| Node.js | 20 or newer | CI validates Node 20. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
+| npm | 10 or newer (bundled with current Node LTS) | Yarn or pnpm also work. |
 | Browser | Any modern Chromium, Firefox, or Safari | |
 | Omni instance | Reachable from your machine | You also need a personal API key. |
 
@@ -177,7 +177,7 @@ Key points:
 - **Native encrypted vault.** Saved Omni instance profiles are encrypted in `./data/vault.enc` by default using Node `crypto` with scrypt and AES-256-GCM. Plaintext API keys are never returned to the browser; UI responses use masked keys only.
 - **Legacy multi-instance cutover.** Instance Manager can import compatible `omni-multi-instance-tools` vault files after the native vault is unlocked. The legacy passphrase is used only for that local import request, valid profiles are re-encrypted into the native vault, duplicate base URLs are skipped, and unsupported legacy-only settings are reported in the dry-run summary.
 - **Vault idle auto-lock.** The native vault auto-locks after local server idle time. Override the timeout with `OMNIKIT_VAULT_IDLE_TIMEOUT_MS`.
-- **Local SQLite job history.** Multi-instance migration jobs are stored in `./data/omnikit.db` by default with job metadata, status, warnings, retry lineage, and post-action results. API keys, bearer tokens, card-like numbers, emails, and phone numbers are redacted before job history is written.
+- **Local JSON job history.** Multi-instance migration jobs are stored in `./data/omnikit-jobs.json` by default with job metadata, status, warnings, retry lineage, and post-action results. API keys, bearer tokens, card-like numbers, emails, and phone numbers are redacted before job history is written.
 - **Compatibility-first proxy guardrails.** The generic proxy only forwards HTTPS requests to Omni `/api/v1` paths. Other Omni API surfaces used by the app, such as SCIM, embeds, and dashboard import/export, go through dedicated handlers.
 - **AI intake is local-first.** Uploaded dbt, Looker, Power BI, Tableau, and Domo artifacts, plus Excel workbooks used by AI Dashboard Studio, are parsed in the browser and held in memory for the active page session. OmniKit does not write raw external BI source files or raw Excel workbooks to IndexedDB or localStorage by default.
 - **No external app runtime services.** The app uses bundled public assets and system fonts; it does not require a hosted OmniKit backend, package registry service, database, telemetry endpoint, or external font CDN at runtime.
@@ -234,8 +234,9 @@ Optional:
   ```
 - `OMNIKIT_VAULT_PATH` — override the native encrypted vault path. Default is `./data/vault.enc`.
 - `OMNIKIT_VAULT_IDLE_TIMEOUT_MS` — override the native vault idle auto-lock timeout. Default is `1800000` (30 minutes). Use `0` only for local troubleshooting when you explicitly want to disable auto-lock.
-- `OMNIKIT_DB_PATH` — override the non-secret migration job history database path. Default is `./data/omnikit.db`.
-- `OMNIKIT_JOBS_PATH` — legacy one-time import path for older `jobs.json` history. If present and the SQLite database is empty, OmniKit imports it and renames it to `jobs.json.bak`.
+- `OMNIKIT_JOB_HISTORY_PATH` — override the non-secret migration job history file path. Default is `./data/omnikit-jobs.json`.
+- `OMNIKIT_DB_PATH` — legacy alias for `OMNIKIT_JOB_HISTORY_PATH`, kept for older local scripts.
+- `OMNIKIT_JOBS_PATH` — legacy one-time import path for older `jobs.json` history. If present and the current job history file is empty, OmniKit imports it and renames it to `jobs.json.bak`.
 - `OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS=true` — allow post-migration action templates to call localhost or private-network URLs. By default, post-migration actions must use HTTPS and cannot target private networks.
 - `OMNIKIT_POST_ACTION_ALLOWLIST` — optional comma-separated hostname allowlist for post-migration actions, such as `hooks.example.com,automation.example.com`.
 
@@ -274,7 +275,7 @@ Open **Instance Manager**, unlock or create the native vault, then use **Import 
 - Legacy multi-instance vault imports are local file reads only. OmniKit validates the path, requires confirmation before reading absolute paths, skips invalid or duplicate profiles, drops unsafe post-migration action URLs, and never returns imported plaintext API keys to the browser.
 - No telemetry, no analytics, no outbound calls except to the Omni Base URL you entered.
 - No external font or tracking scripts are loaded by the app shell.
-- OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, cached dashboard/model context, and multi-instance migration jobs. Job history is redacted before it is written to the local SQLite file. Open **Data Privacy** to inspect and clear browser entries, reset the native vault, or clear local job history.
+- OmniKit stores operational metadata locally so the UI can show history, templates, filter defaults, cached dashboard/model context, and multi-instance migration jobs. Job history is redacted before it is written to the local JSON history file. Open **Data Privacy** to inspect and clear browser entries, reset the native vault, or clear local job history.
 - Post-migration actions are saved as encrypted vault templates and must be explicitly enabled per migration job. Job history stores redacted action metadata only. Actions are HTTPS-only by default, block localhost/private-network targets unless `OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS=true`, and can be restricted with `OMNIKIT_POST_ACTION_ALLOWLIST`.
 - Raw export inspection can display the full dashboard export payload in your browser for troubleshooting. Treat copied diagnostics and exported backups as customer data.
 - The generic proxy is intentionally limited to Omni `/api/v1` endpoints; workflows that need other Omni API surfaces use purpose-built local handlers.
