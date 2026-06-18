@@ -164,7 +164,7 @@ beforeEach(() => {
   tempDir = mkdtempSync(path.join(tmpdir(), 'omnikit-security-'));
   process.env.OMNIKIT_VAULT_PATH = path.join(tempDir, 'vault.enc');
   process.env.OMNIKIT_JOBS_PATH = path.join(tempDir, 'jobs.json');
-  process.env.OMNIKIT_DB_PATH = path.join(tempDir, 'omnikit.db');
+  process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(tempDir, 'omnikit-jobs.json');
   process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS = String(30 * 60 * 1000);
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
@@ -177,7 +177,7 @@ afterEach(() => {
   rmSync(tempDir, { recursive: true, force: true });
   delete process.env.OMNIKIT_VAULT_PATH;
   delete process.env.OMNIKIT_JOBS_PATH;
-  delete process.env.OMNIKIT_DB_PATH;
+  delete process.env.OMNIKIT_JOB_HISTORY_PATH;
   delete process.env.OMNIKIT_VAULT_IDLE_TIMEOUT_MS;
   delete process.env.OMNIKIT_ALLOW_PRIVATE_POST_ACTIONS;
   delete process.env.OMNIKIT_POST_ACTION_ALLOWLIST;
@@ -681,16 +681,13 @@ test('model migration job details are redacted before history persistence', () =
   assert.equal(serialized.includes('orders.view'), true);
 });
 
-test('local job database is created with 0600 permissions', () => {
+test('local job history file is created with 0600 permissions', () => {
   clearJobs();
-  for (const filePath of [getJobsDbPath(), `${getJobsDbPath()}-wal`, `${getJobsDbPath()}-shm`]) {
-    if (!existsSync(filePath)) continue;
-    const mode = statSync(filePath).mode & 0o777;
-    assert.equal(mode, 0o600);
-  }
+  const mode = statSync(getJobsDbPath()).mode & 0o777;
+  assert.equal(mode, 0o600);
 });
 
-test('local job database does not store plaintext secrets or common sensitive data', () => {
+test('local job history file does not store plaintext secrets or common sensitive data', () => {
   const secret = 'Bearer raw-secret-token-value';
   const email = 'customer@example.com';
   insertJob({
@@ -731,10 +728,7 @@ test('local job database does not store plaintext secrets or common sensitive da
     }],
   });
 
-  const dbContents = [getJobsDbPath(), `${getJobsDbPath()}-wal`, `${getJobsDbPath()}-shm`]
-    .filter(existsSync)
-    .map((filePath) => readFileSync(filePath).toString('utf8'))
-    .join('\n');
+  const dbContents = existsSync(getJobsDbPath()) ? readFileSync(getJobsDbPath(), 'utf8') : '';
   assert.equal(dbContents.includes('raw-secret-token-value'), false);
   assert.equal(dbContents.includes(email), false);
   assert.equal(dbContents.includes('212-555-0199'), false);

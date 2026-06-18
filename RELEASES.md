@@ -34,7 +34,7 @@ OmniKit v1.1.0 adds the full multi-instance operations console requested by earl
 - Plaintext saved-instance API keys never return to the browser; UI responses show masked keys only.
 - Decrypted vault contents and derived keys are held in server memory only while the vault is unlocked, and the vault auto-locks after idle time.
 - `data/` is ignored by git so encrypted vault files and job history are not pushed.
-- Non-secret job history uses `./data/omnikit.db` by default, overrideable with `OMNIKIT_DB_PATH`, and redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing. Older `jobs.json` files can be imported once through `OMNIKIT_JOBS_PATH` when the database is empty.
+- Non-secret job history uses `./data/omnikit-jobs.json` by default, overrideable with `OMNIKIT_JOB_HISTORY_PATH`, and redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing. Older `jobs.json` files can be imported once through `OMNIKIT_JOBS_PATH` when the history file is empty.
 - Post-migration action history stores redacted action metadata only. Use `OMNIKIT_POST_ACTION_ALLOWLIST` to restrict allowed action hostnames.
 - The deprecated browser encrypted vault is not used for new migration credentials. Re-add needed profiles to the native vault and clear the legacy browser cache from Instance Manager or Data Privacy.
 - Compatible legacy multi-instance vault imports never return plaintext imported API keys to the browser. Legacy job history from the old repo is not imported in this release; keep the old SQLite database as a read-only archive if you need historical audit evidence.

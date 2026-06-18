@@ -35,7 +35,7 @@ This trace is the control document for completing the net-new Model Migrator wor
 | FR-18 | Honest workbook fidelity and tab-level reporting | Captured | Result details list each tab, carried query/description/visConfig fields, target document links, limitations, and document-level retry boundaries when Omni create fails. |
 | FR-19 | Workbook job item kinds and engine integration | Captured | Workbook job kinds use SSE/history/retry/cancel/redaction. |
 | FR-20 | Target content validation punch list | Captured | Validate-content responses are normalized into severity/status/message/document/field/view/link issue rows and rendered in the run board. |
-| FR-21 | One job, History, retry lineage, OperationLog | Captured | One job, History detail, SSE, retry lineage, item-level OperationLog entries, and SQLite reload preservation tests are implemented. |
+| FR-21 | One job, History, retry lineage, OperationLog | Captured | One job, History detail, SSE, retry lineage, item-level OperationLog entries, and local history reload preservation tests are implemented. |
 | FR-22 | Refresh schema and webhook post-actions | Captured | Model Migrator surfaces target schema refresh and saved post-action templates. |
 
 ## Non-Functional Requirements
@@ -44,7 +44,7 @@ This trace is the control document for completing the net-new Model Migrator wor
 | --- | --- | --- | --- |
 | NFR-1 | Vault-backed security and redaction | Captured | Handler requires vault unlock; security tests cover locked/incomplete/no-secret responses. |
 | NFR-2 | Rate limits and batched YAML writes | Captured | OmniClient limiter applies; branch YAML writes use batch payload. |
-| NFR-3 | Resumability and crash recovery | Captured | Sanitized session draft persists review outputs/decisions, and SQLite reload tests preserve model job details and retry lineage. |
+| NFR-3 | Resumability and crash recovery | Captured | Sanitized session draft persists review outputs/decisions, and local history reload tests preserve model job details and retry lineage. |
 | NFR-4 | Honest copy and unsupported artifact disclosure | Captured | Run results disclose schedules, alerts, permissions, sharing, favorites, and non-exposed workbook artifacts as not automatically moved. |
 | NFR-5 | A11y/polish | Captured | Error banners use `role="alert"`, status messages use `aria-live`, and the workflow remains dropdown-first with loading/empty states. |
 | NFR-6 | Effort guidance | Captured | This phased trace controls the remaining work. |
