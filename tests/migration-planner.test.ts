@@ -19,7 +19,7 @@ let tempDir = '';
 beforeEach(() => {
   tempDir = mkdtempSync(path.join(tmpdir(), 'omnikit-planner-'));
   process.env.OMNIKIT_VAULT_PATH = path.join(tempDir, 'vault.enc');
-  process.env.OMNIKIT_DB_PATH = path.join(tempDir, 'omnikit.db');
+  process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(tempDir, 'omnikit-jobs.json');
   process.env.OMNIKIT_JOBS_PATH = path.join(tempDir, 'jobs.json');
   unlockVault('planner passphrase');
 });
@@ -30,7 +30,7 @@ afterEach(() => {
   lockVault();
   rmSync(tempDir, { recursive: true, force: true });
   delete process.env.OMNIKIT_VAULT_PATH;
-  delete process.env.OMNIKIT_DB_PATH;
+  delete process.env.OMNIKIT_JOB_HISTORY_PATH;
   delete process.env.OMNIKIT_JOBS_PATH;
 });
 

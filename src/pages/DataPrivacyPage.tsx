@@ -219,7 +219,7 @@ export function DataPrivacyPage() {
                 idle auto-lock: {formatDuration(nativeVaultStatus?.idleTimeoutMs)}
               </div>
               <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
-                Non-secret multi-instance migration job history is stored only on this device in <span className="font-mono">./data/omnikit.db</span>, or <span className="font-mono">OMNIKIT_DB_PATH</span> when configured. Job records include status, warnings, retry lineage, imported document IDs, and post-action results. OmniKit redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing job history.
+                Non-secret multi-instance migration job history is stored only on this device in <span className="font-mono">./data/omnikit-jobs.json</span>, or <span className="font-mono">OMNIKIT_JOB_HISTORY_PATH</span> when configured. Job records include status, warnings, retry lineage, imported document IDs, and post-action results. OmniKit redacts API keys, bearer tokens, card-like numbers, emails, and phone numbers before writing job history.
               </p>
               <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
                 Post-migration action templates stay in the encrypted vault. Job history stores redacted action metadata only. Actions are HTTPS-only, block private-network targets by default, and can be restricted with <span className="font-mono">OMNIKIT_POST_ACTION_ALLOWLIST</span>.
