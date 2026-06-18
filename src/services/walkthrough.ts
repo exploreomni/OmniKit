@@ -145,10 +145,10 @@ export const walkthroughSteps: WalkthroughStep[] = [
     route: '/dashboards/migrate',
     label: 'Migrate',
     title: 'Use Dashboard Migrator for same-instance remaps or fan-out copy/import',
-    purpose: 'Model Migrator is now Dashboard Migrator because this workflow moves dashboards. Model Migrator is reserved for a new semantic-layer tool that will move models between connections before handing off dashboard migration here.',
+    purpose: 'Dashboard Migrator handles dashboard migration work: same-instance paths retarget dashboard model / connection references, while cross-instance paths copy and import dashboard content. Model Migrator is reserved for the semantic-layer tool.',
     directions: [
-      'Choose Within this instance when the selected saved instance is the source and destination and only the dashboard base model changes.',
-      'Choose To other saved instances when dashboards need to fan out from one saved source profile to multiple destination instances, models, or folders.',
+      'Choose Same instance: model / connection remap when UAT and PROD live as separate models or connections inside one Omni instance and the dashboard location should stay unchanged.',
+      'Choose Different instance: copy / import when dashboards need to fan out from one saved source profile to multiple destination instances, models, or folders.',
       'In fan-out mode, unlock the native vault, choose the source model and dashboards once, then check the destination instances you want to receive copies.',
       'Review the preflight matrix before running. During the job, use the live board to watch export, import, metadata, folder move, schema refresh, and post-action status by destination.',
     ],

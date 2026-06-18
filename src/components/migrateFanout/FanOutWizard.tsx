@@ -41,6 +41,15 @@ import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { useConfetti } from '@/hooks/useConfetti';
 import { useLogOperation } from '@/contexts/OperationLogContext';
+import {
+  dashboardMatchesSearch,
+  folderDisplayLabel,
+  instanceMatchesSearch,
+  modelDisplayLabel,
+  sortDocuments,
+  sortModels,
+  sortSavedInstances,
+} from '../../utils/catalogSort';
 import { FixPanel } from './FixPanel';
 import {
   targetDraftToMigrationTarget,
@@ -148,6 +157,7 @@ export function FanOutWizard() {
   const [replaceSameNamed, setReplaceSameNamed] = useState(initialDraft?.replaceSameNamed ?? true);
   const [refreshSchemaAfterImport, setRefreshSchemaAfterImport] = useState(initialDraft?.refreshSchemaAfterImport ?? false);
   const [search, setSearch] = useState('');
+  const [destinationSearch, setDestinationSearch] = useState('');
   const [bulkFolderPath, setBulkFolderPath] = useState('');
   const [plan, setPlan] = useState<MigrationPlan | null>(null);
   const [preflightRows, setPreflightRows] = useState<PreflightTargetRow[]>([]);
@@ -167,12 +177,17 @@ export function FanOutWizard() {
   const logOperation = useLogOperation();
   const jobRef = useRef<MigrationJob | null>(null);
 
-  const sourceInstances = instances.filter((instance) => instance.role === 'source' || instance.role === 'both');
-  const destinationInstances = instances.filter((instance) => instance.role === 'destination' || instance.role === 'both');
-  const source = instances.find((instance) => instance.id === sourceId);
+  const sourceInstances = useMemo(
+    () => sortSavedInstances(instances.filter((instance) => instance.role === 'source' || instance.role === 'both')),
+    [instances],
+  );
+  const destinationInstances = useMemo(
+    () => sortSavedInstances(instances.filter((instance) => instance.role === 'destination' || instance.role === 'both')),
+    [instances],
+  );
   const sourceCatalog = catalogs[sourceId];
   const sourceModels = useMemo(() => sourceCatalog?.models || [], [sourceCatalog?.models]);
-  const sourceFolders = sourceCatalog?.folders || [];
+  const sourceFolders = useMemo(() => sourceCatalog?.folders || [], [sourceCatalog?.folders]);
   const creatingVault = vaultStatus?.exists === false;
   const passphraseMatches = !creatingVault || passphrase === passphraseConfirm;
   const passphraseMeetsMinimum = !creatingVault || passphrase.trim().length >= 8;
@@ -224,9 +239,44 @@ export function FanOutWizard() {
   )).length;
   const plannedDeleteCount = plan?.steps.filter((step) => step.kind === 'delete').length || 0;
 
+  const sourceInstanceOptions = useMemo(() => sourceInstances.map((instance) => ({
+    value: instance.id,
+    label: instance.label,
+    subtitle: instance.baseUrl.replace(/^https?:\/\//, ''),
+  })), [sourceInstances]);
+
+  const sourceModelOptions = useMemo(() => [
+    { value: '', label: 'All source models' },
+    ...sortModels(sourceModels).map((model) => ({
+      value: model.id,
+      label: modelDisplayLabel(model),
+      subtitle: model.kind || undefined,
+    })),
+  ], [sourceModels]);
+
+  const sourceFolderOptions = useMemo(() => {
+    const currentValue = sourceFolderPath || sourceFolderId;
+    const options = [
+      { value: '', label: 'My Documents/default' },
+      ...sourceFolders.map((folder) => {
+        const value = folder.path || folder.identifier || folder.id;
+        return value ? { value, label: folderDisplayLabel(folder) || value } : null;
+      }).filter((option): option is { value: string; label: string } => Boolean(option)),
+    ];
+    if (currentValue && !options.some((option) => option.value === currentValue)) {
+      options.push({ value: currentValue, label: currentValue });
+    }
+    return options;
+  }, [sourceFolderId, sourceFolderPath, sourceFolders]);
+
+  const filteredDestinationInstances = useMemo(
+    () => destinationInstances.filter((instance) => instanceMatchesSearch(instance, destinationSearch)),
+    [destinationInstances, destinationSearch],
+  );
+
   const filteredDocuments = useMemo(() => {
-    const normalized = search.toLowerCase();
-    return documents.filter((document) => {
+    const sortedDocuments = sortDocuments(documents);
+    return sortedDocuments.filter((document) => {
       if (sourceModelId) {
         const allowedKeys = sourceModelKeysById.get(sourceModelId) || new Set([sourceModelId]);
         const documentKeys = [cleanModelMetadata(document.baseModelId), cleanModelMetadata(document.baseModelName)]
@@ -234,15 +284,7 @@ export function FanOutWizard() {
         if (documentKeys.length === 0 || !documentKeys.some((value) => allowedKeys.has(value))) return false;
       }
       if (metadataOnly && !metadataMissing(document)) return false;
-      if (!normalized) return true;
-      return [
-        document.name,
-        document.identifier,
-        document.folderPath,
-        cleanModelMetadata(document.baseModelName),
-        cleanModelMetadata(document.baseModelId),
-        ...(document.labels || []),
-      ].some((value) => value?.toLowerCase().includes(normalized));
+      return dashboardMatchesSearch(document, search);
     });
   }, [documents, metadataOnly, search, sourceModelId, sourceModelKeysById]);
 
@@ -594,7 +636,7 @@ export function FanOutWizard() {
 
   async function selectAllDestinations() {
     const selected = new Set(targets.map((target) => target.destinationInstanceId));
-    const additions = destinationInstances.filter((instance) => !selected.has(instance.id));
+    const additions = filteredDestinationInstances.filter((instance) => !selected.has(instance.id));
     const nextAdditions = additions.map((instance) => ({
         id: makeTargetId(instance.id),
         destinationInstanceId: instance.id,
@@ -909,55 +951,45 @@ export function FanOutWizard() {
             <div className="mt-5 space-y-4">
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source instance</label>
-                <select value={sourceId} onChange={(event) => chooseSource(event.target.value)} className="input-field">
-                  <option value="">Select source</option>
-                  {sourceInstances.map((instance) => (
-                    <option key={instance.id} value={instance.id}>{instance.label}</option>
-                  ))}
-                </select>
+                <ComboBox
+                  options={sourceInstanceOptions}
+                  value={sourceId}
+                  onChange={chooseSource}
+                  placeholder="Select source"
+                  allowFreeText={false}
+                  emptyLabel="No source instances found"
+                  ariaLabel="Source instance"
+                />
               </div>
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source model</label>
-                <select
+                <ComboBox
+                  options={sourceModelOptions}
                   value={sourceModelId}
-                  onFocus={() => void loadCatalog(sourceId)}
-                  onChange={(event) => {
-                    setSourceModelId(event.target.value);
+                  onChange={(value) => {
+                    setSourceModelId(value);
                     setSelectedDocumentIds([]);
                     resetPreflight();
                   }}
                   disabled={!sourceId || sourceCatalog?.loading}
-                  className="input-field"
-                >
-                  <option value="">{sourceCatalog?.loading ? 'Loading models...' : 'All source models'}</option>
-                  {sourceModels.map((model) => (
-                    <option key={model.id} value={model.id}>{model.name || model.identifier || model.id}</option>
-                  ))}
-                </select>
+                  placeholder={sourceCatalog?.loading ? 'Loading models...' : 'All source models'}
+                  allowFreeText={false}
+                  emptyLabel="No source models found"
+                  ariaLabel="Source model"
+                />
               </div>
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source folder</label>
-                <select
+                <ComboBox
+                  options={sourceFolderOptions}
                   value={sourceFolderPath || sourceFolderId}
-                  onFocus={() => void loadCatalog(sourceId)}
-                  onChange={(event) => chooseSourceFolder(event.target.value)}
+                  onChange={chooseSourceFolder}
                   disabled={!sourceId || sourceCatalog?.loading}
-                  className="input-field"
-                >
-                  <option value="">{sourceCatalog?.loading ? 'Loading folders...' : 'My Documents/default'}</option>
-                  {sourceFolders.map((folder, index) => (
-                    <option key={`source-folder:${index}:${folder.id}:${folder.path || folder.identifier || folder.name}`} value={folder.path || folder.identifier || folder.id}>
-                      {folder.path || folder.identifier || folder.name}
-                    </option>
-                  ))}
-                  {source && (source.defaultFolderPath || source.defaultFolderId) && !sourceFolders.some((folder) => (
-                    folder.path === (sourceFolderPath || sourceFolderId)
-                    || folder.identifier === (sourceFolderPath || sourceFolderId)
-                    || folder.id === (sourceFolderPath || sourceFolderId)
-                  )) && (
-                    <option value={sourceFolderPath || sourceFolderId}>{sourceFolderPath || sourceFolderId}</option>
-                  )}
-                </select>
+                  placeholder={sourceCatalog?.loading ? 'Loading folders...' : 'My Documents/default'}
+                  allowFreeText={false}
+                  emptyLabel="No source folders found"
+                  ariaLabel="Source folder"
+                />
               </div>
               <button type="button" onClick={() => loadDocuments()} disabled={!sourceId || loadingDocuments} className="btn-primary inline-flex w-full items-center justify-center gap-2">
                 {loadingDocuments ? <Loader2 size={15} className="animate-spin" /> : <FileText size={15} />}
@@ -1042,13 +1074,25 @@ export function FanOutWizard() {
             <h2 className="text-base font-semibold text-content-primary">2. Check destinations</h2>
             <p className="mt-1 text-sm text-content-secondary">Select destination instances once. Defaults fill in from each saved profile.</p>
             <div className="mt-4 flex flex-wrap gap-2">
-              <button type="button" onClick={() => void selectAllDestinations()} disabled={destinationInstances.length === 0 || catalogRefreshing} className="btn-secondary text-xs">Select all destinations</button>
+              <button type="button" onClick={() => void selectAllDestinations()} disabled={filteredDestinationInstances.length === 0 || catalogRefreshing} className="btn-secondary text-xs">
+                {destinationSearch.trim() ? 'Select visible destinations' : 'Select all destinations'}
+              </button>
               <button type="button" onClick={() => void recheckAllTargets()} disabled={targets.length === 0 || catalogRefreshing} className="btn-secondary inline-flex items-center gap-1 text-xs">
                 <RefreshCw size={13} className={catalogRefreshing ? 'animate-spin' : ''} />
                 Re-check all
               </button>
               <button type="button" onClick={() => { setTargets([]); resetPreflight(); }} disabled={targets.length === 0} className="btn-secondary text-xs">Clear targets</button>
             </div>
+            {destinationInstances.length > 0 && (
+              <div className="mt-4">
+                <SearchInput
+                  value={destinationSearch}
+                  onChange={setDestinationSearch}
+                  placeholder="Search destination instances..."
+                  ariaLabel="Search destination instances"
+                />
+              </div>
+            )}
             {catalogRefreshing && (
               <div className="mt-3 rounded-card border border-border-subtle bg-surface-secondary px-3 py-2 text-xs text-content-secondary">
                 Refreshing destination model and folder catalogs in small batches.
@@ -1060,7 +1104,7 @@ export function FanOutWizard() {
               </div>
             )}
             <div className="mt-4 max-h-[460px] space-y-2 overflow-auto">
-              {destinationInstances.map((instance) => {
+              {filteredDestinationInstances.map((instance) => {
                 const checked = targets.some((target) => target.destinationInstanceId === instance.id);
                 return (
                   <label key={instance.id} className={`block rounded-card border px-3 py-3 text-sm transition ${checked ? 'border-omni-300 bg-omni-50' : 'border-border-subtle hover:bg-surface-secondary'}`}>
@@ -1077,6 +1121,11 @@ export function FanOutWizard() {
                   </label>
                 );
               })}
+              {destinationInstances.length > 0 && filteredDestinationInstances.length === 0 && (
+                <div className="rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">
+                  No destination instances match this search.
+                </div>
+              )}
             </div>
           </div>
 

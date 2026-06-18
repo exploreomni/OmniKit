@@ -126,6 +126,85 @@ test('planner replaces same-named dashboards without emptying unrelated target d
   assert.equal(plan.steps.some((step) => step.documentId === 'dest-existing-2'), false);
 });
 
+test('planner treats Omni formula helpers as functions instead of missing destination fields', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: {
+      connectionDatabaseContains: [],
+      connectionDatabaseExact: [],
+      embedExternalIdContains: [],
+      embedExternalIdExact: [],
+    },
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'Formula Dashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': [
+      'dimensions:',
+      '  id:',
+      'measures:',
+      '  total_revenue:',
+    ].join('\n'),
+  }));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{
+      fields: ['orders.id', 'orders.total_revenue'],
+      formula: 'Omni.OMNI_FX_SUM(orders.total_revenue) / Omni.OMNI_FX_EQUALS(orders.id, orders.id)',
+    }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Migrated Dashboards',
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const importStep = plan.steps.find((step) => step.kind === 'import');
+  const warnings = importStep?.warnings || [];
+
+  assert.equal(warnings.some((warning) => warning.includes('OMNI_FX')), false);
+  assert.equal(warnings.some((warning) => warning.includes('referenced fields were not found')), false);
+});
+
 test('saved-instance document listing enriches missing dashboard model details on request', async () => {
   upsertInstance({
     id: 'source-1',

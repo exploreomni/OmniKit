@@ -9,6 +9,7 @@ import type {
   MigrationTarget,
 } from '@/services/opsConsole';
 import type { ComboBoxOption } from '@/components/ui/comboBoxUtils';
+import { compareCatalogText, folderDisplayLabel, modelDisplayLabel, sortModels } from '../../utils/catalogSort';
 import type { DestinationProgress, PreflightTargetRow } from './fanoutTypes';
 
 const MODEL_PLACEHOLDER_VALUES = new Set(['unknown', 'model unknown', 'model not detected', 'not detected', 'n/a', 'none', '-']);
@@ -125,11 +126,11 @@ export function getFanoutPreflightBlockReason(input: {
 }
 
 export function buildTargetModelOptions(
-  models: Array<Pick<InstanceModel, 'id' | 'name' | 'identifier' | 'kind'>>,
+  models: Array<Pick<InstanceModel, 'id' | 'name' | 'identifier' | 'connectionName' | 'kind'>>,
 ): ComboBoxOption[] {
-  return models.map((model) => ({
+  return sortModels(models).map((model) => ({
     value: model.id,
-    label: model.name || model.identifier || model.id,
+    label: modelDisplayLabel(model),
     subtitle: model.kind || undefined,
   }));
 }
@@ -140,9 +141,10 @@ export function buildTargetFolderOptions(
   return folders
     .map((folder) => {
       const value = folder.path || folder.identifier || folder.id;
-      return value ? { value, label: folder.path || folder.identifier || folder.name || value } : null;
+      return value ? { value, label: folderDisplayLabel(folder) || value } : null;
     })
-    .filter((option): option is ComboBoxOption => Boolean(option));
+    .filter((option): option is ComboBoxOption => Boolean(option))
+    .sort((a, b) => compareCatalogText(a.label, b.label) || compareCatalogText(a.value, b.value));
 }
 
 export function preserveSelectedDocumentIds(

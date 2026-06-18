@@ -28,6 +28,13 @@ import {
 } from '../src/components/ui/comboBoxUtils';
 import { initialWizardState, wizardReducer } from '../src/hooks/useWizard';
 import type { MigrationPlan, SavedInstancePublic } from '../src/services/opsConsole';
+import {
+  dashboardMatchesSearch,
+  filterFolderTree,
+  instanceMatchesSearch,
+  sortDocuments,
+  sortModels,
+} from '../src/utils/catalogSort';
 
 const destination: SavedInstancePublic = {
   id: 'dest-1',
@@ -224,17 +231,21 @@ test('fan-out preflight blocker returns actionable reasons and clears when ready
 
 test('target ComboBox helpers filter catalogs, preserve unknown values, and keep target-specific free-text rules', () => {
   const modelOptions = buildTargetModelOptions([
-    { id: 'model-1', name: 'Coffee Model', identifier: 'coffee-model', kind: 'shared' },
     { id: 'model-2', name: '', identifier: 'fallback-model', kind: 'workbook' },
+    { id: 'model-1', name: 'Coffee Model', identifier: 'coffee-model', connectionName: 'PROD', kind: 'shared' },
   ]);
   const folderOptions = buildTargetFolderOptions([
-    { id: 'folder-1', name: 'Migrated', path: 'Shared/Migrated' },
     { id: 'folder-2', name: 'Sandbox', identifier: 'sandbox-folder' },
+    { id: 'folder-1', name: 'Migrated', path: 'Shared/Migrated' },
   ]);
 
   assert.equal(TARGET_MODEL_COMBOBOX_CONFIG.allowFreeText, false);
   assert.equal(TARGET_FOLDER_COMBOBOX_CONFIG.allowFreeText, true);
+  assert.deepEqual(modelOptions.map((option) => option.label), ['fallback-model', 'PROD - Coffee Model']);
+  assert.deepEqual(folderOptions.map((option) => option.value), ['sandbox-folder', 'Shared/Migrated']);
   assert.deepEqual(filterComboBoxOptions(modelOptions, 'coffee').map((option) => option.value), ['model-1']);
+  assert.deepEqual(filterComboBoxOptions(modelOptions, 'prod').map((option) => option.value), ['model-1']);
+  assert.deepEqual(filterComboBoxOptions(modelOptions, 'workbook').map((option) => option.value), ['model-2']);
   assert.deepEqual(filterComboBoxOptions(modelOptions, 'fallback').map((option) => option.value), ['model-2']);
   assert.deepEqual(filterComboBoxOptions(folderOptions, 'Shared').map((option) => option.value), ['Shared/Migrated']);
   assert.deepEqual(resolveComboBoxDisplay(modelOptions, 'model-not-in-catalog'), {
@@ -242,7 +253,7 @@ test('target ComboBox helpers filter catalogs, preserve unknown values, and keep
     showIdBelowLabel: false,
   });
   assert.deepEqual(resolveComboBoxDisplay(modelOptions, 'model-1'), {
-    selectedLabel: 'Coffee Model',
+    selectedLabel: 'PROD - Coffee Model',
     showIdBelowLabel: true,
   });
   assert.equal(
@@ -253,6 +264,50 @@ test('target ComboBox helpers filter catalogs, preserve unknown values, and keep
     comboBoxEmptyText({ allowFreeText: TARGET_MODEL_COMBOBOX_CONFIG.allowFreeText, search: 'missing model', emptyLabel: TARGET_MODEL_COMBOBOX_CONFIG.emptyLabel }),
     'No models found',
   );
+});
+
+test('catalog helpers sort and search large migration catalogs consistently', () => {
+  assert.deepEqual(sortModels([
+    { id: 'z', name: 'Orders', connectionName: 'UAT' },
+    { id: 'a', name: 'Orders', connectionName: 'PROD' },
+    { id: 'm', name: 'Coffee' },
+  ]).map((model) => model.id), ['m', 'a', 'z']);
+
+  assert.deepEqual(sortDocuments([
+    { id: '2', identifier: 'dash-2', name: 'Zebra Dashboard' },
+    { id: '1', identifier: 'dash-1', name: 'Alpha Dashboard', baseModelName: 'Coffee Model', labels: ['Certified'] },
+  ]).map((document) => document.id), ['1', '2']);
+
+  assert.equal(dashboardMatchesSearch({
+    id: 'dash-1',
+    name: 'Alpha Dashboard',
+    baseModelName: 'Coffee Model',
+    folderPath: 'Executive',
+    labels: ['Certified'],
+  }, 'coffee'), true);
+  assert.equal(dashboardMatchesSearch({
+    id: 'dash-1',
+    name: 'Alpha Dashboard',
+    labels: [{ name: 'Certified' }],
+  }, 'certified'), true);
+  assert.equal(instanceMatchesSearch({
+    id: 'dest-prod',
+    label: 'Production',
+    baseUrl: 'https://prod.example.omniapp.co',
+    defaultModelId: 'prod-model',
+  }, 'prod'), true);
+
+  const filteredFolders = filterFolderTree([
+    {
+      id: 'root-z',
+      name: 'Z Root',
+      children: [{ id: 'child-prod', name: 'Prod Dashboards', path: 'Z Root/Prod Dashboards' }],
+    },
+    { id: 'root-a', name: 'A Root' },
+  ], 'prod');
+
+  assert.deepEqual(filteredFolders.map((folder) => folder.id), ['root-z']);
+  assert.deepEqual(filteredFolders[0].children?.map((folder) => folder.id), ['child-prod']);
 });
 
 test('metadata fix flow gates source continuation and preserves selected dashboards after reload', () => {

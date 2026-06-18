@@ -348,8 +348,14 @@ function normalizeFieldRef(value: string): string {
   return value.trim().replace(/\[[^\]]+\]$/, '');
 }
 
+function isOmniFormulaFunctionRef(value: string): boolean {
+  const [namespace, member] = normalizeFieldRef(value).split('.');
+  return namespace?.toLowerCase() === 'omni' && /^OMNI_FX_/i.test(member || '');
+}
+
 function isLikelyFieldRef(value: string): boolean {
-  return /^[A-Za-z_][\w/]*\.[A-Za-z_][\w]*$/.test(normalizeFieldRef(value));
+  const normalized = normalizeFieldRef(value);
+  return !isOmniFormulaFunctionRef(normalized) && /^[A-Za-z_][\w/]*\.[A-Za-z_][\w]*$/.test(normalized);
 }
 
 function extractFieldRefsFromString(value: string, onlyIfFieldLike = false): string[] {

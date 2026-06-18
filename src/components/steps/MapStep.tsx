@@ -3,6 +3,7 @@ import { ArrowRight, AlertTriangle, Loader2, ShieldCheck } from 'lucide-react';
 import { listModels } from '@/services/omniApi';
 import { ComboBox } from '@/components/ui/ComboBox';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { modelDisplayLabel, sortModels } from '../../utils/catalogSort';
 import type { OmniModel } from '@/types';
 import type { WizardState, WizardAction } from '@/types';
 
@@ -37,8 +38,7 @@ function normalizeTokens(value: string | undefined): string[] {
 }
 
 function modelDisplayName(model: OmniModel): string {
-  const hasName = model.name && model.name !== model.id && model.name !== model.identifier;
-  return hasName ? model.name : model.identifier || model.id;
+  return modelDisplayLabel(model);
 }
 
 export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
@@ -107,16 +107,11 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
   }, [state.selectedDashboards]);
 
   const targetOptions = useMemo(() => {
-    return state.targetModels.map((m) => {
+    return sortModels(state.targetModels).map((m) => {
       const id = m.id || m.identifier || '';
-      const hasName = m.name && m.name !== m.id && m.name !== m.identifier;
-      const namePart = hasName ? m.name : m.identifier || m.id;
-      const label = m.connectionName
-        ? `${m.connectionName} - ${namePart}`
-        : namePart;
       return {
         value: id,
-        label,
+        label: modelDisplayLabel(m),
         subtitle: m.kind || undefined,
       };
     });
@@ -203,7 +198,7 @@ export function MapStep({ state, dispatch, onNext, onBack }: MapStepProps) {
           <ShieldCheck size={16} className="mt-0.5 flex-shrink-0 text-omni-700" />
           <div>
             <p className="text-sm font-semibold text-omni-800">
-              {state.sameInstance ? 'Same-instance model remap' : 'Cross-instance dashboard copy'}
+              {state.sameInstance ? 'Same-instance model / connection remap' : 'Cross-instance dashboard copy'}
             </p>
             <p className="mt-1 text-xs leading-relaxed text-omni-700">
               Active connection is the source: <span className="font-mono">{sourceHost || 'current instance'}</span>.

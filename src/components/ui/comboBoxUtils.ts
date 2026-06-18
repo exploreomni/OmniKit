@@ -10,7 +10,8 @@ export function filterComboBoxOptions(options: ComboBoxOption[], search: string)
   return options.filter(
     (option) =>
       option.label.toLowerCase().includes(query) ||
-      option.value.toLowerCase().includes(query)
+      option.value.toLowerCase().includes(query) ||
+      option.subtitle?.toLowerCase().includes(query)
   );
 }
 

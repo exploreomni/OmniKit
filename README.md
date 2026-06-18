@@ -44,8 +44,8 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 
 | Tool | Version | Notes |
 | --- | --- | --- |
-| Node.js | 20 or newer | CI validates Node 20. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
-| npm | 10 or newer (bundled with current Node LTS) | Yarn or pnpm also work. |
+| Node.js | 24 or newer | Required for the built-in `node:sqlite` job-history store. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
+| npm | 11 or newer (bundled with current Node 24) | Yarn or pnpm also work. |
 | Browser | Any modern Chromium, Firefox, or Safari | |
 | Omni instance | Reachable from your machine | You also need a personal API key. |
 
