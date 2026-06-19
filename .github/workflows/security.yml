@@ -28,8 +28,8 @@ jobs:
       - name: Run security regression tests
         run: npm run test:security
 
-      - name: Run fan-out wizard tests
-        run: npm run test:fanout
+      - name: Run dashboard migration tests
+        run: npm run test:dashboard-migration
 
       - name: Run migration planner tests
         run: npm run test:migration-planner
@@ -39,6 +39,9 @@ jobs:
 
       - name: Run instance dashboard tests
         run: npm run test:instance-dashboard
+
+      - name: Run user health tests
+        run: npm run test:user-health
 
       - name: Run dashboard downloads tests
         run: npm run test:dashboard-downloads
