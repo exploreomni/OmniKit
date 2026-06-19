@@ -42,6 +42,16 @@ export interface OmniModelRecord {
   deletedAt?: string | null;
 }
 
+export interface OmniListModelsOptions {
+  modelKind?: string;
+  connectionId?: string;
+  baseModelId?: string;
+  modelId?: string;
+  name?: string;
+  includeDeleted?: boolean;
+  include?: string;
+}
+
 export interface OmniFolderRecord {
   id: string;
   name: string;
@@ -55,9 +65,13 @@ export interface OmniDocumentRecord {
   id: string;
   identifier: string;
   name: string;
+  connectionId?: string;
   folderId?: string;
   folderPath?: string;
   baseModelId?: string;
+  baseModelName?: string;
+  topicNames?: string[];
+  topicIds?: string[];
   type?: string;
   hasDashboard?: boolean | null;
   description?: string | null;
@@ -86,6 +100,15 @@ export interface OmniModelYamlResponse {
   files: Record<string, string>;
   checksums?: Record<string, string>;
   raw: unknown;
+}
+
+export interface OmniModelTopicRecord {
+  name: string;
+  label?: string;
+  description?: string;
+  fileName?: string;
+  yaml?: string;
+  checksum?: string;
 }
 
 export interface OmniModelBranchResult {
@@ -578,7 +601,10 @@ export class OmniClient {
     }).filter((model) => model.id);
   }
 
-  async listModels(modelKind = 'SHARED'): Promise<OmniModelRecord[]> {
+  async listModels(modelKindOrOptions: string | OmniListModelsOptions = 'SHARED'): Promise<OmniModelRecord[]> {
+    const options: OmniListModelsOptions = typeof modelKindOrOptions === 'string'
+      ? { modelKind: modelKindOrOptions }
+      : modelKindOrOptions;
     const all: unknown[] = [];
     let cursor: string | undefined;
     let pages = 0;
@@ -588,7 +614,13 @@ export class OmniClient {
           pageSize: 100,
           sortField: 'name',
           sortDirection: 'asc',
-          modelKind,
+          modelKind: options.modelKind || 'SHARED',
+          connectionId: options.connectionId,
+          baseModelId: options.baseModelId,
+          modelId: options.modelId,
+          name: options.name,
+          includeDeleted: options.includeDeleted === true ? true : undefined,
+          include: options.include,
           cursor,
         },
       });
@@ -710,6 +742,7 @@ export class OmniClient {
         id,
         identifier: id,
         name: String(row.name ?? ''),
+        connectionId: firstString(row.connectionId, row.connection_id, nested(row, 'connection', 'id')),
         folderId: firstString(row.folderId, row.folder_id, nested(row, 'folder', 'id')),
         folderPath: firstString(row.folderPath, row.folder_path, row.path, nested(row, 'folder', 'path')),
         baseModelId: firstString(
@@ -823,6 +856,28 @@ export class OmniClient {
     return data.files;
   }
 
+  async listModelTopics(modelId: string, options: { includeYaml?: boolean; includeChecksums?: boolean } = {}): Promise<OmniModelTopicRecord[]> {
+    const yaml = await this.getModelYaml(modelId, { includeChecksums: options.includeChecksums });
+    return Object.entries(yaml.files)
+      .filter(([filePath]) => filePath.split('/').pop()?.endsWith('.topic'))
+      .map(([filePath, content]) => {
+        const fileName = filePath.split('/').pop() || filePath;
+        const name = fileName.replace(/\.topic$/, '');
+        const label = firstString(content.match(/^label:\s*["']?(.+?)["']?\s*$/m)?.[1]);
+        const description = firstString(content.match(/^description:\s*["']?(.+?)["']?\s*$/m)?.[1]);
+        return {
+          name,
+          ...(label ? { label } : {}),
+          ...(description ? { description } : {}),
+          fileName: filePath,
+          ...(options.includeYaml ? { yaml: content } : {}),
+          ...(yaml.checksums?.[filePath] ? { checksum: yaml.checksums[filePath] } : {}),
+        };
+      })
+      .filter((topic) => topic.name)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
   async getModelYaml(modelId: string, options: {
     branchId?: string;
     fileName?: string;
@@ -886,7 +941,7 @@ export class OmniClient {
     modelId: string;
     fileName: string;
     yaml: string;
-    branchId: string;
+    branchId?: string;
     previousChecksum?: string;
     commitMessage?: string;
   }): Promise<unknown> {

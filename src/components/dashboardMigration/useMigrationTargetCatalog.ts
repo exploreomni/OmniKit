@@ -5,7 +5,7 @@ import {
   type InstanceFolder,
 } from '@/services/opsConsole';
 import { compareCatalogText, folderDisplayLabel, sortModels } from '../../utils/catalogSort';
-import type { TargetCatalog, TargetDraft } from './fanoutTypes';
+import type { DashboardMigrationTargetCatalog, DashboardMigrationTargetDraft } from './dashboardMigrationTypes';
 
 function flattenFolders(folders: InstanceFolder[], prefix = ''): InstanceFolder[] {
   const rows: InstanceFolder[] = [];
@@ -17,8 +17,8 @@ function flattenFolders(folders: InstanceFolder[], prefix = ''): InstanceFolder[
   return rows;
 }
 
-export function useTargetCatalog() {
-  const [catalogs, setCatalogs] = useState<Record<string, TargetCatalog>>({});
+export function useMigrationTargetCatalog() {
+  const [catalogs, setCatalogs] = useState<Record<string, DashboardMigrationTargetCatalog>>({});
 
   const loadCatalog = useCallback(async (instanceId: string, options?: { force?: boolean }) => {
     if (!instanceId) return null;
@@ -28,12 +28,13 @@ export function useTargetCatalog() {
     setCatalogs((prev) => ({
       ...prev,
       [instanceId]: {
-        models: prev[instanceId]?.models || [],
+        connections: prev[instanceId]?.connections || [],
+        models: [],
         folders: prev[instanceId]?.folders || [],
         loading: true,
         loaded: prev[instanceId]?.loaded || false,
         error: '',
-      },
+      } as DashboardMigrationTargetCatalog,
     }));
     try {
       const [modelsRes, foldersRes] = await Promise.all([
@@ -41,29 +42,31 @@ export function useTargetCatalog() {
         listInstanceFolders(instanceId),
       ]);
       const next = {
+        connections: [],
         models: sortModels(modelsRes.models),
         folders: flattenFolders(foldersRes.folders)
           .sort((a, b) => compareCatalogText(folderDisplayLabel(a), folderDisplayLabel(b))),
         loading: false,
         loaded: true,
         error: '',
-      };
+      } as DashboardMigrationTargetCatalog;
       setCatalogs((prev) => ({ ...prev, [instanceId]: next }));
       return next;
     } catch (error) {
       const next = {
-        models: current?.models || [],
+        connections: current?.connections || [],
+        models: [],
         folders: current?.folders || [],
         loading: false,
         loaded: false,
         error: error instanceof Error ? error.message : 'Could not load target models and folders.',
-      };
+      } as DashboardMigrationTargetCatalog;
       setCatalogs((prev) => ({ ...prev, [instanceId]: next }));
       return next;
     }
   }, [catalogs]);
 
-  const hydrateTargetFromCatalog = useCallback((target: TargetDraft, catalog: TargetCatalog | null | undefined): TargetDraft => {
+  const hydrateTargetFromCatalog = useCallback((target: DashboardMigrationTargetDraft, catalog: DashboardMigrationTargetCatalog | null | undefined): DashboardMigrationTargetDraft => {
     if (!catalog) return target;
     const model = catalog.models.find((row) => row.id === target.targetModelId);
     const folder = catalog.folders.find((row) => row.id === target.targetFolderId || row.path === target.targetFolderPath);

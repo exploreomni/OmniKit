@@ -23,7 +23,7 @@ import {
   isAiRefusalText,
   shouldRunAiDialectPass,
 } from '../server/services/modelMigration/aiTranslation';
-import type { OmniDocumentRecord } from '../server/services/omniClient';
+import { OmniClient, type OmniDocumentRecord } from '../server/services/omniClient';
 
 function document(id: string, patch: Partial<OmniDocumentRecord>): OmniDocumentRecord {
   return {
@@ -91,6 +91,67 @@ test('builds per-model inventory without dropping workbook-only documents', () =
     unknownCount: 0,
     documents: [],
   });
+});
+
+test('OmniClient listModels sends connection-scoped model filters to Omni', async (t) => {
+  let requestedUrl = '';
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request, init?: RequestInit) => {
+    requestedUrl = String(url);
+    assert.equal((init?.headers as Record<string, string>)?.Authorization, 'Bearer test-token');
+    return new Response(JSON.stringify({
+      records: [{
+        id: 'model-a',
+        name: 'Model A',
+        connectionId: 'connection-a',
+        modelKind: 'SHARED',
+      }],
+      pageInfo: { hasNextPage: false },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  const client = new OmniClient({
+    label: 'Test',
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: 'test-token',
+  });
+  const models = await client.listModels({ modelKind: 'SHARED', connectionId: 'connection-a' });
+  const url = new URL(requestedUrl);
+
+  assert.equal(url.pathname, '/api/v1/models');
+  assert.equal(url.searchParams.get('modelKind'), 'SHARED');
+  assert.equal(url.searchParams.get('connectionId'), 'connection-a');
+  assert.deepEqual(models.map((model) => model.connectionId), ['connection-a']);
+});
+
+test('OmniClient listFolderDocuments preserves document connection metadata', async (t) => {
+  let requestedUrl = '';
+  t.mock.method(globalThis, 'fetch', async (url: string | URL | Request) => {
+    requestedUrl = String(url);
+    return new Response(JSON.stringify({
+      records: [{
+        identifier: 'coffee-shop-demo',
+        name: 'Coffee Shop Demo',
+        connectionId: 'coffee-connection',
+        folder: { id: 'folder-1', path: 'omni-training' },
+        labels: ['training'],
+      }],
+      pageInfo: { hasNextPage: false },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  });
+
+  const client = new OmniClient({
+    label: 'Test',
+    baseUrl: 'https://example.omniapp.co',
+    apiKey: 'document-test-token',
+  });
+  const documents = await client.listFolderDocuments('folder-1', true);
+  const url = new URL(requestedUrl);
+
+  assert.equal(url.pathname, '/api/v1/documents');
+  assert.equal(url.searchParams.get('folderId'), 'folder-1');
+  assert.equal(url.searchParams.get('include'), 'labels');
+  assert.equal(documents[0].connectionId, 'coffee-connection');
+  assert.equal(documents[0].folderPath, 'omni-training');
 });
 
 test('schema-map rewrite and branch normalization are deterministic', () => {

@@ -16,6 +16,8 @@ interface DocumentLike {
   folderId?: string;
   baseModelId?: string | null;
   baseModelName?: string | null;
+  topicNames?: string[];
+  topicIds?: string[];
   connectionName?: string | null;
   labels?: LabelLike[];
 }
@@ -145,6 +147,8 @@ export function dashboardMatchesSearch(document: DocumentLike, query: string): b
     document.folderId,
     document.baseModelName,
     document.baseModelId,
+    ...(document.topicNames || []),
+    ...(document.topicIds || []),
     document.connectionName,
     ...(document.labels || []).map(labelText),
   ].some((value) => value?.toLowerCase().includes(normalized));

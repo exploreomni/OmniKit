@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { buildEmbedActivity } from '../server/handlers/instance-dashboard';
+import { buildEmbedActivity, groupEntityName } from '../server/handlers/instance-dashboard';
 import type { OmniEmbedUserRecord } from '../server/services/omniClient';
 
 function user(
@@ -40,4 +40,17 @@ test('embed-user activity excludes filtered users and counts login windows', () 
   assert.equal(activity.neverLoggedIn, 1);
   assert.equal(activity.weeklyLogins.reduce((sum, row) => sum + row.count, 0), 3);
   assert.ok(activity.monthlySignups.reduce((sum, row) => sum + row.count, 0) >= 3);
+});
+
+test('embed-user entity grouping falls back to non-generic group labels when no separator is configured', () => {
+  assert.equal(groupEntityName(user('coffee', {
+    groups: [
+      { display: 'All Users', value: 'all' },
+      { display: 'ATX - Coffee Shop Demo', value: 'coffee-group' },
+    ],
+  })), 'ATX - Coffee Shop Demo');
+
+  assert.equal(groupEntityName(user('separator', {
+    groups: [{ display: 'Beta Co :: Viewers', value: 'beta-group' }],
+  }), '::'), 'Beta Co');
 });

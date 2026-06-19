@@ -19,7 +19,9 @@ export type JobItemKind =
   | 'export'
   | 'import'
   | 'metadata'
+  | 'topic_prepare'
   | 'post_action'
+  | 'source_delete'
   | 'model_fast_path'
   | 'model_translate'
   | 'model_branch_create'
@@ -99,10 +101,13 @@ export interface InstanceDocument {
   id: string;
   identifier: string;
   name: string;
+  connectionId?: string;
   folderId?: string;
   folderPath?: string;
   baseModelId?: string;
   baseModelName?: string;
+  topicNames?: string[];
+  topicIds?: string[];
   description?: string | null;
   labels?: string[];
   updatedAt?: string;
@@ -122,6 +127,13 @@ export interface InstanceModel {
   createdAt?: string;
   updatedAt?: string;
   deletedAt?: string | null;
+}
+
+export interface InstanceTopic {
+  name: string;
+  label?: string;
+  description?: string;
+  fileName?: string;
 }
 
 export interface ModelMigratorConnection {
@@ -305,9 +317,12 @@ interface MetricCache {
 }
 
 export interface MigrationPlanStep {
+  routeGroupId?: string;
+  routeGroupName?: string;
   targetId?: string;
   destinationId: string;
   destinationLabel: string;
+  targetConnectionId?: string;
   targetModelId?: string;
   targetModelName?: string;
   targetFolderId?: string;
@@ -317,18 +332,26 @@ export interface MigrationPlanStep {
   documentName?: string;
   replacement?: boolean;
   warnings?: string[];
+  notices?: string[];
+  blocked?: boolean;
+  error?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface MigrationPlan {
   sourceId: string;
   sourceLabel: string;
+  sourceConnectionId?: string;
   destinationIds: string[];
   targets: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed: boolean;
+  deleteSourceOnSuccess: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
   steps: MigrationPlanStep[];
 }
 
@@ -336,10 +359,29 @@ export interface MigrationTarget {
   id: string;
   destinationInstanceId: string;
   destinationLabel?: string;
+  targetConnectionId?: string;
   targetModelId: string;
   targetModelName?: string;
   targetFolderId?: string;
   targetFolderPath?: string;
+  topicMappings?: MigrationTopicMapping[];
+}
+
+export interface MigrationRouteGroup {
+  id: string;
+  name: string;
+  documentIds: string[];
+  targets: MigrationTarget[];
+}
+
+export type MigrationTopicMappingAction = 'map_existing' | 'copy_source';
+
+export interface MigrationTopicMapping {
+  sourceTopicName: string;
+  sourceTopicId?: string;
+  action: MigrationTopicMappingAction;
+  targetTopicName: string;
+  targetTopicLabel?: string;
 }
 
 export interface MigrationJobItem {
@@ -347,6 +389,8 @@ export interface MigrationJobItem {
   jobId: string;
   destinationId: string;
   destinationLabel: string;
+  routeGroupId?: string;
+  routeGroupName?: string;
   targetId?: string;
   targetModelId?: string;
   targetModelName?: string;
@@ -358,6 +402,7 @@ export interface MigrationJobItem {
   status: JobItemStatus;
   error?: string;
   warnings?: string[];
+  notices?: string[];
   startedAt?: number;
   endedAt?: number;
   exportHash?: string;
@@ -372,13 +417,17 @@ export interface MigrationJob {
   workflow?: MigrationWorkflow;
   sourceId: string;
   sourceLabel: string;
+  sourceConnectionId?: string;
   destinationIds: string[];
   targets?: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed: boolean;
+  deleteSourceOnSuccess: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
   parentJobId?: string;
@@ -419,13 +468,17 @@ export function isVaultApiKeyReference(value: string): boolean {
 
 export interface MigrationJobInput {
   sourceId: string;
+  sourceConnectionId?: string;
   destinationIds?: string[];
   targets: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed?: boolean;
+  deleteSourceOnSuccess?: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
   postMigrationActions: PostMigrationAction[];
 }
 
@@ -600,10 +653,12 @@ export async function connectSavedInstance(id: string) {
   );
 }
 
-export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string; includeModelDetails?: boolean } = {}) {
+export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string; connectionId?: string; allFolders?: boolean; includeModelDetails?: boolean } = {}) {
   const params = new URLSearchParams();
   if (options.folderId) params.set('folderId', options.folderId);
   if (options.folderPath) params.set('folderPath', options.folderPath);
+  if (options.connectionId) params.set('connectionId', options.connectionId);
+  if (options.allFolders) params.set('allFolders', 'true');
   if (options.includeModelDetails) params.set('includeModelDetails', 'true');
   const query = params.toString();
   return apiFetch<{ documents: InstanceDocument[] }>(
@@ -611,8 +666,16 @@ export async function listInstanceDocuments(id: string, options: { folderId?: st
   );
 }
 
-export async function listInstanceModels(id: string) {
-  return apiFetch<{ models: InstanceModel[] }>(`/api/instances/${encodeURIComponent(id)}/models?modelKind=SHARED`);
+export async function listInstanceModels(id: string, options: { connectionId?: string } = {}) {
+  const params = new URLSearchParams({ modelKind: 'SHARED' });
+  if (options.connectionId) params.set('connectionId', options.connectionId);
+  return apiFetch<{ models: InstanceModel[] }>(`/api/instances/${encodeURIComponent(id)}/models?${params.toString()}`);
+}
+
+export async function listInstanceModelTopics(id: string, modelId: string) {
+  return apiFetch<{ topics: InstanceTopic[] }>(
+    `/api/instances/${encodeURIComponent(id)}/models/${encodeURIComponent(modelId)}/topics`,
+  );
 }
 
 export async function listModelMigratorConnections(instanceId: string) {

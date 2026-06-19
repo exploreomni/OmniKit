@@ -1,5 +1,5 @@
 import type { PostMigrationAction } from './nativeVault';
-import type { MigrationJob, MigrationJobItem, MigrationTarget } from './migrationJobs';
+import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget } from './migrationJobs';
 
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi;
@@ -62,6 +62,7 @@ export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
     documentName: item.documentName ? redactSensitiveText(item.documentName) : item.documentName,
     error: item.error ? redactSensitiveText(item.error) : item.error,
     warnings: item.warnings?.map(redactSensitiveText),
+    notices: item.notices?.map(redactSensitiveText),
     importedIdentifier: item.importedIdentifier ? redactSensitiveText(item.importedIdentifier) : item.importedIdentifier,
     importedDocumentId: item.importedDocumentId ? redactSensitiveText(item.importedDocumentId) : item.importedDocumentId,
     details: sanitizeDetails(item.details),
@@ -77,12 +78,21 @@ export function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarge
   };
 }
 
+export function sanitizeMigrationRouteGroup(group: MigrationRouteGroup): MigrationRouteGroup {
+  return {
+    ...group,
+    name: redactSensitiveText(group.name),
+    targets: group.targets.map(sanitizeMigrationTarget),
+  };
+}
+
 export function sanitizeJob(job: MigrationJob): MigrationJob {
   return {
     ...job,
     sourceLabel: redactSensitiveText(job.sourceLabel),
     sourceFolderPath: job.sourceFolderPath ? redactSensitiveText(job.sourceFolderPath) : job.sourceFolderPath,
     targets: job.targets?.map(sanitizeMigrationTarget),
+    routeGroups: job.routeGroups?.map(sanitizeMigrationRouteGroup),
     postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
     details: sanitizeDetails(job.details),
     items: job.items.map(sanitizeJobItem),

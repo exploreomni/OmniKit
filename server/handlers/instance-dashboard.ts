@@ -31,11 +31,20 @@ function matchesFilter(value: string, contains: string[], exact: string[]): bool
   return contains.some((pattern) => normalized.includes(pattern)) || exact.some((pattern) => normalized === pattern);
 }
 
-function groupEntityName(user: OmniEmbedUserRecord, separator?: string): string {
-  if (!separator) return '';
-  const group = user.groups.find((row) => row.display.includes(separator));
-  if (!group) return '';
-  return group.display.split(separator)[0]?.trim() ?? '';
+const GENERIC_GROUP_NAMES = new Set(['all users', 'all embed users', 'everyone', 'users', 'admins', 'administrators']);
+
+export function groupEntityName(user: OmniEmbedUserRecord, separator?: string): string {
+  if (separator) {
+    const group = user.groups.find((row) => row.display.includes(separator));
+    if (!group) return '';
+    return group.display.split(separator)[0]?.trim() ?? '';
+  }
+
+  const group = user.groups.find((row) => {
+    const display = row.display.trim();
+    return display && !GENERIC_GROUP_NAMES.has(display.toLowerCase());
+  });
+  return group?.display.trim() || '';
 }
 
 function parseDateMs(value: string | null | undefined): number | null {

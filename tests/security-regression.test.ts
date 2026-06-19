@@ -39,11 +39,15 @@ import {
   subscribeMigrationJobEvents,
   type MigrationJobEvent,
 } from '../server/services/jobEvents';
-import { hydrateVaultCredentialReferences } from '../server/apiMiddleware';
 import {
-  draftContainsForbiddenKeys,
-  sanitizeFanoutDraftForStorage,
-} from '../src/components/migrateFanout/fanoutStorage';
+  apiRouteFromUrl,
+  apiWebRequestUrl,
+  hydrateVaultCredentialReferences,
+} from '../server/apiMiddleware';
+import {
+  dashboardMigrationDraftContainsForbiddenKeys,
+  sanitizeDashboardMigrationDraftForStorage,
+} from '../src/components/dashboardMigration/dashboardMigrationStorage';
 import {
   getConnectionCacheKey,
   hasActiveSavedVaultConnection,
@@ -93,6 +97,18 @@ class MemoryStorage {
   }
 }
 
+test('api middleware preserves query params for handler requests while stripping them for route matching', () => {
+  const rawUrl = '/api/instances/source-1/documents?folderPath=just-for-fun&connectionId=nfl-connection&includeModelDetails=true';
+  const route = apiRouteFromUrl(rawUrl);
+  const webUrl = new URL(apiWebRequestUrl(rawUrl, '127.0.0.1:5175'));
+
+  assert.equal(route, 'instances/source-1/documents');
+  assert.equal(webUrl.pathname, '/api/instances/source-1/documents');
+  assert.equal(webUrl.searchParams.get('folderPath'), 'just-for-fun');
+  assert.equal(webUrl.searchParams.get('connectionId'), 'nfl-connection');
+  assert.equal(webUrl.searchParams.get('includeModelDetails'), 'true');
+});
+
 function makeStoredJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
   const createdAt = Date.now();
   return {
@@ -109,6 +125,7 @@ function makeStoredJob(overrides: Partial<MigrationJob> = {}): MigrationJob {
     documentIds: ['doc-1'],
     emptyFirst: false,
     replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
     postMigrationActions: [],
     status: 'running',
     createdAt,
@@ -490,26 +507,26 @@ test('legacy vault import rejects unsafe paths before file reads', () => {
   );
 });
 
-test('fan-out wizard draft stores only non-secret IDs and paths', () => {
-  const sanitized = sanitizeFanoutDraftForStorage({
+test('dashboard migration draft stores only non-secret IDs and paths', () => {
+  const sanitized = sanitizeDashboardMigrationDraftForStorage({
     step: 1,
     sourceId: 'source-instance',
-    sourceModelId: 'model-1',
+    sourceConnectionId: 'source-connection',
     sourceFolderId: 'source-folder-1',
     sourceFolderPath: 'Executive Dashboards',
     selectedDocumentIds: ['doc-1', 'doc-1', 'doc-2'],
-    emptyFirst: false,
     replaceSameNamed: true,
-    metadataOnly: true,
-    refreshSchemaAfterImport: true,
+    emptyFirst: false,
+    refreshSchemaOnComplete: true,
+    deleteSourceOnSuccess: true,
     targets: [{
       id: 'target-1',
       destinationInstanceId: 'destination-instance',
+      targetConnectionId: 'target-connection',
       targetModelId: 'model-2',
       targetModelName: 'Target Model',
       targetFolderPath: 'Executive Dashboards/Migrated',
       targetFolderId: 'folder-1',
-      selectedActionIndexes: [0, 1],
       apiKey: 'omni_live_secret',
       baseUrl: 'https://secret.example.omniapp.co',
     } as never],
@@ -521,11 +538,13 @@ test('fan-out wizard draft stores only non-secret IDs and paths', () => {
   assert.equal(serialized.includes('secret.example'), false);
   assert.equal(serialized.includes('do not store me'), false);
   assert.deepEqual(sanitized.selectedDocumentIds, ['doc-1', 'doc-2']);
-  assert.equal(sanitized.refreshSchemaAfterImport, true);
   assert.equal(sanitized.replaceSameNamed, true);
+  assert.equal(sanitized.emptyFirst, false);
+  assert.equal(sanitized.refreshSchemaOnComplete, true);
+  assert.equal(sanitized.deleteSourceOnSuccess, true);
   assert.equal(sanitized.sourceFolderPath, 'Executive Dashboards');
-  assert.equal(draftContainsForbiddenKeys(sanitized), false);
-  assert.equal(draftContainsForbiddenKeys({ ...sanitized, apiKey: 'secret' }), true);
+  assert.equal(dashboardMigrationDraftContainsForbiddenKeys(sanitized), false);
+  assert.equal(dashboardMigrationDraftContainsForbiddenKeys({ ...sanitized, apiKey: 'secret' }), true);
 });
 
 test('model migrator review draft stores translation state without plaintext secrets', () => {
@@ -618,6 +637,7 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
     documentIds: ['doc-1'],
     emptyFirst: false,
     replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
     postMigrationActions: [{
       name: 'Notify 4111 1111 1111 1111',
       method: 'POST',
@@ -706,6 +726,7 @@ test('local job history file does not store plaintext secrets or common sensitiv
     documentIds: ['doc-1'],
     emptyFirst: false,
     replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
     postMigrationActions: [{
       name: 'Notify',
       method: 'POST',
@@ -1197,6 +1218,7 @@ test('model migration merge requires successful validation before branch merge',
         }],
         content: [],
         replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
         postMigrationActions: [],
       },
     },
@@ -1335,6 +1357,7 @@ test('model migration merge records PR handoff without forcing protected git set
         }],
         content: [],
         replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
         postMigrationActions: [],
       },
     },

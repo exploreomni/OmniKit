@@ -8,6 +8,7 @@ import {
   listJobs,
   retryMigrationJob,
   runPostMigrationAction,
+  type MigrationRouteGroup,
   type MigrationTarget,
 } from '../services/migrationJobs';
 import { subscribeMigrationJobEvents } from '../services/jobEvents';
@@ -70,6 +71,23 @@ function parseActions(value: unknown): PostMigrationAction[] {
     .filter((action) => action.kind === 'refresh-schema' ? Boolean(action.targetModelId) : Boolean(action.url));
 }
 
+function parseTopicMappings(value: unknown): MigrationTarget['topicMappings'] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((mapping): mapping is Record<string, unknown> => Boolean(mapping) && typeof mapping === 'object' && !Array.isArray(mapping))
+    .map((mapping) => {
+      const action = mapping.action === 'copy_source' ? 'copy_source' as const : 'map_existing' as const;
+      return {
+        sourceTopicName: cleanString(mapping.sourceTopicName) || '',
+        sourceTopicId: cleanString(mapping.sourceTopicId),
+        action,
+        targetTopicName: cleanString(mapping.targetTopicName) || '',
+        targetTopicLabel: cleanString(mapping.targetTopicLabel),
+      };
+    })
+    .filter((mapping) => mapping.sourceTopicName && mapping.targetTopicName);
+}
+
 function parseTargets(value: unknown): MigrationTarget[] {
   if (!Array.isArray(value)) return [];
   return value
@@ -81,26 +99,45 @@ function parseTargets(value: unknown): MigrationTarget[] {
         id: cleanString(target.id) || `${destinationInstanceId}:${targetModelId}:${index}`,
         destinationInstanceId,
         destinationLabel: cleanString(target.destinationLabel),
+        targetConnectionId: cleanString(target.targetConnectionId),
         targetModelId,
         targetModelName: cleanString(target.targetModelName),
         targetFolderId: cleanString(target.targetFolderId),
         targetFolderPath: cleanString(target.targetFolderPath),
+        topicMappings: parseTopicMappings(target.topicMappings),
       };
     })
     .filter((target) => target.destinationInstanceId);
+}
+
+function parseRouteGroups(value: unknown): MigrationRouteGroup[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((group): group is Record<string, unknown> => Boolean(group) && typeof group === 'object' && !Array.isArray(group))
+    .map((group, index) => ({
+      id: cleanString(group.id) || `route-group-${index + 1}`,
+      name: cleanString(group.name) || `Route group ${index + 1}`,
+      documentIds: parseStringArray(group.documentIds),
+      targets: parseTargets(group.targets),
+    }))
+    .filter((group) => group.documentIds.length > 0 && group.targets.length > 0);
 }
 
 function parseJobInput(body: Record<string, unknown>) {
   const targets = parseTargets(body.targets);
   return {
     sourceId: cleanString(body.sourceId) || '',
+    sourceConnectionId: cleanString(body.sourceConnectionId),
     destinationIds: parseStringArray(body.destinationIds),
     targets,
+    routeGroups: parseRouteGroups(body.routeGroups),
     documentIds: parseStringArray(body.documentIds),
     emptyFirst: body.emptyFirst === true,
     replaceSameNamed: body.replaceSameNamed !== false,
+    deleteSourceOnSuccess: body.deleteSourceOnSuccess === true,
     sourceFolderId: cleanString(body.sourceFolderId),
     sourceFolderPath: cleanString(body.sourceFolderPath),
+    sourceAllFolders: body.sourceAllFolders === true,
     postMigrationActions: parseActions(body.postMigrationActions),
   };
 }
@@ -192,10 +229,14 @@ export default async function handler(req: Request): Promise<Response> {
 
     if (req.method === 'POST' && parts[0] === 'preview') {
       const input = parseJobInput(await bodyJson(req));
-      if (!input.sourceId || (input.targets.length === 0 && input.destinationIds.length === 0) || input.documentIds.length === 0) {
+      const requestTargets = [...input.targets, ...input.routeGroups.flatMap((group) => group.targets)];
+      if (!input.sourceId || (requestTargets.length === 0 && input.destinationIds.length === 0) || input.documentIds.length === 0) {
         return json({ error: 'Select one source, at least one migration target, and at least one dashboard.' }, 400);
       }
-      if (input.targets.some((target) => !target.targetModelId)) {
+      if (requestTargets.some((target) => !target.targetConnectionId)) {
+        return json({ error: 'Choose a target connection for every migration target before running preflight.' }, 400);
+      }
+      if (requestTargets.some((target) => !target.targetModelId)) {
         return json({ error: 'Choose a target model for every migration target before running preflight.' }, 400);
       }
       const plan = await buildMigrationPlan(input);
@@ -214,10 +255,14 @@ export default async function handler(req: Request): Promise<Response> {
 
     if (req.method === 'POST' && parts.length === 0) {
       const input = parseJobInput(await bodyJson(req));
-      if (!input.sourceId || (input.targets.length === 0 && input.destinationIds.length === 0) || input.documentIds.length === 0) {
+      const requestTargets = [...input.targets, ...input.routeGroups.flatMap((group) => group.targets)];
+      if (!input.sourceId || (requestTargets.length === 0 && input.destinationIds.length === 0) || input.documentIds.length === 0) {
         return json({ error: 'Select one source, at least one migration target, and at least one dashboard.' }, 400);
       }
-      if (input.targets.some((target) => !target.targetModelId)) {
+      if (requestTargets.some((target) => !target.targetConnectionId)) {
+        return json({ error: 'Choose a target connection for every migration target before starting the import.' }, 400);
+      }
+      if (requestTargets.some((target) => !target.targetModelId)) {
         return json({ error: 'Choose a target model for every migration target before starting the import.' }, 400);
       }
       const job = await createMigrationJob(input);

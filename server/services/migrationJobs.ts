@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OmniClient, OmniClientError } from './omniClient';
+import { OmniClient, OmniClientError, type OmniDocumentRecord } from './omniClient';
 import {
   getInstance,
   type PostMigrationAction,
@@ -42,7 +42,9 @@ export type JobItemKind =
   | 'export'
   | 'import'
   | 'metadata'
+  | 'topic_prepare'
   | 'post_action'
+  | 'source_delete'
   | 'model_fast_path'
   | 'model_translate'
   | 'model_branch_create'
@@ -58,6 +60,8 @@ export type JobItemKind =
 export interface MigrationJobItem {
   id: string;
   jobId: string;
+  routeGroupId?: string;
+  routeGroupName?: string;
   targetId?: string;
   destinationId: string;
   destinationLabel: string;
@@ -72,6 +76,7 @@ export interface MigrationJobItem {
   status: JobItemStatus;
   error?: string;
   warnings?: string[];
+  notices?: string[];
   startedAt?: number;
   endedAt?: number;
   exportHash?: string;
@@ -85,13 +90,17 @@ export interface MigrationJob {
   workflow?: MigrationWorkflow;
   sourceId: string;
   sourceLabel: string;
+  sourceConnectionId?: string;
   destinationIds: string[];
   targets?: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed: boolean;
+  deleteSourceOnSuccess: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
   postMigrationActions: PostMigrationAction[];
   status: JobStatus;
   parentJobId?: string;
@@ -103,9 +112,12 @@ export interface MigrationJob {
 }
 
 export interface MigrationPlanStep {
+  routeGroupId?: string;
+  routeGroupName?: string;
   targetId?: string;
   destinationId: string;
   destinationLabel: string;
+  targetConnectionId?: string;
   targetModelId?: string;
   targetModelName?: string;
   targetFolderId?: string;
@@ -115,18 +127,26 @@ export interface MigrationPlanStep {
   documentName?: string;
   replacement?: boolean;
   warnings?: string[];
+  notices?: string[];
+  blocked?: boolean;
+  error?: string;
+  details?: Record<string, unknown>;
 }
 
 export interface MigrationPlan {
   sourceId: string;
   sourceLabel: string;
+  sourceConnectionId?: string;
   destinationIds: string[];
   targets: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed: boolean;
+  deleteSourceOnSuccess: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
   steps: MigrationPlanStep[];
 }
 
@@ -134,10 +154,29 @@ export interface MigrationTarget {
   id: string;
   destinationInstanceId: string;
   destinationLabel?: string;
+  targetConnectionId?: string;
   targetModelId: string;
   targetModelName?: string;
   targetFolderId?: string;
   targetFolderPath?: string;
+  topicMappings?: MigrationTopicMapping[];
+}
+
+export interface MigrationRouteGroup {
+  id: string;
+  name: string;
+  documentIds: string[];
+  targets: MigrationTarget[];
+}
+
+export type MigrationTopicMappingAction = 'map_existing' | 'copy_source';
+
+export interface MigrationTopicMapping {
+  sourceTopicName: string;
+  sourceTopicId?: string;
+  action: MigrationTopicMappingAction;
+  targetTopicName: string;
+  targetTopicLabel?: string;
 }
 
 interface SourceMeta {
@@ -222,11 +261,16 @@ function createItem(jobId: string, destination: SavedInstance, step: Omit<Migrat
   return {
     id: randomUUID(),
     jobId,
+    routeGroupId: step.routeGroupId,
+    routeGroupName: step.routeGroupName,
     targetId: step.targetId,
     destinationId: destination.id,
     destinationLabel: destination.label,
     targetModelId: step.targetModelId,
     targetModelName: step.targetModelName,
+    details: step.targetConnectionId || step.details
+      ? { ...(step.targetConnectionId ? { targetConnectionId: step.targetConnectionId } : {}), ...(step.details || {}) }
+      : undefined,
     targetFolderId: step.targetFolderId,
     targetFolderPath: step.targetFolderPath,
     kind: step.kind,
@@ -235,6 +279,8 @@ function createItem(jobId: string, destination: SavedInstance, step: Omit<Migrat
     replacement: step.replacement,
     status: 'pending',
     warnings: step.warnings,
+    notices: step.notices,
+    error: step.error,
   };
 }
 
@@ -353,9 +399,16 @@ function isOmniFormulaFunctionRef(value: string): boolean {
   return namespace?.toLowerCase() === 'omni' && /^OMNI_FX_/i.test(member || '');
 }
 
+function isSqlOperatorFunctionRef(value: string): boolean {
+  const [namespace] = normalizeFieldRef(value).split('.');
+  return namespace?.toLowerCase() === 'sqlstdoperatortable';
+}
+
 function isLikelyFieldRef(value: string): boolean {
   const normalized = normalizeFieldRef(value);
-  return !isOmniFormulaFunctionRef(normalized) && /^[A-Za-z_][\w/]*\.[A-Za-z_][\w]*$/.test(normalized);
+  return !isOmniFormulaFunctionRef(normalized)
+    && !isSqlOperatorFunctionRef(normalized)
+    && /^[A-Za-z_][\w/]*\.[A-Za-z_][\w]*$/.test(normalized);
 }
 
 function extractFieldRefsFromString(value: string, onlyIfFieldLike = false): string[] {
@@ -451,6 +504,283 @@ function formatFieldList(fields: string[], limit = 8): string {
   return remaining > 0 ? `${shown}, +${remaining} more` : shown;
 }
 
+function folderScopeAvailable(folderId?: string, folderPath?: string): boolean {
+  return Boolean(folderId?.trim() || folderPath?.trim());
+}
+
+function documentLooksInDefaultFolder(document: Pick<OmniDocumentRecord, 'folderId' | 'folderPath'>): boolean {
+  const folderPath = normalizeFolderPath(document.folderPath);
+  if (folderPath) return folderPath === 'default' || folderPath === 'my documents' || folderPath === 'my documents/default';
+  return !document.folderId?.trim();
+}
+
+function documentKeyMatches(document: Pick<OmniDocumentRecord, 'id' | 'identifier'>, keys: Set<string>): boolean {
+  return [document.id, document.identifier].some((value) => Boolean(value && keys.has(value)));
+}
+
+interface SourceTopicRef {
+  name: string;
+  id?: string;
+}
+
+interface TopicRewriteResult {
+  payload: Record<string, unknown>;
+  replacementCount: number;
+  replacements: Array<{ from: string; to: string }>;
+}
+
+const TOPIC_SCALAR_KEYS = new Set([
+  'topic',
+  'topicname',
+  'topic_name',
+  'topicid',
+  'topic_id',
+  'topicidentifier',
+  'topic_identifier',
+  'topickey',
+  'topic_key',
+  'joinpathsfromtopicname',
+  'join_paths_from_topic_name',
+]);
+
+const TOPIC_ARRAY_KEYS = new Set([
+  'topicnames',
+  'topic_names',
+  'topicids',
+  'topic_ids',
+  'topicidentifiers',
+  'topic_identifiers',
+  'topics',
+]);
+
+function normalizeTopicValue(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  if (!trimmed) return undefined;
+  return trimmed;
+}
+
+function topicKey(value: unknown): string | undefined {
+  return normalizeTopicValue(value)?.toLowerCase();
+}
+
+function normalizeTopicMappings(value: MigrationTopicMapping[] | undefined): MigrationTopicMapping[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((mapping) => {
+      const sourceTopicName = normalizeTopicValue(mapping.sourceTopicName) || '';
+      const sourceTopicId = normalizeTopicValue(mapping.sourceTopicId);
+      const targetTopicName = normalizeTopicValue(mapping.targetTopicName) || '';
+      const action: MigrationTopicMappingAction = mapping.action === 'copy_source' ? 'copy_source' : 'map_existing';
+      return {
+        sourceTopicName,
+        ...(sourceTopicId ? { sourceTopicId } : {}),
+        action,
+        targetTopicName,
+        ...(normalizeTopicValue(mapping.targetTopicLabel) ? { targetTopicLabel: normalizeTopicValue(mapping.targetTopicLabel) } : {}),
+      };
+    })
+    .filter((mapping) => mapping.sourceTopicName && mapping.targetTopicName);
+}
+
+function addTopicRef(topics: Map<string, SourceTopicRef>, name?: unknown, id?: unknown): void {
+  const cleanName = normalizeTopicValue(name);
+  const cleanId = normalizeTopicValue(id);
+  const topicName = cleanName || cleanId;
+  if (!topicName) return;
+  const key = topicKey(cleanId) || topicKey(topicName);
+  if (!key || topics.has(key)) return;
+  topics.set(key, {
+    name: topicName,
+    ...(cleanId ? { id: cleanId } : {}),
+  });
+}
+
+function collectTopicRefs(payload: unknown, document?: { topicNames?: string[]; topicIds?: string[] }): SourceTopicRef[] {
+  const topics = new Map<string, SourceTopicRef>();
+  const maxLength = Math.max(document?.topicNames?.length || 0, document?.topicIds?.length || 0);
+  for (let index = 0; index < maxLength; index += 1) {
+    addTopicRef(topics, document?.topicNames?.[index], document?.topicIds?.[index]);
+  }
+
+  function walk(value: unknown, maxDepth = 10): void {
+    if (maxDepth <= 0 || !value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) walk(item, maxDepth - 1);
+      return;
+    }
+    const record = value as Record<string, unknown>;
+    addTopicRef(topics, record.topicName, record.topicId);
+    addTopicRef(topics, record.topic_name, record.topic_id);
+    addTopicRef(topics, record.topic, record.topicIdentifier || record.topic_identifier || record.topicKey || record.topic_key);
+    addTopicRef(topics, record.join_paths_from_topic_name);
+    addTopicRef(topics, record.joinPathsFromTopicName);
+    if (record.topic && typeof record.topic === 'object' && !Array.isArray(record.topic)) {
+      const topic = record.topic as Record<string, unknown>;
+      addTopicRef(topics, topic.name || topic.label, topic.id || topic.identifier || topic.name);
+    }
+    for (const key of ['topicNames', 'topic_names', 'topicIds', 'topic_ids', 'topicIdentifiers', 'topic_identifiers', 'topics']) {
+      const raw = record[key];
+      if (!Array.isArray(raw)) continue;
+      for (const item of raw) {
+        if (typeof item === 'string') addTopicRef(topics, item);
+        else if (item && typeof item === 'object' && !Array.isArray(item)) {
+          const topic = item as Record<string, unknown>;
+          addTopicRef(topics, topic.name || topic.label, topic.id || topic.identifier || topic.name);
+        }
+      }
+    }
+    for (const child of Object.values(record)) walk(child, maxDepth - 1);
+  }
+
+  walk(payload);
+  return [...topics.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function findStringByKey(obj: unknown, keys: string[], maxDepth = 8): string | undefined {
+  if (maxDepth <= 0) return undefined;
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = findStringByKey(item, keys, maxDepth - 1);
+      if (found) return found;
+    }
+    return undefined;
+  }
+  if (!obj || typeof obj !== 'object') return undefined;
+  const record = obj as Record<string, unknown>;
+  for (const key of keys) {
+    const value = normalizeTopicValue(record[key]);
+    if (value) return value;
+  }
+  for (const value of Object.values(record)) {
+    const found = findStringByKey(value, keys, maxDepth - 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+function extractDashboardModelId(payload: unknown): string | undefined {
+  return findStringByKey(payload, [
+    'sharedModelId',
+    'shared_model_id',
+    'baseModelId',
+    'base_model_id',
+    'modelId',
+    'model_id',
+  ]);
+}
+
+function mappingForSourceTopic(topic: SourceTopicRef, mappings: MigrationTopicMapping[]): MigrationTopicMapping | undefined {
+  const sourceKeys = [topic.id, topic.name].map(topicKey).filter((value): value is string => Boolean(value));
+  return mappings.find((mapping) => {
+    const mappingKeys = [mapping.sourceTopicId, mapping.sourceTopicName].map(topicKey).filter((value): value is string => Boolean(value));
+    return mappingKeys.some((key) => sourceKeys.includes(key));
+  });
+}
+
+function exactTargetTopic(
+  topic: SourceTopicRef,
+  targetTopics: Array<{ name: string; label?: string }>,
+): { name: string; label?: string } | undefined {
+  const sourceKeys = [topic.id, topic.name].map(topicKey).filter((value): value is string => Boolean(value));
+  return targetTopics.find((target) => [target.name, target.label].map(topicKey).some((key) => key && sourceKeys.includes(key)));
+}
+
+function topicYamlLabel(yaml: string): string | undefined {
+  return normalizeTopicValue(yaml.match(/^label:\s*["']?(.+?)["']?\s*$/m)?.[1]);
+}
+
+function findSourceTopicYaml(
+  topics: Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>,
+  topic: SourceTopicRef,
+): { name: string; yaml: string; fileName?: string; checksum?: string } | undefined {
+  const sourceKeys = [topic.id, topic.name].map(topicKey).filter((value): value is string => Boolean(value));
+  const match = topics.find((candidate) => {
+    const label = candidate.yaml ? topicYamlLabel(candidate.yaml) : candidate.label;
+    const candidateKeys = [candidate.name, candidate.label, label, candidate.fileName?.split('/').pop()?.replace(/\.topic$/, '')]
+      .map(topicKey)
+      .filter((value): value is string => Boolean(value));
+    return candidateKeys.some((key) => sourceKeys.includes(key));
+  });
+  return match?.yaml ? { name: match.name, yaml: match.yaml, fileName: match.fileName, checksum: match.checksum } : undefined;
+}
+
+function targetTopicExists(targetTopics: Array<{ name: string; label?: string }>, targetTopicName: string): boolean {
+  const targetKey = topicKey(targetTopicName);
+  return Boolean(targetKey && targetTopics.some((topic) => [topic.name, topic.label].map(topicKey).includes(targetKey)));
+}
+
+function extractTopicViewReferences(yaml: string): string[] {
+  const refs = new Set<string>();
+  const fieldPattern = /\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)/g;
+  for (const match of yaml.matchAll(fieldPattern)) refs.add(match[1]);
+  const scalarPattern = /^\s*(?:base_view_name|left_view_name|right_view_name|view_name):\s*["']?([A-Za-z_][\w/]*)["']?\s*$/gm;
+  for (const match of yaml.matchAll(scalarPattern)) refs.add(match[1]);
+  return [...refs].sort();
+}
+
+function targetViewNamesFromFieldUniverse(fields: Set<string>): Set<string> {
+  const names = new Set<string>();
+  for (const field of fields) {
+    const [viewName] = field.split('.');
+    if (viewName) names.add(viewName);
+  }
+  return names;
+}
+
+function buildTopicRewriteMap(mappings: MigrationTopicMapping[]): Map<string, string> {
+  const rewriteMap = new Map<string, string>();
+  for (const mapping of mappings) {
+    const target = normalizeTopicValue(mapping.targetTopicName);
+    if (!target) continue;
+    for (const source of [mapping.sourceTopicName, mapping.sourceTopicId]) {
+      const cleanSource = normalizeTopicValue(source);
+      if (cleanSource && cleanSource !== target) rewriteMap.set(cleanSource, target);
+    }
+  }
+  return rewriteMap;
+}
+
+function rewriteDashboardTopicReferences(payload: Record<string, unknown>, mappings: MigrationTopicMapping[]): TopicRewriteResult {
+  const rewriteMap = buildTopicRewriteMap(mappings);
+  if (rewriteMap.size === 0) return { payload, replacementCount: 0, replacements: [] };
+  let replacementCount = 0;
+  const replacements: Array<{ from: string; to: string }> = [];
+
+  function replaceString(value: string): string {
+    const target = rewriteMap.get(value);
+    if (!target) return value;
+    replacementCount += 1;
+    replacements.push({ from: value, to: target });
+    return target;
+  }
+
+  function walk(value: unknown, keyHint = '', maxDepth = 16): unknown {
+    if (maxDepth <= 0) return value;
+    const normalizedKey = keyHint.toLowerCase();
+    const isTopicScalar = TOPIC_SCALAR_KEYS.has(normalizedKey);
+    const isTopicArray = TOPIC_ARRAY_KEYS.has(normalizedKey);
+    if (typeof value === 'string') return isTopicScalar || isTopicArray ? replaceString(value) : value;
+    if (Array.isArray(value)) {
+      return value.map((item) => (
+        typeof item === 'string' && isTopicArray ? replaceString(item) : walk(item, keyHint, maxDepth - 1)
+      ));
+    }
+    if (!value || typeof value !== 'object') return value;
+    const record = value as Record<string, unknown>;
+    return Object.fromEntries(Object.entries(record).map(([key, item]) => [
+      key,
+      walk(item, key, maxDepth - 1),
+    ]));
+  }
+
+  return {
+    payload: walk(payload) as Record<string, unknown>,
+    replacementCount,
+    replacements,
+  };
+}
+
 function normalizeTargets(input: {
   targets?: MigrationTarget[];
   destinationIds?: string[];
@@ -471,10 +801,12 @@ function normalizeTargets(input: {
         id: target.id || `${destination.id}:${targetModelId}:${index}`,
         destinationInstanceId: destination.id,
         destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId?.trim(),
         targetModelId,
         targetModelName: target.targetModelName?.trim() || targetModelId,
         targetFolderId: explicitFolderId || (explicitFolderPath ? undefined : destination.defaultFolderId),
         targetFolderPath: explicitFolderPath || destination.defaultFolderPath,
+        topicMappings: normalizeTopicMappings(target.topicMappings),
       };
     });
   }
@@ -488,12 +820,42 @@ function normalizeTargets(input: {
       id: `${destination.id}:${destination.defaultModelId}`,
       destinationInstanceId: destination.id,
       destinationLabel: destination.label,
+      targetConnectionId: undefined,
       targetModelId: destination.defaultModelId,
       targetModelName: destination.defaultModelId,
       targetFolderId: destination.defaultFolderId,
       targetFolderPath: destination.defaultFolderPath,
+      topicMappings: [],
     };
   });
+}
+
+function normalizeRouteGroups(input: {
+  routeGroups?: MigrationRouteGroup[];
+  targets?: MigrationTarget[];
+  destinationIds?: string[];
+  documentIds: string[];
+}): MigrationRouteGroup[] {
+  if (Array.isArray(input.routeGroups) && input.routeGroups.length > 0) {
+    return input.routeGroups.map((group, index) => {
+      const documentIds = [...new Set((group.documentIds || []).map((id) => id.trim()).filter(Boolean))];
+      const targets = normalizeTargets({ targets: group.targets });
+      if (documentIds.length === 0) throw new Error(`Choose at least one dashboard for route group ${group.name || index + 1}.`);
+      if (targets.length === 0) throw new Error(`Choose at least one target for route group ${group.name || index + 1}.`);
+      return {
+        id: group.id?.trim() || `route-group-${index + 1}`,
+        name: group.name?.trim() || `Route group ${index + 1}`,
+        documentIds,
+        targets,
+      };
+    });
+  }
+  return [{
+    id: 'default-route',
+    name: 'All selected dashboards',
+    documentIds: [...new Set(input.documentIds.map((id) => id.trim()).filter(Boolean))],
+    targets: normalizeTargets(input),
+  }];
 }
 
 export function listJobs(): MigrationJob[] {
@@ -510,52 +872,129 @@ export function clearJobs(): void {
 
 export async function buildMigrationPlan(input: {
   sourceId: string;
+  sourceConnectionId?: string;
   destinationIds?: string[];
   targets?: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed?: boolean;
+  deleteSourceOnSuccess?: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
 }): Promise<MigrationPlan> {
   const source = requireInstance(input.sourceId);
-  const targets = normalizeTargets(input);
+  const routeGroups = normalizeRouteGroups(input);
+  const targetsById = new Map<string, MigrationTarget>();
+  for (const target of routeGroups.flatMap((group) => group.targets)) {
+    if (!targetsById.has(target.id)) targetsById.set(target.id, target);
+  }
+  const targets = [...targetsById.values()];
+  const sourceDocumentIds = [...new Set(routeGroups.flatMap((group) => group.documentIds))];
   const sourceClient = new OmniClient(source);
-  const sourceFolderId = input.sourceFolderId?.trim() || source.defaultFolderId;
-  const sourceFolderPath = input.sourceFolderPath?.trim() || source.defaultFolderPath;
+  const sourceAllFolders = input.sourceAllFolders === true;
+  const sourceFolderId = sourceAllFolders ? undefined : input.sourceFolderId?.trim() || source.defaultFolderId;
+  const sourceFolderPath = sourceAllFolders ? undefined : input.sourceFolderPath?.trim() || source.defaultFolderPath;
   const replaceSameNamed = input.replaceSameNamed !== false;
   const sourceDocs = await listDocumentsForFolder(sourceClient, sourceFolderId, sourceFolderPath, true);
-  const selected = sourceDocs.filter((doc) => input.documentIds.includes(doc.identifier));
-  const missing = input.documentIds.filter((id) => !selected.some((doc) => doc.identifier === id));
+  const selected = sourceDocs.filter((doc) => sourceDocumentIds.includes(doc.identifier) || sourceDocumentIds.includes(doc.id));
+  const selectedByKey = new Map<string, OmniDocumentRecord>();
+  for (const doc of selected) {
+    selectedByKey.set(doc.identifier, doc);
+    selectedByKey.set(doc.id, doc);
+  }
+  const missing = sourceDocumentIds.filter((id) => !selectedByKey.has(id));
   if (missing.length > 0) throw new Error(`Source documents not found: ${missing.join(', ')}`);
-  const selectedNames = new Set(selected.map((doc) => doc.name).filter(Boolean));
+  const selectedSourceDocumentKeys = new Set(selected.flatMap((doc) => [doc.id, doc.identifier]).filter(Boolean));
 
   const steps: MigrationPlanStep[] = [];
   const deleteStepKeys = new Set<string>();
   const exportCache = new Map<string, Record<string, unknown>>();
   const fieldRefCache = new Map<string, string[]>();
-  for (const target of targets) {
+  const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
+
+  function sourceTopicCatalog(modelId: string) {
+    const cached = sourceTopicCatalogCache.get(modelId);
+    if (cached) return cached;
+    const next = sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true });
+    sourceTopicCatalogCache.set(modelId, next);
+    return next;
+  }
+
+  for (const routeGroup of routeGroups) {
+    const groupSelectedByIdentifier = new Map<string, OmniDocumentRecord>();
+    for (const documentId of routeGroup.documentIds) {
+      const doc = selectedByKey.get(documentId);
+      if (doc) groupSelectedByIdentifier.set(doc.identifier, doc);
+    }
+    const groupSelected = [...groupSelectedByIdentifier.values()];
+    const selectedNames = new Set(groupSelected.map((doc) => doc.name).filter(Boolean));
+
+    for (const target of routeGroup.targets) {
     const destination = requireInstance(target.destinationInstanceId);
     const destinationClient = new OmniClient(destination);
-    const existing = await listDocumentsForFolder(
-      destinationClient,
-      target.targetFolderId,
-      target.targetFolderPath || destination.defaultFolderPath,
-    );
+    const cleanupNotices: string[] = [];
+    const cleanupFolderPath = target.targetFolderPath || destination.defaultFolderPath;
+    const cleanupCanBeScoped = folderScopeAvailable(target.targetFolderId, cleanupFolderPath);
+    const canUseDefaultReplacementFallback = !input.emptyFirst && replaceSameNamed && !cleanupCanBeScoped;
+    let existing: OmniDocumentRecord[] = [];
+    if (input.emptyFirst || replaceSameNamed) {
+      if (cleanupCanBeScoped) {
+        existing = await listDocumentsForFolder(
+          destinationClient,
+          target.targetFolderId,
+          cleanupFolderPath,
+        );
+      } else if (canUseDefaultReplacementFallback) {
+        existing = (await listDocumentsForFolder(destinationClient))
+          .filter((document) => selectedNames.has(document.name) && documentLooksInDefaultFolder(document));
+      } else {
+        cleanupNotices.push('Target cleanup was skipped because the selected target folder is the default My Documents area and OmniKit cannot scope replacement deletes safely.');
+      }
+    }
     const destinationWarnings: string[] = [];
+    const targetTopicWarnings: string[] = [];
     const targetFields = await loadTargetFieldUniverse(destinationClient, target.targetModelId);
+    const targetViewNames = targetViewNamesFromFieldUniverse(targetFields.fields);
     if (targetFields.warning) destinationWarnings.push(targetFields.warning);
+    const hasCreateTopicMappings = (target.topicMappings || []).some((mapping) => mapping.action === 'copy_source');
+    let targetModelRecord: { gitConfigured?: boolean; pullRequestRequired?: boolean; gitProtected?: boolean } | undefined;
+    if (hasCreateTopicMappings) {
+      try {
+        const targetModels = await destinationClient.listModels({ modelKind: 'SHARED', connectionId: target.targetConnectionId });
+        targetModelRecord = targetModels.find((model) => (
+          [model.id, model.identifier, model.baseModelId, model.name].some((value) => value === target.targetModelId)
+        ));
+      } catch (error) {
+        targetTopicWarnings.push(`Target model editability could not be checked: ${error instanceof Error ? error.message : String(error)}.`);
+      }
+    }
+    let targetTopics: Array<{ name: string; label?: string }> | null = null;
+
+    async function loadTargetTopicsForPreflight(): Promise<Array<{ name: string; label?: string }>> {
+      if (targetTopics) return targetTopics;
+      targetTopics = await destinationClient.listModelTopics(target.targetModelId);
+      return targetTopics;
+    }
 
     for (const existingDoc of existing) {
       const replacingExistingDoc = !input.emptyFirst && replaceSameNamed && selectedNames.has(existingDoc.name);
       if (!input.emptyFirst && !replacingExistingDoc) continue;
+      if (destination.id === source.id && documentKeyMatches(existingDoc, selectedSourceDocumentKeys)) {
+        cleanupNotices.push(`Skipped target cleanup for selected source dashboard ${existingDoc.name} because source and target are the same Omni instance.`);
+        continue;
+      }
       const deleteKey = `${destination.id}:${existingDoc.identifier}`;
       if (deleteStepKeys.has(deleteKey)) continue;
       deleteStepKeys.add(deleteKey);
       steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
         targetId: target.id,
         destinationId: destination.id,
         destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
         targetModelId: target.targetModelId,
         targetModelName: target.targetModelName,
         targetFolderId: target.targetFolderId,
@@ -567,12 +1006,17 @@ export async function buildMigrationPlan(input: {
       });
     }
 
-    for (const doc of selected) {
+    for (const doc of groupSelected) {
+      const cleanupStepNotices = [...new Set(cleanupNotices)];
       let compatibilityWarnings = [...destinationWarnings];
+      let topicWarnings = [...targetTopicWarnings];
+      let resolvedTopicMappings: MigrationTopicMapping[] = [];
+      let sourceTopics: SourceTopicRef[] = [];
+      const topicBlockers: string[] = [];
       try {
         let refs = fieldRefCache.get(doc.identifier);
+        let payload = exportCache.get(doc.identifier);
         if (!refs) {
-          let payload = exportCache.get(doc.identifier);
           if (!payload) {
             payload = await sourceClient.exportDocument(doc.identifier);
             exportCache.set(doc.identifier, payload);
@@ -580,22 +1024,101 @@ export async function buildMigrationPlan(input: {
           refs = extractDashboardFieldRefs(payload);
           fieldRefCache.set(doc.identifier, refs);
         }
-        if (refs.length === 0) {
+        if (!payload) {
+          payload = await sourceClient.exportDocument(doc.identifier);
+          exportCache.set(doc.identifier, payload);
+        }
+        const sourceModelId = doc.baseModelId || extractDashboardModelId(payload);
+        const sameTargetModel = Boolean(sourceModelId && sourceModelId === target.targetModelId);
+        if (!sameTargetModel && refs.length === 0) {
           compatibilityWarnings.push('No dashboard field references were detected in the export payload. Review the imported dashboard in Omni before publishing.');
-        } else if (targetFields.fields.size > 0) {
+        } else if (!sameTargetModel && targetFields.fields.size > 0) {
           const missingFields = refs.filter((field) => !targetFields.fields.has(field));
           if (missingFields.length > 0) {
             compatibilityWarnings.push(`${missingFields.length} referenced fields were not found in the destination model: ${formatFieldList(missingFields)}.`);
           }
         }
+        sourceTopics = collectTopicRefs(payload, doc);
+        if (sourceTopics.length > 0) {
+          let targetTopicRows: Array<{ name: string; label?: string }> = [];
+          try {
+            targetTopicRows = await loadTargetTopicsForPreflight();
+          } catch (error) {
+            topicBlockers.push(`Target topic catalog could not be loaded: ${error instanceof Error ? error.message : String(error)}.`);
+          }
+          for (const topic of sourceTopics) {
+            const explicitMapping = mappingForSourceTopic(topic, target.topicMappings || []);
+            const exact = exactTargetTopic(topic, targetTopicRows);
+            const mapping = explicitMapping || (exact ? {
+              sourceTopicName: topic.name,
+              sourceTopicId: topic.id,
+              action: 'map_existing' as const,
+              targetTopicName: exact.name,
+              targetTopicLabel: exact.label,
+            } : undefined);
+            if (!mapping) {
+              topicBlockers.push(`Topic ${topic.name} is used by ${doc.name} but is not mapped for ${destination.label}.`);
+              continue;
+            }
+            if (mapping.action === 'map_existing') {
+              if (!targetTopicExists(targetTopicRows, mapping.targetTopicName)) {
+                topicBlockers.push(`Mapped target topic ${mapping.targetTopicName} was not found in ${target.targetModelName || target.targetModelId}.`);
+                continue;
+              }
+              resolvedTopicMappings.push(mapping);
+              continue;
+            }
+            if (!sourceModelId) {
+              topicBlockers.push(`Cannot create target topic ${mapping.targetTopicName} because the source model ID could not be detected.`);
+              continue;
+            }
+            if (targetModelRecord?.pullRequestRequired || targetModelRecord?.gitProtected) {
+              topicBlockers.push(`Cannot create target topic ${mapping.targetTopicName} directly because ${target.targetModelName || target.targetModelId} requires protected branch or pull-request YAML changes.`);
+              continue;
+            }
+            if (targetModelRecord?.gitConfigured) {
+              topicWarnings.push(`Target model ${target.targetModelName || target.targetModelId} is git configured; created topic YAML may require Omni-side review after import.`);
+            }
+            if (targetTopicExists(targetTopicRows, mapping.targetTopicName)) {
+              topicBlockers.push(`Target topic ${mapping.targetTopicName} already exists. Use the existing topic or enter a new topic name.`);
+              continue;
+            }
+            try {
+              const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
+              const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
+              if (!sourceTopicYaml) {
+                topicBlockers.push(`Source topic YAML was not found for ${topic.name} in model ${sourceModelId}.`);
+                continue;
+              }
+              const viewRefs = extractTopicViewReferences(sourceTopicYaml.yaml);
+              if (viewRefs.length > 0 && targetViewNames.size > 0) {
+                const missingViews = viewRefs.filter((viewName) => !targetViewNames.has(viewName));
+                if (missingViews.length > 0) {
+                  topicWarnings.push(`Copied topic ${topic.name} references target views that were not detected: ${formatFieldList(missingViews)}.`);
+                }
+              }
+              resolvedTopicMappings.push(mapping);
+            } catch (error) {
+              topicBlockers.push(`Source topic ${topic.name} could not be inspected: ${error instanceof Error ? error.message : String(error)}.`);
+            }
+          }
+          resolvedTopicMappings = [...new Map(resolvedTopicMappings.map((mapping) => [
+            `${mapping.sourceTopicId || mapping.sourceTopicName}:${mapping.targetTopicName}`,
+            mapping,
+          ])).values()];
+        }
       } catch (error) {
         compatibilityWarnings.push(`Compatibility preflight could not inspect ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
       }
       compatibilityWarnings = [...new Set(compatibilityWarnings)];
+      topicWarnings = [...new Set(topicWarnings)];
       steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
         targetId: target.id,
         destinationId: destination.id,
         destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
         targetModelId: target.targetModelId,
         targetModelName: target.targetModelName,
         targetFolderId: target.targetFolderId,
@@ -604,10 +1127,37 @@ export async function buildMigrationPlan(input: {
         documentId: doc.identifier,
         documentName: doc.name,
       });
+      if (sourceTopics.length > 0 || topicBlockers.length > 0) {
+        steps.push({
+          routeGroupId: routeGroup.id,
+          routeGroupName: routeGroup.name,
+          targetId: target.id,
+          destinationId: destination.id,
+          destinationLabel: destination.label,
+          targetConnectionId: target.targetConnectionId,
+          targetModelId: target.targetModelId,
+          targetModelName: target.targetModelName,
+          targetFolderId: target.targetFolderId,
+          targetFolderPath: target.targetFolderPath,
+          kind: 'topic_prepare',
+          documentId: doc.identifier,
+          documentName: doc.name,
+          blocked: topicBlockers.length > 0,
+          error: topicBlockers.length > 0 ? topicBlockers.join(' ') : undefined,
+          warnings: topicWarnings.length > 0 ? topicWarnings : undefined,
+          details: {
+            sourceTopics,
+            topicMappings: resolvedTopicMappings,
+          },
+        });
+      }
       steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
         targetId: target.id,
         destinationId: destination.id,
         destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
         targetModelId: target.targetModelId,
         targetModelName: target.targetModelName,
         targetFolderId: target.targetFolderId,
@@ -616,11 +1166,18 @@ export async function buildMigrationPlan(input: {
         documentId: doc.identifier,
         documentName: doc.name,
         warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
+        notices: cleanupStepNotices.length > 0 ? cleanupStepNotices : undefined,
+        blocked: topicBlockers.length > 0,
+        error: topicBlockers.length > 0 ? 'Dashboard import is blocked until topic mappings are resolved.' : undefined,
+        details: resolvedTopicMappings.length > 0 ? { topicMappings: resolvedTopicMappings } : undefined,
       });
       steps.push({
+        routeGroupId: routeGroup.id,
+        routeGroupName: routeGroup.name,
         targetId: target.id,
         destinationId: destination.id,
         destinationLabel: destination.label,
+        targetConnectionId: target.targetConnectionId,
         targetModelId: target.targetModelId,
         targetModelName: target.targetModelName,
         targetFolderId: target.targetFolderId,
@@ -630,53 +1187,89 @@ export async function buildMigrationPlan(input: {
         documentName: doc.name,
       });
     }
+    }
+  }
+
+  if (input.deleteSourceOnSuccess) {
+    for (const doc of selected) {
+      steps.push({
+        destinationId: source.id,
+        destinationLabel: source.label,
+        kind: 'source_delete',
+        documentId: doc.identifier,
+        documentName: doc.name,
+      });
+    }
   }
 
   return {
     sourceId: input.sourceId,
     sourceLabel: source.label,
+    sourceConnectionId: input.sourceConnectionId?.trim(),
     destinationIds: [...new Set(targets.map((target) => target.destinationInstanceId))],
     targets,
-    documentIds: input.documentIds,
+    routeGroups,
+    documentIds: sourceDocumentIds,
     emptyFirst: input.emptyFirst,
     replaceSameNamed,
+    deleteSourceOnSuccess: input.deleteSourceOnSuccess === true,
     sourceFolderId,
     sourceFolderPath,
+    sourceAllFolders,
     steps,
   };
 }
 
 export async function createMigrationJob(input: {
   sourceId: string;
+  sourceConnectionId?: string;
   destinationIds?: string[];
   targets?: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
   emptyFirst: boolean;
   replaceSameNamed?: boolean;
+  deleteSourceOnSuccess?: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
   postMigrationActions: PostMigrationAction[];
   parentJobId?: string;
 }): Promise<MigrationJob> {
   const source = requireInstance(input.sourceId);
   const plan = await buildMigrationPlan(input);
+  const blockedStep = plan.steps.find((step) => step.blocked || step.error);
+  if (blockedStep) {
+    throw new Error(blockedStep.error || 'Migration plan has unresolved blockers.');
+  }
   const jobId = randomUUID();
   const items = plan.steps.map((step) => createItem(jobId, requireInstance(step.destinationId), step));
   const job: MigrationJob = {
     id: jobId,
     sourceId: input.sourceId,
     sourceLabel: source.label,
+    sourceConnectionId: plan.sourceConnectionId,
     destinationIds: plan.destinationIds,
     targets: plan.targets,
-    documentIds: input.documentIds,
+    routeGroups: plan.routeGroups,
+    documentIds: plan.documentIds,
     emptyFirst: input.emptyFirst,
     replaceSameNamed: input.replaceSameNamed !== false,
+    deleteSourceOnSuccess: input.deleteSourceOnSuccess === true,
     sourceFolderId: plan.sourceFolderId,
     sourceFolderPath: plan.sourceFolderPath,
+    sourceAllFolders: plan.sourceAllFolders,
     postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
     status: 'pending',
     parentJobId: input.parentJobId,
     createdAt: Date.now(),
+    details: {
+      operationMode: 'copy_import',
+      sourceConnectionId: plan.sourceConnectionId,
+      sourceAllFolders: plan.sourceAllFolders === true,
+      routeGroupCount: plan.routeGroups?.length || 0,
+      deleteSourceOnSuccess: input.deleteSourceOnSuccess === true,
+    },
     items,
   };
   activePostMigrationActions.set(jobId, input.postMigrationActions);
@@ -862,6 +1455,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
     documentIds: contentIds,
     emptyFirst: false,
     replaceSameNamed: input.replaceSameNamed !== false,
+    deleteSourceOnSuccess: false,
     postMigrationActions: input.postMigrationActions.map(sanitizePostMigrationAction),
     status: 'pending',
     parentJobId: input.parentJobId,
@@ -925,7 +1519,7 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
   }
   const failedImports = parent.items.filter((item) => {
     if (options.destinationId && item.destinationId !== options.destinationId) return false;
-    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export');
+    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export' || item.kind === 'topic_prepare');
   });
   const targetsById = new Map<string, MigrationTarget>();
   for (const item of failedImports) {
@@ -947,14 +1541,45 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
   const targets = [...targetsById.values()].filter((target) => target.targetModelId);
   const documentIds = [...new Set(failedImports.map((item) => item.documentId).filter((item): item is string => Boolean(item)))];
   if (targets.length === 0 || documentIds.length === 0) throw new Error('No failed import/export items to retry.');
+  const routeGroupsById = new Map<string, {
+    id: string;
+    name: string;
+    documentIds: Set<string>;
+    targetsById: Map<string, MigrationTarget>;
+  }>();
+  for (const item of failedImports) {
+    if (!item.routeGroupId || !item.documentId) continue;
+    const route = parent.routeGroups?.find((group) => group.id === item.routeGroupId);
+    const target = route?.targets.find((candidate) => candidate.id === item.targetId)
+      || parent.targets?.find((candidate) => candidate.id === item.targetId);
+    if (!target?.targetModelId) continue;
+    const group = routeGroupsById.get(item.routeGroupId) || {
+      id: item.routeGroupId,
+      name: item.routeGroupName || route?.name || item.routeGroupId,
+      documentIds: new Set<string>(),
+      targetsById: new Map<string, MigrationTarget>(),
+    };
+    group.documentIds.add(item.documentId);
+    group.targetsById.set(target.id, target);
+    routeGroupsById.set(item.routeGroupId, group);
+  }
+  const routeGroups = [...routeGroupsById.values()].map((group) => ({
+    id: group.id,
+    name: group.name,
+    documentIds: [...group.documentIds],
+    targets: [...group.targetsById.values()],
+  }));
   return createMigrationJob({
     sourceId: parent.sourceId,
-    targets,
+    sourceConnectionId: parent.sourceConnectionId,
+    targets: routeGroups.length > 0 ? undefined : targets,
+    routeGroups: routeGroups.length > 0 ? routeGroups : undefined,
     documentIds,
     emptyFirst: false,
     replaceSameNamed: parent.replaceSameNamed,
     sourceFolderId: parent.sourceFolderId,
     sourceFolderPath: parent.sourceFolderPath,
+    sourceAllFolders: parent.sourceAllFolders,
     postMigrationActions: [],
     parentJobId: parent.id,
   });
@@ -1530,16 +2155,23 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const exports = new Map<string, { payload: Record<string, unknown>; hash: string }>();
   const importConsumers = new Map<string, number>();
   const sourceMeta = new Map<string, SourceMeta>();
+  const sourceDocumentDetails = new Map<string, { baseModelId?: string; topicNames?: string[]; topicIds?: string[] }>();
   const sourceLabels = new Map<string, { color?: string | null; description?: string | null }>();
   const destinationClientCache = new Map<string, OmniClient>();
   const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
   const destinationLabelCache = new Map<string, Set<string>>();
+  const preparedTopicKeys = new Set<string>();
+  const selectedSourceDocumentKeys = new Set(job.documentIds.filter(Boolean));
+  const sourceTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>>>();
+  const targetTopicCatalogCache = new Map<string, Promise<Array<{ name: string; label?: string }>>>();
 
   try {
+    const sourceFolderId = job.sourceAllFolders ? undefined : job.sourceFolderId || source.defaultFolderId;
+    const sourceFolderPath = job.sourceAllFolders ? undefined : job.sourceFolderPath || source.defaultFolderPath;
     const docs = await listDocumentsForFolder(
       sourceClient,
-      job.sourceFolderId || source.defaultFolderId,
-      job.sourceFolderPath || source.defaultFolderPath,
+      sourceFolderId,
+      sourceFolderPath,
       true,
     );
     for (const doc of docs) {
@@ -1547,6 +2179,15 @@ async function executeJob(job: MigrationJob): Promise<void> {
         description: doc.description ?? null,
         labels: doc.labels ?? [],
       });
+      sourceDocumentDetails.set(doc.identifier, {
+        baseModelId: doc.baseModelId,
+        topicNames: doc.topicNames,
+        topicIds: doc.topicIds,
+      });
+      if (selectedSourceDocumentKeys.has(doc.identifier) || selectedSourceDocumentKeys.has(doc.id)) {
+        selectedSourceDocumentKeys.add(doc.identifier);
+        selectedSourceDocumentKeys.add(doc.id);
+      }
     }
     const labels = await sourceClient.listLabels();
     for (const label of labels) sourceLabels.set(label.name, { color: label.color, description: label.description });
@@ -1560,6 +2201,33 @@ async function executeJob(job: MigrationJob): Promise<void> {
     const client = new OmniClient(destination);
     destinationClientCache.set(destination.id, client);
     return client;
+  }
+
+  function targetForItem(item: MigrationJobItem): MigrationTarget | undefined {
+    return job.targets?.find((target) => target.id === item.targetId);
+  }
+
+  function detailTopicMappings(details: Record<string, unknown> | undefined): MigrationTopicMapping[] {
+    const raw = details?.topicMappings;
+    if (!Array.isArray(raw)) return [];
+    return normalizeTopicMappings(raw as MigrationTopicMapping[]);
+  }
+
+  function sourceTopicCatalog(modelId: string) {
+    const cached = sourceTopicCatalogCache.get(modelId);
+    if (cached) return cached;
+    const next = sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true });
+    sourceTopicCatalogCache.set(modelId, next);
+    return next;
+  }
+
+  function targetTopicCatalog(destination: SavedInstance, client: OmniClient, targetModelId: string) {
+    const key = `${destination.id}:${targetModelId}`;
+    const cached = targetTopicCatalogCache.get(key);
+    if (cached) return cached;
+    const next = client.listModelTopics(targetModelId);
+    targetTopicCatalogCache.set(key, next);
+    return next;
   }
 
   function releaseExportConsumer(documentId: string | undefined): void {
@@ -1576,9 +2244,21 @@ async function executeJob(job: MigrationJob): Promise<void> {
   function skipDependentItems(documentId: string, reason: string): void {
     for (const item of job.items) {
       if (item.documentId !== documentId) continue;
-      if ((item.kind === 'import' || item.kind === 'metadata') && item.status === 'pending') {
+      if ((item.kind === 'import' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
         markAndPersistItem(item, 'skipped', { error: reason });
       }
+    }
+  }
+
+  function skipDestinationDocumentItems(failedItem: MigrationJobItem, reason: string): void {
+    if (!failedItem.documentId) return;
+    for (const item of job.items) {
+      if (item.status !== 'pending') continue;
+      if (item.documentId !== failedItem.documentId) continue;
+      if (item.targetId !== failedItem.targetId || item.destinationId !== failedItem.destinationId) continue;
+      if (item.kind !== 'import' && item.kind !== 'metadata') continue;
+      markAndPersistItem(item, 'skipped', { error: reason });
+      if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
   }
 
@@ -1612,6 +2292,86 @@ async function executeJob(job: MigrationJob): Promise<void> {
     }
   }
 
+  async function prepareDashboardTopicsForImport(
+    item: MigrationJobItem,
+    destination: SavedInstance,
+    destinationClient: OmniClient,
+    payload: Record<string, unknown>,
+    targetModelId: string,
+  ): Promise<{ warnings: string[]; details: Record<string, unknown> }> {
+    const sourceDoc = item.documentId ? sourceDocumentDetails.get(item.documentId) : undefined;
+    const sourceTopics = collectTopicRefs(payload, sourceDoc);
+    const target = targetForItem(item);
+    const configuredMappings = detailTopicMappings(item.details).length > 0
+      ? detailTopicMappings(item.details)
+      : target?.topicMappings || [];
+    const targetTopics = await targetTopicCatalog(destination, destinationClient, targetModelId);
+    const warnings: string[] = [];
+    const appliedMappings: MigrationTopicMapping[] = [];
+    const createdTopics: string[] = [];
+    const mappedTopics: string[] = [];
+
+    for (const topic of sourceTopics) {
+      const explicitMapping = mappingForSourceTopic(topic, configuredMappings);
+      const exact = exactTargetTopic(topic, targetTopics);
+      const mapping = explicitMapping || (exact ? {
+        sourceTopicName: topic.name,
+        sourceTopicId: topic.id,
+        action: 'map_existing' as const,
+        targetTopicName: exact.name,
+        targetTopicLabel: exact.label,
+      } : undefined);
+      if (!mapping) {
+        throw new Error(`Topic ${topic.name} is used by ${item.documentName || item.documentId} but is not mapped for ${destination.label}.`);
+      }
+      if (mapping.action === 'map_existing') {
+        if (!targetTopicExists(targetTopics, mapping.targetTopicName)) {
+          throw new Error(`Mapped target topic ${mapping.targetTopicName} was not found in ${targetModelId}.`);
+        }
+        mappedTopics.push(`${topic.name}->${mapping.targetTopicName}`);
+        appliedMappings.push(mapping);
+        continue;
+      }
+
+      if (targetTopicExists(targetTopics, mapping.targetTopicName)) {
+        throw new Error(`Target topic ${mapping.targetTopicName} already exists. Use the existing topic or enter a new topic name.`);
+      }
+      const sourceModelId = sourceDoc?.baseModelId || extractDashboardModelId(payload);
+      if (!sourceModelId) {
+        throw new Error(`Cannot create target topic ${mapping.targetTopicName} because the source model ID could not be detected.`);
+      }
+      const sourceTopicRows = await sourceTopicCatalog(sourceModelId);
+      const sourceTopicYaml = findSourceTopicYaml(sourceTopicRows, topic);
+      if (!sourceTopicYaml) {
+        throw new Error(`Source topic YAML was not found for ${topic.name} in model ${sourceModelId}.`);
+      }
+      const prepareKey = `${destination.id}:${targetModelId}:${mapping.targetTopicName}`;
+      if (!preparedTopicKeys.has(prepareKey)) {
+        await destinationClient.updateModelYamlFile({
+          modelId: targetModelId,
+          fileName: `${mapping.targetTopicName}.topic`,
+          yaml: sourceTopicYaml.yaml,
+          commitMessage: `OmniKit Dashboard Migrator create topic ${mapping.targetTopicName}`,
+        });
+        preparedTopicKeys.add(prepareKey);
+        createdTopics.push(mapping.targetTopicName);
+      } else {
+        warnings.push(`Topic ${mapping.targetTopicName} was already prepared for this job.`);
+      }
+      appliedMappings.push(mapping);
+    }
+
+    return {
+      warnings,
+      details: {
+        sourceTopics,
+        topicMappings: appliedMappings,
+        mappedTopics,
+        createdTopics,
+      },
+    };
+  }
+
   async function processDestinationItem(item: MigrationJobItem): Promise<void> {
     if (canceledJobs.has(job.id)) {
       markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
@@ -1625,8 +2385,30 @@ async function executeJob(job: MigrationJob): Promise<void> {
     try {
       if (item.kind === 'delete') {
         if (!item.documentId) throw new Error('Delete item missing document id.');
+        if (destination.id === source.id && selectedSourceDocumentKeys.has(item.documentId)) {
+          markAndPersistItem(item, 'skipped', {
+            error: 'Target cleanup skipped because it matched a selected source dashboard in the same Omni instance.',
+          });
+          return;
+        }
         await destinationClient.requestDeleteDocument(item.documentId);
         markAndPersistItem(item, 'succeeded');
+      } else if (item.kind === 'topic_prepare') {
+        if (!item.documentId) throw new Error('Topic preparation item missing document id.');
+        const cached = exports.get(item.documentId);
+        if (!cached) {
+          markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; topic preparation skipped.' });
+          skipDestinationDocumentItems(item, 'Topic preparation skipped because export payload was unavailable.');
+          return;
+        }
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const prepared = await prepareDashboardTopicsForImport(item, destination, destinationClient, cached.payload, targetModelId);
+        const warnings = [...(item.warnings || []), ...prepared.warnings];
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: { ...(item.details || {}), ...prepared.details },
+        });
       } else if (item.kind === 'import') {
         if (!item.documentId) throw new Error('Import item missing document id.');
         const cached = exports.get(item.documentId);
@@ -1638,8 +2420,12 @@ async function executeJob(job: MigrationJob): Promise<void> {
         const targetModelId = item.targetModelId || destination.defaultModelId;
         const targetFolderPath = item.targetFolderPath || destination.defaultFolderPath;
         if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const topicMappings = detailTopicMappings(item.details).length > 0
+          ? detailTopicMappings(item.details)
+          : targetForItem(item)?.topicMappings || [];
+        const rewritten = rewriteDashboardTopicReferences(cached.payload, topicMappings);
         const imported = await destinationClient.importDocument({
-          exportPayload: cached.payload,
+          exportPayload: rewritten.payload,
           baseModelId: targetModelId,
           folderPath: targetFolderPath,
           documentName: item.documentName || 'Untitled',
@@ -1688,6 +2474,11 @@ async function executeJob(job: MigrationJob): Promise<void> {
           importedIdentifier: identifier,
           importedDocumentId: documentId,
           warnings: warnings.length > 0 ? warnings : undefined,
+          details: {
+            ...(item.details || {}),
+            topicRewriteCount: rewritten.replacementCount,
+            topicRewrites: rewritten.replacements,
+          },
         });
         releaseExportConsumer(item.documentId);
       } else if (item.kind === 'metadata') {
@@ -1730,6 +2521,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
     } catch (error) {
       const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
       markAndPersistItem(item, 'failed', { error: message });
+      if (item.kind === 'topic_prepare') {
+        skipDestinationDocumentItems(item, `Topic preparation failed; dependent import skipped. ${message}`);
+      }
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
   }
@@ -1778,6 +2572,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
       && item.documentId === documentId
       && item.kind !== 'export'
       && item.kind !== 'delete'
+      && item.kind !== 'source_delete'
     ));
     await runGroupedDestinationItems(documentItems);
     importConsumers.delete(documentId);
@@ -1789,7 +2584,52 @@ async function executeJob(job: MigrationJob): Promise<void> {
       item.status === 'pending'
       && item.kind !== 'export'
       && item.kind !== 'delete'
+      && item.kind !== 'source_delete'
     )));
+  }
+
+  function sourceDocumentImportSucceeded(documentId: string | undefined): boolean {
+    if (!documentId) return false;
+    const imports = job.items.filter((item) => item.kind === 'import' && item.documentId === documentId);
+    return imports.length > 0 && imports.every((item) => item.status === 'succeeded' || item.status === 'warning');
+  }
+
+  function hasFailedPostMigrationAction(): boolean {
+    return job.items.some((item) => item.kind === 'post_action' && item.status === 'failed');
+  }
+
+  async function runSourceDeleteStage(): Promise<void> {
+    const sourceDeleteItems = job.items.filter((item) => item.kind === 'source_delete' && item.status === 'pending');
+    if (sourceDeleteItems.length === 0) return;
+    const postActionFailed = hasFailedPostMigrationAction();
+    for (const item of sourceDeleteItems) {
+      if (canceledJobs.has(job.id)) {
+        markAndPersistItem(item, 'skipped', { error: 'Canceled by user.' });
+        continue;
+      }
+      if (postActionFailed) {
+        markAndPersistItem(item, 'skipped', { error: 'Source delete skipped because a post-migration action failed.' });
+        continue;
+      }
+      if (!sourceDocumentImportSucceeded(item.documentId)) {
+        markAndPersistItem(item, 'skipped', { error: 'Source delete skipped because the dashboard import did not complete successfully.' });
+        continue;
+      }
+      markAndPersistItem(item, 'running');
+      try {
+        if (!item.documentId) throw new Error('Source delete item missing document id.');
+        await sourceClient.requestDeleteDocument(item.documentId);
+        markAndPersistItem(item, 'succeeded', {
+          details: {
+            operation: 'move_source_to_trash',
+            verifiedAfterImport: true,
+          },
+        });
+      } catch (error) {
+        const message = error instanceof OmniClientError || error instanceof Error ? error.message : String(error);
+        markAndPersistItem(item, 'failed', { error: message });
+      }
+    }
   }
 
   await runDeleteStage();
@@ -1809,6 +2649,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   }
 
   await runJobPostActions(job);
+  await runSourceDeleteStage();
   job.status = computeJobStatus(job.items);
   job.endedAt = Date.now();
   persistJobStatus(job);

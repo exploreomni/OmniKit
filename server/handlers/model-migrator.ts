@@ -352,7 +352,7 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'GET' && action === 'models') {
       const connectionId = cleanString(url.searchParams.get('connectionId'));
       const modelKind = cleanString(url.searchParams.get('modelKind')) || 'SHARED';
-      const models = (await client.listModels(modelKind))
+      const models = (await client.listModels({ modelKind, connectionId }))
         .filter(isActiveModel)
         .filter((model) => !connectionId || model.connectionId === connectionId);
       return json({ models });

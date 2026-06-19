@@ -1,18 +1,20 @@
 import { useSearchParams } from 'react-router-dom';
-import { Shield, Users } from 'lucide-react';
+import { Activity, Shield, Users } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { UsersPage } from '@/pages/UsersPage';
 import { GroupsPage } from '@/pages/GroupsPage';
+import { UserHealthPage } from '@/pages/UserHealthPage';
 
-type UserManagementTab = 'users' | 'groups';
+type UserManagementTab = 'users' | 'groups' | 'health';
 
 export function UserManagementPage() {
   const [searchParams, setSearchParams] = useSearchParams();
-  const activeTab = searchParams.get('tab') === 'groups' ? 'groups' : 'users';
+  const rawTab = searchParams.get('tab');
+  const activeTab: UserManagementTab = rawTab === 'groups' || rawTab === 'health' ? rawTab : 'users';
 
   function setTab(tab: UserManagementTab) {
-    setSearchParams(tab === 'groups' ? { tab } : {});
+    setSearchParams(tab === 'users' ? {} : { tab });
   }
 
   return (
@@ -44,9 +46,21 @@ export function UserManagementPage() {
           <Shield size={14} />
           Groups
         </button>
+        <button
+          type="button"
+          onClick={() => setTab('health')}
+          className={`px-4 py-2 rounded-button text-sm font-semibold transition-colors inline-flex items-center gap-2 ${
+            activeTab === 'health' ? 'bg-omni-700 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
+          }`}
+        >
+          <Activity size={14} />
+          User Health
+        </button>
       </div>
 
-      {activeTab === 'users' ? <UsersPage embedded /> : <GroupsPage embedded />}
+      {activeTab === 'users' && <UsersPage embedded />}
+      {activeTab === 'groups' && <GroupsPage embedded />}
+      {activeTab === 'health' && <UserHealthPage />}
     </div>
   );
 }

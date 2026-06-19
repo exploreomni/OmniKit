@@ -1,136 +1,16 @@
-import { useEffect } from 'react';
-import { useLocation, useNavigate } from 'react-router-dom';
-import { Stepper } from '@/components/layout/Stepper';
-import { SelectStep } from '@/components/steps/SelectStep';
-import { MapStep } from '@/components/steps/MapStep';
-import { ReviewStep } from '@/components/steps/ReviewStep';
-import { ResultsStep } from '@/components/steps/ResultsStep';
-import { FanOutWizard } from '@/components/migrateFanout/FanOutWizard';
-import { useWizard } from '@/hooks/useWizard';
-import { useConnection } from '@/contexts/ConnectionContext';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { DashboardMigrationWizard } from '@/components/dashboardMigration/DashboardMigrationWizard';
 import { Blobby } from '@/components/ui/Blobby';
-import { RequireConnection } from '@/components/layout/RequireConnection';
 
 export function MigratePage() {
-  const { state, dispatch, nextStep, prevStep, resetAll } = useWizard();
-  const { connection, isConnected } = useConnection();
-  const navigate = useNavigate();
-  const location = useLocation();
-  const mode = new URLSearchParams(location.search).get('mode') === 'copy' ? 'copy' : 'remap';
-
-  useEffect(() => {
-    if (!isConnected) return;
-    if (
-      state.source.baseUrl === connection.baseUrl &&
-      state.source.apiKey === connection.apiKey &&
-      state.source.status === 'success'
-    ) {
-      return;
-    }
-    dispatch({
-      type: 'UPDATE_SOURCE',
-      payload: {
-        baseUrl: connection.baseUrl,
-        apiKey: connection.apiKey,
-        status: 'success',
-        errorMessage: '',
-      },
-    });
-  }, [
-    isConnected,
-    connection.baseUrl,
-    connection.apiKey,
-    state.source.baseUrl,
-    state.source.apiKey,
-    state.source.status,
-    dispatch,
-  ]);
-
-  useEffect(() => {
-    function handleBeforeUnload(e: BeforeUnloadEvent) {
-      if (state.migrationInProgress || state.selectedDashboards.length > 0) {
-        e.preventDefault();
-      }
-    }
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [state.migrationInProgress, state.selectedDashboards.length]);
-
-  function renderStep() {
-    switch (state.currentStep) {
-      case 0:
-        return <SelectStep state={state} dispatch={dispatch} onNext={nextStep} onBack={() => navigate('/connect')} />;
-      case 1:
-        return <MapStep state={state} dispatch={dispatch} onNext={nextStep} onBack={prevStep} />;
-      case 2:
-        return <ReviewStep state={state} dispatch={dispatch} onBack={prevStep} />;
-      case 3:
-        return <ResultsStep state={state} onReset={resetAll} />;
-      default:
-        return null;
-    }
-  }
-
-  if (mode === 'remap' && !isConnected) {
-    return (
-      <RequireConnection>
-        <div />
-      </RequireConnection>
-    );
-  }
-
   return (
     <div className="space-y-5">
       <PageHeader
         title="Dashboard Migrator"
-        description="Pick whether dashboards should stay in this Omni instance and point to another model/connection, or be copied into a different saved Omni instance."
+        description="Copy dashboards from one Omni connection to one or more destinations. Choose the destination instance, connection, model, folder, and topic handling, then review replacements and optional cleanup before anything runs."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
       />
-      <div className="card p-5">
-        <div className="mb-4">
-          <h2 className="text-base font-semibold text-content-primary">What kind of dashboard migration is this?</h2>
-          <p className="mt-1 text-sm text-content-secondary">
-            Use same-instance remap when UAT and PROD are separate models or connections inside one Omni instance. Use cross-instance copy only when the destination is another saved Omni instance.
-          </p>
-        </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          <button
-            type="button"
-            onClick={() => navigate('/dashboards/migrate')}
-            className={`rounded-button px-4 py-4 text-left transition ${
-              mode === 'remap' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
-            }`}
-          >
-            <div className="text-sm font-semibold">Same instance: model / connection remap</div>
-            <div className={`mt-1 text-xs ${mode === 'remap' ? 'text-white/80' : 'text-content-secondary'}`}>
-              Point selected dashboards at another model in this Omni instance. No dashboard copy, folder move, or new instance is created.
-            </div>
-          </button>
-          <button
-            type="button"
-            onClick={() => navigate('/dashboards/migrate?mode=copy')}
-            className={`rounded-button px-4 py-4 text-left transition ${
-              mode === 'copy' ? 'bg-omni-600 text-white shadow-sm' : 'text-content-secondary hover:bg-surface-secondary'
-            }`}
-          >
-            <div className="text-sm font-semibold">Different instance: copy / import</div>
-            <div className={`mt-1 text-xs ${mode === 'copy' ? 'text-white/80' : 'text-content-secondary'}`}>
-              Copy dashboards from one saved source profile into one or many saved destination instances, models, and folders.
-            </div>
-          </button>
-        </div>
-      </div>
-      {mode === 'copy' ? (
-        <FanOutWizard />
-      ) : isConnected ? (
-        <>
-          <Stepper currentStep={state.currentStep} />
-          <div className="pb-12">
-            {renderStep()}
-          </div>
-        </>
-      ) : null}
+      <DashboardMigrationWizard />
     </div>
   );
 }

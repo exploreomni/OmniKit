@@ -1,5 +1,5 @@
-export const WALKTHROUGH_VERSION = '2026-06-12-model-migrator-foundation';
-export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 12, 2026';
+export const WALKTHROUGH_VERSION = '2026-06-18-dashboard-migration-user-health';
+export const WALKTHROUGH_DISPLAY_VERSION = 'Updated June 18, 2026';
 export const WALKTHROUGH_STORAGE_KEY = 'omnikit:walkthrough:v1';
 
 export type WalkthroughStepId =
@@ -91,7 +91,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     directions: [
       'Unlock or create the native vault, then add source, destination, or source + destination instance profiles.',
       'If you are moving from omni-multi-instance-tools, use Import legacy multi-instance vault, run the dry run first, import valid profiles, then test each imported instance.',
-      'Save default model IDs, folder IDs or folder paths, tag-based metric filters, and optional HTTPS post-migration action templates.',
+      'Save default model IDs, folder IDs or folder paths, and tag-based metric filters.',
       'Use the Connections tab to scan saved instances, filter internal/test records, find schema model coverage issues, and queue schema refresh jobs from the local vault.',
       'Use the Embed Users tab to review active 7/30/90-day counts, never-logged-in users, signup/login trends, and entity rollups.',
     ],
@@ -144,16 +144,18 @@ export const walkthroughSteps: WalkthroughStep[] = [
     id: 'dashboard-migrator',
     route: '/dashboards/migrate',
     label: 'Migrate',
-    title: 'Use Dashboard Migrator for same-instance remaps or fan-out copy/import',
-    purpose: 'Dashboard Migrator handles dashboard migration work: same-instance paths retarget dashboard model / connection references, while cross-instance paths copy and import dashboard content. Model Migrator is reserved for the semantic-layer tool.',
+    title: 'Use Dashboard Migrator for reviewed copy/import jobs',
+    purpose: 'Dashboard Migrator copies selected dashboards from a source instance and connection into one or more destinations, each with its own instance, connection, model, folder, and topic choices. Model Migrator is reserved for the semantic-layer tool.',
     directions: [
-      'Choose Same instance: model / connection remap when UAT and PROD live as separate models or connections inside one Omni instance and the dashboard location should stay unchanged.',
-      'Choose Different instance: copy / import when dashboards need to fan out from one saved source profile to multiple destination instances, models, or folders.',
-      'In fan-out mode, unlock the native vault, choose the source model and dashboards once, then check the destination instances you want to receive copies.',
-      'Review the preflight matrix before running. During the job, use the live board to watch export, import, metadata, folder move, schema refresh, and post-action status by destination.',
+      'Unlock the native vault, then choose the source instance and connection to load dashboards across that connection.',
+      'Select dashboards after confirming their current folder, model, and topic metadata, then add every destination needed for the migration.',
+      'Map detected source topics to existing target topics or create a new target topic before import when the target model is compatible.',
+      'Keep same-name replacement on for clean reruns, optionally empty target folders, and choose whether to queue native schema refresh per destination.',
+      'Choose whether to move the source dashboard to Trash after verified success.',
+      'Run the readiness check before starting. During the job, use the live board to watch export, topic preparation, import, metadata, schema refresh, and source-delete status.',
     ],
-    outcome: 'Dashboard migration work becomes a reviewed, retryable fan-out job with clear warnings for missing fields, folder placement, metadata preservation, and destination-specific failures.',
-    caution: 'Preflight checks field presence and job shape, not business-definition equivalence. Destructive cleanup should be enabled only when the destination folder contents are understood.',
+    outcome: 'Dashboard migration work becomes a reviewed, retryable copy/import job with clear warnings for missing fields, topic dependencies, folder placement, target replacement, metadata preservation, schema refresh, and source cleanup.',
+    caution: 'The readiness check reviews field presence and job shape, not business-definition equivalence. Source cleanup should be enabled only when the imported dashboard has been verified enough for the operational handoff.',
   },
   {
     id: 'model-migrator',
@@ -232,7 +234,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     title: 'Manage people, labels, schedules, and embeds carefully',
     purpose: 'Governance pages help admins understand who has access, how content is organized, and what automated delivery exists.',
     directions: [
-      'Use User Management for users and groups.',
+      'Use User Management for users, groups, inactive-user review, and entity access gaps.',
       'Use Labels to apply or audit content labels.',
       'Use Schedules and Embed URLs for delivery and embedded access workflows.',
     ],
@@ -260,7 +262,7 @@ export const walkthroughSteps: WalkthroughStep[] = [
     title: 'Use history and validation as the operating rhythm',
     purpose: 'The safest OmniKit habit is simple: select, review, apply only when validation passes, then use History and Omni review screens as the audit trail.',
     directions: [
-      'Check History after meaningful operations or fan-out migration jobs.',
+      'Check History after meaningful operations or dashboard migration jobs.',
       'Open a migration job detail to review redacted step history, retry lineage, imported document IDs, warnings, and post-action results.',
       'Prefer dev branches and validation for semantic changes.',
       'Return to this guide from the sidebar any time someone needs a refresher.',

@@ -29,7 +29,7 @@ OmniKit is a self-contained, local-first Omni admin workspace. The UI and local 
 - Review existing dashboards with AI-assisted readiness checks and admin-friendly recommendations
 - Manage saved Omni instance profiles in a native encrypted local vault
 - Track multi-instance connection and embed-user metrics with internal/test filters
-- Migrate dashboards through same-instance model remap or saved-instance copy/import with multi-destination fan-out
+- Migrate dashboards through one saved-instance copy/import workflow with one or many target instance/connection/model rows
 - Bulk copy, move, and delete dashboards across folders
 - Download dashboards and build PowerPoint decks from live Omni tiles
 - Manage connections, uploads, users, groups, models, topics, labels, schedules, and embeds
@@ -105,7 +105,7 @@ New users see a click-through walkthrough the first time they open OmniKit. The 
   - **Build New Dashboard** starts a first-pass dashboard developer chat from a selected model/topic, audience, KPI list, filters, layout, and color guidance. It routes missing or unsafe metrics back to AI Semantic Studio instead of inventing model fields.
   - **Excel to Dashboard** parses `.xlsx` workbooks in page memory, inventories sheets/formulas/charts, drafts safe dashboard tiles from existing Omni fields, and lists formula/lookup work as AI Semantic Studio follow-ups instead of updating topics or views directly.
   - **Review Existing Dashboard** inspects a live Omni dashboard and returns a review checklist for purpose, UX risks, semantic risks, and Omni UI handoff.
-- **Dashboard Migrator** — use **Within this instance** when dashboards stay inside the connected Omni instance and only need base-model remapping. Use **To other saved instances** for the fan-out wizard: unlock the native vault, pick one saved source/model/dashboard set, check one or more destination instances, confirm each destination model/folder, run a preflight matrix, and monitor live per-destination progress. The fan-out path preserves descriptions and labels where Omni supports it, records per-step job status, and lets failed destinations be retried without rerunning successful work.
+- **Dashboard Migrator** — unlock the native vault, choose one source instance and connection, then select dashboards across that connection with their current folder, model, and topic metadata visible. Send one or more dashboard groups to one or many destinations; each destination chooses its own instance, connection, model, optional folder, and topic mappings, including repeated destinations for the same instance when different connections, models, or folders are needed. OmniKit uses export/import with the destination `baseModelId`, prepares mapped or copied destination topics before import, replaces same-named destination dashboards by default for clean reruns, preserves descriptions and labels where Omni supports it, can queue native schema refresh per destination, and can move the source dashboard to Trash only after verified success.
 - **Model Migrator** — migrate semantic models between saved Omni instances through a branch-only workflow. Choose source/target connections, select shared models, map target models, review fast-path versus translate-pipeline YAML changes, port workbook-only query content, and track model/workbook progress in unified job history without exposing API keys in browser payloads. Dashboard selections are carried in the same scope as explicit Dashboard Migrator handoff items.
 - **Dashboard Operations** — bulk move, copy, or delete dashboards across folders with confirmation steps and operation logging.
 - **Dashboard Downloads** — export one or more dashboards to local files.
@@ -125,7 +125,7 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 
 ### Data & AI Readiness
 
-- **Instance Manager** — create a native encrypted local vault, save source/destination Omni instance profiles, test saved credentials, import compatible legacy multi-instance vaults with a dry run, configure default models/folders, define tag-based internal/test filters, store validated HTTPS post-migration action templates, refresh schema models, and scan connection or embed-user activity metrics across saved instances.
+- **Instance Manager** — create a native encrypted local vault, save source/destination Omni instance profiles, test saved credentials, import compatible legacy multi-instance vaults with a dry run, configure default models/folders, define tag-based internal/test filters, refresh schema models natively, and scan connection or embed-user activity metrics across saved instances.
 - **Connection Health** — validate Omni connectivity and inspect core account readiness signals.
 - **Upload Governance** — review uploaded datasets, ownership, freshness, and governance signals.
 - **Model & Topic Health** — validate models and inspect topic coverage.
@@ -136,12 +136,12 @@ Templates, saved batches, dashboard metadata caches, and filter defaults live in
 
 - **Labels** — bulk apply or remove labels from selected content.
 - **Schedules** — review, pause, resume, trigger, or delete scheduled deliveries.
-- **User Management** — manage users and groups, including bulk user operations.
+- **User Management** — manage users and groups, including bulk user operations and user-health review for inactive users or entities without active users.
 - **Embed URLs** — generate signed embed URLs for approved implementation workflows.
 
 ### History
 
-Every batch run, migration, and bulk operation is appended here with timestamps and status. Fan-out migration jobs are merged into the same local history view with retry lineage, redacted step details, imported document IDs, warnings, and post-action results.
+Every batch run, migration, and bulk operation is appended here with timestamps and status. Dashboard migration jobs are merged into the same local history view with retry lineage, redacted step details, imported document IDs, warnings, and post-action results.
 
 ### Data Privacy
 
@@ -196,9 +196,10 @@ Key points:
 | `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
 | `npm run typecheck:node` | Run `tsc --noEmit` across the local Node server source. |
 | `npm run lint` | Run ESLint. |
-| `npm run test:fanout` | Run focused Dashboard Migrator fan-out wizard helper tests. |
+| `npm run test:dashboard-migration` | Run focused Dashboard Migrator destination and grouping helper tests. |
 | `npm run test:migration-planner` | Run focused Dashboard Migrator planner tests. |
 | `npm run test:model-migrator` | Run focused Model Migrator inventory helper tests. |
+| `npm run test:user-health` | Run focused User Management health tests. |
 | `npm run test:security` | Run focused vault, job-history, and post-action security regression tests. |
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the full local security gate: audit, all focused tests, typechecks, lint, and build. |

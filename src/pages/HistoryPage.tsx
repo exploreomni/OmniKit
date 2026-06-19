@@ -332,7 +332,7 @@ export function HistoryPage() {
             {typeFilter === 'all' ? 'No History Yet' : 'No Matching History'}
           </h3>
           <p className="max-w-md text-center text-sm text-content-secondary">
-            Operations, fan-out migrations, retries, and post-migration actions will appear here after they run on this device.
+            Operations, dashboard migrations, retries, and post-migration actions will appear here after they run on this device.
           </p>
         </div>
       ) : (
@@ -375,7 +375,7 @@ export function HistoryPage() {
                     <div className="min-w-0">
                       <div className="flex items-center gap-2">
                         <ArrowRightLeft size={16} className="text-omni-600" />
-                        <span className="truncate text-sm font-semibold text-content-primary">{isModelJob ? 'Model migration' : 'Fan-out migration'} from {item.job.sourceLabel}</span>
+                        <span className="truncate text-sm font-semibold text-content-primary">{isModelJob ? 'Model migration' : 'Dashboard migration'} from {item.job.sourceLabel}</span>
                       </div>
                       <div className="mt-1 text-xs text-content-secondary">
                         {formatTime(item.job.createdAt)} · {isModelJob ? `${modelCount} model${modelCount === 1 ? '' : 's'} · ${dashboardCount} dashboard${dashboardCount === 1 ? '' : 's'} · ${workbookCount} workbook${workbookCount === 1 ? '' : 's'}` : `${item.job.documentIds.length} dashboard${item.job.documentIds.length === 1 ? '' : 's'}`} · {item.job.targets?.length || item.job.destinationIds.length} target{(item.job.targets?.length || item.job.destinationIds.length) === 1 ? '' : 's'} · {formatDuration((item.job.endedAt || Date.now()) - (item.job.startedAt || item.job.createdAt))}

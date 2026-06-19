@@ -92,6 +92,73 @@ function findStringByKey(obj: unknown, keys: string[], maxDepth = 6): string | u
   return undefined;
 }
 
+function collectTopicMetadata(payload: unknown): { topicNames: string[]; topicIds: string[] } {
+  const topicNames = new Set<string>();
+  const topicIds = new Set<string>();
+
+  function addName(value: unknown): void {
+    const cleaned = cleanModelMetadata(value);
+    if (cleaned) topicNames.add(cleaned);
+  }
+
+  function addId(value: unknown): void {
+    const cleaned = cleanModelMetadata(value);
+    if (cleaned) topicIds.add(cleaned);
+  }
+
+  function walk(value: unknown, maxDepth = 8): void {
+    if (maxDepth <= 0 || !value || typeof value !== 'object') return;
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (item && typeof item === 'object') walk(item, maxDepth - 1);
+      }
+      return;
+    }
+
+    const record = value as Record<string, unknown>;
+    addName(record.topicName);
+    addName(record.topic_name);
+    if (typeof record.topic === 'string') addName(record.topic);
+    addId(record.topicId);
+    addId(record.topic_id);
+    addId(record.topicIdentifier);
+    addId(record.topic_identifier);
+    addId(record.topicKey);
+    addId(record.topic_key);
+    addName(record.join_paths_from_topic_name);
+    addName(record.joinPathsFromTopicName);
+
+    if (isRecord(record.topic)) {
+      addName(record.topic.label || record.topic.name);
+      addId(record.topic.id || record.topic.identifier || record.topic.name);
+    }
+
+    for (const key of ['topicNames', 'topic_names', 'topicIdentifiers', 'topic_identifiers', 'topics']) {
+      const raw = record[key];
+      if (!Array.isArray(raw)) continue;
+      for (const item of raw) {
+        if (typeof item === 'string') addName(item);
+        else if (isRecord(item)) {
+          addName(item.label || item.name);
+          addId(item.id || item.identifier || item.name);
+        }
+      }
+    }
+
+    for (const child of Object.values(record)) {
+      if (child && typeof child === 'object') walk(child, maxDepth - 1);
+    }
+  }
+
+  walk(payload);
+  const names = [...topicNames].sort((a, b) => a.localeCompare(b));
+  const ids = [...topicIds].sort((a, b) => a.localeCompare(b));
+  return {
+    topicNames: names,
+    topicIds: ids.length > 0 ? ids : names,
+  };
+}
+
 function modelLabel(model: OmniModelRecord): string {
   return model.name || model.identifier || model.id;
 }
@@ -113,6 +180,9 @@ function extractModelDetails(payload: unknown): { baseModelId?: string; baseMode
     || nestedString(payload, 'dashboard', 'model', 'id')
     || nestedString(payload, 'dashboard', 'baseModel', 'id')
     || nestedString(payload, 'dashboard', 'baseModelId')
+    || nestedString(payload, 'workbookModel', 'baseModelId')
+    || nestedString(payload, 'workbookModel', 'id')
+    || nestedString(payload, 'workbookModel', 'modelId')
     || nestedString(payload, 'document', 'sharedModelId')
     || nestedString(payload, 'document', 'baseModel', 'id')
     || nestedString(payload, 'document', 'baseModelId')
@@ -129,37 +199,114 @@ function extractModelDetails(payload: unknown): { baseModelId?: string; baseMode
   const baseModelName = cleanModelMetadata(nestedString(payload, 'document', 'baseModel', 'name')
     || nestedString(payload, 'dashboard', 'baseModel', 'name')
     || nestedString(payload, 'dashboard', 'model', 'name')
+    || nestedString(payload, 'workbookModel', 'name')
+    || nestedString(payload, 'workbookModel', 'modelName')
     || nestedString(payload, 'document', 'model', 'name')
     || nestedString(payload, 'model', 'name')
     || findStringByKey(payload, ['modelName', 'model_name'], 4));
   return { baseModelId, baseModelName };
 }
 
-async function enrichDocumentModelDetails(client: OmniClient, documents: OmniDocumentRecord[]): Promise<Array<OmniDocumentRecord & { baseModelName?: string }>> {
-  const models = await client.listModels('SHARED').catch(() => [] as OmniModelRecord[]);
+function topicLabelFromYaml(content: string): string | undefined {
+  const labelMatch = content.match(/^label:\s*["']?(.+?)["']?\s*$/m);
+  return cleanModelMetadata(labelMatch?.[1]);
+}
+
+async function inferSingleTopicFromModel(client: OmniClient, modelId: string | undefined): Promise<{ topicNames: string[]; topicIds: string[] }> {
+  const cleanModelId = cleanModelMetadata(modelId);
+  if (!cleanModelId) return { topicNames: [], topicIds: [] };
+  try {
+    const files = await client.getModelYamlFiles(cleanModelId);
+    const topics = Object.entries(files)
+      .filter(([filePath]) => filePath.split('/').pop()?.endsWith('.topic'))
+      .map(([filePath, content]) => {
+        const fileName = filePath.split('/').pop() || filePath;
+        const id = cleanModelMetadata(fileName.replace(/\.topic$/, ''));
+        if (!id) return null;
+        return {
+          id,
+          name: topicLabelFromYaml(content) || id,
+        };
+      })
+      .filter((topic): topic is { id: string; name: string } => Boolean(topic));
+    if (topics.length !== 1) return { topicNames: [], topicIds: [] };
+    return { topicNames: [topics[0].name], topicIds: [topics[0].id] };
+  } catch {
+    return { topicNames: [], topicIds: [] };
+  }
+}
+
+function activeConnectionModels(models: OmniModelRecord[], connectionId?: string): OmniModelRecord[] {
+  return models
+    .filter((model) => !model.deletedAt)
+    .filter((model) => !connectionId || model.connectionId === connectionId);
+}
+
+async function enrichDocumentModelDetails(
+  client: OmniClient,
+  documents: OmniDocumentRecord[],
+  options: { connectionId?: string } = {},
+): Promise<OmniDocumentRecord[]> {
+  const models = activeConnectionModels(
+    await client.listModels({ modelKind: 'SHARED', connectionId: options.connectionId }).catch(() => [] as OmniModelRecord[]),
+    options.connectionId,
+  );
   const namesByKey = modelNameByKey(models);
-  const enriched: Array<OmniDocumentRecord & { baseModelName?: string }> = [];
+  const connectionFallbackModel = options.connectionId && models.length === 1 ? models[0] : undefined;
+  const enriched: OmniDocumentRecord[] = [];
 
   for (const document of documents) {
-    const documentWithModel = document as OmniDocumentRecord & { baseModelName?: string };
-    let baseModelId = cleanModelMetadata(documentWithModel.baseModelId);
-    let baseModelName = cleanModelMetadata(documentWithModel.baseModelName) || (baseModelId ? namesByKey.get(baseModelId) : undefined);
-    if (!baseModelId || !baseModelName) {
+    let baseModelId = cleanModelMetadata(document.baseModelId);
+    let baseModelName = cleanModelMetadata(document.baseModelName) || (baseModelId ? namesByKey.get(baseModelId) : undefined);
+    let topicNames = document.topicNames || [];
+    let topicIds = document.topicIds || [];
+    if (!baseModelId || !baseModelName || topicNames.length === 0 || topicIds.length === 0) {
       try {
-        const details = extractModelDetails(await client.exportDocument(document.identifier));
+        const exportPayload = await client.exportDocument(document.identifier);
+        const details = extractModelDetails(exportPayload);
+        const topics = collectTopicMetadata(exportPayload);
         baseModelId ||= details.baseModelId;
         baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
+        if (topicNames.length === 0) topicNames = topics.topicNames;
+        if (topicIds.length === 0) topicIds = topics.topicIds;
       } catch {
         // Best-effort enrichment; preflight still validates migrations before imports run.
       }
     }
-    const documentWithoutModelPlaceholders = { ...documentWithModel };
+    if (!baseModelId || !baseModelName || topicNames.length === 0 || topicIds.length === 0) {
+      try {
+        const queryDetails = await client.getDocumentQueries(document.identifier);
+        const details = extractModelDetails(queryDetails);
+        const topics = collectTopicMetadata(queryDetails);
+        baseModelId ||= details.baseModelId;
+        baseModelName ||= details.baseModelName || (baseModelId ? namesByKey.get(baseModelId) : undefined);
+        if (topicNames.length === 0) topicNames = topics.topicNames;
+        if (topicIds.length === 0) topicIds = topics.topicIds;
+      } catch {
+        // Query metadata is optional; keep moving with model fallback if available.
+      }
+    }
+    if (!baseModelId && connectionFallbackModel) baseModelId = connectionFallbackModel.id;
+    if (!baseModelName && baseModelId) baseModelName = namesByKey.get(baseModelId);
+    if (!baseModelName && connectionFallbackModel && baseModelId === connectionFallbackModel.id) {
+      baseModelName = modelLabel(connectionFallbackModel);
+    }
+    if ((topicNames.length === 0 || topicIds.length === 0) && baseModelId) {
+      const topics = await inferSingleTopicFromModel(client, baseModelId);
+      if (topicNames.length === 0) topicNames = topics.topicNames;
+      if (topicIds.length === 0) topicIds = topics.topicIds;
+    }
+    const documentWithoutModelPlaceholders = { ...document };
     delete documentWithoutModelPlaceholders.baseModelId;
     delete documentWithoutModelPlaceholders.baseModelName;
+    delete documentWithoutModelPlaceholders.topicNames;
+    delete documentWithoutModelPlaceholders.topicIds;
     enriched.push({
       ...documentWithoutModelPlaceholders,
       ...(baseModelId ? { baseModelId } : {}),
       ...(baseModelName ? { baseModelName } : {}),
+      ...(topicNames.length > 0 ? { topicNames } : {}),
+      ...(topicIds.length > 0 ? { topicIds } : {}),
     });
   }
 
@@ -346,8 +493,10 @@ export default async function handler(req: Request): Promise<Response> {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
       const client = new OmniClient(secret);
-      const folderId = cleanString(url.searchParams.get('folderId')) || secret.defaultFolderId;
-      const folderPath = cleanString(url.searchParams.get('folderPath')) || secret.defaultFolderPath;
+      const allFolders = url.searchParams.get('allFolders') === 'true';
+      const folderId = allFolders ? undefined : cleanString(url.searchParams.get('folderId')) || secret.defaultFolderId;
+      const folderPath = allFolders ? undefined : cleanString(url.searchParams.get('folderPath')) || secret.defaultFolderPath;
+      const connectionId = cleanString(url.searchParams.get('connectionId'));
       const includeModelDetails = url.searchParams.get('includeModelDetails') === 'true';
       let documents = await client.listFolderDocuments(folderId, true);
       if (!folderId && folderPath) {
@@ -357,8 +506,21 @@ export default async function handler(req: Request): Promise<Response> {
           return actualPath === requestedPath || actualPath.endsWith(`/${requestedPath}`);
         });
       }
-      if (includeModelDetails) documents = await enrichDocumentModelDetails(client, documents);
+      if (connectionId) {
+        documents = documents.filter((document) => !document.connectionId || document.connectionId === connectionId);
+      }
+      if (includeModelDetails) documents = await enrichDocumentModelDetails(client, documents, { connectionId });
       return json({ documents });
+    }
+
+    if (req.method === 'GET' && parts[1] === 'models' && parts[3] === 'topics') {
+      const secret = getInstance(id);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const modelId = decodeURIComponent(parts[2] || '').trim();
+      if (!modelId) return json({ error: 'Model id required.' }, 400);
+      const client = new OmniClient(secret);
+      const topics = await client.listModelTopics(modelId);
+      return json({ topics });
     }
 
     if (req.method === 'GET' && parts[1] === 'models') {
@@ -366,7 +528,8 @@ export default async function handler(req: Request): Promise<Response> {
       if (!secret) return json({ error: 'Instance not found.' }, 404);
       const client = new OmniClient(secret);
       const modelKind = cleanString(url.searchParams.get('modelKind')) || 'SHARED';
-      const models = await client.listModels(modelKind);
+      const connectionId = cleanString(url.searchParams.get('connectionId'));
+      const models = activeConnectionModels(await client.listModels({ modelKind, connectionId }), connectionId);
       return json({ models });
     }
 

@@ -85,34 +85,7 @@ export interface OmniTopic {
   }>;
 }
 
-export interface ModelMapping {
-  sourceModelId: string;
-  targetModelId: string;
-  dashboardCount: number;
-}
-
-export interface DashboardSelection extends OmniDocument {
-  selected: boolean;
-}
-
 export type MigrationItemStatus = 'pending' | 'in_progress' | 'success' | 'failed' | 'skipped' | 'ready' | 'warning';
-
-export interface MigrationResult {
-  id: string;
-  name: string;
-  status: MigrationItemStatus;
-  error?: string;
-  warnings?: string[];
-  sourceModel?: string;
-  targetModel?: string;
-}
-
-export interface MigrationSummary {
-  succeeded: number;
-  failed: number;
-  skipped: number;
-  total: number;
-}
 
 export type BulkOperationStatus = 'idle' | 'running' | 'complete';
 
@@ -134,30 +107,6 @@ export interface BulkOperationSummary {
   failed: number;
   skipped: number;
   total: number;
-}
-
-export type WizardStep = 0 | 1 | 2 | 3;
-
-export const STEP_LABELS = ['Select', 'Map', 'Review', 'Done'] as const;
-
-export interface WizardState {
-  currentStep: WizardStep;
-  source: ConnectionConfig;
-  target: ConnectionConfig;
-  sameInstance: boolean;
-  folders: OmniFolder[];
-  documents: OmniDocument[];
-  selectedDashboards: OmniDocument[];
-  sourceModels: OmniModel[];
-  targetModels: OmniModel[];
-  modelMappings: Record<string, string>;
-  targetFolder: string;
-  dryRun: boolean;
-  dryRunCompleted: boolean;
-  migrationInProgress: boolean;
-  migrationResults: MigrationResult[];
-  migrationSummary: MigrationSummary | null;
-  currentMigrationIndex: number;
 }
 
 export interface OmniConnection {
@@ -414,24 +363,3 @@ export interface PageInfo {
   pageSize: number;
   totalRecords: number;
 }
-
-export type WizardAction =
-  | { type: 'SET_STEP'; step: WizardStep }
-  | { type: 'UPDATE_SOURCE'; payload: Partial<ConnectionConfig> }
-  | { type: 'UPDATE_TARGET'; payload: Partial<ConnectionConfig> }
-  | { type: 'SET_SAME_INSTANCE'; value: boolean }
-  | { type: 'SET_FOLDERS'; folders: OmniFolder[] }
-  | { type: 'SET_DOCUMENTS'; documents: OmniDocument[] }
-  | { type: 'SET_SELECTED_DASHBOARDS'; dashboards: OmniDocument[] }
-  | { type: 'SET_SOURCE_MODELS'; models: OmniModel[] }
-  | { type: 'SET_TARGET_MODELS'; models: OmniModel[] }
-  | { type: 'SET_MODEL_MAPPING'; sourceId: string; targetId: string }
-  | { type: 'SET_ALL_MODEL_MAPPINGS'; mappings: Record<string, string> }
-  | { type: 'SET_TARGET_FOLDER'; folder: string }
-  | { type: 'SET_DRY_RUN'; value: boolean }
-  | { type: 'SET_DRY_RUN_COMPLETED'; value: boolean }
-  | { type: 'START_MIGRATION' }
-  | { type: 'UPDATE_MIGRATION_PROGRESS'; index: number; result: MigrationResult }
-  | { type: 'COMPLETE_MIGRATION'; summary: MigrationSummary; results: MigrationResult[] }
-  | { type: 'ENRICH_DOCUMENTS'; enrichments: Record<string, { baseModelId: string | null; baseModelName: string | null; topicNames: string[] | null; connectionName: string | null; connectionId: string | null; enrichmentError: string | null }> }
-  | { type: 'RESET_ALL' };

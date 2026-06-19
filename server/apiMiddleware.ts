@@ -138,9 +138,17 @@ function maybeHydrateBody(bodyBuffer: Buffer, routePrefix: string): Buffer {
   }
 }
 
-function toWebRequest(req: IncomingMessage, bodyBuffer: Buffer, route: string): Request {
+export function apiRouteFromUrl(rawUrl: string): string {
+  return rawUrl.slice('/api/'.length).split('?')[0].replace(/\/+$/, '');
+}
+
+export function apiWebRequestUrl(rawUrl: string, host: string): string {
+  return new URL(rawUrl || '/api/', `http://${host || 'localhost'}`).toString();
+}
+
+function toWebRequest(req: IncomingMessage, bodyBuffer: Buffer): Request {
   const host = req.headers.host || 'localhost';
-  const url = `http://${host}/api/${route}`;
+  const url = apiWebRequestUrl(req.url || '/api/', String(host));
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
     if (!value) continue;
@@ -180,7 +188,7 @@ export function apiMiddleware() {
       return;
     }
 
-    const route = url.slice('/api/'.length).split('?')[0].replace(/\/+$/, '');
+    const route = apiRouteFromUrl(url);
 
     if (route === 'healthz') {
       res.statusCode = 200;
@@ -201,7 +209,7 @@ export function apiMiddleware() {
     try {
       const body = await readBody(req);
       const hydratedBody = maybeHydrateBody(body, routePrefix);
-      const webReq = toWebRequest(req, hydratedBody, route);
+      const webReq = toWebRequest(req, hydratedBody);
       const webRes = await handler(webReq);
       await sendWebResponse(webRes, res);
     } catch (err) {

@@ -678,16 +678,6 @@ export async function enrichDocuments(
   return { ...hits, ...fresh };
 }
 
-interface MigrateParams {
-  source: { base_url: string; api_key: string };
-  target: { base_url: string; api_key: string };
-  dashboards: { id: string; name: string; base_model_id?: string }[];
-  model_mapping: Record<string, string>;
-  target_folder?: string;
-  dry_run: boolean;
-  in_place?: boolean;
-}
-
 async function consumeSseStream(
   res: Response,
   onEvent: (event: Record<string, unknown>) => void
@@ -744,18 +734,6 @@ async function consumeSseStream(
       warning: 'Connection ended before operation completed. Results may be incomplete.',
     });
   }
-}
-
-export async function migrate(
-  params: MigrateParams,
-  onEvent: (event: Record<string, unknown>) => void
-): Promise<void> {
-  const res = await safeFetch(
-    edgeFunctionUrl('migrate'),
-    { method: 'POST', headers: defaultHeaders, body: JSON.stringify(params) },
-    'Migration'
-  );
-  await consumeSseStream(res, onEvent);
 }
 
 export async function bulkDeleteDocuments(

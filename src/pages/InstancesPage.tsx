@@ -21,7 +21,7 @@ import {
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { SearchInput } from '@/components/ui/SearchInput';
-import { useTargetCatalog } from '@/components/migrateFanout/useTargetCatalog';
+import { useMigrationTargetCatalog } from '@/components/dashboardMigration/useMigrationTargetCatalog';
 import {
   changeNativeVaultPassphrase,
   deleteSavedInstance,
@@ -754,7 +754,7 @@ function InstanceEditor({
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
-  const { catalogs, loadCatalog } = useTargetCatalog();
+  const { catalogs, loadCatalog } = useMigrationTargetCatalog();
   const formCatalog = form.id ? catalogs[form.id] : undefined;
   const formModels = useMemo(() => formCatalog?.models || [], [formCatalog?.models]);
   const formFolders = useMemo(() => formCatalog?.folders || [], [formCatalog?.folders]);
@@ -1469,7 +1469,7 @@ export function InstancesPage() {
           <div className="grid gap-3 sm:grid-cols-3">
             <StatCard label="Saved instances" value={instances.length} note="Stored in native encrypted vault" />
             <StatCard label="Sources" value={sourceCount} note="Available for metrics and dashboard export" />
-            <StatCard label="Destinations" value={destinationCount} note="Available for dashboard import/fan-out" />
+            <StatCard label="Destinations" value={destinationCount} note="Available for dashboard import" />
           </div>
 
           <div className="card p-2">
