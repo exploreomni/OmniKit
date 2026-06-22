@@ -17,6 +17,7 @@ interface ComboBoxProps {
   ariaLabel?: string;
   disabled?: boolean;
   emptyLabel?: string;
+  onOpen?: () => void;
 }
 
 export function ComboBox({
@@ -28,6 +29,7 @@ export function ComboBox({
   ariaLabel,
   disabled = false,
   emptyLabel = 'No options found',
+  onOpen,
 }: ComboBoxProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [search, setSearch] = useState('');
@@ -111,6 +113,7 @@ export function ComboBox({
   function openMenu() {
     if (disabled) return;
     setIsOpen(true);
+    onOpen?.();
     setTimeout(() => inputRef.current?.focus(), 0);
   }
 
@@ -226,7 +229,7 @@ export function ComboBox({
                     </span>
                   )}
                 </div>
-                {option.label !== option.value && (
+                {option.showValue && option.label !== option.value && (
                   <div className="text-xs text-content-secondary font-mono truncate">{option.value}</div>
                 )}
               </button>

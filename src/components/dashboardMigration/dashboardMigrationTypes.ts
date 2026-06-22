@@ -102,6 +102,9 @@ export interface DashboardMigrationTargetCatalog {
   folders: InstanceFolder[];
   loading: boolean;
   loaded: boolean;
+  foldersLoading?: boolean;
+  foldersLoaded?: boolean;
+  folderError?: string;
   error: string;
 }
 

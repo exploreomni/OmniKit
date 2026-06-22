@@ -33,6 +33,7 @@ import {
   fetchPostMigrationAction,
   validatePostMigrationActionTargetForRequest,
 } from './postMigrationActions';
+import { readThroughCache } from './readThroughCache';
 
 export { redactSensitiveText, sanitizeJobHistory } from './jobSanitizer';
 
@@ -174,6 +175,22 @@ export interface MigrationRouteGroup {
   name: string;
   documentIds: string[];
   targets: MigrationTarget[];
+}
+
+export interface MigrationSourceDocumentHint {
+  id: string;
+  identifier: string;
+  name: string;
+  connectionId?: string;
+  folderId?: string;
+  folderPath?: string;
+  baseModelId?: string;
+  baseModelName?: string;
+  topicNames?: string[];
+  topicIds?: string[];
+  description?: string | null;
+  labels?: string[];
+  updatedAt?: string;
 }
 
 export type MigrationTopicMappingAction = 'map_existing' | 'copy_source';
@@ -500,9 +517,13 @@ function extractFieldsFromViewYaml(fileName: string, yaml: string): string[] {
   return [...refs];
 }
 
-async function loadTargetFieldUniverse(client: OmniClient, modelId: string): Promise<{ fields: Set<string>; warning?: string }> {
+async function loadTargetFieldUniverse(
+  client: OmniClient,
+  modelId: string,
+  loadYamlFiles: () => Promise<Record<string, string>> = () => client.getModelYamlFiles(modelId),
+): Promise<{ fields: Set<string>; warning?: string }> {
   try {
-    const files = await client.getModelYamlFiles(modelId);
+    const files = await loadYamlFiles();
     const fields = new Set<string>();
     for (const [fileName, yaml] of Object.entries(files)) {
       for (const fieldRef of extractFieldsFromViewYaml(fileName, yaml)) fields.add(fieldRef);
@@ -1654,12 +1675,14 @@ export async function buildMigrationPlan(input: {
   targets?: MigrationTarget[];
   routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
+  sourceDocumentHints?: MigrationSourceDocumentHint[];
   emptyFirst: boolean;
   replaceSameNamed?: boolean;
   deleteSourceOnSuccess?: boolean;
   sourceFolderId?: string;
   sourceFolderPath?: string;
   sourceAllFolders?: boolean;
+  usePreviewCache?: boolean;
 }): Promise<MigrationPlan> {
   const source = requireInstance(input.sourceId);
   const routeGroups = normalizeRouteGroups(input);
@@ -1674,7 +1697,26 @@ export async function buildMigrationPlan(input: {
   const sourceFolderId = sourceAllFolders ? undefined : input.sourceFolderId?.trim() || source.defaultFolderId;
   const sourceFolderPath = sourceAllFolders ? undefined : input.sourceFolderPath?.trim() || source.defaultFolderPath;
   const replaceSameNamed = input.replaceSameNamed !== false;
-  const sourceDocs = await listDocumentsForFolder(sourceClient, sourceFolderId, sourceFolderPath, true);
+  const previewCacheEnabled = input.usePreviewCache === true;
+  const cacheScope = `migration-preview:${input.sourceId}:${input.sourceConnectionId || ''}`;
+  const cachedPreviewRead = <T>(key: string, loader: () => Promise<T>) => readThroughCache(
+    `${cacheScope}:${key}`,
+    loader,
+    { enabled: previewCacheEnabled },
+  );
+  const sourceDocumentHints = previewCacheEnabled
+    ? (input.sourceDocumentHints || [])
+      .filter((document) => sourceDocumentIds.includes(document.identifier) || sourceDocumentIds.includes(document.id))
+      .map((document) => ({ ...document }))
+    : [];
+  const hintKeys = new Set(sourceDocumentHints.flatMap((document) => [document.id, document.identifier]).filter(Boolean));
+  const hintsCoverSelection = sourceDocumentIds.length > 0 && sourceDocumentIds.every((documentId) => hintKeys.has(documentId));
+  const sourceDocs = hintsCoverSelection
+    ? sourceDocumentHints as OmniDocumentRecord[]
+    : await cachedPreviewRead(
+      `source-documents:${JSON.stringify({ sourceFolderId, sourceFolderPath })}`,
+      () => listDocumentsForFolder(sourceClient, sourceFolderId, sourceFolderPath, true),
+    );
   const selected = sourceDocs.filter((doc) => sourceDocumentIds.includes(doc.identifier) || sourceDocumentIds.includes(doc.id));
   const selectedByKey = new Map<string, OmniDocumentRecord>();
   for (const doc of selected) {
@@ -1695,10 +1737,21 @@ export async function buildMigrationPlan(input: {
   const sourceModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
   const targetModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
 
+  function cachedInstanceRead<T>(instanceId: string, key: string, loader: () => Promise<T>) {
+    return readThroughCache(
+      `migration-preview:${instanceId}:${key}`,
+      loader,
+      { enabled: previewCacheEnabled },
+    );
+  }
+
   function sourceTopicCatalog(modelId: string) {
     const cached = sourceTopicCatalogCache.get(modelId);
     if (cached) return cached;
-    const next = sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true });
+    const next = cachedPreviewRead(
+      `source-topics:${modelId}`,
+      () => sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true }),
+    );
     sourceTopicCatalogCache.set(modelId, next);
     return next;
   }
@@ -1708,7 +1761,10 @@ export async function buildMigrationPlan(input: {
     if (cached) return cached;
     const next = (async (): Promise<QueryViewCatalogResult> => {
       try {
-        const files = await sourceClient.getModelYamlFiles(modelId);
+        const files = await cachedPreviewRead(
+          `source-model-yaml-files:${modelId}`,
+          () => sourceClient.getModelYamlFiles(modelId),
+        );
         return { queryViews: queryViewsFromModelYamlFiles(files) };
       } catch (error) {
         return {
@@ -1724,7 +1780,10 @@ export async function buildMigrationPlan(input: {
   function sourceQueryViewCatalog(modelId: string) {
     const cached = sourceQueryViewCatalogCache.get(modelId);
     if (cached) return cached;
-    const next = sourceClient.listModelQueryViews(modelId, { includeYaml: true, includeChecksums: true });
+    const next = cachedPreviewRead(
+      `source-query-views:${modelId}`,
+      () => sourceClient.listModelQueryViews(modelId, { includeYaml: true, includeChecksums: true }),
+    );
     sourceQueryViewCatalogCache.set(modelId, next);
     return next;
   }
@@ -1732,7 +1791,7 @@ export async function buildMigrationPlan(input: {
   function sourceModelYamlFiles(modelId: string) {
     const cached = sourceModelYamlFilesCache.get(modelId);
     if (cached) return cached;
-    const next = sourceClient.getModelYamlFiles(modelId);
+    const next = cachedPreviewRead(`source-model-yaml-files:${modelId}`, () => sourceClient.getModelYamlFiles(modelId));
     sourceModelYamlFilesCache.set(modelId, next);
     return next;
   }
@@ -1741,7 +1800,7 @@ export async function buildMigrationPlan(input: {
     const key = `${destination.id}:${targetModelId}`;
     const cached = targetModelYamlFilesCache.get(key);
     if (cached) return cached;
-    const next = client.getModelYamlFiles(targetModelId);
+    const next = cachedInstanceRead(destination.id, `target-model-yaml-files:${targetModelId}`, () => client.getModelYamlFiles(targetModelId));
     targetModelYamlFilesCache.set(key, next);
     return next;
   }
@@ -1765,13 +1824,21 @@ export async function buildMigrationPlan(input: {
     let existing: OmniDocumentRecord[] = [];
     if (input.emptyFirst || replaceSameNamed) {
       if (cleanupCanBeScoped) {
-        existing = await listDocumentsForFolder(
-          destinationClient,
-          target.targetFolderId,
-          cleanupFolderPath,
+        existing = await cachedInstanceRead(
+          destination.id,
+          `target-documents:${JSON.stringify({ folderId: target.targetFolderId, folderPath: cleanupFolderPath })}`,
+          () => listDocumentsForFolder(
+            destinationClient,
+            target.targetFolderId,
+            cleanupFolderPath,
+          ),
         );
       } else if (canUseDefaultReplacementFallback) {
-        existing = (await listDocumentsForFolder(destinationClient))
+        existing = (await cachedInstanceRead(
+          destination.id,
+          'target-documents:default-fallback',
+          () => listDocumentsForFolder(destinationClient),
+        ))
           .filter((document) => selectedNames.has(document.name) && documentLooksInDefaultFolder(document));
       } else {
         cleanupNotices.push('Target cleanup was skipped because the selected target folder is the default My Documents area and OmniKit cannot scope replacement deletes safely.');
@@ -1780,7 +1847,11 @@ export async function buildMigrationPlan(input: {
     const destinationWarnings: string[] = [];
     const targetTopicWarnings: string[] = [];
     const targetQueryViewWarnings: string[] = [];
-    const targetFields = await loadTargetFieldUniverse(destinationClient, target.targetModelId);
+    const targetFields = await loadTargetFieldUniverse(
+      destinationClient,
+      target.targetModelId,
+      () => targetModelYamlFiles(destination, destinationClient, target.targetModelId),
+    );
     const targetViewNames = targetViewNamesFromFieldUniverse(targetFields.fields);
     if (targetFields.warning) destinationWarnings.push(targetFields.warning);
     const hasCreateTopicMappings = (target.topicMappings || []).some((mapping) => mapping.action === 'copy_source');
@@ -1788,7 +1859,11 @@ export async function buildMigrationPlan(input: {
     let targetModelRecord: { gitConfigured?: boolean; pullRequestRequired?: boolean; gitProtected?: boolean } | undefined;
     if (hasCreateTopicMappings || hasCreateQueryViewMappings) {
       try {
-        const targetModels = await destinationClient.listModels({ modelKind: 'SHARED', connectionId: target.targetConnectionId });
+        const targetModels = await cachedInstanceRead(
+          destination.id,
+          `target-models:${JSON.stringify({ modelKind: 'SHARED', connectionId: target.targetConnectionId })}`,
+          () => destinationClient.listModels({ modelKind: 'SHARED', connectionId: target.targetConnectionId }),
+        );
         targetModelRecord = targetModels.find((model) => (
           [model.id, model.identifier, model.baseModelId, model.name].some((value) => value === target.targetModelId)
         ));
@@ -1803,13 +1878,21 @@ export async function buildMigrationPlan(input: {
 
 	    async function loadTargetTopicsForPreflight(): Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>> {
 	      if (targetTopics) return targetTopics;
-	      targetTopics = await destinationClient.listModelTopics(target.targetModelId, { includeYaml: true, includeChecksums: true });
+	      targetTopics = await cachedInstanceRead(
+	        destination.id,
+	        `target-topics:${target.targetModelId}`,
+	        () => destinationClient.listModelTopics(target.targetModelId, { includeYaml: true, includeChecksums: true }),
+	      );
 	      return targetTopics;
 	    }
 
     async function loadTargetQueryViewsForPreflight(): Promise<OmniModelQueryViewRecord[]> {
       if (targetQueryViews) return targetQueryViews;
-      targetQueryViews = await destinationClient.listModelQueryViews(target.targetModelId, { includeYaml: true, includeChecksums: true });
+      targetQueryViews = await cachedInstanceRead(
+        destination.id,
+        `target-query-views:${target.targetModelId}`,
+        () => destinationClient.listModelQueryViews(target.targetModelId, { includeYaml: true, includeChecksums: true }),
+      );
       return targetQueryViews;
     }
 
@@ -1863,14 +1946,20 @@ export async function buildMigrationPlan(input: {
         let payload = exportCache.get(doc.identifier);
         if (!refs) {
           if (!payload) {
-            payload = await sourceClient.exportDocument(doc.identifier);
+            payload = await cachedPreviewRead(
+              `source-export:${doc.identifier}`,
+              () => sourceClient.exportDocument(doc.identifier),
+            );
             exportCache.set(doc.identifier, payload);
           }
           refs = extractDashboardFieldRefs(payload);
           fieldRefCache.set(doc.identifier, refs);
         }
         if (!payload) {
-          payload = await sourceClient.exportDocument(doc.identifier);
+          payload = await cachedPreviewRead(
+            `source-export:${doc.identifier}`,
+            () => sourceClient.exportDocument(doc.identifier),
+          );
           exportCache.set(doc.identifier, payload);
         }
         sourceModelId = doc.baseModelId || extractDashboardModelId(payload);
@@ -3068,7 +3157,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         }
         if (item.targetFolderPath && identifier) {
           try {
-            const docsAfterImport = await targetClient.listFolderDocuments(undefined);
+            const docsAfterImport = await listDocumentsForFolder(targetClient, item.targetFolderId, item.targetFolderPath);
             const importedDoc = docsAfterImport.find((doc) => doc.identifier === identifier || doc.id === documentId);
             const requestedPath = normalizeFolderPath(item.targetFolderPath);
             const actualPath = normalizeFolderPath(importedDoc?.folderPath);
@@ -3756,7 +3845,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         }
         if (targetFolderPath && identifier) {
           try {
-            const docsAfterImport = await destinationClient.listFolderDocuments(undefined);
+            const docsAfterImport = await listDocumentsForFolder(destinationClient, item.targetFolderId, targetFolderPath);
             const importedDoc = docsAfterImport.find((doc) => doc.identifier === identifier || doc.id === documentId);
             const requestedPath = normalizeFolderPath(targetFolderPath);
             const actualPath = normalizeFolderPath(importedDoc?.folderPath);

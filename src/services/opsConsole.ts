@@ -147,6 +147,17 @@ export interface InstanceQueryView {
   checksum?: string;
 }
 
+export interface ApiPerformanceTimingEntry {
+  name: string;
+  durationMs: number;
+  detail?: Record<string, unknown>;
+}
+
+export interface ApiPerformanceTimings {
+  totalMs: number;
+  timings: ApiPerformanceTimingEntry[];
+}
+
 export interface ModelMigratorConnection {
   id: string;
   name: string;
@@ -496,6 +507,7 @@ export interface MigrationJobInput {
   targets: MigrationTarget[];
   routeGroups?: MigrationRouteGroup[];
   documentIds: string[];
+  sourceDocumentHints?: InstanceDocument[];
   emptyFirst: boolean;
   replaceSameNamed?: boolean;
   deleteSourceOnSuccess?: boolean;
@@ -676,15 +688,26 @@ export async function connectSavedInstance(id: string) {
   );
 }
 
-export async function listInstanceDocuments(id: string, options: { folderId?: string; folderPath?: string; connectionId?: string; allFolders?: boolean; includeModelDetails?: boolean } = {}) {
+export async function listInstanceDocuments(
+  id: string,
+  options: {
+    folderId?: string;
+    folderPath?: string;
+    connectionId?: string;
+    allFolders?: boolean;
+    includeModelDetails?: boolean;
+    documentIds?: string[];
+  } = {},
+) {
   const params = new URLSearchParams();
   if (options.folderId) params.set('folderId', options.folderId);
   if (options.folderPath) params.set('folderPath', options.folderPath);
   if (options.connectionId) params.set('connectionId', options.connectionId);
   if (options.allFolders) params.set('allFolders', 'true');
   if (options.includeModelDetails) params.set('includeModelDetails', 'true');
+  if (options.documentIds?.length) params.set('documentIds', options.documentIds.join(','));
   const query = params.toString();
-  return apiFetch<{ documents: InstanceDocument[] }>(
+  return apiFetch<{ documents: InstanceDocument[]; performance?: ApiPerformanceTimings }>(
     `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`,
   );
 }
@@ -884,7 +907,7 @@ export async function fetchDashboardDownloadFile(
 }
 
 export async function previewMigrationJob(input: MigrationJobInput) {
-  return apiFetch<{ plan: MigrationPlan }>('/api/migration-jobs/preview', {
+  return apiFetch<{ plan: MigrationPlan; performance?: ApiPerformanceTimings }>('/api/migration-jobs/preview', {
     method: 'POST',
     body: JSON.stringify(input),
   });

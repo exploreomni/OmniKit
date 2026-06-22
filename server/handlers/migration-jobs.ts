@@ -17,6 +17,7 @@ import {
   type PostMigrationAction,
 } from '../services/nativeVault';
 import { redactSensitiveText } from '../services/jobSanitizer';
+import { createPerformanceTracker } from '../services/performanceTimings';
 
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'canceled']);
 
@@ -149,6 +150,28 @@ function parseRouteGroups(value: unknown): MigrationRouteGroup[] {
     .filter((group) => group.documentIds.length > 0 && group.targets.length > 0);
 }
 
+function parseSourceDocumentHints(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((document): document is Record<string, unknown> => Boolean(document) && typeof document === 'object' && !Array.isArray(document))
+    .map((document) => ({
+      id: cleanString(document.id) || '',
+      identifier: cleanString(document.identifier) || cleanString(document.id) || '',
+      name: cleanString(document.name) || '',
+      connectionId: cleanString(document.connectionId),
+      folderId: cleanString(document.folderId),
+      folderPath: cleanString(document.folderPath),
+      baseModelId: cleanString(document.baseModelId),
+      baseModelName: cleanString(document.baseModelName),
+      topicNames: parseStringArray(document.topicNames),
+      topicIds: parseStringArray(document.topicIds),
+      description: cleanString(document.description) || null,
+      labels: parseStringArray(document.labels),
+      updatedAt: cleanString(document.updatedAt),
+    }))
+    .filter((document) => document.identifier && document.name);
+}
+
 function parseJobInput(body: Record<string, unknown>) {
   const targets = parseTargets(body.targets);
   return {
@@ -158,6 +181,7 @@ function parseJobInput(body: Record<string, unknown>) {
     targets,
     routeGroups: parseRouteGroups(body.routeGroups),
     documentIds: parseStringArray(body.documentIds),
+    sourceDocumentHints: parseSourceDocumentHints(body.sourceDocumentHints),
     emptyFirst: body.emptyFirst === true,
     replaceSameNamed: body.replaceSameNamed !== false,
     deleteSourceOnSuccess: body.deleteSourceOnSuccess === true,
@@ -265,8 +289,17 @@ export default async function handler(req: Request): Promise<Response> {
       if (requestTargets.some((target) => !target.targetModelId)) {
         return json({ error: 'Choose a target model for every migration target before running preflight.' }, 400);
       }
-      const plan = await buildMigrationPlan(input);
-      return json({ plan });
+      const timings = createPerformanceTracker();
+      const plan = await timings.time(
+        'build-migration-plan',
+        () => buildMigrationPlan({ ...input, usePreviewCache: true }),
+        (result) => ({
+          stepCount: result?.steps.length || 0,
+          targetCount: requestTargets.length,
+          documentCount: input.documentIds.length,
+        }),
+      );
+      return json({ plan, performance: timings.snapshot() });
     }
 
     if (req.method === 'POST' && parts[0] === 'actions' && parts[1] === 'run') {

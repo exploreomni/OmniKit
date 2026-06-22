@@ -1278,7 +1278,7 @@ test('target ComboBox helpers filter catalogs, preserve unknown values, and keep
   });
   assert.deepEqual(resolveComboBoxDisplay(modelOptions, 'model-1'), {
     selectedLabel: 'PROD - Coffee Model',
-    showIdBelowLabel: true,
+    showIdBelowLabel: false,
   });
   assert.equal(
     comboBoxEmptyText({ allowFreeText: TARGET_FOLDER_COMBOBOX_CONFIG.allowFreeText, search: 'New/Folder', emptyLabel: TARGET_FOLDER_COMBOBOX_CONFIG.emptyLabel }),

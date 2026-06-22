@@ -14,10 +14,12 @@ import {
   unlockVault,
   upsertInstance,
 } from '../server/services/nativeVault';
+import { clearReadThroughCache } from '../server/services/readThroughCache';
 
 let tempDir = '';
 
 beforeEach(() => {
+  clearReadThroughCache();
   tempDir = mkdtempSync(path.join(tmpdir(), 'omnikit-planner-'));
   process.env.OMNIKIT_VAULT_PATH = path.join(tempDir, 'vault.enc');
   process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(tempDir, 'omnikit-jobs.json');
@@ -26,6 +28,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  clearReadThroughCache();
   mock.restoreAll();
   resetVault();
   lockVault();
@@ -4404,9 +4407,9 @@ test('saved-instance document listing can load all folders scoped by selected co
     postMigrationActions: [],
   });
 
-  let requestedFolderId: string | undefined;
-  mock.method(OmniClient.prototype, 'listFolderDocuments', async (folderId?: string) => {
-    requestedFolderId = folderId;
+  let requestedOptions: unknown;
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async (options?: unknown) => {
+    requestedOptions = options;
     return [
       {
         id: 'default-doc',
@@ -4442,7 +4445,7 @@ test('saved-instance document listing can load all folders scoped by selected co
   assert.equal(response.status, 200);
   const body = await response.json() as { documents: Array<{ id: string; folderPath?: string }> };
 
-  assert.equal(requestedFolderId, undefined);
+  assert.deepEqual(requestedOptions, { folderId: undefined, includeLabels: true, connectionId: 'nfl-connection' });
   assert.deepEqual(body.documents.map((document) => document.id), ['default-doc', 'team-doc']);
   assert.deepEqual(body.documents.map((document) => document.folderPath), ['Default Only', 'Shared/Team Dashboards']);
 });

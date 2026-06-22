@@ -1360,6 +1360,7 @@ export function buildDashboardMigrationJobInput(input: {
   targets: MigrationTarget[];
   routeGroups: MigrationRouteGroup[];
   documentIds: string[];
+  sourceDocumentHints?: InstanceDocument[];
   emptyFirst: boolean;
   replaceSameNamed: boolean;
   deleteSourceOnSuccess: boolean;
@@ -1372,6 +1373,7 @@ export function buildDashboardMigrationJobInput(input: {
     targets: input.targets,
     routeGroups: input.routeGroups,
     documentIds: input.documentIds,
+    sourceDocumentHints: input.sourceDocumentHints,
     emptyFirst: input.emptyFirst,
     replaceSameNamed: input.replaceSameNamed,
     deleteSourceOnSuccess: input.deleteSourceOnSuccess,

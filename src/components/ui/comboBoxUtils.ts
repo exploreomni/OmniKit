@@ -2,6 +2,7 @@ export interface ComboBoxOption {
   value: string;
   label: string;
   subtitle?: string;
+  showValue?: boolean;
 }
 
 export function filterComboBoxOptions(options: ComboBoxOption[], search: string): ComboBoxOption[] {
@@ -19,7 +20,7 @@ export function resolveComboBoxDisplay(options: ComboBoxOption[], value: string)
   const selectedOption = options.find((option) => option.value === value);
   return {
     selectedLabel: selectedOption?.label || value,
-    showIdBelowLabel: Boolean(selectedOption && selectedOption.label !== selectedOption.value),
+    showIdBelowLabel: Boolean(selectedOption?.showValue && selectedOption.label !== selectedOption.value),
   };
 }
 

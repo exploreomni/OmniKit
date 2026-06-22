@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   BookOpen,
   Database,
+  ExternalLink,
   FileText,
   FolderInput,
   Info,
@@ -108,10 +109,10 @@ import {
   type PreflightTargetRow,
 } from './dashboardMigrationTypes';
 
-type WizardStep = 0 | 1 | 2 | 3 | 4;
+type WizardStep = 0 | 1 | 2 | 3 | 4 | 5;
 type ConfirmAction = 'start-with-cleanup' | 'cancel' | null;
 
-const STEP_LABELS = ['Source', 'Select & group', 'Assign destinations', 'Review', 'Run'];
+const STEP_LABELS = ['Source', 'Select & group', 'Assign destinations', 'Resolve dependencies', 'Review', 'Run'];
 const PREFLIGHT_TIMEOUT_MS = 120_000;
 const DEFAULT_SOURCE_FOLDER_FILTER = '__omnikit_default_source_folder__';
 const MISSING_MODEL_FILTER = '__omnikit_missing_model__';
@@ -148,6 +149,13 @@ function connectionSubtitle(connection: ModelMigratorConnection) {
 
 function metadataList(values?: string[]) {
   return values?.length ? values.join(', ') : 'not detected';
+}
+
+function documentNeedsMetadataEnrichment(document: InstanceDocument) {
+  return !cleanDashboardModelMetadata(document.baseModelId)
+    || !cleanDashboardModelMetadata(document.baseModelName)
+    || !document.topicNames?.length
+    || !document.topicIds?.length;
 }
 
 function cleanFilterValue(value?: string | null) {
@@ -244,6 +252,23 @@ function groupedItemMessages(messages?: string[]) {
   return [...counts.entries()].map(([message, count]) => ({ message, count }));
 }
 
+function queryViewMappingKey(mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'sourceQueryViewName' | 'sourceFileName'>) {
+  return (mapping.sourceFileName || mapping.sourceQueryViewName).toLowerCase();
+}
+
+function topicMappingKey(mapping: Pick<DashboardMigrationTopicMappingDraft, 'sourceTopicName' | 'sourceTopicId'>) {
+  return (mapping.sourceTopicId || mapping.sourceTopicName).toLowerCase();
+}
+
+function semanticDestinationKey(row: DashboardMigrationTargetDraft) {
+  if (!row.destinationInstanceId || !row.targetConnectionId || !row.targetModelId) return `row:${row.id}`;
+  return [row.destinationInstanceId, row.targetConnectionId, row.targetModelId].join('::');
+}
+
+function targetRouteFolderLabel(row: DashboardMigrationTargetDraft) {
+  return row.targetFolderPath || 'My Documents/default';
+}
+
 function detailStringArray(details: Record<string, unknown> | undefined, key: string): string[] {
   const value = details?.[key];
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
@@ -328,14 +353,20 @@ export function DashboardMigrationWizard() {
   const [loadingSourceCatalog, setLoadingSourceCatalog] = useState(false);
   const [loadingSourceModels, setLoadingSourceModels] = useState(false);
   const [loadingDocuments, setLoadingDocuments] = useState(false);
+  const [dashboardLoadStatus, setDashboardLoadStatus] = useState('');
+  const [metadataEnrichmentStatus, setMetadataEnrichmentStatus] = useState('');
+  const [metadataEnrichmentRetryIds, setMetadataEnrichmentRetryIds] = useState<string[]>([]);
   const [dashboardLoadAttempted, setDashboardLoadAttempted] = useState(false);
   const [preflightLoading, setPreflightLoading] = useState(false);
+  const [preflightStatus, setPreflightStatus] = useState('');
   const [jobBusy, setJobBusy] = useState(false);
   const [confirmAction, setConfirmAction] = useState<ConfirmAction>(null);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const fireConfetti = useConfetti();
   const logOperation = useLogOperation();
+  const enrichedDocumentIdsRef = useRef<Set<string>>(new Set());
+  const enrichingDocumentIdsRef = useRef<Set<string>>(new Set());
 
   const creatingVault = vaultStatus?.exists === false;
   const passphraseMatches = !creatingVault || passphrase === passphraseConfirm;
@@ -429,6 +460,59 @@ export function DashboardMigrationWizard() {
       return changed ? next : current;
     });
   }, [sourceConnectionId, sourceModels]);
+
+  const enrichSelectedDashboardMetadata = useCallback(async (documentIds: string[], options: { force?: boolean } = {}) => {
+    if (options.force) {
+      documentIds.forEach((documentId) => enrichedDocumentIdsRef.current.delete(documentId));
+    }
+    const ids = [...new Set(documentIds)]
+      .filter((documentId) => !enrichedDocumentIdsRef.current.has(documentId))
+      .filter((documentId) => !enrichingDocumentIdsRef.current.has(documentId));
+    if (!sourceId || ids.length === 0) return;
+
+    ids.forEach((documentId) => enrichingDocumentIdsRef.current.add(documentId));
+    setMetadataEnrichmentStatus(`Reading model and topic metadata for ${ids.length} selected dashboard${ids.length === 1 ? '' : 's'}...`);
+    let failed = false;
+    try {
+      const res = await listInstanceDocuments(sourceId, {
+        connectionId: sourceConnectionId || undefined,
+        allFolders: true,
+        includeModelDetails: true,
+        documentIds: ids,
+      });
+      const enrichedById = new Map<string, InstanceDocument>();
+      for (const document of res.documents) {
+        enrichedById.set(document.identifier, document);
+        enrichedById.set(document.id, document);
+      }
+      setDocuments((current) => current.map((document) => {
+        const enriched = enrichedById.get(document.identifier) || enrichedById.get(document.id);
+        return enriched ? { ...document, ...enriched } : document;
+      }));
+      setMetadataEnrichmentRetryIds([]);
+    } catch (err) {
+      failed = true;
+      setMetadataEnrichmentRetryIds(ids);
+      setMetadataEnrichmentStatus(errorText(err, 'Metadata enrichment could not finish. Review will validate the selected dashboards before import.'));
+    } finally {
+      ids.forEach((documentId) => {
+        enrichingDocumentIdsRef.current.delete(documentId);
+        enrichedDocumentIdsRef.current.add(documentId);
+      });
+      if (!failed && enrichingDocumentIdsRef.current.size === 0) {
+        window.setTimeout(() => setMetadataEnrichmentStatus(''), 1500);
+      }
+    }
+  }, [sourceConnectionId, sourceId]);
+
+  useEffect(() => {
+    if (selectedDocumentIds.length === 0 || documents.length === 0) return;
+    const selectedNeedingMetadata = documents
+      .filter((document) => selectedDocumentIds.includes(document.identifier))
+      .filter(documentNeedsMetadataEnrichment)
+      .map((document) => document.identifier);
+    if (selectedNeedingMetadata.length > 0) void enrichSelectedDashboardMetadata(selectedNeedingMetadata);
+  }, [documents, enrichSelectedDashboardMetadata, selectedDocumentIds]);
 
   const dashboardFolderOptions = useMemo(() => {
     const hasDefaultFolder = documents.some((document) => !cleanFilterValue(document.folderPath));
@@ -554,6 +638,43 @@ export function DashboardMigrationWizard() {
     () => activeAssignedTargetRowsWithQueryViewMappings.filter((row) => (row.queryViewMappings || []).length > 0),
     [activeAssignedTargetRowsWithQueryViewMappings],
   );
+  const activeAssignedQueryViewSemanticGroups = useMemo(() => {
+    const groups = new Map<string, {
+      id: string;
+      primaryRow: DashboardMigrationTargetDraft;
+      rows: DashboardMigrationTargetDraft[];
+      routeIndexes: number[];
+      folderLabels: string[];
+      queryViewMappings: DashboardMigrationQueryViewMappingDraft[];
+    }>();
+    for (const row of activeAssignedRowsWithDetectedQueryViewMappings) {
+      const key = semanticDestinationKey(row);
+      const routeIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
+      const existing = groups.get(key);
+      const group = existing || {
+        id: key,
+        primaryRow: row,
+        rows: [],
+        routeIndexes: [],
+        folderLabels: [],
+        queryViewMappings: [],
+      };
+      group.rows.push(row);
+      if (routeIndex > 0) group.routeIndexes.push(routeIndex);
+      const folderLabel = targetRouteFolderLabel(row);
+      if (!group.folderLabels.includes(folderLabel)) group.folderLabels.push(folderLabel);
+      const existingKeys = new Set(group.queryViewMappings.map(queryViewMappingKey));
+      for (const mapping of row.queryViewMappings || []) {
+        const mappingKey = queryViewMappingKey(mapping);
+        if (!existingKeys.has(mappingKey)) {
+          group.queryViewMappings.push(mapping);
+          existingKeys.add(mappingKey);
+        }
+      }
+      groups.set(key, group);
+    }
+    return [...groups.values()];
+  }, [activeAssignedRowsWithDetectedQueryViewMappings, targetRows]);
 
   const activeTargetRowsWithTopicMappings = useMemo<DashboardMigrationTargetDraft[]>(() => (
     targetRows.map((row) => {
@@ -573,6 +694,43 @@ export function DashboardMigrationWizard() {
     () => activeTargetRowsWithTopicMappings.filter((row) => activeRouteGroup.targetRowIds.includes(row.id)),
     [activeRouteGroup.targetRowIds, activeTargetRowsWithTopicMappings],
   );
+  const activeAssignedTopicSemanticGroups = useMemo(() => {
+    const groups = new Map<string, {
+      id: string;
+      primaryRow: DashboardMigrationTargetDraft;
+      rows: DashboardMigrationTargetDraft[];
+      routeIndexes: number[];
+      folderLabels: string[];
+      topicMappings: DashboardMigrationTopicMappingDraft[];
+    }>();
+    for (const row of activeAssignedTargetRowsWithTopicMappings) {
+      const key = semanticDestinationKey(row);
+      const routeIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
+      const existing = groups.get(key);
+      const group = existing || {
+        id: key,
+        primaryRow: row,
+        rows: [],
+        routeIndexes: [],
+        folderLabels: [],
+        topicMappings: [],
+      };
+      group.rows.push(row);
+      if (routeIndex > 0) group.routeIndexes.push(routeIndex);
+      const folderLabel = targetRouteFolderLabel(row);
+      if (!group.folderLabels.includes(folderLabel)) group.folderLabels.push(folderLabel);
+      const existingKeys = new Set(group.topicMappings.map(topicMappingKey));
+      for (const mapping of row.topicMappings || []) {
+        const mappingKey = topicMappingKey(mapping);
+        if (!existingKeys.has(mappingKey)) {
+          group.topicMappings.push(mapping);
+          existingKeys.add(mappingKey);
+        }
+      }
+      groups.set(key, group);
+    }
+    return [...groups.values()];
+  }, [activeAssignedTargetRowsWithTopicMappings, targetRows]);
 
   const compiledRouteGroups = useMemo(() => (
     routeGroups
@@ -784,6 +942,20 @@ export function DashboardMigrationWizard() {
   const sourceDeleteItems = job?.items.filter((item) => item.kind === 'source_delete') || [];
   const totalItems = job?.items.length || 0;
   const completedItems = job ? terminalCount(job.items) : 0;
+  const failedItems = job?.items.filter((item) => item.status === 'failed') || [];
+  const warningItems = job?.items.filter((item) => item.status === 'warning' || (item.warnings?.length || 0) > 0) || [];
+  const importedDashboardLinks = importItems
+    .filter((item) => item.importedIdentifier && (item.status === 'succeeded' || item.status === 'warning'))
+    .map((item) => {
+      const instance = instances.find((candidate) => candidate.id === item.destinationId);
+      const baseUrl = instance?.baseUrl.replace(/\/+$/, '');
+      return {
+        id: item.id,
+        label: item.documentName || item.importedIdentifier || 'Imported dashboard',
+        destinationLabel: item.destinationLabel,
+        url: baseUrl && item.importedIdentifier ? `${baseUrl}/dashboards/${item.importedIdentifier}` : '',
+      };
+    });
 
   const refresh = useCallback(async () => {
     setError('');
@@ -873,6 +1045,11 @@ export function DashboardMigrationWizard() {
     setDashboardTopicFilter('');
     setDashboardLabelFilter('');
     setDashboardLoadAttempted(false);
+    setDashboardLoadStatus('');
+    setMetadataEnrichmentStatus('');
+    setMetadataEnrichmentRetryIds([]);
+    enrichedDocumentIdsRef.current.clear();
+    enrichingDocumentIdsRef.current.clear();
   }
 
   async function unlockVault() {
@@ -921,20 +1098,23 @@ export function DashboardMigrationWizard() {
         folders: prev[instanceId]?.folders || [],
         loading: true,
         loaded: prev[instanceId]?.loaded || false,
+        foldersLoading: prev[instanceId]?.foldersLoading || false,
+        foldersLoaded: prev[instanceId]?.foldersLoaded || false,
+        folderError: prev[instanceId]?.folderError || '',
         error: '',
       },
     }));
     try {
-      const [connectionsRes, foldersRes] = await Promise.all([
-        listModelMigratorConnections(instanceId),
-        listInstanceFolders(instanceId),
-      ]);
+      const connectionsRes = await listModelMigratorConnections(instanceId);
       const catalog: DashboardMigrationTargetCatalog = {
         connections: connectionsRes.connections.filter((connection) => !connection.deletedAt),
         models: [],
-        folders: flattenFolders(foldersRes.folders),
+        folders: current?.folders || [],
         loading: false,
         loaded: true,
+        foldersLoading: current?.foldersLoading || false,
+        foldersLoaded: current?.foldersLoaded || false,
+        folderError: current?.folderError || '',
         error: '',
       };
       setTargetCatalogs((prev) => ({ ...prev, [instanceId]: catalog }));
@@ -946,10 +1126,72 @@ export function DashboardMigrationWizard() {
         folders: current?.folders || [],
         loading: false,
         loaded: false,
+        foldersLoading: current?.foldersLoading || false,
+        foldersLoaded: current?.foldersLoaded || false,
+        folderError: current?.folderError || '',
         error: errorText(err, 'Could not load target connections and folders.'),
       };
       setTargetCatalogs((prev) => ({ ...prev, [instanceId]: catalog }));
       setError(catalog.error);
+      return catalog;
+    }
+  }
+
+  async function loadTargetFolders(instanceId: string): Promise<DashboardMigrationTargetCatalog | null> {
+    if (!instanceId) return null;
+    const current = targetCatalogs[instanceId];
+    if (current?.foldersLoaded && !current.foldersLoading) return current;
+    setTargetCatalogs((prev) => ({
+      ...prev,
+      [instanceId]: {
+        connections: prev[instanceId]?.connections || [],
+        models: prev[instanceId]?.models || [],
+        folders: prev[instanceId]?.folders || [],
+        loading: prev[instanceId]?.loading || false,
+        loaded: prev[instanceId]?.loaded || false,
+        foldersLoading: true,
+        foldersLoaded: prev[instanceId]?.foldersLoaded || false,
+        folderError: '',
+        error: prev[instanceId]?.error || '',
+      },
+    }));
+    try {
+      const foldersRes = await listInstanceFolders(instanceId);
+      const catalog: DashboardMigrationTargetCatalog = {
+        connections: current?.connections || [],
+        models: current?.models || [],
+        folders: flattenFolders(foldersRes.folders),
+        loading: current?.loading || false,
+        loaded: current?.loaded || false,
+        foldersLoading: false,
+        foldersLoaded: true,
+        folderError: '',
+        error: current?.error || '',
+      };
+      setTargetCatalogs((prev) => ({
+        ...prev,
+        [instanceId]: {
+          ...catalog,
+          connections: prev[instanceId]?.connections || catalog.connections,
+          loaded: prev[instanceId]?.loaded || catalog.loaded,
+          error: prev[instanceId]?.error || catalog.error,
+        },
+      }));
+      return catalog;
+    } catch (err) {
+      const catalog: DashboardMigrationTargetCatalog = {
+        connections: current?.connections || [],
+        models: current?.models || [],
+        folders: current?.folders || [],
+        loading: current?.loading || false,
+        loaded: current?.loaded || false,
+        foldersLoading: false,
+        foldersLoaded: false,
+        folderError: errorText(err, 'Could not load target folders.'),
+        error: current?.error || '',
+      };
+      setTargetCatalogs((prev) => ({ ...prev, [instanceId]: catalog }));
+      setError(catalog.folderError || 'Could not load target folders.');
       return catalog;
     }
   }
@@ -1257,44 +1499,46 @@ export function DashboardMigrationWizard() {
   }
 
   function updateQueryViewMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationQueryViewMappingDraft) {
-    const keyFor = (mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'sourceQueryViewName' | 'sourceFileName'>) => (
-      (mapping.sourceFileName || mapping.sourceQueryViewName).toLowerCase()
-    );
-    const nextKey = keyFor(nextMapping);
+    const nextKey = queryViewMappingKey(nextMapping);
+    const peerRowIds = targetRows
+      .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
+      .filter((targetRow) => semanticDestinationKey(targetRow) === semanticDestinationKey(row))
+      .map((targetRow) => targetRow.id);
     setRouteGroups((current) => current.map((group) => {
       if (group.id !== activeRouteGroup.id) return group;
-      const currentMappings = group.queryViewMappingsByTargetId?.[row.id] || [];
-      const nextMappings = currentMappings.some((mapping) => keyFor(mapping) === nextKey)
-        ? currentMappings.map((mapping) => keyFor(mapping) === nextKey ? nextMapping : mapping)
-        : [...currentMappings, nextMapping];
+      const queryViewMappingsByTargetId = { ...(group.queryViewMappingsByTargetId || {}) };
+      for (const targetRowId of peerRowIds) {
+        const currentMappings = queryViewMappingsByTargetId[targetRowId] || [];
+        queryViewMappingsByTargetId[targetRowId] = currentMappings.some((mapping) => queryViewMappingKey(mapping) === nextKey)
+          ? currentMappings.map((mapping) => queryViewMappingKey(mapping) === nextKey ? nextMapping : mapping)
+          : [...currentMappings, nextMapping];
+      }
       return {
         ...group,
-        queryViewMappingsByTargetId: {
-          ...(group.queryViewMappingsByTargetId || {}),
-          [row.id]: nextMappings,
-        },
+        queryViewMappingsByTargetId,
       };
     }));
     resetPlan();
   }
 
   function updateTopicMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationTopicMappingDraft) {
-    const keyFor = (mapping: Pick<DashboardMigrationTopicMappingDraft, 'sourceTopicName' | 'sourceTopicId'>) => (
-      (mapping.sourceTopicId || mapping.sourceTopicName).toLowerCase()
-    );
-    const nextKey = keyFor(nextMapping);
+    const nextKey = topicMappingKey(nextMapping);
+    const peerRowIds = targetRows
+      .filter((targetRow) => activeRouteGroup.targetRowIds.includes(targetRow.id))
+      .filter((targetRow) => semanticDestinationKey(targetRow) === semanticDestinationKey(row))
+      .map((targetRow) => targetRow.id);
     setRouteGroups((current) => current.map((group) => {
       if (group.id !== activeRouteGroup.id) return group;
-      const currentMappings = group.topicMappingsByTargetId?.[row.id] || [];
-      const nextMappings = currentMappings.some((mapping) => keyFor(mapping) === nextKey)
-        ? currentMappings.map((mapping) => keyFor(mapping) === nextKey ? nextMapping : mapping)
-        : [...currentMappings, nextMapping];
+      const topicMappingsByTargetId = { ...(group.topicMappingsByTargetId || {}) };
+      for (const targetRowId of peerRowIds) {
+        const currentMappings = topicMappingsByTargetId[targetRowId] || [];
+        topicMappingsByTargetId[targetRowId] = currentMappings.some((mapping) => topicMappingKey(mapping) === nextKey)
+          ? currentMappings.map((mapping) => topicMappingKey(mapping) === nextKey ? nextMapping : mapping)
+          : [...currentMappings, nextMapping];
+      }
       return {
         ...group,
-        topicMappingsByTargetId: {
-          ...(group.topicMappingsByTargetId || {}),
-          [row.id]: nextMappings,
-        },
+        topicMappingsByTargetId,
       };
     }));
     resetPlan();
@@ -1457,6 +1701,10 @@ export function DashboardMigrationWizard() {
       return;
     }
     setLoadingDocuments(true);
+    setDashboardLoadStatus('Loading the dashboard catalog for this connection...');
+    setMetadataEnrichmentStatus('');
+    enrichedDocumentIdsRef.current.clear();
+    enrichingDocumentIdsRef.current.clear();
     setDashboardLoadAttempted(true);
     setError('');
     setMessage('');
@@ -1465,13 +1713,15 @@ export function DashboardMigrationWizard() {
       const res = await listInstanceDocuments(sourceId, {
         connectionId: sourceConnectionId || undefined,
         allFolders: true,
-        includeModelDetails: true,
+        includeModelDetails: false,
       });
+      setDashboardLoadStatus('Scoping dashboards to the selected connection...');
       const connectionScopedDocuments = sourceConnectionId
         ? res.documents.filter((document) => !document.connectionId || document.connectionId === sourceConnectionId)
         : res.documents;
       let modelRows = sourceModels;
       if (sourceConnectionId && modelRows.length === 0) {
+        setDashboardLoadStatus('Checking source models for fallback metadata...');
         const modelsRes = await listModelMigratorModels(sourceId, { connectionId: sourceConnectionId });
         modelRows = modelsRes.models;
         setSourceModels(modelsRes.models);
@@ -1492,9 +1742,11 @@ export function DashboardMigrationWizard() {
     } catch (err) {
       setDocuments([]);
       setSelectedDocumentIds([]);
+      setDashboardLoadStatus('');
       setError(errorText(err, 'Could not load source dashboards.'));
     } finally {
       setLoadingDocuments(false);
+      setDashboardLoadStatus('');
     }
   }
 
@@ -1515,6 +1767,7 @@ export function DashboardMigrationWizard() {
       targets: migrationTargets,
       routeGroups: compiledRouteGroups,
       documentIds: selectedDocumentIds,
+      sourceDocumentHints: selectedDocuments,
       emptyFirst,
       replaceSameNamed,
       deleteSourceOnSuccess,
@@ -1592,6 +1845,7 @@ export function DashboardMigrationWizard() {
       return;
     }
     setPreflightLoading(true);
+    setPreflightStatus('Building the route preview and checking destination readiness...');
     setError('');
     setMessage('Checking that destinations are ready before import.');
     setPlan(null);
@@ -1602,23 +1856,25 @@ export function DashboardMigrationWizard() {
         PREFLIGHT_TIMEOUT_MS,
         'Destination readiness check timed out before OmniKit received a response. No changes were applied.',
       );
+      setPreflightStatus('Checking query-view and topic mappings from the readiness result...');
       const queryViewSync = await syncDetectedQueryViewMappingsFromPlan(res.plan);
       setPlan(res.plan);
       setPlanRows(preflightRowsFromPlan(res.plan));
       if (queryViewSync.needsReview) {
-        setStep(2);
+        setStep(3);
         setMessage(queryViewSync.blockedCount > 0
-          ? 'Query-view mappings were detected and need attention before review. Resolve them in Step 3, then check readiness again.'
-          : 'Query-view mappings were detected. Review them in Step 3, then check readiness again.');
+          ? 'Query-view mappings were detected and need attention before review. Resolve them in Step 4, then check readiness again.'
+          : 'Query-view mappings were detected. Review them in Step 4, then check readiness again.');
         return;
       }
-      setStep(3);
+      setStep(4);
       setMessage('Review is ready. Check warnings before starting the migration.');
     } catch (err) {
       setMessage('');
       setError(errorText(err, 'Could not check destination readiness.'));
     } finally {
       setPreflightLoading(false);
+      setPreflightStatus('');
     }
   }
 
@@ -1633,7 +1889,7 @@ export function DashboardMigrationWizard() {
     try {
       const res = await createOpsMigrationJob(buildJobInput());
       setJob(res.job);
-      setStep(4);
+      setStep(5);
       setMessage('Dashboard migration job started.');
     } catch (err) {
       setError(errorText(err, 'Could not start dashboard migration job.'));
@@ -1685,8 +1941,9 @@ export function DashboardMigrationWizard() {
     if (index === 0) return true;
     if (index === 1) return documents.length > 0;
     if (index === 2) return selectedDocumentIds.length > 0;
-    if (index === 3) return planRows.length > 0;
-    if (index === 4) return Boolean(job);
+    if (index === 3) return selectedDocumentIds.length > 0 && targetRows.length > 0;
+    if (index === 4) return planRows.length > 0;
+    if (index === 5) return Boolean(job);
     return false;
   }
 
@@ -2088,7 +2345,7 @@ export function DashboardMigrationWizard() {
       {message && <div aria-live="polite" className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
 
       <div className="card p-3">
-        <div className="grid gap-2 md:grid-cols-5">
+        <div className="grid gap-2 md:grid-cols-6">
           {STEP_LABELS.map((label, index) => {
             const enabled = index === step || canOpenStep(index);
             return (
@@ -2142,7 +2399,15 @@ export function DashboardMigrationWizard() {
                   emptyLabel="No source connections found for this instance"
                   ariaLabel="Source connection"
                 />
+                <p className="mt-1 text-xs text-content-secondary">
+                  Type to search long connection lists by name, warehouse/database, dialect, or audit ID.
+                </p>
               </div>
+              {sourceConnectionId && (
+                <div className="rounded-card border border-blue-100 bg-blue-50 px-3 py-2 text-sm text-blue-800">
+                  OmniKit will search all dashboards tied to this connection, across all folders.
+                </div>
+              )}
               <button
                 type="button"
                 onClick={() => void loadDashboards()}
@@ -2153,6 +2418,9 @@ export function DashboardMigrationWizard() {
                 {loadingDocuments ? <Loader2 size={15} className="animate-spin" /> : <FileText size={15} />}
                 Load dashboards
               </button>
+              {dashboardLoadStatus && (
+                <p aria-live="polite" className="text-xs text-content-secondary">{dashboardLoadStatus}</p>
+              )}
             </div>
           </div>
           <div className="card p-5">
@@ -2181,12 +2449,25 @@ export function DashboardMigrationWizard() {
             <div>
               <h2 className="text-base font-semibold text-content-primary">2. Select and group dashboards</h2>
               <p className="mt-1 text-sm text-content-secondary">
-                Select dashboards first, then decide whether they should move together or as separate groups.
+                First choose what to move. Then keep everything together or create groups when dashboards need different destinations.
               </p>
             </div>
             <div className="flex flex-wrap gap-2">
               <button type="button" onClick={selectAllVisibleDocuments} disabled={filteredDocuments.length === 0} className="btn-secondary text-xs">Select visible</button>
               <button type="button" onClick={() => { setSelectedDocumentIds([]); resetPlan(); }} disabled={selectedDocumentIds.length === 0} className="btn-secondary text-xs">Clear</button>
+            </div>
+          </div>
+          <div className="mt-5 rounded-card border border-border-subtle bg-white p-4">
+            <div className="flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h3 className="text-sm font-semibold text-content-primary">Select dashboards</h3>
+                <p className="mt-1 text-xs text-content-secondary">
+                  Showing dashboards from the selected source connection across all folders.
+                </p>
+              </div>
+              <div className="text-xs text-content-secondary">
+                {selectedDocumentIds.length} selected from {filteredDocuments.length} visible
+              </div>
             </div>
           </div>
           <div className="mt-4">
@@ -2230,10 +2511,25 @@ export function DashboardMigrationWizard() {
               ariaLabel="Filter dashboards by label"
             />
           </div>
+          {metadataEnrichmentStatus && (
+            <div aria-live="polite" className="mt-3 flex flex-col gap-2 rounded-card border border-blue-100 bg-blue-50 px-3 py-2 text-xs text-blue-800 md:flex-row md:items-center md:justify-between">
+              <span>{metadataEnrichmentStatus}</span>
+              {metadataEnrichmentRetryIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void enrichSelectedDashboardMetadata(metadataEnrichmentRetryIds, { force: true })}
+                  className="rounded-button border border-blue-200 bg-white px-2 py-1 font-semibold text-blue-800 hover:bg-blue-100"
+                >
+                  Retry metadata
+                </button>
+              )}
+            </div>
+          )}
           <div className="mt-4 max-h-[520px] overflow-auto rounded-card border border-border-subtle">
             {filteredDocuments.map((document) => {
               const selected = selectedDocumentIds.includes(document.identifier);
               const model = dashboardDocumentModelLabel(document, sourceModelNameById);
+              const metadataPending = selected && documentNeedsMetadataEnrichment(document);
               return (
                 <label key={document.identifier} className={`grid gap-3 border-b border-border-subtle px-3 py-3 text-sm last:border-b-0 hover:bg-surface-secondary md:grid-cols-[auto_minmax(0,1fr)_minmax(220px,0.75fr)_minmax(220px,0.75fr)_0.5fr] ${selected ? 'bg-omni-50/50' : ''}`}>
                   <input
@@ -2247,6 +2543,11 @@ export function DashboardMigrationWizard() {
                     <span className="block font-semibold text-content-primary">{document.name}</span>
                     <span className="block font-mono text-xs text-content-secondary">{document.identifier}</span>
                     <span className="mt-1 block text-xs text-content-secondary">{document.folderPath || 'My Documents/default'}</span>
+                    {metadataPending && (
+                      <span className="mt-1 inline-flex rounded-chip bg-blue-50 px-2 py-0.5 text-[11px] font-semibold text-blue-800">
+                        Checking model/topic...
+                      </span>
+                    )}
                   </span>
                   <span className="text-xs text-content-secondary" title={model.detected ? undefined : 'No model metadata was available from the dashboard export.'}>
                     <span className="block font-semibold text-content-primary">Model: {model.label}</span>
@@ -2267,9 +2568,9 @@ export function DashboardMigrationWizard() {
           <div className="mt-5 rounded-card border border-border-subtle bg-surface-secondary/30 p-4">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
-                <h3 className="text-base font-semibold text-content-primary">Dashboard groups</h3>
+                <h3 className="text-base font-semibold text-content-primary">Organize dashboard groups</h3>
                 <p className="mt-1 text-sm text-content-secondary">
-                  Groups decide which dashboards can be routed separately in the next step.
+                  Groups let different dashboards go to different destinations. Keep one group for simple migrations.
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -2385,14 +2686,18 @@ export function DashboardMigrationWizard() {
         </section>
       )}
 
-      {step === 2 && (
+      {(step === 2 || step === 3) && (
         <section className="space-y-5">
           <div className="card p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
-                <h2 className="text-base font-semibold text-content-primary">3. Assign destinations</h2>
+                <h2 className="text-base font-semibold text-content-primary">
+                  {step === 2 ? '3. Assign destinations' : '4. Resolve dependencies'}
+                </h2>
                 <p className="mt-1 text-sm text-content-secondary">
-                  Add destinations, then choose which dashboard groups should route to each one.
+                  {step === 2
+                    ? 'Add destinations, then choose which dashboard groups should route to each one.'
+                    : 'Confirm the query views and topics OmniKit should use or create before dashboard import.'}
                 </p>
               </div>
             </div>
@@ -2412,13 +2717,13 @@ export function DashboardMigrationWizard() {
             </div>
 	          </div>
 
-	          {activeAssignedRowsWithDetectedQueryViewMappings.length > 0 && (
+	          {step === 3 && activeAssignedQueryViewSemanticGroups.length > 0 && (
 	            <div className="card p-5">
 	              <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
 	                <div>
-	                  <h2 className="text-base font-semibold text-content-primary">Query-view mappings by route</h2>
+	                  <h2 className="text-base font-semibold text-content-primary">Query-view decisions by target model</h2>
 	                  <p className="mt-1 text-sm text-content-secondary">
-	                    Query views are prepared before topics so topic-backed dashboards have their underlying views available.
+	                    Query views are shared by the destination model, so routes that only differ by folder use the same decisions.
 	                  </p>
 	                </div>
 	                <div className="rounded-chip bg-surface-secondary px-3 py-1 text-xs font-semibold text-content-secondary">
@@ -2426,22 +2731,38 @@ export function DashboardMigrationWizard() {
 	                </div>
 	              </div>
 	              <div className="mt-4 space-y-4">
-	                {activeAssignedRowsWithDetectedQueryViewMappings.map((row) => {
+	                {activeAssignedQueryViewSemanticGroups.map((semanticGroup) => {
+	                  const row = semanticGroup.primaryRow;
 	                  const queryViewCatalog = targetQueryViewCatalog(row);
 	                  const routeBlocker = queryViewMappingRouteBlocker(row);
-	                  const destinationIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
-	                  const routeMappings = row.queryViewMappings || [];
+	                  const destinationLabel = semanticGroup.routeIndexes.length > 1
+	                    ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
+	                    : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
+	                  const routeMappings = semanticGroup.queryViewMappings;
 	                  return (
-	                    <div key={`query-view-route-${activeRouteGroup.id}-${row.id}`} className="rounded-card border border-border-subtle bg-white p-4">
+	                    <div key={`query-view-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
 	                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
 	                        <div className="min-w-0">
 	                          <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
 	                            <FileText size={14} />
-	                            Destination {destinationIndex || '?'} query-view route
+	                            {destinationLabel} query-view decisions
 	                          </div>
 	                          <div className="mt-1 truncate text-xs text-content-secondary">
-	                            {routePathLabel(activeRouteGroup, row)}
+	                            {dashboardMigrationRoutePathLabel({
+	                              groupName: activeRouteGroup.name,
+	                              destinationLabel: targetInstanceLabel(row.destinationInstanceId),
+	                              connectionLabel: targetConnectionLabel(row.destinationInstanceId, row.targetConnectionId),
+	                              modelLabel: row.targetModelName || row.targetModelId || 'Model not selected',
+	                              folderLabel: semanticGroup.folderLabels.length > 1
+	                                ? `${semanticGroup.folderLabels.length} folders: ${semanticGroup.folderLabels.join(', ')}`
+	                                : semanticGroup.folderLabels[0] || targetRouteFolderLabel(row),
+	                            })}
 	                          </div>
+	                          {semanticGroup.rows.length > 1 && (
+	                            <div className="mt-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+	                              One decision set applies to {semanticGroup.rows.length} folder route{semanticGroup.rows.length === 1 ? '' : 's'} in this same target model.
+	                            </div>
+	                          )}
 	                        </div>
 	                        <div className="flex flex-wrap items-center gap-2">
 	                          {queryViewCatalog?.loading && (
@@ -2463,7 +2784,7 @@ export function DashboardMigrationWizard() {
 	                      {queryViewCatalog?.loaded && routeMappings.length > 0 && (
 	                        <div className="mt-3 space-y-3">
 	                          {routeMappings.map((mapping) => (
-	                            <div key={`${row.id}:${mapping.sourceFileName || mapping.sourceQueryViewName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
+	                            <div key={`${semanticGroup.id}:${mapping.sourceFileName || mapping.sourceQueryViewName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
 	                              <div className="min-w-0">
 	                                <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source query view</div>
 	                                <div className="mt-1 truncate text-sm font-semibold text-content-primary">{mapping.sourceQueryViewName}</div>
@@ -2551,7 +2872,7 @@ export function DashboardMigrationWizard() {
 	                                    placeholder={queryViewCatalog?.loading ? 'Checking destination query views...' : 'Select existing query view'}
 	                                    allowFreeText={false}
 	                                    emptyLabel={queryViewCatalog?.loaded ? 'No destination query views found for this model' : 'Choose a destination model first'}
-	                                    ariaLabel={`Destination ${destinationIndex || '?'} query view for ${mapping.sourceQueryViewName} on ${activeRouteGroup.name}`}
+	                                    ariaLabel={`${destinationLabel} query view for ${mapping.sourceQueryViewName} on ${activeRouteGroup.name}`}
 	                                  />
 	                                )}
 	                              </div>
@@ -2594,6 +2915,8 @@ export function DashboardMigrationWizard() {
 	            </div>
 	          )}
 
+	          {step === 2 && (
+	          <>
 	          <div className="card p-5">
 	            <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
@@ -2762,9 +3085,10 @@ export function DashboardMigrationWizard() {
                           options={targetFolderOptions(row)}
                           value={row.targetFolderPath || row.targetFolderId}
                           disabled={!row.destinationInstanceId || targetCatalog?.loading}
+                          onOpen={() => void loadTargetFolders(row.destinationInstanceId)}
                           onChange={(value) => chooseTargetFolder(row, value)}
-                          placeholder={targetCatalog?.loading ? 'Loading destination folders...' : 'My Documents/default'}
-                          emptyLabel={TARGET_FOLDER_COMBOBOX_CONFIG.emptyLabel}
+                          placeholder={targetCatalog?.foldersLoading ? 'Loading destination folders...' : 'My Documents/default'}
+                          emptyLabel={targetCatalog?.folderError || TARGET_FOLDER_COMBOBOX_CONFIG.emptyLabel}
                           allowFreeText={TARGET_FOLDER_COMBOBOX_CONFIG.allowFreeText}
                           ariaLabel={`Destination ${index + 1} folder`}
                         />
@@ -2880,13 +3204,16 @@ export function DashboardMigrationWizard() {
               </div>
             )}
           </div>
+	          </>
+	          )}
 
+          {step === 3 && (
           <div className="card p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
-                <h2 className="text-base font-semibold text-content-primary">Topic mappings by route</h2>
+                <h2 className="text-base font-semibold text-content-primary">Topic decisions by target model</h2>
                 <p className="mt-1 text-sm text-content-secondary">
-                  Topic choices are scoped to the selected dashboard group and destination route.
+                  Topic choices are shared by the destination model, so folder-only route duplicates use one decision set.
                 </p>
               </div>
               <div className="rounded-chip bg-surface-secondary px-3 py-1 text-xs font-semibold text-content-secondary">
@@ -2900,28 +3227,44 @@ export function DashboardMigrationWizard() {
               <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
                 The selected dashboard group does not reference any source topics, so no topic mappings are needed for this group.
               </div>
-            ) : activeAssignedTargetRowsWithTopicMappings.length === 0 ? (
+            ) : activeAssignedTopicSemanticGroups.length === 0 ? (
               <div className="mt-4 rounded-card border border-dashed border-border-subtle p-5 text-sm text-content-secondary">
                 Assign {activeRouteGroup.name} to at least one destination before mapping topics.
               </div>
             ) : (
               <div className="mt-4 space-y-4">
-                {activeAssignedTargetRowsWithTopicMappings.map((row) => {
+                {activeAssignedTopicSemanticGroups.map((semanticGroup) => {
+                  const row = semanticGroup.primaryRow;
                   const topicCatalog = targetTopicCatalog(row);
                   const routeBlocker = topicMappingRouteBlocker(row);
-                  const destinationIndex = targetRows.findIndex((targetRow) => targetRow.id === row.id) + 1;
-                  const routeMappings = row.topicMappings || [];
+                  const destinationLabel = semanticGroup.routeIndexes.length > 1
+                    ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
+                    : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
+                  const routeMappings = semanticGroup.topicMappings;
                   return (
-                    <div key={`topic-route-${activeRouteGroup.id}-${row.id}`} className="rounded-card border border-border-subtle bg-white p-4">
+                    <div key={`topic-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
                       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                             <BookOpen size={14} />
-                            Destination {destinationIndex || '?'} topic route
+                            {destinationLabel} topic decisions
                           </div>
                           <div className="mt-1 truncate text-xs text-content-secondary">
-                            {routePathLabel(activeRouteGroup, row)}
+                            {dashboardMigrationRoutePathLabel({
+                              groupName: activeRouteGroup.name,
+                              destinationLabel: targetInstanceLabel(row.destinationInstanceId),
+                              connectionLabel: targetConnectionLabel(row.destinationInstanceId, row.targetConnectionId),
+                              modelLabel: row.targetModelName || row.targetModelId || 'Model not selected',
+                              folderLabel: semanticGroup.folderLabels.length > 1
+                                ? `${semanticGroup.folderLabels.length} folders: ${semanticGroup.folderLabels.join(', ')}`
+                                : semanticGroup.folderLabels[0] || targetRouteFolderLabel(row),
+                            })}
                           </div>
+                          {semanticGroup.rows.length > 1 && (
+                            <div className="mt-2 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                              One decision set applies to {semanticGroup.rows.length} folder route{semanticGroup.rows.length === 1 ? '' : 's'} in this same target model.
+                            </div>
+                          )}
                         </div>
                         <div className="flex flex-wrap items-center gap-2">
                           {topicCatalog?.loading && (
@@ -2943,7 +3286,7 @@ export function DashboardMigrationWizard() {
                       {topicCatalog?.loaded && routeMappings.length > 0 && (
                         <div className="mt-3 space-y-3">
                           {routeMappings.map((mapping) => (
-                            <div key={`${row.id}:${mapping.sourceTopicId || mapping.sourceTopicName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
+                            <div key={`${semanticGroup.id}:${mapping.sourceTopicId || mapping.sourceTopicName}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,0.8fr)_minmax(0,1.1fr)]">
                               <div className="min-w-0">
                                 <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source topic</div>
                                 <div className="mt-1 truncate text-sm font-semibold text-content-primary">{mapping.sourceTopicName}</div>
@@ -3016,7 +3359,7 @@ export function DashboardMigrationWizard() {
                                     placeholder={topicCatalog?.loading ? 'Checking destination topics...' : 'Select existing topic'}
                                     allowFreeText={false}
                                     emptyLabel={topicCatalog?.loaded ? 'No destination topics found for this model' : 'Choose a destination model first'}
-                                    ariaLabel={`Destination ${destinationIndex || '?'} topic for ${mapping.sourceTopicName} on ${activeRouteGroup.name}`}
+                                    ariaLabel={`${destinationLabel} topic for ${mapping.sourceTopicName} on ${activeRouteGroup.name}`}
                                   />
                                 )}
                               </div>
@@ -3054,6 +3397,31 @@ export function DashboardMigrationWizard() {
               </div>
             )}
           </div>
+          )}
+
+          {step === 3 && planRows.length === 0 && (
+            <div className="card p-5">
+              <h2 className="text-base font-semibold text-content-primary">Check readiness to find dependencies</h2>
+              <p className="mt-1 text-sm text-content-secondary">
+                OmniKit needs to preview the route before it can detect query views, relationships, topics, and replacement work.
+              </p>
+              <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                Use the readiness button below. If dependencies are found, they will appear here as a checklist to resolve.
+              </div>
+            </div>
+          )}
+
+          {step === 3 && planRows.length > 0 && activeAssignedQueryViewSemanticGroups.length === 0 && activeRouteSourceTopics.length === 0 && (
+            <div className="card p-5">
+              <h2 className="text-base font-semibold text-content-primary">No semantic dependencies need choices</h2>
+              <p className="mt-1 text-sm text-content-secondary">
+                OmniKit did not detect query views or topics that need manual mapping for the selected dashboard group.
+              </p>
+              <div className="mt-4 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+                This route can move straight to Review after the readiness check completes.
+              </div>
+            </div>
+          )}
 
           <div className="grid gap-5 lg:grid-cols-[1fr_0.82fr]">
             <div className="card p-5">
@@ -3171,7 +3539,9 @@ export function DashboardMigrationWizard() {
               </div>
             </div>
             <div className="card p-5">
-              <h3 className="text-base font-semibold text-content-primary">Readiness check</h3>
+              <h3 className="text-base font-semibold text-content-primary">
+                {step === 2 ? 'Readiness check' : 'Dependency readiness'}
+              </h3>
               <div className="mt-4 grid gap-3 text-sm">
                 <div className="rounded-card bg-surface-secondary p-3">
                   <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Dashboards</div>
@@ -3191,12 +3561,15 @@ export function DashboardMigrationWizard() {
                 </div>
               </div>
               <div className="mt-5 flex justify-between gap-3">
-                <button type="button" onClick={() => setStep(1)} className="btn-secondary">Back</button>
+                <button type="button" onClick={() => setStep(step === 3 ? 2 : 1)} className="btn-secondary">
+                  {step === 3 ? 'Back to destinations' : 'Back'}
+                </button>
                 <div className="flex flex-col items-end gap-2">
                   <button type="button" onClick={runPreflight} disabled={!canPreflight} className="btn-primary inline-flex items-center gap-2">
                     {preflightLoading ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
-                    Check readiness
+                    {step === 3 ? 'Recheck readiness' : 'Check readiness'}
                   </button>
+                  {preflightStatus && <p aria-live="polite" className="max-w-sm text-right text-xs text-content-secondary">{preflightStatus}</p>}
                   {preflightBlockReason && !preflightLoading && <p className="max-w-sm text-right text-xs text-content-secondary">{preflightBlockReason}</p>}
                 </div>
               </div>
@@ -3205,10 +3578,10 @@ export function DashboardMigrationWizard() {
         </section>
       )}
 
-      {step === 3 && (
+      {step === 4 && (
         <section className="grid gap-5 lg:grid-cols-[1fr_0.62fr]">
           <div className="card p-5">
-            <h2 className="text-base font-semibold text-content-primary">4. Review</h2>
+            <h2 className="text-base font-semibold text-content-primary">5. Review impact</h2>
             <div className="mt-4 rounded-card border border-border-subtle bg-surface-secondary/40 p-4">
               <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
                 <div>
@@ -3269,6 +3642,49 @@ export function DashboardMigrationWizard() {
                   ))}
                 </div>
               )}
+            </div>
+            <div className="mt-4 rounded-card border border-border-subtle bg-white p-4">
+              <h3 className="text-sm font-semibold text-content-primary">What will happen</h3>
+              <ol className="mt-3 space-y-2 text-sm text-content-secondary">
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">1</span>
+                  <span>OmniKit exports the selected source dashboards from the chosen connection.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">2</span>
+                  <span>For each route, OmniKit prepares required query views, relationships, and topics before import.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">3</span>
+                  <span>
+                    {targetDeleteCount > 0
+                      ? `${targetDeleteCount} existing target dashboard${targetDeleteCount === 1 ? '' : 's'} will be moved to Trash in scoped target folders before import.`
+                      : replaceSameNamed
+                        ? 'Same-name replacement is on, but no scoped target replacements were found in this preview.'
+                        : 'Same-name replacement is off, so existing target dashboards will not be touched.'}
+                  </span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">4</span>
+                  <span>Dashboards are imported into each configured destination connection, model, and folder.</span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">5</span>
+                  <span>
+                    {refreshSchemaOnComplete
+                      ? 'Schema refresh is queued for the selected target models after import.'
+                      : 'Schema refresh is off.'}
+                  </span>
+                </li>
+                <li className="flex gap-2">
+                  <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-omni-50 text-xs font-semibold text-omni-700">6</span>
+                  <span>
+                    {deleteSourceOnSuccess
+                      ? 'Source dashboards are moved to Trash only after every route succeeds and selected post-actions do not fail.'
+                      : 'Source delete is off, so the original dashboards stay where they are.'}
+                  </span>
+                </li>
+              </ol>
             </div>
             <div className="mt-4 rounded-card border border-border-subtle bg-white p-4">
               <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
@@ -3652,7 +4068,7 @@ export function DashboardMigrationWizard() {
             </div>
             <div className="card p-5">
               <div className="flex flex-col gap-3">
-                <button type="button" onClick={() => setStep(2)} className="btn-secondary">Back to destinations</button>
+                <button type="button" onClick={() => setStep(3)} className="btn-secondary">Back to dependencies</button>
                 <button type="button" onClick={() => void startJob()} disabled={!canRun} className="btn-primary inline-flex items-center justify-center gap-2">
                   {jobBusy ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
                   Start migration
@@ -3664,12 +4080,12 @@ export function DashboardMigrationWizard() {
         </section>
       )}
 
-      {step === 4 && (
+      {step === 5 && (
         <section className="space-y-5">
           <div className="card p-5">
             <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
               <div>
-                <h2 className="text-base font-semibold text-content-primary">5. Run and results</h2>
+                <h2 className="text-base font-semibold text-content-primary">6. Run and results</h2>
                 <p className="mt-1 text-sm text-content-secondary">Live progress is streamed from the local migration engine.</p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -3700,6 +4116,77 @@ export function DashboardMigrationWizard() {
             ) : (
               <div className="mt-4 space-y-4">
                 <DashboardMigrationLaunchScene current={completedItems} total={totalItems} status={job.status} />
+                {jobDone && (
+                  <div className={`rounded-card border p-4 ${failedItems.length > 0 ? 'border-red-200 bg-red-50/40' : warningItems.length > 0 || job.status === 'partial' ? 'border-yellow-200 bg-yellow-50/40' : 'border-green-200 bg-green-50/40'}`}>
+                    <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                      <div>
+                        <h3 className="text-base font-semibold text-content-primary">
+                          {failedItems.length > 0
+                            ? 'Migration needs attention'
+                            : warningItems.length > 0 || job.status === 'partial'
+                              ? 'Migration landed with warnings'
+                              : 'Landed successfully'}
+                        </h3>
+                        <p className="mt-1 text-sm text-content-secondary">
+                          {failedItems.length > 0
+                            ? `${failedItems.length} step${failedItems.length === 1 ? '' : 's'} failed. Open the item log below for the exact route and retry details.`
+                            : 'The selected dashboards finished their route. Review the target links below, then open the dashboard in Omni when you are ready.'}
+                        </p>
+                      </div>
+                      <StatusChip
+                        status={failedItems.length > 0 ? 'failed' : warningItems.length > 0 || job.status === 'partial' ? 'warning' : 'success'}
+                        label={failedItems.length > 0 ? 'Needs attention' : warningItems.length > 0 || job.status === 'partial' ? 'Warnings' : 'Complete'}
+                      />
+                    </div>
+                    <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{importItems.length}</span><br />
+                        Dashboard import route{importItems.length === 1 ? '' : 's'}
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{queryViewPrepareItems.length ? terminalCount(queryViewPrepareItems) : 'None'}</span><br />
+                        Query views prepared
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{relationshipPrepareItems.length ? terminalCount(relationshipPrepareItems) : 'None'}</span><br />
+                        Relationships prepared
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{topicPrepareItems.length ? terminalCount(topicPrepareItems) : 'None'}</span><br />
+                        Topics prepared
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{sourceDeleteItems.length ? terminalCount(sourceDeleteItems) : 'Off'}</span><br />
+                        Source delete
+                      </div>
+                    </div>
+                    {importedDashboardLinks.length > 0 && (
+                      <div className="mt-4">
+                        <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Open target dashboards</div>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {importedDashboardLinks.map((link) => (
+                            link.url ? (
+                              <a
+                                key={link.id}
+                                href={link.url}
+                                target="_blank"
+                                rel="noreferrer"
+                                className="btn-secondary inline-flex items-center gap-2 text-xs"
+                              >
+                                <ExternalLink size={13} />
+                                {link.label} · {link.destinationLabel}
+                              </a>
+                            ) : (
+                              <span key={link.id} className="rounded-chip bg-white px-3 py-1 text-xs font-semibold text-content-secondary">
+                                {link.label} · {link.destinationLabel}
+                              </span>
+                            )
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
                 <div className="grid gap-3 lg:grid-cols-8">
                   <div className="rounded-card border border-border-subtle p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Destinations</div>
@@ -3734,7 +4221,7 @@ export function DashboardMigrationWizard() {
                     <div className="mt-2 text-xl font-semibold text-content-primary">{sourceDeleteItems.length ? `${terminalCount(sourceDeleteItems)}/${sourceDeleteItems.length}` : 'Off'}</div>
                   </div>
                 </div>
-                <details className="rounded-card border border-border-subtle">
+                <details open={failedItems.length > 0} className="rounded-card border border-border-subtle">
                   <summary className="cursor-pointer px-4 py-3 text-sm font-semibold text-content-primary">Item log</summary>
                   <div className="max-h-[420px] overflow-auto border-t border-border-subtle">
 	                    {job.items.map((item) => {

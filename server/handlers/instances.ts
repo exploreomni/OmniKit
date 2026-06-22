@@ -15,6 +15,8 @@ import { OmniClient, type OmniDocumentRecord, type OmniModelRecord } from '../se
 import { importLegacyVault } from '../services/legacyVaultImport';
 import { validatePostMigrationActionTarget } from '../services/postMigrationActions';
 import { redactSensitiveText } from '../services/jobSanitizer';
+import { createPerformanceTracker } from '../services/performanceTimings';
+import { readThroughCache } from '../services/readThroughCache';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
@@ -490,25 +492,63 @@ export default async function handler(req: Request): Promise<Response> {
     if (req.method === 'GET' && parts[1] === 'documents') {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const timings = createPerformanceTracker();
       const client = new OmniClient(secret);
       const allFolders = url.searchParams.get('allFolders') === 'true';
       const folderId = allFolders ? undefined : cleanString(url.searchParams.get('folderId')) || secret.defaultFolderId;
       const folderPath = allFolders ? undefined : cleanString(url.searchParams.get('folderPath')) || secret.defaultFolderPath;
       const connectionId = cleanString(url.searchParams.get('connectionId'));
       const includeModelDetails = url.searchParams.get('includeModelDetails') === 'true';
-      let documents = await client.listFolderDocuments(folderId, true);
+      const requestedDocumentIds = new Set(
+        (url.searchParams.get('documentIds') || '')
+          .split(',')
+          .map((value) => value.trim())
+          .filter(Boolean),
+      );
+      let documents = await timings.time(
+        'list-documents',
+        () => readThroughCache(
+          `instance:${id}:documents:${JSON.stringify({ folderId, allFolders, folderPath, connectionId, includeLabels: true })}`,
+          () => client.listFolderDocuments({ folderId, includeLabels: true, connectionId }),
+        ),
+        (result) => ({
+          allFolders,
+          hasFolderId: Boolean(folderId),
+          hasFolderPath: Boolean(folderPath),
+          connectionScoped: Boolean(connectionId),
+          count: result?.length || 0,
+        }),
+      );
       if (!folderId && folderPath) {
+        const filterStartedAt = Date.now();
         const requestedPath = normalizeFolderPath(folderPath);
         documents = documents.filter((document) => {
           const actualPath = normalizeFolderPath(document.folderPath);
           return actualPath === requestedPath || actualPath.endsWith(`/${requestedPath}`);
         });
+        timings.mark('filter-folder-path', Date.now() - filterStartedAt, { count: documents.length });
       }
       if (connectionId) {
+        const filterStartedAt = Date.now();
         documents = documents.filter((document) => !document.connectionId || document.connectionId === connectionId);
+        timings.mark('filter-connection', Date.now() - filterStartedAt, { count: documents.length });
       }
-      if (includeModelDetails) documents = await enrichDocumentModelDetails(client, documents, { connectionId });
-      return json({ documents });
+      if (requestedDocumentIds.size > 0) {
+        const filterStartedAt = Date.now();
+        documents = documents.filter((document) => requestedDocumentIds.has(document.identifier) || requestedDocumentIds.has(document.id));
+        timings.mark('filter-document-ids', Date.now() - filterStartedAt, { count: documents.length });
+      }
+      if (includeModelDetails) {
+        documents = await timings.time(
+          'enrich-model-details',
+          () => readThroughCache(
+            `instance:${id}:documents:metadata:${JSON.stringify({ connectionId, ids: documents.map((document) => document.identifier).sort() })}`,
+            () => enrichDocumentModelDetails(client, documents, { connectionId }),
+          ),
+          () => ({ count: documents.length }),
+        );
+      }
+      return json({ documents, performance: timings.snapshot() });
     }
 
     if (req.method === 'GET' && parts[1] === 'models' && parts[3] === 'topics') {
@@ -517,7 +557,7 @@ export default async function handler(req: Request): Promise<Response> {
       const modelId = decodeURIComponent(parts[2] || '').trim();
       if (!modelId) return json({ error: 'Model id required.' }, 400);
       const client = new OmniClient(secret);
-      const topics = await client.listModelTopics(modelId);
+      const topics = await readThroughCache(`instance:${id}:model:${modelId}:topics`, () => client.listModelTopics(modelId));
       return json({ topics });
     }
 
@@ -529,7 +569,10 @@ export default async function handler(req: Request): Promise<Response> {
       const includeYaml = url.searchParams.get('includeYaml') === 'true';
       const includeChecksums = url.searchParams.get('includeChecksums') === 'true';
       const client = new OmniClient(secret);
-      const queryViews = await client.listModelQueryViews(modelId, { includeYaml, includeChecksums });
+      const queryViews = await readThroughCache(
+        `instance:${id}:model:${modelId}:query-views:${JSON.stringify({ includeYaml, includeChecksums })}`,
+        () => client.listModelQueryViews(modelId, { includeYaml, includeChecksums }),
+      );
       return json({ queryViews });
     }
 
@@ -539,7 +582,13 @@ export default async function handler(req: Request): Promise<Response> {
       const client = new OmniClient(secret);
       const modelKind = cleanString(url.searchParams.get('modelKind')) || 'SHARED';
       const connectionId = cleanString(url.searchParams.get('connectionId'));
-      const models = activeConnectionModels(await client.listModels({ modelKind, connectionId }), connectionId);
+      const models = activeConnectionModels(
+        await readThroughCache(
+          `instance:${id}:models:${JSON.stringify({ modelKind, connectionId })}`,
+          () => client.listModels({ modelKind, connectionId }),
+        ),
+        connectionId,
+      );
       return json({ models });
     }
 
@@ -547,7 +596,7 @@ export default async function handler(req: Request): Promise<Response> {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
       const client = new OmniClient(secret);
-      const folders = await client.listFolders();
+      const folders = await readThroughCache(`instance:${id}:folders`, () => client.listFolders());
       return json({ folders });
     }
 

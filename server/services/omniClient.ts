@@ -735,27 +735,53 @@ export class OmniClient {
     return all.map(normalizeFolder).filter((folder): folder is OmniFolderRecord => Boolean(folder));
   }
 
-  async listFolderDocuments(folderId?: string, includeLabels = false): Promise<OmniDocumentRecord[]> {
-    const all: unknown[] = [];
-    let cursor: string | undefined;
-    let pages = 0;
-    do {
-      const response = await this.request('GET', '/api/v1/documents', {
-        query: {
-          pageSize: 100,
-          sortField: 'name',
-          sortDirection: 'asc',
-          folderId,
-          include: includeLabels ? 'labels' : undefined,
-          cursor,
-        },
-      });
-      const data = await response.json();
-      all.push(...extractArray(data, ['documents', 'dashboards', 'records', 'data', 'items']));
-      const pageInfo = extractPageInfo(data);
-      cursor = pageInfo?.hasNextPage ? pageInfo.nextCursor : undefined;
-      pages += 1;
-    } while (cursor && pages < 50);
+  async listFolderDocuments(
+    folderIdOrOptions?: string | {
+      folderId?: string;
+      includeLabels?: boolean;
+      connectionId?: string;
+    },
+    includeLabels = false,
+  ): Promise<OmniDocumentRecord[]> {
+    const options = typeof folderIdOrOptions === 'object' && folderIdOrOptions !== null
+      ? folderIdOrOptions
+      : { folderId: folderIdOrOptions, includeLabels };
+    const folderId = options.folderId;
+    const shouldIncludeLabels = options.includeLabels ?? includeLabels;
+    const loadPages = async (connectionId?: string) => {
+      const all: unknown[] = [];
+      let cursor: string | undefined;
+      let pages = 0;
+      do {
+        const response = await this.request('GET', '/api/v1/documents', {
+          query: {
+            pageSize: 100,
+            sortField: 'name',
+            sortDirection: 'asc',
+            folderId,
+            connectionId,
+            include: shouldIncludeLabels ? 'labels' : undefined,
+            cursor,
+          },
+        });
+        const data = await response.json();
+        all.push(...extractArray(data, ['documents', 'dashboards', 'records', 'data', 'items']));
+        const pageInfo = extractPageInfo(data);
+        cursor = pageInfo?.hasNextPage ? pageInfo.nextCursor : undefined;
+        pages += 1;
+      } while (cursor && pages < 50);
+      return all;
+    };
+
+    let all: unknown[];
+    try {
+      all = await loadPages(options.connectionId);
+    } catch (error) {
+      if (!options.connectionId || !(error instanceof OmniClientError) || error.status !== 400 || !/connectionId|Unrecognized key/i.test(error.message)) {
+        throw error;
+      }
+      all = await loadPages();
+    }
 
     return all.map((raw) => {
       const row = raw as Record<string, unknown>;
