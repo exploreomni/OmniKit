@@ -18,6 +18,7 @@ export interface RecipeRecord {
   description?: string;
   createdAt: number;
   updatedAt: number;
+  savedForInstanceId?: string;
   savedForHost?: string;
   savedForInstanceLabel?: string;
   savedForBaseUrlHost?: string;
@@ -28,6 +29,7 @@ export interface SaveRecipeInput {
   id?: string;
   name: string;
   description?: string;
+  savedForInstanceId?: string;
   savedForHost?: string;
   savedForInstanceLabel?: string;
   savedForBaseUrlHost?: string;
@@ -84,6 +86,7 @@ function normalizeRecord(value: unknown): RecipeRecord | null {
       description: clampText(raw.description, 240),
       createdAt: Number.isFinite(raw.createdAt) ? Number(raw.createdAt) : now,
       updatedAt: Number.isFinite(raw.updatedAt) ? Number(raw.updatedAt) : now,
+      savedForInstanceId: clampText(raw.savedForInstanceId, 120),
       savedForHost: clampText(raw.savedForHost, 160),
       savedForInstanceLabel: clampText(raw.savedForInstanceLabel, 120),
       savedForBaseUrlHost: clampText(raw.savedForBaseUrlHost, 160),
@@ -120,6 +123,7 @@ export function saveRecipe(input: SaveRecipeInput): RecipeRecord {
     description: clampText(input.description, 240),
     createdAt: previous?.createdAt || now,
     updatedAt: now,
+    savedForInstanceId: clampText(input.savedForInstanceId, 120),
     savedForHost: clampText(input.savedForHost, 160),
     savedForInstanceLabel: clampText(input.savedForInstanceLabel, 120),
     savedForBaseUrlHost: clampText(input.savedForBaseUrlHost, 160),
@@ -147,6 +151,7 @@ export function duplicateRecipe(id: string): RecipeRecord | null {
   return saveRecipe({
     name: `Copy of ${target.name}`.slice(0, 100),
     description: target.description,
+    savedForInstanceId: target.savedForInstanceId,
     savedForHost: target.savedForHost,
     savedForInstanceLabel: target.savedForInstanceLabel,
     savedForBaseUrlHost: target.savedForBaseUrlHost,

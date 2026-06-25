@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import bulkCopyDocuments from './handlers/bulk-copy-documents';
 import bulkDeleteDocuments from './handlers/bulk-delete-documents';
 import bulkMoveDocuments from './handlers/bulk-move-documents';
+import deckRecipes from './handlers/deck-recipes';
 import dashboardDownloads from './handlers/dashboard-downloads';
 import enrichDocuments from './handlers/enrich-documents';
 import generateEmbedUrl from './handlers/generate-embed-url';
@@ -30,12 +31,13 @@ import { redactSensitiveText } from './services/jobSanitizer';
 type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator', 'dashboard-downloads']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes']);
 
 const routes: Record<string, Handler> = {
   'bulk-copy-documents': bulkCopyDocuments,
   'bulk-delete-documents': bulkDeleteDocuments,
   'bulk-move-documents': bulkMoveDocuments,
+  'deck-recipes': deckRecipes,
   'dashboard-downloads': dashboardDownloads,
   'enrich-documents': enrichDocuments,
   'generate-embed-url': generateEmbedUrl,

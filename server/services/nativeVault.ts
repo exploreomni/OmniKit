@@ -1,6 +1,8 @@
 import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createCipheriv, createDecipheriv, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
+import { validateRecipe } from '../../src/services/deckBuilder/deckRecipe';
+import type { DeckRecipe } from '../../src/services/deckBuilder/types';
 
 const VAULT_VERSION = 1;
 const SALT_LEN = 16;
@@ -56,9 +58,32 @@ export type SavedInstancePublic = Omit<SavedInstance, 'apiKey'> & {
   apiKeyMasked: string;
 };
 
+export interface VaultDeckRecipeRecord {
+  id: string;
+  name: string;
+  description?: string;
+  savedForInstanceId?: string;
+  savedForInstanceLabel?: string;
+  savedForBaseUrlHost?: string;
+  createdAt: number;
+  updatedAt: number;
+  recipe: DeckRecipe;
+}
+
+export interface SaveDeckRecipeInput {
+  id?: string;
+  name: string;
+  description?: string;
+  savedForInstanceId?: string;
+  savedForInstanceLabel?: string;
+  savedForBaseUrlHost?: string;
+  recipe: DeckRecipe;
+}
+
 interface VaultPayload {
   version: typeof VAULT_VERSION;
   instances: SavedInstance[];
+  deckRecipes: VaultDeckRecipeRecord[];
 }
 
 interface UnlockedVault {
@@ -174,6 +199,76 @@ function normalizeRole(value: unknown): InstanceRole {
   return value === 'source' || value === 'destination' || value === 'both' ? value : 'destination';
 }
 
+const FORBIDDEN_DECK_RECIPE_KEYS = new Set([
+  'apikey',
+  'api_key',
+  'token',
+  'secret',
+  'password',
+  'passphrase',
+]);
+
+function cleanOptionalText(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, maxLength) : undefined;
+}
+
+function createDeckRecipeId(): string {
+  return `recipe_${Date.now()}_${randomUUID().slice(0, 8)}`;
+}
+
+export function deckRecipeRecordContainsForbiddenKeys(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((entry) => deckRecipeRecordContainsForbiddenKeys(entry));
+  for (const [key, child] of Object.entries(value)) {
+    if (FORBIDDEN_DECK_RECIPE_KEYS.has(key.toLowerCase())) return true;
+    if (deckRecipeRecordContainsForbiddenKeys(child)) return true;
+  }
+  return false;
+}
+
+function normalizeDeckRecipeRecord(raw: Partial<VaultDeckRecipeRecord> & { recipe?: unknown }, existing?: VaultDeckRecipeRecord): VaultDeckRecipeRecord | null {
+  if (!raw || typeof raw !== 'object') return null;
+  try {
+    const now = Date.now();
+    const record: VaultDeckRecipeRecord = {
+      id: cleanOptionalText(raw.id, 120) || existing?.id || createDeckRecipeId(),
+      name: cleanOptionalText(raw.name, 100) || existing?.name || 'Untitled recipe',
+      description: cleanOptionalText(raw.description, 240),
+      savedForInstanceId: cleanOptionalText(raw.savedForInstanceId, 120),
+      savedForInstanceLabel: cleanOptionalText(raw.savedForInstanceLabel, 120),
+      savedForBaseUrlHost: cleanOptionalText(raw.savedForBaseUrlHost, 160),
+      createdAt: Number.isFinite(raw.createdAt) ? Number(raw.createdAt) : existing?.createdAt || now,
+      updatedAt: Number.isFinite(raw.updatedAt) ? Number(raw.updatedAt) : now,
+      recipe: validateRecipe(raw.recipe),
+    };
+    if (deckRecipeRecordContainsForbiddenKeys(record)) {
+      throw Object.assign(new Error('Deck recipe contains secret-shaped keys and cannot be stored in the vault.'), { statusCode: 400 });
+    }
+    return record;
+  } catch {
+    if (existing) throw Object.assign(new Error('Saved recipe could not be updated because the recipe payload is invalid.'), { statusCode: 400 });
+    return null;
+  }
+}
+
+export function normalizeVaultPayload(raw: unknown): VaultPayload {
+  const parsed = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Partial<VaultPayload> : {};
+  return {
+    version: VAULT_VERSION,
+    instances: Array.isArray(parsed.instances)
+      ? parsed.instances.map((instance) => normalizeInstance(instance as SavedInstance))
+      : [],
+    deckRecipes: Array.isArray(parsed.deckRecipes)
+      ? parsed.deckRecipes
+          .map((record) => normalizeDeckRecipeRecord(record as Partial<VaultDeckRecipeRecord> & { recipe?: unknown }))
+          .filter((record): record is VaultDeckRecipeRecord => Boolean(record))
+          .sort((a, b) => b.updatedAt - a.updatedAt)
+      : [],
+  };
+}
+
 function deriveKey(passphrase: string, salt: Buffer): Buffer {
   return scryptSync(passphrase.normalize('NFKC'), salt, KEY_LEN, {
     N: SCRYPT_N,
@@ -282,7 +377,7 @@ export function unlockVault(passphrase: string): void {
   if (!existsSync(vaultPath)) {
     const salt = randomBytes(SALT_LEN);
     const key = deriveKey(passphrase, salt);
-    unlockedVault = { key, salt, payload: { version: VAULT_VERSION, instances: [] } };
+    unlockedVault = { key, salt, payload: { version: VAULT_VERSION, instances: [], deckRecipes: [] } };
     touchVault();
     persist();
     return;
@@ -298,12 +393,7 @@ export function unlockVault(passphrase: string): void {
   unlockedVault = {
     key,
     salt: Buffer.from(salt),
-    payload: {
-      version: VAULT_VERSION,
-      instances: Array.isArray(parsed.instances)
-        ? parsed.instances.map((instance) => normalizeInstance(instance as SavedInstance))
-        : [],
-    },
+    payload: normalizeVaultPayload(parsed),
   };
   touchVault();
 }
@@ -382,6 +472,72 @@ export function markInstanceValidated(id: string): SavedInstancePublic {
   return toPublic(existing);
 }
 
+export function listDeckRecipes(): VaultDeckRecipeRecord[] {
+  return [...requireUnlocked().payload.deckRecipes].sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+export function getDeckRecipe(id: string): VaultDeckRecipeRecord | undefined {
+  return requireUnlocked().payload.deckRecipes.find((record) => record.id === id);
+}
+
+export function upsertDeckRecipe(raw: SaveDeckRecipeInput): VaultDeckRecipeRecord {
+  const vault = requireUnlocked();
+  const existing = raw.id ? vault.payload.deckRecipes.find((record) => record.id === raw.id) : undefined;
+  const saved = normalizeDeckRecipeRecord(raw, existing);
+  if (!saved) throw Object.assign(new Error('Deck recipe payload is invalid.'), { statusCode: 400 });
+  vault.payload.deckRecipes = [
+    ...vault.payload.deckRecipes.filter((record) => record.id !== saved.id),
+    saved,
+  ].sort((a, b) => b.updatedAt - a.updatedAt);
+  persist();
+  return saved;
+}
+
+export function renameDeckRecipe(id: string, name: string): VaultDeckRecipeRecord | undefined {
+  const vault = requireUnlocked();
+  const existing = vault.payload.deckRecipes.find((record) => record.id === id);
+  if (!existing) return undefined;
+  const saved = normalizeDeckRecipeRecord({ ...existing, name, updatedAt: Date.now() }, existing);
+  if (!saved) throw Object.assign(new Error('Deck recipe payload is invalid.'), { statusCode: 400 });
+  vault.payload.deckRecipes = vault.payload.deckRecipes.map((record) => record.id === id ? saved : record).sort((a, b) => b.updatedAt - a.updatedAt);
+  persist();
+  return saved;
+}
+
+export function duplicateDeckRecipe(id: string): VaultDeckRecipeRecord | undefined {
+  const vault = requireUnlocked();
+  const existing = vault.payload.deckRecipes.find((record) => record.id === id);
+  if (!existing) return undefined;
+  const now = Date.now();
+  const copy = normalizeDeckRecipeRecord({
+    ...existing,
+    id: createDeckRecipeId(),
+    name: `Copy of ${existing.name}`.slice(0, 100),
+    createdAt: now,
+    updatedAt: now,
+  });
+  if (!copy) throw Object.assign(new Error('Deck recipe payload is invalid.'), { statusCode: 400 });
+  vault.payload.deckRecipes = [copy, ...vault.payload.deckRecipes].sort((a, b) => b.updatedAt - a.updatedAt);
+  persist();
+  return copy;
+}
+
+export function deleteDeckRecipe(id: string): void {
+  const vault = requireUnlocked();
+  vault.payload.deckRecipes = vault.payload.deckRecipes.filter((record) => record.id !== id);
+  persist();
+}
+
+export function importDeckRecipes(records: unknown[]): VaultDeckRecipeRecord[] {
+  const imported: VaultDeckRecipeRecord[] = [];
+  for (const record of records) {
+    const normalized = normalizeDeckRecipeRecord(record as Partial<VaultDeckRecipeRecord> & { recipe?: unknown });
+    if (!normalized) continue;
+    imported.push(upsertDeckRecipe(normalized));
+  }
+  return imported;
+}
+
 export function vaultStatus() {
   enforceIdleTimeout();
   return {
@@ -391,5 +547,6 @@ export function vaultStatus() {
     idleTimeoutMs: getVaultIdleTimeoutMs(),
     lastActivityAt: lastVaultActivityAt || undefined,
     instanceCount: unlockedVault?.payload.instances.length ?? 0,
+    deckRecipeCount: unlockedVault?.payload.deckRecipes.length ?? 0,
   };
 }

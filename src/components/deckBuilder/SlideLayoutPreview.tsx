@@ -19,6 +19,10 @@ import {
   Type,
 } from 'lucide-react';
 import { layoutForRole } from '@/services/deckBuilder/templateStore';
+import {
+  previewModeForTileExportState,
+  previewModeForTileResult,
+} from '@/services/deckBuilder/previewMode';
 import type {
   BrandConfig,
   DashboardTile,
@@ -214,10 +218,10 @@ function sourceLabel(source: TileVisualSource): string {
 }
 
 function sourceDescription(source: TileVisualSource): string {
-  if (source === 'tile-image') return 'Uses Omni-rendered tile images for visual fidelity; text and marks are not editable in PowerPoint.';
-  if (source === 'full-dashboard') return 'Uses the full dashboard image as a fallback when tile-level exports are incomplete.';
+  if (source === 'tile-image') return 'Uses the exact Omni-rendered tile image for visual fidelity. It will not be editable in PowerPoint.';
+  if (source === 'full-dashboard') return 'Uses a full-dashboard screenshot as a fallback when tile-level output is incomplete.';
   if (source === 'skip') return 'Leaves this tile out of the generated deck.';
-  return 'Builds editable PowerPoint shapes when the tile result can be translated safely.';
+  return 'Creates editable PowerPoint charts and tables from Omni query data when OmniKit can translate the result.';
 }
 
 function tileKindLabel(tile: DashboardTile): string {
@@ -321,50 +325,171 @@ function formatPreviewCell(value: unknown): string {
   return s.length > 28 ? `${s.slice(0, 25)}...` : s;
 }
 
-function ActualResultPreview({ result }: { result: TileResult }) {
-  if (result.rows.length === 0 || result.renderKind === 'empty') {
-    return (
-      <div className="w-full h-full grid place-items-center rounded-[4px] border border-slate-300 bg-white text-[11px] text-slate-500">
-        No data returned
-      </div>
-    );
-  }
+const NUMERIC_COLUMN_TYPES = new Set(['number', 'integer', 'float', 'double', 'decimal', 'numeric']);
 
-  if (result.renderKind === 'table' || result.columns.length > 3) {
-    const cols = result.columns.slice(0, 4);
-    const rows = result.rows.slice(0, 5);
-    return (
-      <div className="w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden text-[8px]">
-        <div className="grid" style={{ gridTemplateColumns: `repeat(${cols.length}, minmax(0, 1fr))` }}>
-          {cols.map((col) => (
-            <div key={col.name} className="bg-slate-700 text-white font-semibold px-1 py-1 truncate">
-              {col.label || col.name}
+function isNumericColumnType(type: string | undefined): boolean {
+  return NUMERIC_COLUMN_TYPES.has((type || '').toLowerCase());
+}
+
+function previewResultDetail(result: TileResult): string {
+  const source = result.renderKind === 'unsupported' ? 'Native unsupported' : `Native ${result.renderKind}`;
+  return `${source} · ${result.rowCount.toLocaleString()} rows · ${result.columns.length} columns`;
+}
+
+function DetailBadge({ result }: { result: TileResult }) {
+  return (
+    <span className="absolute right-2 bottom-2 rounded bg-white/90 px-1.5 py-0.5 text-[8px] text-slate-500 border border-slate-200">
+      {previewResultDetail(result)}
+    </span>
+  );
+}
+
+function TableResultPreview({ result }: { result: TileResult }) {
+  const cols = result.columns.slice(0, 4);
+  const rows = result.rows.slice(0, 5);
+  return (
+    <div className="w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden text-[8px]">
+      <div className="grid" style={{ gridTemplateColumns: `repeat(${cols.length || 1}, minmax(0, 1fr))` }}>
+        {cols.map((col) => (
+          <div key={col.name} className="bg-slate-700 text-white font-semibold px-1 py-1 truncate">
+            {col.label || col.name}
+          </div>
+        ))}
+        {rows.map((row, rowIdx) =>
+          cols.map((col) => (
+            <div key={`${rowIdx}-${col.name}`} className={`px-1 py-1 border-t border-slate-200 truncate ${rowIdx % 2 ? 'bg-slate-50' : 'bg-white'}`}>
+              {formatPreviewCell(row[col.name])}
             </div>
-          ))}
-          {rows.map((row, rowIdx) =>
-            cols.map((col) => (
-              <div key={`${rowIdx}-${col.name}`} className={`px-1 py-1 border-t border-slate-200 truncate ${rowIdx % 2 ? 'bg-slate-50' : 'bg-white'}`}>
-                {formatPreviewCell(row[col.name])}
-              </div>
-            )),
-          )}
-        </div>
+          )),
+        )}
+      </div>
+    </div>
+  );
+}
+
+function chartColumns(result: TileResult) {
+  const dimCol = result.columns.find((col) => !isNumericColumnType(col.type)) || result.columns[0];
+  const measure = result.columns.find((col) => col.name !== dimCol?.name && isNumericColumnType(col.type))
+    || result.columns.find((col) => col.name !== dimCol?.name)
+    || result.columns[0];
+  return { dimCol, measure };
+}
+
+function ActualResultPreview({ result }: { result: TileResult }) {
+  const mode = previewModeForTileResult(result);
+
+  if (mode === 'empty') {
+    return (
+      <div className="relative w-full h-full grid place-items-center rounded-[4px] border border-slate-300 bg-white text-[11px] text-slate-500">
+        <span>No data returned</span>
+        <DetailBadge result={result} />
       </div>
     );
   }
 
-  const dimCol = result.columns.find((col) => !['number', 'integer', 'float', 'double', 'decimal', 'numeric'].includes(col.type || '')) || result.columns[0];
-  const measure = result.columns.find((col) => col.name !== dimCol.name) || result.columns[0];
-  const values = result.rows.slice(0, 8).map((row) => Number(row[measure.name]) || 0);
+  if (mode === 'unsupported') {
+    return (
+      <div className="relative w-full h-full grid place-items-center rounded-[4px] border border-amber-200 bg-amber-50 p-3 text-center text-[10px] text-amber-800">
+        <span>Native preview is not supported for this tile. Use Omni image for visual fidelity.</span>
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  if (mode === 'markdown') {
+    const text = result.rows
+      .flatMap((row) => result.columns.map((col) => formatPreviewCell(row[col.name])))
+      .filter(Boolean)
+      .join('\n');
+    return (
+      <div className="relative w-full h-full rounded-[4px] border border-slate-300 bg-white overflow-hidden p-3 text-[10px] leading-snug text-slate-700">
+        <div className="line-clamp-[10] whitespace-pre-wrap">{text || 'Markdown content'}</div>
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  if (mode === 'kpi') {
+    const valueCol = result.columns.find((col) => isNumericColumnType(col.type)) || result.columns[result.columns.length - 1] || result.columns[0];
+    const first = result.rows[0] || {};
+    return (
+      <div className="relative w-full h-full rounded-[4px] border border-slate-300 bg-white overflow-hidden p-3 flex flex-col justify-center">
+        <div className="text-[9px] uppercase tracking-wider text-slate-500 truncate">{valueCol?.label || valueCol?.name || 'Value'}</div>
+        <div className="text-[22px] leading-tight font-bold text-slate-900 truncate">{formatPreviewCell(valueCol ? first[valueCol.name] : '')}</div>
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  if (mode === 'table') {
+    return (
+      <div className="relative w-full h-full">
+        <TableResultPreview result={result} />
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  const { dimCol, measure } = chartColumns(result);
+  if (!dimCol || !measure) {
+    return (
+      <div className="relative w-full h-full">
+        <TableResultPreview result={result} />
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  const rows = result.rows.slice(0, 10);
+  const values = rows.map((row) => Number(row[measure.name]) || 0);
   const max = Math.max(...values.map((v) => Math.abs(v)), 1);
 
+  if (result.renderKind === 'pie') {
+    const total = values.reduce((sum, value) => sum + Math.abs(value), 0) || 1;
+    let cursor = 0;
+    const stops = values.slice(0, 5).map((value, idx) => {
+      const start = cursor;
+      cursor += (Math.abs(value) / total) * 100;
+      const color = idx % 2 ? 'rgba(255,71,148,0.72)' : idx % 3 ? 'rgba(100,116,139,0.82)' : 'rgba(200,24,106,0.82)';
+      return `${color} ${start}% ${cursor}%`;
+    }).join(', ');
+    return (
+      <div className="relative w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
+        <div className="text-[9px] font-semibold text-slate-700 truncate mb-2">{measure.label || measure.name}</div>
+        <div className="mx-auto mt-1 h-[70%] aspect-square rounded-full border border-slate-200 shadow-inner" style={{ background: `conic-gradient(${stops || '#e2e8f0 0 100%'})` }} />
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
+  if (result.renderKind === 'line') {
+    const points = values.map((value, idx) => {
+      const x = values.length <= 1 ? 50 : (idx / (values.length - 1)) * 100;
+      const y = 100 - (Math.abs(value) / max) * 92;
+      return `${x},${Math.max(3, Math.min(96, y))}`;
+    }).join(' ');
+    return (
+      <div className="relative w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
+        <div className="text-[9px] font-semibold text-slate-700 truncate mb-2">{measure.label || measure.name}</div>
+        <svg viewBox="0 0 100 100" className="h-[72%] w-full overflow-visible border-l border-b border-slate-300">
+          <polyline points={points} fill="none" stroke="rgba(200,24,106,0.86)" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" />
+          {points.split(' ').filter(Boolean).map((point, idx) => {
+            const [x, y] = point.split(',').map(Number);
+            return <circle key={idx} cx={x} cy={y} r="2.5" fill="rgba(255,71,148,0.86)" />;
+          })}
+        </svg>
+        <DetailBadge result={result} />
+      </div>
+    );
+  }
+
   return (
-    <div className="w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
+    <div className="relative w-full h-full bg-white rounded-[4px] border border-slate-300 overflow-hidden p-2">
       <div className="text-[9px] font-semibold text-slate-700 truncate mb-2">
         {measure.label || measure.name}
       </div>
       <div className="h-[75%] flex items-end gap-[3%] px-[3%] border-l border-b border-slate-300">
-        {values.map((value, idx) => (
+        {values.slice(0, 8).map((value, idx) => (
           <div
             key={idx}
             className="flex-1 rounded-t"
@@ -376,6 +501,7 @@ function ActualResultPreview({ result }: { result: TileResult }) {
           />
         ))}
       </div>
+      <DetailBadge result={result} />
     </div>
   );
 }
@@ -391,7 +517,8 @@ function TilePreview({
   fit: SlideFitMode;
   preview?: TileExportState;
 }) {
-  if (preview?.pngDataUrl) {
+  const mode = previewModeForTileExportState(preview);
+  if (mode === 'image' && preview?.pngDataUrl) {
     return (
       <img
         src={preview.pngDataUrl}
@@ -404,14 +531,14 @@ function TilePreview({
   if (preview?.result) {
     return <ActualResultPreview result={preview.result} />;
   }
-  if (preview?.status === 'failed') {
+  if (mode === 'failed') {
     return (
       <div className="w-full h-full grid place-items-center rounded-[4px] border border-red-200 bg-red-50 p-3 text-center text-[10px] text-red-700">
-        Preview failed: {preview.error || 'Unknown error'}
+        Preview failed: {preview?.error || 'Unknown error'}
       </div>
     );
   }
-  if (preview?.status && preview.status !== 'pending') {
+  if (mode === 'rendering') {
     return (
       <div className="w-full h-full grid place-items-center rounded-[4px] border border-omni-200 bg-omni-50 p-3 text-center text-[10px] text-omni-700">
         Rendering preview...
@@ -498,6 +625,15 @@ export function SlideLayoutPreview({
       ? 'bg-omni-50 text-omni-700 border-omni-200'
       : 'bg-surface-secondary text-content-tertiary border-border';
   const activeSourceDescription = sourceDescription(activeSource);
+  const canRecoverToImage =
+    activeSource === 'native' &&
+    (activePreview?.status === 'failed' ||
+      (activePreview?.status === 'done' &&
+        activePreview.result &&
+        (activePreview.result.renderKind === 'unsupported' || activePreview.result.renderKind === 'table')));
+  const imageRecoveryReason = activePreview?.status === 'failed'
+    ? 'Native preview failed. Switch this slide to an exact Omni image when visual fidelity matters.'
+    : 'Native preview rendered as a table. Switch this slide to an exact Omni image if you expected the Omni visual.';
   const controlSections: Array<{ id: ControlSection; label: string }> = [
     { id: 'layout', label: 'Layout' },
     { id: 'source', label: 'Source' },
@@ -586,6 +722,12 @@ export function SlideLayoutPreview({
       ) delete next[tile.id];
     }
     onChange(next);
+  }
+
+  function recoverActiveSlideToImage() {
+    if (!activeTile) return;
+    onTileVisualSourceChange(activeTile.id, 'tile-image');
+    window.setTimeout(() => onRenderPreview(activeTile.id), 0);
   }
 
   function updateOverlay(tileId: string, overlayId: string, patch: Partial<SlideOverlay>) {
@@ -774,6 +916,14 @@ export function SlideLayoutPreview({
         {previewError && (
           <div className="rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
             {previewError}
+          </div>
+        )}
+        {canRecoverToImage && (
+          <div className="flex items-center justify-between gap-3 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+            <span>{imageRecoveryReason}</span>
+            <button type="button" onClick={recoverActiveSlideToImage} disabled={previewing} className="btn-secondary btn-sm flex-shrink-0">
+              <ImageIcon size={12} /> Use Omni image instead
+            </button>
           </div>
         )}
 

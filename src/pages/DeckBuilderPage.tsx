@@ -93,15 +93,20 @@ import {
   makeLayoutKit,
 } from '@/services/deckBuilder/templateStore';
 import {
-  deleteRecipe,
-  duplicateRecipe,
-  getRecipe,
   hostFromBaseUrl,
   listRecipes,
-  renameRecipe,
-  saveRecipe as saveRecipeRecord,
   type RecipeRecord,
 } from '@/services/deckBuilder/recipeStore';
+import {
+  deleteVaultRecipe,
+  duplicateVaultRecipe,
+  getVaultRecipe,
+  importLocalRecipesToVault,
+  isVaultLockedError,
+  listVaultRecipes,
+  renameVaultRecipe,
+  saveVaultRecipe,
+} from '@/services/deckBuilder/recipeVaultApi';
 import {
   clearDeckDraft,
   loadDeckDraft,
@@ -248,7 +253,10 @@ export function DeckBuilderPage() {
   const [batchHistory, setBatchHistory] = useState<BatchHistoryEntry[]>([]);
   const [batchClientStates, setBatchClientStates] = useState<Record<string, BatchClientStatus>>({});
 
-  const [recipes, setRecipes] = useState<RecipeRecord[]>(() => listRecipes());
+  const [recipes, setRecipes] = useState<RecipeRecord[]>([]);
+  const [localRecipeCount, setLocalRecipeCount] = useState(() => listRecipes().length);
+  const [recipesLoading, setRecipesLoading] = useState(false);
+  const [recipeVaultLocked, setRecipeVaultLocked] = useState(false);
   const [recipeLibraryMessage, setRecipeLibraryMessage] = useState('');
   const [recipeLibraryError, setRecipeLibraryError] = useState('');
   const [pendingDraft, setPendingDraft] = useState<DeckBuilderDraft | null>(null);
@@ -458,13 +466,34 @@ export function DeckBuilderPage() {
       setDashboardsSyncedAt(null);
     }
     setBatchHistory(batchHistoryCache.load(connectionKey));
-    setRecipes(listRecipes());
+    setLocalRecipeCount(listRecipes().length);
     setPendingDraft(loadDeckDraft(connectionKey));
   }, [connection.baseUrl, connectionKey]);
 
-  const refreshRecipes = useCallback(() => {
-    setRecipes(listRecipes());
+  const refreshRecipes = useCallback(async () => {
+    setRecipesLoading(true);
+    try {
+      const records = await listVaultRecipes();
+      setRecipes(records);
+      setRecipeVaultLocked(false);
+      setRecipeLibraryError('');
+    } catch (error) {
+      setRecipes([]);
+      setRecipeVaultLocked(isVaultLockedError(error));
+      setRecipeLibraryError(
+        isVaultLockedError(error)
+          ? 'Unlock the native vault to use saved deck recipes.'
+          : error instanceof Error ? error.message : 'Failed to load saved deck recipes.',
+      );
+    } finally {
+      setRecipesLoading(false);
+      setLocalRecipeCount(listRecipes().length);
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshRecipes();
+  }, [refreshRecipes]);
 
   useEffect(() => {
     if (!connection.baseUrl || !dashboard) return;
@@ -1431,22 +1460,34 @@ export function DeckBuilderPage() {
     downloadJson(filename, recipe);
   }, [buildCurrentRecipe, dashboard]);
 
-  const handleSaveRecipeToLibrary = useCallback((name: string, description?: string) => {
+  const handleSaveRecipeToLibrary = useCallback(async (name: string, description?: string) => {
     if (!dashboard) return;
     const recipe = buildCurrentRecipe();
     if (!recipe) return;
-    const record = saveRecipeRecord({
-      name,
-      description: description?.trim() || dashboard.name,
-      savedForHost: recipeHostLabel,
-      savedForInstanceLabel: connection.instanceLabel,
-      savedForBaseUrlHost: hostFromBaseUrl(connection.baseUrl),
-      recipe,
-    });
-    refreshRecipes();
-    setRecipeLibraryError('');
-    setRecipeLibraryMessage(`Saved "${record.name}" to your local recipe library.`);
-  }, [buildCurrentRecipe, connection.baseUrl, connection.instanceLabel, dashboard, recipeHostLabel, refreshRecipes]);
+    try {
+      const record = await saveVaultRecipe({
+        name,
+        description: description?.trim() || dashboard.name,
+        savedForInstanceId: connection.instanceId,
+        savedForHost: recipeHostLabel,
+        savedForInstanceLabel: connection.instanceLabel,
+        savedForBaseUrlHost: hostFromBaseUrl(connection.baseUrl),
+        recipe,
+      });
+      await refreshRecipes();
+      setRecipeLibraryError('');
+      setRecipeVaultLocked(false);
+      setRecipeLibraryMessage(`Saved "${record.name}" to your vault recipe library.`);
+    } catch (error) {
+      setRecipeLibraryMessage('');
+      setRecipeVaultLocked(isVaultLockedError(error));
+      setRecipeLibraryError(
+        isVaultLockedError(error)
+          ? 'Unlock the native vault before saving deck recipes.'
+          : error instanceof Error ? error.message : 'Failed to save deck recipe.',
+      );
+    }
+  }, [buildCurrentRecipe, connection.baseUrl, connection.instanceId, connection.instanceLabel, dashboard, recipeHostLabel, refreshRecipes]);
 
   const openSaveRecipeDialog = useCallback(() => {
     setTextPrompt({
@@ -1462,16 +1503,17 @@ export function DeckBuilderPage() {
   }, [dashboard, handleSaveRecipeToLibrary]);
 
   const handleLoadRecipeRecord = useCallback(async (record: RecipeRecord) => {
-    const current = getRecipe(record.id);
-    if (!current) {
-      setRecipeLibraryError('That saved recipe is no longer available.');
-      refreshRecipes();
-      return;
-    }
     try {
+      const current = await getVaultRecipe(record.id);
+      if (!current) {
+        setRecipeLibraryError('That saved recipe is no longer available.');
+        await refreshRecipes();
+        return;
+      }
       await applyRecipe(current.recipe, current.name);
     } catch (err) {
       setRecipeLibraryMessage('');
+      setRecipeVaultLocked(isVaultLockedError(err));
       setRecipeLibraryError(err instanceof Error ? err.message : 'Failed to load saved recipe.');
     }
   }, [applyRecipe, refreshRecipes]);
@@ -1482,35 +1524,56 @@ export function DeckBuilderPage() {
       label: 'Recipe name',
       initialValue: record.name,
       confirmLabel: 'Rename',
-      onConfirm: (name) => {
-        const updated = renameRecipe(record.id, name);
-        refreshRecipes();
-        setRecipeLibraryError('');
-        setRecipeLibraryMessage(updated ? `Renamed recipe to "${updated.name}".` : 'That recipe is no longer available.');
+      onConfirm: async (name) => {
+        try {
+          const updated = await renameVaultRecipe(record.id, name);
+          await refreshRecipes();
+          setRecipeLibraryError('');
+          setRecipeVaultLocked(false);
+          setRecipeLibraryMessage(updated ? `Renamed recipe to "${updated.name}".` : 'That recipe is no longer available.');
+        } catch (error) {
+          setRecipeLibraryMessage('');
+          setRecipeVaultLocked(isVaultLockedError(error));
+          setRecipeLibraryError(error instanceof Error ? error.message : 'Failed to rename deck recipe.');
+        }
       },
     });
   }, [refreshRecipes]);
 
-  const handleDuplicateRecipe = useCallback((record: RecipeRecord) => {
-    const duplicated = duplicateRecipe(record.id);
-    refreshRecipes();
-    setRecipeLibraryError('');
-    setRecipeLibraryMessage(duplicated ? `Duplicated "${record.name}".` : 'That recipe is no longer available.');
+  const handleDuplicateRecipe = useCallback(async (record: RecipeRecord) => {
+    try {
+      const duplicated = await duplicateVaultRecipe(record.id);
+      await refreshRecipes();
+      setRecipeLibraryError('');
+      setRecipeVaultLocked(false);
+      setRecipeLibraryMessage(duplicated ? `Duplicated "${record.name}".` : 'That recipe is no longer available.');
+    } catch (error) {
+      setRecipeLibraryMessage('');
+      setRecipeVaultLocked(isVaultLockedError(error));
+      setRecipeLibraryError(error instanceof Error ? error.message : 'Failed to duplicate deck recipe.');
+    }
   }, [refreshRecipes]);
 
   const handleDeleteRecipe = useCallback((record: RecipeRecord) => {
     setConfirmDialog({
       title: 'Delete Recipe',
-      message: `Delete "${record.name}" from your local recipe library?`,
+      message: `Delete "${record.name}" from your vault recipe library?`,
       confirmLabel: 'Delete recipe',
       variant: 'danger',
       requireTypedConfirmation: true,
       confirmationPhrase: record.name,
-      onConfirm: () => {
-        deleteRecipe(record.id);
-        refreshRecipes();
-        setRecipeLibraryError('');
-        setRecipeLibraryMessage(`Deleted "${record.name}".`);
+      onConfirm: async () => {
+        try {
+          await deleteVaultRecipe(record.id);
+          await refreshRecipes();
+          setRecipeLibraryError('');
+          setRecipeVaultLocked(false);
+          setRecipeLibraryMessage(`Deleted "${record.name}".`);
+        } catch (error) {
+          setRecipeLibraryMessage('');
+          setRecipeVaultLocked(isVaultLockedError(error));
+          setRecipeLibraryError(error instanceof Error ? error.message : 'Failed to delete deck recipe.');
+        }
       },
     });
   }, [refreshRecipes]);
@@ -1518,6 +1581,32 @@ export function DeckBuilderPage() {
   const handleExportRecipeRecord = useCallback((record: RecipeRecord) => {
     downloadJson(safeRecipeFileName(record.name), record.recipe);
   }, []);
+
+  const handleImportLocalRecipesToVault = useCallback(async () => {
+    const localRecords = listRecipes();
+    if (localRecords.length === 0) {
+      setRecipeLibraryError('');
+      setRecipeLibraryMessage('No browser-only recipes were found to import.');
+      return;
+    }
+    try {
+      const imported = await importLocalRecipesToVault(localRecords);
+      await refreshRecipes();
+      setRecipeVaultLocked(false);
+      setRecipeLibraryError('');
+      setRecipeLibraryMessage(`Imported ${imported.length} browser recipe${imported.length === 1 ? '' : 's'} into the vault.`);
+    } catch (error) {
+      setRecipeLibraryMessage('');
+      setRecipeVaultLocked(isVaultLockedError(error));
+      setRecipeLibraryError(
+        isVaultLockedError(error)
+          ? 'Unlock the native vault before importing browser recipes.'
+          : error instanceof Error ? error.message : 'Failed to import browser recipes.',
+      );
+    } finally {
+      setLocalRecipeCount(listRecipes().length);
+    }
+  }, [refreshRecipes]);
 
   const handleSaveBrand = useCallback(() => {
     const filename = `${(brand.name || 'brand').toLowerCase().replace(/[^a-z0-9]+/g, '-')}.brand.json`;
@@ -1693,13 +1782,21 @@ export function DeckBuilderPage() {
               <div>
                 <h2 className="text-sm font-semibold text-content-primary">Recipes</h2>
                 <p className="text-[11px] text-content-tertiary">
-                  Save repeat deck setups locally, or import/export JSON recipes for sharing.
+                  Save repeat deck setups in the encrypted vault. Import/export JSON recipes for sharing or portability.
                 </p>
               </div>
-              <button onClick={() => recipeFileInput.current?.click()} className="btn-secondary" type="button">
-                <Upload size={14} />
-                Import JSON
-              </button>
+              <div className="flex flex-wrap items-center gap-2">
+                {localRecipeCount > 0 && (
+                  <button onClick={() => void handleImportLocalRecipesToVault()} className="btn-secondary" type="button" disabled={recipesLoading}>
+                    <Upload size={14} />
+                    Import {localRecipeCount} browser recipe{localRecipeCount === 1 ? '' : 's'}
+                  </button>
+                )}
+                <button onClick={() => recipeFileInput.current?.click()} className="btn-secondary" type="button">
+                  <Upload size={14} />
+                  Import JSON
+                </button>
+              </div>
             </div>
             <input
               ref={recipeFileInput}
@@ -1725,8 +1822,19 @@ export function DeckBuilderPage() {
                 {recipeLibraryMessage}
               </div>
             )}
+            {recipeVaultLocked && (
+              <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-[12px] text-content-secondary">
+                Recipe library actions use the native encrypted vault. Unlock the vault from Instance Manager, then return here to save or load recipes.
+              </div>
+            )}
 
-            {recipes.length === 0 ? (
+            {recipesLoading ? (
+              <div className="rounded-card border border-border bg-surface-secondary px-4 py-5 text-center">
+                <div className="inline-flex items-center gap-2 text-[13px] font-medium text-content-primary">
+                  <Loader2 size={14} className="animate-spin" /> Loading vault recipes
+                </div>
+              </div>
+            ) : recipes.length === 0 ? (
               <div className="rounded-card border border-dashed border-border bg-surface-secondary px-4 py-5 text-center">
                 <div className="text-[13px] font-medium text-content-primary">No saved recipes yet</div>
                 <p className="text-[11px] text-content-tertiary mt-1">
@@ -1766,19 +1874,19 @@ export function DeckBuilderPage() {
                         </div>
                       </div>
                       <div className="flex flex-wrap gap-1.5">
-                        <button onClick={() => void handleLoadRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting}>
+                        <button onClick={() => void handleLoadRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting || recipeVaultLocked}>
                           Load
                         </button>
-                        <button onClick={() => handleRenameRecipe(record)} className="btn-ghost btn-sm" type="button">
+                        <button onClick={() => handleRenameRecipe(record)} className="btn-ghost btn-sm" type="button" disabled={recipeVaultLocked}>
                           Rename
                         </button>
-                        <button onClick={() => handleDuplicateRecipe(record)} className="btn-ghost btn-sm" type="button">
+                        <button onClick={() => void handleDuplicateRecipe(record)} className="btn-ghost btn-sm" type="button" disabled={recipeVaultLocked}>
                           Duplicate
                         </button>
                         <button onClick={() => handleExportRecipeRecord(record)} className="btn-ghost btn-sm" type="button">
                           Export
                         </button>
-                        <button onClick={() => handleDeleteRecipe(record)} className="btn-ghost btn-sm text-red-600 hover:text-red-700" type="button">
+                        <button onClick={() => handleDeleteRecipe(record)} className="btn-ghost btn-sm text-red-600 hover:text-red-700" type="button" disabled={recipeVaultLocked}>
                           Delete
                         </button>
                       </div>
@@ -2392,7 +2500,7 @@ export function DeckBuilderPage() {
               </p>
             </div>
             <div className="flex flex-wrap justify-end gap-2">
-              <button onClick={openSaveRecipeDialog} className="btn-secondary flex-shrink-0" type="button" disabled={generating || !dashboard}>
+              <button onClick={openSaveRecipeDialog} className="btn-secondary flex-shrink-0" type="button" disabled={generating || !dashboard || recipeVaultLocked} title={recipeVaultLocked ? 'Unlock the native vault before saving recipes.' : undefined}>
                 <Save size={13} /> Save current as recipe
               </button>
               <button

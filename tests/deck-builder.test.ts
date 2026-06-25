@@ -1,7 +1,24 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
+import { join } from 'node:path';
 import JSZip from 'jszip';
 
+import deckRecipesHandler from '../server/handlers/deck-recipes';
+import {
+  deleteDeckRecipe,
+  duplicateDeckRecipe,
+  listDeckRecipes,
+  lockVault,
+  normalizeVaultPayload,
+  renameDeckRecipe,
+  resetVault,
+  unlockVault,
+  upsertDeckRecipe,
+} from '../server/services/nativeVault';
+import {
+  previewModeForTileExportState,
+  previewModeForTileResult,
+} from '../src/services/deckBuilder/previewMode';
 import { buildRecipe, validateRecipe } from '../src/services/deckBuilder/deckRecipe';
 import {
   clearDeckDraft,
@@ -21,7 +38,7 @@ import {
   saveRecipe,
 } from '../src/services/deckBuilder/recipeStore';
 import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
-import type { DeckRecipe, LayoutKit } from '../src/services/deckBuilder/types';
+import type { DeckRecipe, LayoutKit, TileResult } from '../src/services/deckBuilder/types';
 
 class MemoryStorage {
   private readonly values = new Map<string, string>();
@@ -85,19 +102,64 @@ function makeRecipe(patch: Partial<DeckRecipe> = {}): DeckRecipe {
   };
 }
 
+function makeTileResult(patch: Partial<TileResult> = {}): TileResult {
+  return {
+    columns: [
+      { name: 'hour', label: 'Hour', type: 'string' },
+      { name: 'sales', label: 'Sales', type: 'number' },
+      { name: 'orders', label: 'Orders', type: 'number' },
+      { name: 'daypart', label: 'Daypart', type: 'string' },
+    ],
+    rows: [
+      { hour: '6', sales: 21900, orders: 4594, daypart: 'Morning Rush' },
+      { hour: '7', sales: 63526, orders: 13428, daypart: 'Morning Rush' },
+    ],
+    rowCount: 2,
+    truncated: false,
+    renderKind: 'bar',
+    ...patch,
+  };
+}
+
 beforeEach(() => {
   installLocalStorage();
 });
 
 afterEach(() => {
   delete (globalThis as typeof globalThis & { window?: unknown }).window;
+  if (process.env.OMNIKIT_VAULT_PATH?.includes('omnikit-deck-builder-test-vault')) {
+    resetVault();
+    delete process.env.OMNIKIT_VAULT_PATH;
+  }
 });
+
+function useTempVault(slug: string): void {
+  process.env.OMNIKIT_VAULT_PATH = join('/private/tmp', `omnikit-deck-builder-test-vault-${process.pid}-${slug}-${Date.now()}.enc`);
+  resetVault();
+}
 
 test('uses an explicit transparent PPTX fill for border-only shapes', () => {
   assert.deepEqual(TRANSPARENT_PPTX_FILL, {
     color: 'FFFFFF',
     transparency: 100,
   });
+});
+
+test('native preview trusts renderKind for chart-like results with more than three columns', () => {
+  assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'bar' })), 'chart');
+  assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'line' })), 'chart');
+  assert.equal(previewModeForTileResult(makeTileResult({ renderKind: 'pie' })), 'chart');
+});
+
+test('native preview keeps table and image override decisions explicit', () => {
+  const tableResult = makeTileResult({ renderKind: 'table' });
+  assert.equal(previewModeForTileResult(tableResult), 'table');
+  assert.equal(previewModeForTileExportState({
+    tileId: 'tile-1',
+    status: 'done',
+    pngDataUrl: 'data:image/png;base64,preview',
+    result: tableResult,
+  }), 'image');
 });
 
 test('generated PPTX keeps overlay and decoration border boxes transparent', async () => {
@@ -211,6 +273,79 @@ test('saves and validates local deck recipes without persisting secret-shaped ke
   assert.equal(record.savedForHost, 'Example Omni (example.omniapp.co)');
   assert.equal(record.savedForInstanceLabel, 'Example Omni');
   assert.equal(record.savedForBaseUrlHost, 'example.omniapp.co');
+});
+
+test('vault payloads without deck recipes normalize with an empty recipe library', () => {
+  const payload = normalizeVaultPayload({ version: 1, instances: [] });
+  assert.deepEqual(payload.deckRecipes, []);
+});
+
+test('vault deck recipe operations persist encrypted recipe metadata', async () => {
+  useTempVault('crud');
+  unlockVault('deck-passphrase');
+
+  const saved = upsertDeckRecipe({
+    name: 'Executive recipe',
+    description: 'Board deck',
+    savedForInstanceId: 'instance-1',
+    savedForInstanceLabel: 'Example Omni',
+    savedForBaseUrlHost: 'example.omniapp.co',
+    recipe: makeRecipe(),
+  });
+  assert.equal(saved.name, 'Executive recipe');
+  assert.equal(saved.savedForInstanceId, 'instance-1');
+  assert.equal(listDeckRecipes().length, 1);
+
+  const exportResponse = await deckRecipesHandler(new Request(`http://localhost/api/deck-recipes/${saved.id}/export`));
+  assert.equal(exportResponse.status, 200);
+  const exportBody = await exportResponse.json() as { recipe?: DeckRecipe; metadata?: { name?: string } };
+  assert.equal(exportBody.recipe?.dashboardName, 'Executive Dashboard');
+  assert.equal(exportBody.metadata?.name, 'Executive recipe');
+
+  lockVault();
+  unlockVault('deck-passphrase');
+  assert.equal(listDeckRecipes()[0]?.name, 'Executive recipe');
+
+  const renamed = renameDeckRecipe(saved.id, 'Renamed recipe');
+  assert.equal(renamed?.name, 'Renamed recipe');
+  const duplicated = duplicateDeckRecipe(saved.id);
+  assert.equal(duplicated?.name, 'Copy of Renamed recipe');
+  assert.equal(listDeckRecipes().length, 2);
+
+  deleteDeckRecipe(saved.id);
+  assert.deepEqual(listDeckRecipes().map((record) => record.name), ['Copy of Renamed recipe']);
+});
+
+test('vault deck recipes strip secret-shaped recipe data before persistence', () => {
+  useTempVault('secrets');
+  unlockVault('deck-passphrase');
+
+  const dirtyRecipe = {
+    ...makeRecipe(),
+    apiKey: 'omni_live_should_not_store',
+    token: 'session-token',
+    brand: {
+      ...DEFAULT_BRAND,
+      token: 'brand-token',
+    },
+  } as DeckRecipe;
+
+  const saved = upsertDeckRecipe({
+    name: 'Dirty recipe',
+    recipe: dirtyRecipe,
+  });
+  const serialized = JSON.stringify(saved);
+  assert.equal(serialized.includes('apiKey'), false);
+  assert.equal(serialized.includes('token'), false);
+  assert.equal(serialized.includes('omni_live_should_not_store'), false);
+});
+
+test('deck recipe API requires an unlocked vault', async () => {
+  useTempVault('locked-api');
+  const response = await deckRecipesHandler(new Request('http://localhost/api/deck-recipes'));
+  assert.equal(response.status, 423);
+  const body = await response.json() as { error?: string };
+  assert.equal(body.error, 'vault locked');
 });
 
 test('validates legacy recipes without dashboard metadata', () => {
