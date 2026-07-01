@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, test } from 'node:test';
 import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import JSZip from 'jszip';
 
 import deckRecipesHandler from '../server/handlers/deck-recipes';
@@ -151,7 +152,7 @@ afterEach(() => {
 });
 
 function useTempVault(slug: string): void {
-  process.env.OMNIKIT_VAULT_PATH = join('/private/tmp', `omnikit-deck-builder-test-vault-${process.pid}-${slug}-${Date.now()}.enc`);
+  process.env.OMNIKIT_VAULT_PATH = join(tmpdir(), `omnikit-deck-builder-test-vault-${process.pid}-${slug}-${Date.now()}.enc`);
   resetVault();
 }
 
