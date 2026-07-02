@@ -6,7 +6,7 @@ import { afterEach, beforeEach, mock, test } from 'node:test';
 
 import instancesHandler from '../server/handlers/instances';
 import migrationJobsHandler from '../server/handlers/migration-jobs';
-import { buildMigrationPlan, createMigrationJob, getJob, retryMigrationJob } from '../server/services/migrationJobs';
+import { buildMigrationPlan, createMigrationJob, getJob, retryMigrationJob, validateDashboardMigrationPatches } from '../server/services/migrationJobs';
 import { OmniClient, type OmniDocumentRecord } from '../server/services/omniClient';
 import {
   lockVault,
@@ -2837,6 +2837,302 @@ test('dashboard migration applies accepted semantic field code patches before im
     yaml: customYaml,
     previousChecksum: 'target-orders',
   }]);
+});
+
+test('dashboard migration retry reruns failed field preparation with updated patches', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    defaultFolderPath: 'Migrated Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const writes: Array<{ fileName: string; yaml: string; previousChecksum?: string }> = [];
+  let importedCreated = false;
+  const sourceYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n    aggregate_type: sum\n';
+  const targetYaml = 'measures:\n  total_sales:\n    sql: ${orders.amount}\n';
+  const brokenYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.broken_total_sales}\n';
+  const fixedYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n    aggregate_type: sum\n';
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    if (clientLabel(this) === 'Source') {
+      return [{
+        id: 'source-doc-1',
+        identifier: 'source-doc-1',
+        name: 'Semantic Field Dashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }];
+    }
+    return importedCreated
+      ? [{
+        id: 'imported-doc-1',
+        identifier: 'imported-doc-1',
+        name: 'Semantic Field Dashboard',
+        folderPath: 'Migrated Dashboards',
+        baseModelId: 'target-model',
+      }]
+      : [];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'listModels', async () => [{ id: 'target-model', name: 'Target Model' }]);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? { 'orders.view': sourceYaml }
+      : { 'orders.view': targetYaml };
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    return clientLabel(this) === 'Source'
+      ? {
+        files: { 'orders.view': sourceYaml },
+        checksums: options.includeChecksums ? { 'orders.view': 'source-orders' } : undefined,
+        raw: { modelId },
+      }
+      : {
+        files: { 'orders.view': targetYaml },
+        checksums: options.includeChecksums ? { 'orders.view': 'target-orders' } : undefined,
+        raw: { modelId },
+      };
+  });
+  mock.method(OmniClient.prototype, 'updateModelYamlFile', async (input: { fileName: string; yaml: string; previousChecksum?: string }) => {
+    if (input.yaml.includes('broken_total_sales')) throw new Error('Omni validation rejected broken field YAML.');
+    writes.push({ fileName: input.fileName, yaml: input.yaml, previousChecksum: input.previousChecksum });
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.semantic_total_sales'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async () => {
+    importedCreated = true;
+    return { identifier: 'imported-doc-1', documentId: 'imported-doc-1' };
+  });
+  mock.method(OmniClient.prototype, 'moveDocument', async () => ({}));
+
+  const baseTarget = {
+    id: 'target-1',
+    destinationInstanceId: 'dest-1',
+    targetConnectionId: 'target-connection-1',
+    targetModelId: 'target-model',
+    targetFolderPath: 'Migrated Dashboards',
+    fieldMappings: [{
+      sourceFieldRef: 'orders.semantic_total_sales',
+      action: 'create_from_source' as const,
+      sourceFileName: 'orders.view',
+      targetFileName: 'orders.view',
+    }],
+  };
+  const initialInput = {
+    sourceId: 'source-1',
+    routeGroups: [{
+      id: 'route-fields',
+      name: 'Field route',
+      documentIds: ['source-doc-1'],
+      targets: [{
+        ...baseTarget,
+        semanticPatches: [{
+          id: 'field:orders.semantic_total_sales:orders.view',
+          artifactType: 'field' as const,
+          sourceName: 'orders.semantic_total_sales',
+          targetFileName: 'orders.view',
+          acceptedYaml: brokenYaml,
+          previousChecksum: 'target-orders',
+          resolution: 'custom_edit' as const,
+          status: 'ready' as const,
+        }],
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    postMigrationActions: [],
+  };
+
+  const created = await createMigrationJob(initialInput);
+  const failedJob = await waitForJob(created.id);
+  const fieldPrep = failedJob.items.find((item) => item.kind === 'field_prepare');
+  const importItem = failedJob.items.find((item) => item.kind === 'import');
+
+  assert.equal(failedJob.status, 'partial');
+  assert.equal(fieldPrep?.status, 'failed');
+  assert.match(fieldPrep?.error || '', /broken field YAML/);
+  assert.equal(importItem?.status, 'skipped');
+  assert.match(importItem?.error || '', /import skipped|dependent step skipped/i);
+
+  const retry = await retryMigrationJob(failedJob.id, {
+    retryInput: {
+      ...initialInput,
+      routeGroups: [{
+        id: 'route-fields',
+        name: 'Field route',
+        documentIds: ['source-doc-1'],
+        targets: [{
+          ...baseTarget,
+          semanticPatches: [{
+            id: 'field:orders.semantic_total_sales:orders.view',
+            artifactType: 'field',
+            sourceName: 'orders.semantic_total_sales',
+            targetFileName: 'orders.view',
+            acceptedYaml: fixedYaml,
+            previousChecksum: 'target-orders',
+            resolution: 'custom_edit',
+            status: 'ready',
+          }],
+        }],
+      }],
+    },
+  });
+  const retriedJob = await waitForJob(retry.id);
+  const retriedFieldPrep = retriedJob.items.find((item) => item.kind === 'field_prepare');
+  const retriedImport = retriedJob.items.find((item) => item.kind === 'import');
+
+  assert.equal(retriedJob.status, 'succeeded');
+  assert.deepEqual(retriedJob.routeGroups?.map((group) => group.id), ['route-fields']);
+  assert.deepEqual(retriedJob.documentIds, ['source-doc-1']);
+  assert.equal(retriedFieldPrep?.status, 'succeeded');
+  assert.equal(retriedImport?.status, 'succeeded');
+  assert.deepEqual(writes, [{
+    fileName: 'orders.view',
+    yaml: fixedYaml,
+    previousChecksum: 'target-orders',
+  }]);
+});
+
+test('dashboard patch validation uses scratch branch lifecycle and maps errors to artifacts', async () => {
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const calls: string[] = [];
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'target-model',
+    name: 'Target Model',
+    connectionId: 'target-connection-1',
+    gitConfigured: true,
+  }]);
+  mock.method(OmniClient.prototype, 'createModelBranch', async (input: { branchName: string }) => {
+    calls.push(`create:${input.branchName.startsWith('omnikit-validate-')}`);
+    return { id: 'branch-model-id', name: input.branchName, raw: {} };
+  });
+  mock.method(OmniClient.prototype, 'updateModelYamlFiles', async (input: { branchId: string; files: Array<{ fileName: string }> }) => {
+    calls.push(`write:${input.branchId}:${input.files.map((file) => file.fileName).join(',')}`);
+  });
+  mock.method(OmniClient.prototype, 'validateModel', async (_modelId: string, branchId?: string) => {
+    calls.push(`validate:${branchId}`);
+    return [{ message: 'Bad field definition', yaml_path: 'orders.view.measures.semantic_total_sales' }];
+  });
+  mock.method(OmniClient.prototype, 'deleteModelBranch', async (branchId: string) => {
+    calls.push(`delete:${branchId}`);
+  });
+
+  const validation = await validateDashboardMigrationPatches({
+    sourceId: 'source-1',
+    routeGroups: [{
+      id: 'route-fields',
+      name: 'Field route',
+      documentIds: ['source-doc-1'],
+      targets: [{
+        id: 'target-1',
+        destinationInstanceId: 'dest-1',
+        targetConnectionId: 'target-connection-1',
+        targetModelId: 'target-model',
+        semanticPatches: [{
+          id: 'field:orders.semantic_total_sales:orders.view',
+          artifactType: 'field',
+          sourceName: 'orders.semantic_total_sales',
+          targetFileName: 'orders.view',
+          acceptedYaml: 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+          resolution: 'custom_edit',
+          status: 'ready',
+        }],
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    postMigrationActions: [],
+  });
+
+  assert.equal(validation.status, 'failed');
+  assert.equal(validation.results[0].mode, 'branch');
+  assert.equal(validation.results[0].artifacts[0].status, 'failed');
+  assert.match(validation.results[0].artifacts[0].messages.join(' '), /Bad field definition/);
+  assert.deepEqual(calls, [
+    'create:true',
+    'write:branch-model-id:orders.view',
+    'validate:branch-model-id',
+    'delete:branch-model-id',
+  ]);
+});
+
+test('dashboard patch validation falls back to structural checks for non-branch models', async () => {
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultModelId: 'target-model',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  let branchCreated = false;
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'target-model',
+    name: 'Target Model',
+    connectionId: 'target-connection-1',
+    gitConfigured: false,
+  }]);
+  mock.method(OmniClient.prototype, 'createModelBranch', async () => {
+    branchCreated = true;
+    return { id: 'branch-model-id', name: 'branch', raw: {} };
+  });
+
+  const validation = await validateDashboardMigrationPatches({
+    sourceId: 'source-1',
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection-1',
+      targetModelId: 'target-model',
+      semanticPatches: [{
+        id: 'field:orders.semantic_total_sales:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.semantic_total_sales',
+        targetFileName: 'orders.view',
+        acceptedYaml: 'sql: ${orders.total_sales}\n',
+        resolution: 'custom_edit',
+        status: 'ready',
+      }],
+    }],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    postMigrationActions: [],
+  });
+
+  assert.equal(branchCreated, false);
+  assert.equal(validation.status, 'failed');
+  assert.equal(validation.results[0].mode, 'structural');
+  assert.match(validation.results[0].artifacts[0].messages.join(' '), /dimensions: or measures:/);
 });
 
 test('dashboard migration blocks unsafe accepted semantic field patches before import', async () => {

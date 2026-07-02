@@ -1075,6 +1075,11 @@ export class OmniClient {
     return await response.json().catch(() => ({})) as Record<string, unknown>;
   }
 
+  async deleteModelBranch(branchId: string): Promise<Record<string, unknown>> {
+    const response = await this.request('DELETE', `/api/v1/models/${encodeURIComponent(branchId)}`);
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
   async migrateModel(input: {
     sourceModelId: string;
     gitRef?: string;

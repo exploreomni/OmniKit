@@ -31,6 +31,8 @@ import {
   retryOpsMigrationJob,
   subscribeMigrationJob,
   unlockNativeVault,
+  validateMigrationPatches,
+  type DashboardPatchValidationResult,
   type InstanceDocument,
   type InstanceFolder,
   type InstanceModel,
@@ -93,6 +95,7 @@ import {
   preflightRowsFromPlan,
   preflightRouteGroupsFromPlan,
   queryViewRequirementsByRouteTargetFromPlan,
+  shouldAutoRunDashboardReadiness,
   statusClass,
   TARGET_FOLDER_COMBOBOX_CONFIG,
   TARGET_MODEL_COMBOBOX_CONFIG,
@@ -584,7 +587,9 @@ export function DashboardMigrationWizard() {
   const [emptyFirst, setEmptyFirst] = useState(false);
   const [refreshSchemaOnComplete, setRefreshSchemaOnComplete] = useState(false);
   const [deleteSourceOnSuccess, setDeleteSourceOnSuccess] = useState(false);
-  const [validatePatchesBeforeRun, setValidatePatchesBeforeRun] = useState(true);
+  const [validatePatchesBeforeRun, setValidatePatchesBeforeRun] = useState(false);
+  const [patchValidationResult, setPatchValidationResult] = useState<DashboardPatchValidationResult | null>(null);
+  const [patchValidationLoading, setPatchValidationLoading] = useState(false);
   const [plan, setPlan] = useState<MigrationPlan | null>(null);
   const [planRows, setPlanRows] = useState<PreflightTargetRow[]>([]);
   const [job, setJob] = useState<MigrationJob | null>(null);
@@ -612,6 +617,7 @@ export function DashboardMigrationWizard() {
   const enrichedDocumentIdsRef = useRef<Set<string>>(new Set());
   const enrichingDocumentIdsRef = useRef<Set<string>>(new Set());
   const autoPreflightSignatureRef = useRef('');
+  const lastReadinessSignatureRef = useRef('');
   const autoCollapsedDependencySignatureRef = useRef('');
 
   const creatingVault = vaultStatus?.exists === false;
@@ -2873,6 +2879,7 @@ export function DashboardMigrationWizard() {
       setMessage(preflightBlockReason);
       return;
     }
+    const readinessSignature = routeConfigurationSignature;
     setPreflightLoading(true);
     setPreflightStatus('Building the route preview and checking destination readiness...');
     setError('');
@@ -2889,6 +2896,7 @@ export function DashboardMigrationWizard() {
       const dependencySync = await syncDetectedDependenciesFromPlan(res.plan);
       setPlan(res.plan);
       setPlanRows(preflightRowsFromPlan(res.plan));
+      lastReadinessSignatureRef.current = readinessSignature;
       if (dependencySync.queryView.needsReview || dependencySync.field.needsReview) {
         const dependencyLabels = [
           dependencySync.queryView.needsReview ? 'query-view mappings' : '',
@@ -2913,6 +2921,7 @@ export function DashboardMigrationWizard() {
   }
 
   async function validateReadinessBeforeRun() {
+    const readinessSignature = routeConfigurationSignature;
     setPreflightLoading(true);
     setPreflightStatus('Rechecking dependency freshness before migration...');
     setMessage('Rechecking target YAML freshness before the migration starts.');
@@ -2927,6 +2936,7 @@ export function DashboardMigrationWizard() {
       const freshRows = preflightRowsFromPlan(res.plan);
       setPlan(res.plan);
       setPlanRows(freshRows);
+      lastReadinessSignatureRef.current = readinessSignature;
       const blocked = freshRows.some((row) => row.status === 'blocked');
       if (dependencySync.queryView.needsReview || dependencySync.field.needsReview || blocked) {
         setStep(3);
@@ -2946,6 +2956,38 @@ export function DashboardMigrationWizard() {
     }
   }
 
+  async function validatePatchesBeforeMigration() {
+    setPatchValidationLoading(true);
+    setPatchValidationResult(null);
+    setPreflightStatus('Validating accepted dependency patches before migration...');
+    setMessage('Checking accepted field, query-view, relationship, and topic patches before the migration starts.');
+    setError('');
+    try {
+      const res = await withTimeout(
+        validateMigrationPatches(buildJobInput()),
+        PREFLIGHT_TIMEOUT_MS,
+        'Patch validation timed out before OmniKit received a response. No changes were applied.',
+      );
+      setPatchValidationResult(res.validation);
+      if (res.validation.status === 'failed') {
+        setStep(4);
+        setMessage('Patch validation found dependency code issues. Review the validation results below or return to Step 4 to fix them.');
+        return false;
+      }
+      setMessage(res.validation.status === 'skipped'
+        ? 'No accepted dependency patches needed validation for this migration.'
+        : 'Accepted dependency patches passed validation.');
+      return true;
+    } catch (err) {
+      setMessage('');
+      setError(errorText(err, 'Could not validate dependency patches before running the migration.'));
+      return false;
+    } finally {
+      setPatchValidationLoading(false);
+      setPreflightStatus('');
+    }
+  }
+
   async function startJob(confirmedCleanup = false) {
     if (requiresStartConfirmation && !confirmedCleanup) {
       setConfirmAction('start-with-cleanup');
@@ -2958,6 +3000,8 @@ export function DashboardMigrationWizard() {
       if (validatePatchesBeforeRun) {
         const ready = await validateReadinessBeforeRun();
         if (!ready) return;
+        const patchesReady = await validatePatchesBeforeMigration();
+        if (!patchesReady) return;
       }
       const res = await createOpsMigrationJob(buildJobInput());
       setJob(res.job);
@@ -2990,7 +3034,7 @@ export function DashboardMigrationWizard() {
     setJobBusy(true);
     setError('');
     try {
-      const res = await retryOpsMigrationJob(job.id);
+      const res = await retryOpsMigrationJob(job.id, { retryInput: buildJobInput() });
       setJob(res.job);
       setMessage('Retry job started for failed prep, export, and import steps.');
     } catch (err) {
@@ -3016,6 +3060,15 @@ export function DashboardMigrationWizard() {
     setDependencyArtifactFilter(artifact);
     setDependencySearch(item.targetModelName || item.documentName || item.documentId || '');
     setMessage(`Focused Step 4 on the failed ${kindLabel(item.kind).toLowerCase()} item. Resolve the dependency and retry the migration.`);
+  }
+
+  function focusPatchValidationArtifact(artifactType: DependencyArtifactFilter, searchValue: string) {
+    setStep(3);
+    setDependencyReviewMode(artifactType === 'field' || artifactType === 'relationship' ? 'code' : 'guided');
+    setDependencyStatusFilter('blocked');
+    setDependencyArtifactFilter(artifactType);
+    setDependencySearch(searchValue);
+    setMessage('Focused Step 4 on the dependency patch that failed pre-run validation.');
   }
 
   function startNewMigration() {
@@ -3409,10 +3462,19 @@ export function DashboardMigrationWizard() {
   ]);
 
   useEffect(() => {
-    if (step !== 3) return;
-    if (planRows.length > 0 || preflightLoading || preflightBlockReason) return;
-    if (!sourceId || !sourceConnectionId || selectedDocumentIds.length === 0 || migrationTargets.length === 0) return;
-    if (autoPreflightSignatureRef.current === routeConfigurationSignature) return;
+    if (!shouldAutoRunDashboardReadiness({
+      step,
+      planRowCount: planRows.length,
+      preflightLoading,
+      preflightBlockReason,
+      sourceId,
+      sourceConnectionId,
+      selectedDocumentCount: selectedDocumentIds.length,
+      migrationTargetCount: migrationTargets.length,
+      routeConfigurationSignature,
+      autoPreflightSignature: autoPreflightSignatureRef.current,
+      lastReadinessSignature: lastReadinessSignatureRef.current,
+    })) return;
     autoPreflightSignatureRef.current = routeConfigurationSignature;
     setPreflightStatus('Automatically checking destination readiness for this route...');
     void runPreflight();
@@ -3429,6 +3491,10 @@ export function DashboardMigrationWizard() {
     sourceId,
     step,
   ]);
+
+  useEffect(() => {
+    setPatchValidationResult(null);
+  }, [routeConfigurationSignature, validatePatchesBeforeRun]);
 
   const hasUnsavedCustomSemanticYaml = useMemo(() => routeGroups.some((group) => (
     Object.values(group.semanticPatchesByTargetId || {}).some((patches) => (
@@ -3898,10 +3964,12 @@ export function DashboardMigrationWizard() {
                     Use guided choices for normal migrations, or review the exact YAML patches before OmniKit applies them.
                   </p>
                 </div>
-                <div className="inline-flex rounded-card border border-border-subtle bg-white p-1 text-xs font-semibold">
+                <div className="inline-flex rounded-card border border-border-subtle bg-white p-1 text-xs font-semibold" role="tablist" aria-label="Dependency review mode">
                   <button
                     type="button"
                     onClick={() => setDependencyReviewMode('guided')}
+                    role="tab"
+                    aria-selected={dependencyReviewMode === 'guided'}
                     className={`rounded-card px-3 py-1 ${dependencyReviewMode === 'guided' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
                   >
                     Guided choices
@@ -3909,13 +3977,15 @@ export function DashboardMigrationWizard() {
                   <button
                     type="button"
                     onClick={() => setDependencyReviewMode('code')}
+                    role="tab"
+                    aria-selected={dependencyReviewMode === 'code'}
                     className={`rounded-card px-3 py-1 ${dependencyReviewMode === 'code' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
                   >
                     Code review
                   </button>
                 </div>
               </div>
-              <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+              <div className="mt-4 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800" aria-live="polite">
                 Code review is advanced. It lets you accept or edit the model, query-view, relationship, and topic YAML OmniKit will write before import.
               </div>
             </div>
@@ -5889,6 +5959,65 @@ export function DashboardMigrationWizard() {
                     <span className="text-content-secondary">Recheck model/topic/query-view changes before run</span>
                   </span>
                 </label>
+                {patchValidationLoading && (
+                  <div className="rounded-card border border-blue-200 bg-blue-50 p-3 text-blue-800" aria-live="polite">
+                    <Loader2 size={14} className="mr-1 inline-block animate-spin" />
+                    Validating accepted dependency patches...
+                  </div>
+                )}
+                {patchValidationResult && (
+                  <div className={`rounded-card border p-3 ${
+                    patchValidationResult.status === 'failed'
+                      ? 'border-red-200 bg-red-50 text-red-800'
+                      : patchValidationResult.status === 'skipped'
+                        ? 'border-border-subtle bg-surface-secondary text-content-secondary'
+                        : 'border-green-200 bg-green-50 text-green-800'
+                  }`} role={patchValidationResult.status === 'failed' ? 'alert' : undefined} aria-live={patchValidationResult.status === 'failed' ? undefined : 'polite'}>
+                    <div className="font-semibold">
+                      {patchValidationResult.status === 'failed'
+                        ? 'Patch validation needs attention'
+                        : patchValidationResult.status === 'skipped'
+                          ? 'No patch validation was needed'
+                          : 'Patch validation passed'}
+                    </div>
+                    <div className="mt-2 space-y-2">
+                      {patchValidationResult.results.map((result) => (
+                        <div key={`${result.destinationId}:${result.targetModelId}:${result.targetId}`} className="rounded-card bg-white/70 px-3 py-2">
+                          <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                            <span className="font-semibold text-content-primary">{result.destinationLabel || result.destinationId} · {result.targetModelName || result.targetModelId}</span>
+                            <span className="text-content-secondary">{result.mode === 'branch' ? 'Scratch branch' : result.mode === 'structural' ? 'Structural check' : 'Skipped'} · {result.status}</span>
+                          </div>
+                          {result.error && <div className="mt-1 text-red-700">{result.error}</div>}
+                          {result.cleanupError && <div className="mt-1 text-red-700">Scratch branch cleanup failed: {result.cleanupError}</div>}
+                          {result.artifacts.length > 0 && (
+                            <div className="mt-2 space-y-1">
+                              {result.artifacts.map((artifact) => (
+                                <div key={artifact.id} className="flex flex-col gap-2 rounded-card border border-border-subtle bg-white px-2 py-1 sm:flex-row sm:items-start sm:justify-between">
+                                  <div>
+                                    <div className="font-semibold text-content-primary">{artifact.sourceName || artifact.targetFileName}</div>
+                                    <div className="text-content-secondary">{artifact.artifactType.replace('_', ' ')} · {artifact.targetFileName} · {artifact.status}</div>
+                                    {artifact.messages.map((warning) => (
+                                      <div key={warning} className={artifact.status === 'failed' ? 'text-red-700' : 'text-content-secondary'}>{warning}</div>
+                                    ))}
+                                  </div>
+                                  {artifact.status === 'failed' && (
+                                    <button
+                                      type="button"
+                                      className="btn-secondary text-xs"
+                                      onClick={() => focusPatchValidationArtifact(artifact.artifactType, artifact.sourceName || artifact.targetFileName)}
+                                    >
+                                      Fix in Step 4
+                                    </button>
+                                  )}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             </div>
             <div className="card p-5">

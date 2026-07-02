@@ -1338,6 +1338,27 @@ export function getDashboardMigrationPreflightBlockReason(input: {
   return '';
 }
 
+export function shouldAutoRunDashboardReadiness(input: {
+  step: number;
+  planRowCount: number;
+  preflightLoading: boolean;
+  preflightBlockReason?: string | null;
+  sourceId?: string | null;
+  sourceConnectionId?: string | null;
+  selectedDocumentCount: number;
+  migrationTargetCount: number;
+  routeConfigurationSignature: string;
+  autoPreflightSignature: string;
+  lastReadinessSignature: string;
+}) {
+  if (input.step !== 3) return false;
+  if (input.preflightLoading || input.preflightBlockReason) return false;
+  if (!input.sourceId || !input.sourceConnectionId) return false;
+  if (input.selectedDocumentCount === 0 || input.migrationTargetCount === 0) return false;
+  if (input.autoPreflightSignature === input.routeConfigurationSignature) return false;
+  return input.planRowCount === 0 || input.lastReadinessSignature !== input.routeConfigurationSignature;
+}
+
 export function getDashboardLoadBlockReason(input: {
   sourceId?: string | null;
   sourceConnectionId?: string | null;

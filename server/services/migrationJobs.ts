@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OmniClient, OmniClientError, type OmniDocumentRecord, type OmniModelQueryViewRecord, type OmniModelYamlResponse } from './omniClient';
+import { OmniClient, OmniClientError, type OmniDocumentRecord, type OmniModelBranchResult, type OmniModelQueryViewRecord, type OmniModelYamlResponse, type OmniValidationIssue } from './omniClient';
 import {
   getInstance,
   type PostMigrationAction,
@@ -194,6 +194,55 @@ export interface MigrationSourceDocumentHint {
   description?: string | null;
   labels?: string[];
   updatedAt?: string;
+}
+
+export interface DashboardMigrationJobInput {
+  sourceId: string;
+  sourceConnectionId?: string;
+  destinationIds?: string[];
+  targets?: MigrationTarget[];
+  routeGroups?: MigrationRouteGroup[];
+  documentIds: string[];
+  sourceDocumentHints?: MigrationSourceDocumentHint[];
+  emptyFirst: boolean;
+  replaceSameNamed?: boolean;
+  deleteSourceOnSuccess?: boolean;
+  sourceFolderId?: string;
+  sourceFolderPath?: string;
+  sourceAllFolders?: boolean;
+  postMigrationActions: PostMigrationAction[];
+  parentJobId?: string;
+}
+
+export type DashboardPatchValidationMode = 'branch' | 'structural' | 'skipped';
+export type DashboardPatchValidationStatus = 'passed' | 'failed' | 'skipped';
+
+export interface DashboardPatchValidationArtifact {
+  id: string;
+  artifactType: MigrationSemanticPatchArtifact;
+  sourceName?: string;
+  targetFileName: string;
+  status: DashboardPatchValidationStatus;
+  messages: string[];
+}
+
+export interface DashboardPatchValidationModelResult {
+  targetId: string;
+  destinationId: string;
+  destinationLabel?: string;
+  targetModelId: string;
+  targetModelName?: string;
+  mode: DashboardPatchValidationMode;
+  status: DashboardPatchValidationStatus;
+  artifacts: DashboardPatchValidationArtifact[];
+  branchName?: string;
+  error?: string;
+  cleanupError?: string;
+}
+
+export interface DashboardPatchValidationResult {
+  status: DashboardPatchValidationStatus;
+  results: DashboardPatchValidationModelResult[];
 }
 
 export type MigrationTopicMappingAction = 'map_existing' | 'copy_source';
@@ -3464,22 +3513,263 @@ export async function buildMigrationPlan(input: {
   };
 }
 
-export async function createMigrationJob(input: {
-  sourceId: string;
-  sourceConnectionId?: string;
-  destinationIds?: string[];
-  targets?: MigrationTarget[];
-  routeGroups?: MigrationRouteGroup[];
-  documentIds: string[];
-  emptyFirst: boolean;
-  replaceSameNamed?: boolean;
-  deleteSourceOnSuccess?: boolean;
-  sourceFolderId?: string;
-  sourceFolderPath?: string;
-  sourceAllFolders?: boolean;
-  postMigrationActions: PostMigrationAction[];
-  parentJobId?: string;
-}): Promise<MigrationJob> {
+function validationTargetLabel(target: MigrationTarget): string {
+  return target.targetModelName || target.targetModelId || target.id;
+}
+
+function artifactResultFromPatch(
+  patch: MigrationSemanticPatch,
+  status: DashboardPatchValidationStatus,
+  messages: string[] = [],
+): DashboardPatchValidationArtifact {
+  return {
+    id: patch.id,
+    artifactType: patch.artifactType,
+    sourceName: patch.sourceName,
+    targetFileName: patch.targetFileName,
+    status,
+    messages: messages.map(redactSensitiveText),
+  };
+}
+
+function targetPatchValidationKey(target: MigrationTarget): string {
+  return `${target.destinationInstanceId}:${target.targetModelId}`;
+}
+
+function collectSemanticPatchValidationTargets(input: DashboardMigrationJobInput): MigrationTarget[] {
+  const byKey = new Map<string, MigrationTarget>();
+  for (const group of normalizeRouteGroups(input)) {
+    for (const target of group.targets) {
+      const semanticPatches = normalizeSemanticPatches(target.semanticPatches);
+      if (semanticPatches.length === 0) continue;
+      const key = targetPatchValidationKey(target);
+      const existing = byKey.get(key);
+      byKey.set(key, {
+        ...(existing || target),
+        semanticPatches: [
+          ...(existing?.semanticPatches || []),
+          ...semanticPatches,
+        ],
+      });
+    }
+  }
+  return [...byKey.values()].map((target) => ({
+    ...target,
+    semanticPatches: [...new Map((target.semanticPatches || []).map((patch) => [patch.id, patch])).values()],
+  }));
+}
+
+function fieldNameFromPatch(patch: MigrationSemanticPatch): string {
+  return (patch.sourceName || patch.id).split('.').pop() || patch.sourceName || patch.id;
+}
+
+function structuralPatchMessages(patch: MigrationSemanticPatch): string[] {
+  if (patch.resolution === 'keep_target') return [];
+  const messages: string[] = [];
+  const yaml = patch.acceptedYaml?.trim() || '';
+  if (!yaml) messages.push('Accepted YAML is empty.');
+  if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') messages.push('Patch is still marked blocked in Step 4.');
+  if (patch.destructive && !patch.confirmedDestructive) messages.push('Destructive patch must be confirmed before validation or run.');
+  if (!yaml) return messages;
+  if (/\t/.test(yaml)) messages.push('YAML contains tab indentation; use spaces before running.');
+  if (patch.artifactType === 'field') {
+    const fieldName = fieldNameFromPatch(patch).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (!/^\s*(dimensions|measures)\s*:/m.test(yaml)) {
+      messages.push('Field patches must include a dimensions: or measures: section.');
+    }
+    if (fieldName && !new RegExp(`^\\s{2,}${fieldName}\\s*:`, 'm').test(yaml)) {
+      messages.push(`Field patch does not define ${fieldNameFromPatch(patch)}.`);
+    }
+  } else if (patch.artifactType === 'query_view') {
+    if (!/^\s*(query|sql)\s*:/m.test(yaml)) {
+      messages.push('Query-view patches must include query: or sql:.');
+    }
+  } else if (patch.artifactType === 'topic') {
+    if (!/^\s*(base_view|base_view_name|views)\s*:/m.test(yaml)) {
+      messages.push('Topic patches must include base_view, base_view_name, or views.');
+    }
+  } else if (patch.artifactType === 'relationship') {
+    if (!/join_from_view\s*:/m.test(yaml) || !/join_to_view\s*:/m.test(yaml)) {
+      messages.push('Relationship patches must include join_from_view and join_to_view.');
+    }
+  }
+  return messages;
+}
+
+function validationIssueText(issue: OmniValidationIssue): string {
+  return redactSensitiveText([
+    issue.yaml_path,
+    issue.message,
+    JSON.stringify(issue),
+  ].filter(Boolean).join(' '));
+}
+
+function issueMatchesPatch(issue: OmniValidationIssue, patch: MigrationSemanticPatch): boolean {
+  const text = validationIssueText(issue).toLowerCase();
+  return [patch.targetFileName, patch.sourceFileName, patch.sourceName]
+    .filter((value): value is string => Boolean(value))
+    .some((value) => text.includes(value.toLowerCase()));
+}
+
+function summarizeValidationResults(results: DashboardPatchValidationModelResult[]): DashboardPatchValidationStatus {
+  if (results.length === 0) return 'skipped';
+  if (results.some((result) => result.status === 'failed')) return 'failed';
+  if (results.every((result) => result.status === 'skipped')) return 'skipped';
+  return 'passed';
+}
+
+export async function validateDashboardMigrationPatches(input: DashboardMigrationJobInput): Promise<DashboardPatchValidationResult> {
+  const targets = collectSemanticPatchValidationTargets(input);
+  const results: DashboardPatchValidationModelResult[] = [];
+  for (const target of targets) {
+    const destination = requireInstance(target.destinationInstanceId);
+    const client = new OmniClient(destination);
+    const patches = normalizeSemanticPatches(target.semanticPatches);
+    const baseResult: Omit<DashboardPatchValidationModelResult, 'mode' | 'status' | 'artifacts'> = {
+      targetId: target.id,
+      destinationId: destination.id,
+      destinationLabel: destination.label,
+      targetModelId: target.targetModelId,
+      targetModelName: target.targetModelName,
+    };
+    if (patches.length === 0) {
+      results.push({ ...baseResult, mode: 'skipped', status: 'skipped', artifacts: [] });
+      continue;
+    }
+
+    let targetModelRecord = (await client.listModels({ modelId: target.targetModelId, include: 'git' }).catch(() => []))
+      .find((model) => model.id === target.targetModelId);
+    if (!targetModelRecord) {
+      targetModelRecord = (await client.listModels('SHARED').catch(() => []))
+        .find((model) => model.id === target.targetModelId);
+    }
+
+    if (targetModelRecord?.pullRequestRequired || targetModelRecord?.gitProtected) {
+      results.push({
+        ...baseResult,
+        mode: 'skipped',
+        status: 'skipped',
+        artifacts: patches.map((patch) => artifactResultFromPatch(patch, 'skipped', [
+          `${validationTargetLabel(target)} requires pull-request or protected-branch changes; OmniKit will validate at run/handoff time.`,
+        ])),
+      });
+      continue;
+    }
+
+    if (!targetModelRecord?.gitConfigured) {
+      const artifacts = patches.map((patch) => {
+        if (patch.resolution === 'keep_target') return artifactResultFromPatch(patch, 'skipped', ['No YAML write selected.']);
+        const messages = structuralPatchMessages(patch);
+        return artifactResultFromPatch(patch, messages.length > 0 ? 'failed' : 'passed', messages.length > 0
+          ? messages
+          : ['Structural check passed; Omni validates fully at run.']);
+      });
+      results.push({
+        ...baseResult,
+        mode: 'structural',
+        status: artifacts.some((artifact) => artifact.status === 'failed') ? 'failed' : artifacts.every((artifact) => artifact.status === 'skipped') ? 'skipped' : 'passed',
+        artifacts,
+      });
+      continue;
+    }
+
+    const branchName = `omnikit-validate-${randomUUID().slice(0, 8)}`;
+    let branch: OmniModelBranchResult | undefined;
+    let cleanupError = '';
+    try {
+      const structuralFailures = patches
+        .map((patch) => ({ patch, messages: structuralPatchMessages(patch) }))
+        .filter((row) => row.patch.resolution !== 'keep_target' && row.messages.length > 0);
+      if (structuralFailures.length > 0) {
+        results.push({
+          ...baseResult,
+          mode: 'structural',
+          status: 'failed',
+          branchName,
+          artifacts: patches.map((patch) => {
+            const failure = structuralFailures.find((row) => row.patch.id === patch.id);
+            if (patch.resolution === 'keep_target') return artifactResultFromPatch(patch, 'skipped', ['No YAML write selected.']);
+            return artifactResultFromPatch(patch, failure ? 'failed' : 'passed', failure?.messages || ['Structural check passed.']);
+          }),
+        });
+        continue;
+      }
+
+      if (!target.targetConnectionId) throw new Error(`Cannot validate ${validationTargetLabel(target)} because the target connection is missing.`);
+      branch = await client.createModelBranch({
+        connectionId: target.targetConnectionId,
+        baseModelId: target.targetModelId,
+        branchName,
+      });
+      const files = patches
+        .filter((patch) => patch.resolution !== 'keep_target' && patch.acceptedYaml?.trim())
+        .map((patch) => ({
+          fileName: patch.targetFileName,
+          yaml: patch.acceptedYaml as string,
+          previousChecksum: patch.previousChecksum,
+        }));
+      await client.updateModelYamlFiles({
+        modelId: target.targetModelId,
+        branchId: branch.id,
+        files,
+        commitMessage: 'Validate Dashboard Migrator dependency patches',
+      });
+      const issues = await client.validateModel(target.targetModelId, branch.id);
+      const blockingIssues = issues.filter((issue) => issue.is_warning !== true);
+      const artifacts = patches.map((patch) => {
+        if (patch.resolution === 'keep_target') return artifactResultFromPatch(patch, 'skipped', ['No YAML write selected.']);
+        const patchIssues = blockingIssues.filter((issue) => issueMatchesPatch(issue, patch));
+        return artifactResultFromPatch(
+          patch,
+          patchIssues.length > 0 ? 'failed' : 'passed',
+          patchIssues.length > 0 ? patchIssues.map(validationIssueText) : ['Omni validation passed on scratch branch.'],
+        );
+      });
+      const unmatchedIssues = blockingIssues.filter((issue) => !patches.some((patch) => issueMatchesPatch(issue, patch)));
+      results.push({
+        ...baseResult,
+        mode: 'branch',
+        status: blockingIssues.length > 0 ? 'failed' : 'passed',
+        branchName,
+        artifacts,
+        ...(unmatchedIssues.length > 0 ? { error: unmatchedIssues.map(validationIssueText).join(' ') } : {}),
+      });
+    } catch (error) {
+      results.push({
+        ...baseResult,
+        mode: branch ? 'branch' : 'structural',
+        status: 'failed',
+        branchName,
+        artifacts: patches.map((patch) => artifactResultFromPatch(patch, patch.resolution === 'keep_target' ? 'skipped' : 'failed', [
+          error instanceof Error ? error.message : String(error),
+        ])),
+        error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+      });
+    } finally {
+      if (branch?.id) {
+        try {
+          await client.deleteModelBranch(branch.id);
+        } catch (error) {
+          cleanupError = redactSensitiveText(error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+    if (cleanupError) {
+      const last = results[results.length - 1];
+      if (last && last.targetId === target.id && last.targetModelId === target.targetModelId) {
+        last.status = 'failed';
+        last.cleanupError = cleanupError;
+        last.error = [last.error, `Scratch branch cleanup failed: ${cleanupError}`].filter(Boolean).join(' ');
+      }
+    }
+  }
+  return {
+    status: summarizeValidationResults(results),
+    results,
+  };
+}
+
+export async function createMigrationJob(input: DashboardMigrationJobInput): Promise<MigrationJob> {
   const source = requireInstance(input.sourceId);
   const plan = await buildMigrationPlan(input);
   const blockedStep = plan.steps.find((step) => step.blocked || step.error);
@@ -3732,7 +4022,114 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
   return getJob(job.id) || sanitizeJob(job);
 }
 
-export async function retryMigrationJob(id: string, options: { destinationId?: string } = {}): Promise<MigrationJob> {
+function retryTargetKey(target: Pick<MigrationTarget, 'destinationInstanceId' | 'targetModelId'>): string {
+  return `${target.destinationInstanceId}:${target.targetModelId || ''}`;
+}
+
+function retryItemTargetKey(item: MigrationJobItem): string {
+  return `${item.destinationId}:${item.targetModelId || ''}`;
+}
+
+function isDashboardPrepKind(kind: JobItemKind): boolean {
+  return kind === 'field_prepare'
+    || kind === 'query_view_prepare'
+    || kind === 'relationship_prepare'
+    || kind === 'topic_prepare';
+}
+
+function isDashboardRetryItem(item: MigrationJobItem, destinationId?: string): boolean {
+  if (destinationId && item.destinationId !== destinationId) return false;
+  if (item.status === 'failed') {
+    return item.kind === 'import' || item.kind === 'export' || isDashboardPrepKind(item.kind);
+  }
+  if (item.status !== 'skipped' || item.kind !== 'import') return false;
+  return /preparation (failed|skipped).*dependent (step|import) skipped/i.test(item.error || '');
+}
+
+function scopeDashboardRetryInput(
+  parent: MigrationJob,
+  retryItems: MigrationJobItem[],
+  input: DashboardMigrationJobInput,
+): DashboardMigrationJobInput {
+  if (input.sourceId !== parent.sourceId) {
+    throw new Error('Retry input must use the same source instance as the failed migration job.');
+  }
+  if ((input.sourceConnectionId || '') !== (parent.sourceConnectionId || '')) {
+    throw new Error('Retry input must use the same source connection as the failed migration job.');
+  }
+
+  const documentIds = new Set(retryItems.map((item) => item.documentId).filter((value): value is string => Boolean(value)));
+  const targetIds = new Set(retryItems.map((item) => item.targetId).filter((value): value is string => Boolean(value)));
+  const targetKeys = new Set(retryItems.map(retryItemTargetKey));
+  const routeScopes = new Map<string, { documentIds: Set<string>; targetIds: Set<string>; targetKeys: Set<string> }>();
+
+  for (const item of retryItems) {
+    if (!item.routeGroupId || !item.documentId) continue;
+    const scope = routeScopes.get(item.routeGroupId) || {
+      documentIds: new Set<string>(),
+      targetIds: new Set<string>(),
+      targetKeys: new Set<string>(),
+    };
+    scope.documentIds.add(item.documentId);
+    if (item.targetId) scope.targetIds.add(item.targetId);
+    scope.targetKeys.add(retryItemTargetKey(item));
+    routeScopes.set(item.routeGroupId, scope);
+  }
+
+  const scopedDocumentIds = input.documentIds.filter((documentId) => documentIds.has(documentId));
+  if (scopedDocumentIds.length === 0) {
+    throw new Error('Retry input no longer contains the failed dashboard selection.');
+  }
+
+  if (input.routeGroups && input.routeGroups.length > 0 && routeScopes.size > 0) {
+    const routeGroups = input.routeGroups
+      .map((group) => {
+        const scope = routeScopes.get(group.id);
+        if (!scope) return null;
+        const groupDocumentIds = group.documentIds.filter((documentId) => scope.documentIds.has(documentId));
+        const groupTargets = group.targets.filter((target) => (
+          scope.targetIds.has(target.id) || scope.targetKeys.has(retryTargetKey(target))
+        ));
+        if (groupDocumentIds.length === 0 || groupTargets.length === 0) return null;
+        return {
+          ...group,
+          documentIds: groupDocumentIds,
+          targets: groupTargets,
+        };
+      })
+      .filter((group): group is MigrationRouteGroup => Boolean(group));
+    if (routeGroups.length === 0) {
+      throw new Error('Retry input no longer contains the failed route and destination selection.');
+    }
+    return {
+      ...input,
+      targets: undefined,
+      routeGroups,
+      documentIds: [...new Set(routeGroups.flatMap((group) => group.documentIds))],
+      emptyFirst: false,
+      deleteSourceOnSuccess: false,
+      postMigrationActions: [],
+      parentJobId: parent.id,
+    };
+  }
+
+  const targets = (input.targets || []).filter((target) => targetIds.has(target.id) || targetKeys.has(retryTargetKey(target)));
+  if (targets.length === 0) {
+    throw new Error('Retry input no longer contains the failed destination selection.');
+  }
+  return {
+    ...input,
+    targets,
+    routeGroups: undefined,
+    documentIds: scopedDocumentIds,
+    emptyFirst: false,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+    parentJobId: parent.id,
+  };
+}
+
+export async function retryMigrationJob(id: string, options: { destinationId?: string; retryInput?: DashboardMigrationJobInput } = {}): Promise<MigrationJob> {
   const parent = getJob(id);
   if (!parent) throw new Error('Job not found.');
   if (parent.workflow === 'model') {
@@ -3761,10 +4158,11 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
       replaceSameNamed: false,
     });
   }
-  const failedImports = parent.items.filter((item) => {
-    if (options.destinationId && item.destinationId !== options.destinationId) return false;
-    return item.status === 'failed' && (item.kind === 'import' || item.kind === 'export' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare');
-  });
+  const failedImports = parent.items.filter((item) => isDashboardRetryItem(item, options.destinationId));
+  if (options.retryInput) {
+    if (failedImports.length === 0) throw new Error('No failed prep, export, or import items to retry.');
+    return createMigrationJob(scopeDashboardRetryInput(parent, failedImports, options.retryInput));
+  }
   const targetsById = new Map<string, MigrationTarget>();
   for (const item of failedImports) {
     const destination = requireInstance(item.destinationId);

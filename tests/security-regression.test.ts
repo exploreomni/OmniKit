@@ -102,6 +102,15 @@ class MemoryStorage {
   }
 }
 
+function emptyMetricFilter() {
+  return {
+    connectionDatabaseContains: [],
+    connectionDatabaseExact: [],
+    embedExternalIdContains: [],
+    embedExternalIdExact: [],
+  };
+}
+
 test('api middleware preserves query params for handler requests while stripping them for route matching', () => {
   const rawUrl = '/api/instances/source-1/documents?folderPath=just-for-fun&connectionId=nfl-connection&includeModelDetails=true';
   const route = apiRouteFromUrl(rawUrl);
@@ -1009,6 +1018,78 @@ test('migration job handler redacts secret-shaped immediate errors', async () =>
   assert.equal(response.status, 500);
   assert.equal(JSON.stringify(body).includes('omni_live_response_secret_123456'), false);
   assert.match(body.error || '', /\[redacted\]/);
+});
+
+test('migration patch validation redacts Omni validation issue details', async () => {
+  unlockVault('native passphrase');
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  const originalListModels = OmniClient.prototype.listModels;
+  const originalCreateModelBranch = OmniClient.prototype.createModelBranch;
+  const originalUpdateModelYamlFiles = OmniClient.prototype.updateModelYamlFiles;
+  const originalValidateModel = OmniClient.prototype.validateModel;
+  const originalDeleteModelBranch = OmniClient.prototype.deleteModelBranch;
+  try {
+    OmniClient.prototype.listModels = async () => [{
+      id: 'target-model',
+      name: 'Target Model',
+      connectionId: 'connection-1',
+      gitConfigured: true,
+    }];
+    OmniClient.prototype.createModelBranch = async () => ({ id: 'branch-model-id', name: 'omnikit-validate-test', raw: {} });
+    OmniClient.prototype.updateModelYamlFiles = async () => ({ ok: true });
+    OmniClient.prototype.validateModel = async () => [{
+      message: 'Validation failed with token omni_secret_live_123456 and admin@example.com',
+      yaml_path: 'orders.view',
+    }];
+    OmniClient.prototype.deleteModelBranch = async () => ({ ok: true });
+
+    const response = await migrationJobsHandler(new Request('http://127.0.0.1/api/migration-jobs/validate-patches', {
+      method: 'POST',
+      body: JSON.stringify({
+        sourceId: 'source-1',
+        documentIds: ['doc-1'],
+        targets: [{
+          id: 'target-1',
+          destinationInstanceId: 'dest-1',
+          targetConnectionId: 'connection-1',
+          targetModelId: 'target-model',
+          semanticPatches: [{
+            id: 'field:orders.semantic_total_sales:orders.view',
+            artifactType: 'field',
+            sourceName: 'orders.semantic_total_sales',
+            targetFileName: 'orders.view',
+            acceptedYaml: 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+            resolution: 'custom_edit',
+            status: 'ready',
+          }],
+        }],
+        emptyFirst: false,
+        replaceSameNamed: false,
+        postMigrationActions: [],
+      }),
+    }));
+    const body = await response.json();
+    const serialized = JSON.stringify(body);
+
+    assert.equal(response.status, 200);
+    assert.equal(serialized.includes('omni_secret_live_123456'), false);
+    assert.equal(serialized.includes('admin@example.com'), false);
+    assert.match(serialized, /\[redacted\]/);
+  } finally {
+    OmniClient.prototype.listModels = originalListModels;
+    OmniClient.prototype.createModelBranch = originalCreateModelBranch;
+    OmniClient.prototype.updateModelYamlFiles = originalUpdateModelYamlFiles;
+    OmniClient.prototype.validateModel = originalValidateModel;
+    OmniClient.prototype.deleteModelBranch = originalDeleteModelBranch;
+  }
 });
 
 test('migration job SSE item events redact bare errors without item payloads', () => {

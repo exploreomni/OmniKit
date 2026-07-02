@@ -597,6 +597,37 @@ export interface MigrationJobInput {
   postMigrationActions: PostMigrationAction[];
 }
 
+export type DashboardPatchValidationStatus = 'passed' | 'failed' | 'skipped';
+export type DashboardPatchValidationMode = 'branch' | 'structural' | 'skipped';
+
+export interface DashboardPatchValidationArtifact {
+  id: string;
+  artifactType: MigrationSemanticPatch['artifactType'];
+  sourceName?: string;
+  targetFileName: string;
+  status: DashboardPatchValidationStatus;
+  messages: string[];
+}
+
+export interface DashboardPatchValidationModelResult {
+  targetId: string;
+  destinationId: string;
+  destinationLabel?: string;
+  targetModelId: string;
+  targetModelName?: string;
+  mode: DashboardPatchValidationMode;
+  status: DashboardPatchValidationStatus;
+  artifacts: DashboardPatchValidationArtifact[];
+  branchName?: string;
+  error?: string;
+  cleanupError?: string;
+}
+
+export interface DashboardPatchValidationResult {
+  status: DashboardPatchValidationStatus;
+  results: DashboardPatchValidationModelResult[];
+}
+
 async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...options,
@@ -1022,10 +1053,20 @@ export async function runPostMigrationActions(actions: PostMigrationAction[]) {
   );
 }
 
-export async function retryOpsMigrationJob(id: string, destinationId?: string) {
+export async function validateMigrationPatches(input: MigrationJobInput) {
+  return apiFetch<{ validation: DashboardPatchValidationResult }>('/api/migration-jobs/validate-patches', {
+    method: 'POST',
+    body: JSON.stringify(input),
+  });
+}
+
+export async function retryOpsMigrationJob(id: string, options: { destinationId?: string; retryInput?: MigrationJobInput } = {}) {
   return apiFetch<{ job: MigrationJob }>(`/api/migration-jobs/${encodeURIComponent(id)}/retry`, {
     method: 'POST',
-    body: JSON.stringify(destinationId ? { destinationId } : {}),
+    body: JSON.stringify({
+      ...(options.destinationId ? { destinationId: options.destinationId } : {}),
+      ...(options.retryInput ? { retryInput: options.retryInput } : {}),
+    }),
   });
 }
 

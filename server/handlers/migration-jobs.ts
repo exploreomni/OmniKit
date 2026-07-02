@@ -4,10 +4,12 @@ import {
   cancelMigrationJob,
   clearJobs,
   createMigrationJob,
+  type DashboardMigrationJobInput,
   getJob,
   listJobs,
   retryMigrationJob,
   runPostMigrationAction,
+  validateDashboardMigrationPatches,
   type MigrationRouteGroup,
   type MigrationSemanticDependencyNode,
   type MigrationSemanticPatchSafetyCategory,
@@ -282,7 +284,7 @@ function parseSourceDocumentHints(value: unknown) {
     .filter((document) => document.identifier && document.name);
 }
 
-function parseJobInput(body: Record<string, unknown>) {
+function parseJobInput(body: Record<string, unknown>): DashboardMigrationJobInput {
   const targets = parseTargets(body.targets);
   return {
     sourceId: cleanString(body.sourceId) || '',
@@ -300,6 +302,11 @@ function parseJobInput(body: Record<string, unknown>) {
     sourceAllFolders: body.sourceAllFolders === true,
     postMigrationActions: parseActions(body.postMigrationActions),
   };
+}
+
+function parseOptionalRetryInput(value: unknown): DashboardMigrationJobInput | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  return parseJobInput(value as Record<string, unknown>);
 }
 
 function sseEncode(event: string, data: unknown): string {
@@ -389,8 +396,11 @@ export default async function handler(req: Request): Promise<Response> {
 
     if (req.method === 'POST' && parts[0] === 'preview') {
       const input = parseJobInput(await bodyJson(req));
-      const requestTargets = [...input.targets, ...input.routeGroups.flatMap((group) => group.targets)];
-      if (!input.sourceId || (requestTargets.length === 0 && input.destinationIds.length === 0) || input.documentIds.length === 0) {
+      const requestTargets = [
+        ...(input.targets || []),
+        ...((input.routeGroups || []).flatMap((group) => group.targets)),
+      ];
+      if (!input.sourceId || (requestTargets.length === 0 && (input.destinationIds || []).length === 0) || input.documentIds.length === 0) {
         return json({ error: 'Select one source, at least one migration target, and at least one dashboard.' }, 400);
       }
       if (requestTargets.some((target) => !target.targetConnectionId)) {
@@ -422,10 +432,26 @@ export default async function handler(req: Request): Promise<Response> {
       return json({ results });
     }
 
+    if (req.method === 'POST' && parts[0] === 'validate-patches') {
+      const input = parseJobInput(await bodyJson(req));
+      const requestTargets = [
+        ...(input.targets || []),
+        ...((input.routeGroups || []).flatMap((group) => group.targets)),
+      ];
+      if (!input.sourceId || input.documentIds.length === 0 || requestTargets.length === 0) {
+        return json({ error: 'Select a source, at least one dashboard, and at least one migration target before validating dependency patches.' }, 400);
+      }
+      const result = await validateDashboardMigrationPatches(input);
+      return json({ validation: result });
+    }
+
     if (req.method === 'POST' && parts.length === 0) {
       const input = parseJobInput(await bodyJson(req));
-      const requestTargets = [...input.targets, ...input.routeGroups.flatMap((group) => group.targets)];
-      if (!input.sourceId || (requestTargets.length === 0 && input.destinationIds.length === 0) || input.documentIds.length === 0) {
+      const requestTargets = [
+        ...(input.targets || []),
+        ...((input.routeGroups || []).flatMap((group) => group.targets)),
+      ];
+      if (!input.sourceId || (requestTargets.length === 0 && (input.destinationIds || []).length === 0) || input.documentIds.length === 0) {
         return json({ error: 'Select one source, at least one migration target, and at least one dashboard.' }, 400);
       }
       if (requestTargets.some((target) => !target.targetConnectionId)) {
@@ -443,7 +469,10 @@ export default async function handler(req: Request): Promise<Response> {
 
     if (req.method === 'POST' && parts[1] === 'retry') {
       const body = await bodyJson(req);
-      const job = await retryMigrationJob(id, { destinationId: cleanString(body.destinationId) });
+      const job = await retryMigrationJob(id, {
+        destinationId: cleanString(body.destinationId),
+        retryInput: parseOptionalRetryInput(body.retryInput),
+      });
       return json({ job });
     }
 

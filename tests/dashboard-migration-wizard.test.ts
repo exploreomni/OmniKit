@@ -34,6 +34,7 @@ import {
   queryViewRequirementsByRouteTargetFromPlan,
   removeTargetFromMigrationPlan,
   routeTopicActionSummariesFromSteps,
+  shouldAutoRunDashboardReadiness,
   summarizePlanByTarget,
   TARGET_FOLDER_COMBOBOX_CONFIG,
   TARGET_MODEL_COMBOBOX_CONFIG,
@@ -1318,6 +1319,49 @@ test('dashboard migration preflight blocker returns actionable reasons and clear
   assert.equal(getDashboardMigrationPreflightBlockReason(readyInput), '');
 });
 
+test('dashboard migration readiness auto-trigger fires once per route input change', () => {
+  const readyInput = {
+    step: 3,
+    planRowCount: 0,
+    preflightLoading: false,
+    preflightBlockReason: '',
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    selectedDocumentCount: 1,
+    migrationTargetCount: 1,
+    routeConfigurationSignature: 'route:v1',
+    autoPreflightSignature: '',
+    lastReadinessSignature: '',
+  };
+
+  assert.equal(shouldAutoRunDashboardReadiness(readyInput), true);
+  assert.equal(shouldAutoRunDashboardReadiness({
+    ...readyInput,
+    autoPreflightSignature: 'route:v1',
+  }), false);
+  assert.equal(shouldAutoRunDashboardReadiness({
+    ...readyInput,
+    planRowCount: 3,
+    autoPreflightSignature: 'route:v1',
+    lastReadinessSignature: 'route:v1',
+  }), false);
+  assert.equal(shouldAutoRunDashboardReadiness({
+    ...readyInput,
+    planRowCount: 3,
+    routeConfigurationSignature: 'route:v2',
+    autoPreflightSignature: 'route:v1',
+    lastReadinessSignature: 'route:v1',
+  }), true);
+  assert.equal(shouldAutoRunDashboardReadiness({
+    ...readyInput,
+    preflightLoading: true,
+  }), false);
+  assert.equal(shouldAutoRunDashboardReadiness({
+    ...readyInput,
+    preflightBlockReason: 'Resolve mappings first.',
+  }), false);
+});
+
 test('dashboard load blocker requires source instance and connection only', () => {
   const readyInput = {
     sourceId: 'source-1',
@@ -2260,6 +2304,67 @@ test('dashboard migration draft persists options without credential fields', () 
   assert.equal(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].targetFieldRef, 'orders.total_sales');
   assert.deepEqual(sanitized.routeGroups?.[0].fieldMappingsByTargetId?.['target-1']?.[0].warnings, []);
   assert.equal(JSON.stringify(sanitized).includes('apiKey'), false);
+});
+
+test('dashboard migration draft strips custom YAML bodies and blocks resumed custom edits', () => {
+  const sanitized = sanitizeDashboardMigrationDraftForStorage({
+    step: 3,
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    selectedDocumentIds: ['doc-1'],
+    targets: [{
+      id: 'target-1',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'model-target',
+      semanticPatches: [{
+        id: 'field:orders.semantic_total_sales:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.semantic_total_sales',
+        targetFileName: 'orders.view',
+        acceptedYaml: 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        recommendedYaml: 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        sourceYaml: 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+        resolution: 'custom_edit',
+        status: 'ready',
+        confirmedDestructive: true,
+        warnings: ['Review custom YAML.'],
+      }],
+    }],
+    routeGroups: [{
+      id: 'route-1',
+      name: 'Orders route',
+      documentIds: ['doc-1'],
+      targetRowIds: ['target-1'],
+      semanticPatchesByTargetId: {
+        'target-1': [{
+          id: 'topic:orders:orders.topic',
+          artifactType: 'topic',
+          sourceName: 'orders',
+          targetFileName: 'orders.topic',
+          acceptedYaml: 'base_view: orders\n',
+          resolution: 'custom_edit',
+          status: 'ready',
+        }],
+      },
+    }],
+    replaceSameNamed: true,
+    emptyFirst: false,
+    refreshSchemaOnComplete: false,
+    deleteSourceOnSuccess: false,
+  });
+  const serialized = JSON.stringify(sanitized);
+  const targetPatch = sanitized.targets[0].semanticPatches?.[0];
+  const routePatch = sanitized.routeGroups?.[0].semanticPatchesByTargetId?.['target-1']?.[0];
+
+  assert.equal(serialized.includes('acceptedYaml'), false);
+  assert.equal(serialized.includes('recommendedYaml'), false);
+  assert.equal(serialized.includes('sourceYaml'), false);
+  assert.equal(targetPatch?.status, 'blocked');
+  assert.equal(targetPatch?.confirmedDestructive, false);
+  assert.equal(targetPatch?.warnings?.some((warning) => /Custom YAML is not stored/i.test(warning)), true);
+  assert.equal(routePatch?.status, 'blocked');
+  assert.equal(routePatch?.warnings?.some((warning) => /Custom YAML is not stored/i.test(warning)), true);
 });
 
 test('dashboard migration draft preserves Step 2 groups before destinations exist', () => {
