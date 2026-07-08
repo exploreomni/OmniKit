@@ -82,6 +82,7 @@ export interface DashboardMigrationTargetDraft {
   targetModelName: string;
   targetFolderPath: string;
   targetFolderId: string;
+  sameNamedStrategy?: 'update' | 'replace';
   topicMappings?: DashboardMigrationTopicMappingDraft[];
   queryViewMappings?: DashboardMigrationQueryViewMappingDraft[];
   fieldMappings?: DashboardMigrationFieldMappingDraft[];
@@ -100,6 +101,7 @@ export function createDashboardMigrationTargetDraft(
     targetModelName: '',
     targetFolderPath: destinationInstance.defaultFolderPath || '',
     targetFolderId: destinationInstance.defaultFolderId || '',
+    sameNamedStrategy: 'update',
     topicMappings: [],
     queryViewMappings: [],
     fieldMappings: [],
@@ -199,6 +201,7 @@ export interface PreflightTargetRow {
   noticeCount: number;
   deleteCount: number;
   replaceCount: number;
+  updateCount: number;
   error?: string;
 }
 
@@ -220,6 +223,7 @@ export function targetDraftToMigrationTarget(
     targetModelName: target.targetModelName || target.targetModelId,
     targetFolderId: target.targetFolderId || undefined,
     targetFolderPath: target.targetFolderPath || undefined,
+    sameNamedStrategy: target.sameNamedStrategy === 'replace' ? 'replace' : 'update',
     topicMappings: topicMappings
       .filter((mapping) => mapping.sourceTopicName && mapping.action !== 'unresolved')
       .map((mapping) => ({

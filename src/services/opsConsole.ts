@@ -17,6 +17,7 @@ export type MigrationWorkflow = 'dashboard' | 'model';
 export type JobItemKind =
   | 'delete'
   | 'export'
+  | 'update'
   | 'import'
   | 'metadata'
   | 'field_prepare'
@@ -387,6 +388,7 @@ export interface MigrationTarget {
   targetModelName?: string;
   targetFolderId?: string;
   targetFolderPath?: string;
+  sameNamedStrategy?: 'update' | 'replace';
   topicMappings?: MigrationTopicMapping[];
   queryViewMappings?: MigrationQueryViewMapping[];
   fieldMappings?: MigrationFieldMapping[];

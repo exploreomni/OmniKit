@@ -779,29 +779,50 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
     }],
     status: 'failed',
     createdAt: Date.now(),
-    items: [{
-      id: 'item-1',
-      jobId: 'job-1',
-      destinationId: 'dest-1',
-      destinationLabel: 'dest-admin@example.com',
-      targetModelId: 'model-1',
-      targetModelName: 'Finance model for customer@example.com',
-      targetFolderPath: 'Customers/212-555-0199',
-      kind: 'import',
-      documentName: 'Finance 4111-1111-1111-1111',
-      status: 'failed',
-      error: 'Bearer secret-token-value for customer@example.com at 212-555-0199',
-      warnings: ['api_key:abc123'],
-      details: {
-        relationshipEdges: [{
-          joinFromView: 'customer@example.com_orders',
-          joinToView: 'phone_212-555-0199_metrics',
-          relationshipType: 'many_to_one',
-          yaml: 'on_sql: ${customer@example.com_orders.id} = ${phone_212-555-0199_metrics.id}',
-          on_sql: 'select * from private_customer_table',
-        }],
+    items: [
+      {
+        id: 'item-1',
+        jobId: 'job-1',
+        destinationId: 'dest-1',
+        destinationLabel: 'dest-admin@example.com',
+        targetModelId: 'model-1',
+        targetModelName: 'Finance model for customer@example.com',
+        targetFolderPath: 'Customers/212-555-0199',
+        kind: 'import',
+        documentName: 'Finance 4111-1111-1111-1111',
+        status: 'failed',
+        error: 'Bearer secret-token-value for customer@example.com at 212-555-0199',
+        warnings: ['api_key:abc123'],
+        details: {
+          relationshipEdges: [{
+            joinFromView: 'customer@example.com_orders',
+            joinToView: 'phone_212-555-0199_metrics',
+            relationshipType: 'many_to_one',
+            yaml: 'on_sql: ${customer@example.com_orders.id} = ${phone_212-555-0199_metrics.id}',
+            on_sql: 'select * from private_customer_table',
+          }],
+        },
       },
-    }],
+      {
+        id: 'item-update',
+        jobId: 'job-1',
+        destinationId: 'dest-1',
+        destinationLabel: 'dest-admin@example.com',
+        targetModelId: 'model-1',
+        kind: 'update',
+        documentName: 'Finance 4111-1111-1111-1111',
+        status: 'warning',
+        warnings: ['Published draft with token=secret-token-value'],
+        details: {
+          draftIdentifier: 'draft-customer@example.com-212-555-0199',
+          summary: 'OmniKit migration for customer@example.com using Bearer secret-token-value',
+          publishedAt: '2026-06-25T00:00:00.000Z',
+          tileCount: 2,
+          deletedTileCount: 1,
+          updateInPlace: true,
+        },
+      },
+    ],
   };
 
   const serialized = JSON.stringify(sanitizeJobHistory([job]));
@@ -812,7 +833,9 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
   assert.equal(serialized.includes('abc123'), false);
   assert.equal(serialized.includes('on_sql'), false);
   assert.equal(serialized.includes('private_customer_table'), false);
+  assert.equal(serialized.includes('draft-customer'), false);
   assert.equal(serialized.includes('relationshipType'), true);
+  assert.equal(serialized.includes('updateInPlace'), true);
 });
 
 test('model migration job details are redacted before history persistence', () => {

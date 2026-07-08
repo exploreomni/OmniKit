@@ -6,6 +6,7 @@ import type {
   DashboardTile,
   DeckRecipe,
   FilterOverride,
+  InsightSource,
   NativeVisualOverride,
   RenderStrategy,
   SlideOverride,
@@ -52,6 +53,7 @@ export interface DeckDraftInput {
   dashboardUrl: string;
   selectedTileIds: string[];
   insights: Record<string, string>;
+  insightSources?: Record<string, InsightSource>;
   brand: BrandConfig;
   includeAppendix: boolean;
   generatedFrom?: string;
@@ -142,6 +144,7 @@ export function sanitizeDeckDraftForStorage(baseUrl: string, input: DeckDraftInp
     dashboardUrl: input.dashboardUrl || dashboard?.url || '',
     selectedTileIds: input.selectedTileIds,
     insights: input.insights,
+    insightSources: input.insightSources,
     brand: input.brand,
     includeAppendix: input.includeAppendix,
     generatedFrom: input.generatedFrom,

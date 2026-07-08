@@ -2,7 +2,7 @@ import type { PostMigrationAction } from './nativeVault';
 import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget } from './migrationJobs';
 
 const REDACTED = '[redacted]';
-const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9.-]|$)/gi;
+const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9.]|$)/gi;
 const TOKEN_PATTERN = /\b(Bearer\s+)[A-Za-z0-9._~+/=-]+\b/gi;
 const OMNI_TOKEN_PATTERN = /\bomni_[A-Za-z0-9._~+/=-]{8,}\b/gi;
 const SECRET_ASSIGNMENT_PATTERN = /\b(api[_-]?key|authorization|token|secret|password|passphrase)(["'\s:=]+)([^"',\s}]+)/gi;

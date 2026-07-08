@@ -99,12 +99,17 @@ export function BatchSetup({
               Batch mode: one deck per client
             </span>
           </div>
-          <p className="text-[11px] text-content-tertiary mt-0.5">
-            Pick a filter (e.g. Account Name) and a list of values. We&apos;ll generate one deck per
-            value and bundle them in a zip.
-          </p>
-        </div>
-      </label>
+	          <p className="text-[11px] text-content-tertiary mt-0.5">
+	            Pick a filter (e.g. Account Name) and a list of values. We&apos;ll generate one deck per
+	            value and bundle them in a zip.
+	          </p>
+	          {enabled && (
+	            <p className="mt-1 text-[10px] text-content-tertiary">
+	              AI insights reflect the preview filter values, not each generated batch value.
+	            </p>
+	          )}
+	        </div>
+	      </label>
 
       {enabled && (
         <div className="space-y-3 pl-7">

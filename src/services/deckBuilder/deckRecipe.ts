@@ -2,6 +2,7 @@ import type {
   BrandConfig,
   DeckRecipe,
   FilterOverride,
+  InsightSource,
   NativeVisualOverride,
   SlideOverride,
   TileVisualNumberFormat,
@@ -17,6 +18,7 @@ export function buildRecipe(input: {
   dashboardName?: string;
   selectedTileIds: string[];
   insights: Record<string, string>;
+  insightSources?: Record<string, InsightSource>;
   brand: BrandConfig;
   includeAppendix: boolean;
   generatedFrom?: string;
@@ -35,6 +37,7 @@ export function buildRecipe(input: {
     dashboardName: input.dashboardName,
     selectedTileIds: input.selectedTileIds,
     insights: input.insights,
+    insightSources: input.insightSources,
     brand: input.brand,
     includeAppendix: input.includeAppendix,
     generatedFrom: input.generatedFrom,
@@ -102,6 +105,14 @@ export function validateRecipe(payload: unknown): DeckRecipe {
             .map(([k, v]) => [k, v as TileVisualSource])
         )
       : undefined;
+  const insightSources: Record<string, InsightSource> | undefined =
+    obj.insightSources && typeof obj.insightSources === 'object'
+      ? Object.fromEntries(
+          Object.entries(obj.insightSources as Record<string, unknown>)
+            .filter(([, v]) => v === 'ai' || v === 'user' || v === 'ai_edited')
+            .map(([k, v]) => [k, v as InsightSource])
+        )
+      : undefined;
   const slideOverrides: Record<string, SlideOverride> | undefined =
     obj.slideOverrides && typeof obj.slideOverrides === 'object'
       ? Object.fromEntries(
@@ -142,6 +153,7 @@ export function validateRecipe(payload: unknown): DeckRecipe {
     dashboardName: typeof obj.dashboardName === 'string' && obj.dashboardName.trim() ? obj.dashboardName.trim().slice(0, 160) : undefined,
     selectedTileIds: obj.selectedTileIds.map(String),
     insights: (obj.insights && typeof obj.insights === 'object') ? obj.insights as Record<string, string> : {},
+    insightSources,
     brand: validateBrand(obj.brand) || DEFAULT_BRAND,
     includeAppendix: Boolean(obj.includeAppendix),
     generatedFrom: typeof obj.generatedFrom === 'string' ? obj.generatedFrom : undefined,

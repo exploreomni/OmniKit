@@ -119,6 +119,31 @@ test('target drafts convert to migration targets without secrets', () => {
   assert.equal(JSON.stringify(target).includes('omni****1234'), false);
 });
 
+test('target drafts default same-name dashboards to update in place and preserve explicit replacement', () => {
+  const created = createDashboardMigrationTargetDraft('target-created', {
+    id: destination.id,
+    defaultFolderId: 'folder-default',
+    defaultFolderPath: 'Shared/Migrated',
+  });
+  const defaultTarget = targetDraftToMigrationTarget({
+    id: 'target-default',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+  }, [destination]);
+  const replacementTarget = targetDraftToMigrationTarget({
+    id: 'target-replace',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+    sameNamedStrategy: 'replace',
+  }, [destination]);
+
+  assert.equal(created.sameNamedStrategy, 'update');
+  assert.equal(defaultTarget.sameNamedStrategy, 'update');
+  assert.equal(replacementTarget.sameNamedStrategy, 'replace');
+});
+
 test('target drafts convert topic mappings to migration targets with target connection audit fields', () => {
   const target = targetDraftToMigrationTarget({
     id: 'target-1',
@@ -2038,6 +2063,78 @@ test('dashboard migration review impact summary explains migration before route 
   assert.deepEqual(summary.warningGroups, [{ message: 'Review calculated field compatibility.', count: 1 }]);
 });
 
+test('dashboard migration preflight and review summaries count in-place updates', () => {
+  const plan: MigrationPlan = {
+    sourceId: 'source-1',
+    sourceLabel: 'Source',
+    destinationIds: ['dest-1'],
+    targets: [{
+      id: 'target-a',
+      destinationInstanceId: 'dest-1',
+      destinationLabel: 'Destination One',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'model-a',
+      targetModelName: 'Model A',
+      targetFolderPath: 'Shared/Migrated',
+      sameNamedStrategy: 'update',
+    }],
+    routeGroups: [{
+      id: 'route-orders',
+      name: 'Orders route',
+      documentIds: ['orders-dashboard'],
+      targets: [{
+        id: 'target-a',
+        destinationInstanceId: 'dest-1',
+        destinationLabel: 'Destination One',
+        targetConnectionId: 'target-connection',
+        targetModelId: 'model-a',
+        targetModelName: 'Model A',
+        targetFolderPath: 'Shared/Migrated',
+        sameNamedStrategy: 'update',
+      }],
+    }],
+    documentIds: ['orders-dashboard'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    steps: [{
+      routeGroupId: 'route-orders',
+      routeGroupName: 'Orders route',
+      targetId: 'target-a',
+      destinationId: 'dest-1',
+      destinationLabel: 'Destination One',
+      targetConnectionId: 'target-connection',
+      targetModelId: 'model-a',
+      targetModelName: 'Model A',
+      targetFolderPath: 'Shared/Migrated',
+      kind: 'update',
+      documentId: 'orders-dashboard',
+      documentName: 'Orders Dashboard',
+      details: {
+        destinationDocumentId: 'target-dashboard',
+        sameNamedStrategy: 'update',
+      },
+    }],
+  };
+
+  const rows = preflightRowsFromPlan(plan);
+  const routes = preflightRouteGroupsFromPlan(plan);
+  const summary = dashboardMigrationReviewImpactSummary(plan, {
+    routeGroups: routes,
+    refreshSchemaOnComplete: false,
+    deleteSourceOnSuccess: false,
+  });
+
+  assert.equal(rows[0].updateCount, 1);
+  assert.equal(routes[0].updateCount, 1);
+  assert.equal(routes[0].targets[0].updateCount, 1);
+  assert.equal(summary.updateCount, 1);
+  const impactText = summary.impactStatements.join(' ');
+  assert.match(impactText, /updated in place/i);
+  assert.match(impactText, /preserving its destination ID, slug, permissions, embeds, favorites, schedules, and history/i);
+  assert.doesNotMatch(impactText, /moved to Trash/i);
+});
+
 test('dashboard migration review impact summary surfaces relationship preparation', () => {
   const target = {
     id: 'target-a',
@@ -2461,6 +2558,7 @@ test('dashboard migration draft persists options without credential fields', () 
       targetModelName: 'Target Model',
       targetFolderPath: 'Shared/Migrated',
       targetFolderId: 'folder-1',
+      sameNamedStrategy: 'replace',
     }],
     routeGroups: [{
       id: 'route-1',
@@ -2510,6 +2608,7 @@ test('dashboard migration draft persists options without credential fields', () 
   assert.equal(sanitized.routeAssignmentsCustomized, true);
   assert.equal(sanitized.sourceFolderPath, 'Shared/Dashboards');
   assert.equal(sanitized.targets[0].targetConnectionId, 'target-connection');
+  assert.equal(sanitized.targets[0].sameNamedStrategy, 'replace');
   assert.equal(sanitized.routeGroups?.[0].topicMappingsByTargetId?.['target-1']?.[0].targetTopicName, 'orders_topic_copy');
   assert.deepEqual(sanitized.routeGroups?.[0].topicMappingsByTargetId?.['target-1']?.[0].warnings, []);
   assert.equal(sanitized.routeGroups?.[0].queryViewMappingsByTargetId?.['target-1']?.[0].targetQueryViewName, 'orders_metric_copy');

@@ -21,12 +21,21 @@ import {
   previewModeForTileResult,
 } from '../src/services/deckBuilder/previewMode';
 import { summarizeTileQuery } from '../src/services/deckBuilder/querySummary';
+import { buildInsightDigest } from '../src/services/deckBuilder/querySummary';
+import {
+  buildDeckInsightPrompt,
+  cleanDeckInsightText,
+  DECK_INSIGHT_MAX_CHARS,
+  DECK_INSIGHT_PROMPT_VERSION,
+  isDeckInsightRefusal,
+} from '../src/services/deckBuilder/prompts';
 import {
   applyNativeVisualOverride,
   nativeVisualCompatibility,
   resolveEffectiveRenderKind,
 } from '../src/services/deckBuilder/nativeVisuals';
 import {
+  deckOutputContinueLabel,
   deckOutputDetailsCopy,
   deckOutputReadiness,
   deckOutputSummary,
@@ -57,6 +66,14 @@ import {
 } from '../src/services/deckBuilder/recipeStore';
 import { DEFAULT_BRAND } from '../src/services/deckBuilder/types';
 import type { DeckRecipe, LayoutKit, TileResult, TileVisualSpec } from '../src/services/deckBuilder/types';
+import {
+  buildRecipeLoadFeedback,
+  generationFailureMessage,
+  insightSourceAfterUserEdit,
+  shouldGenerateAiInsightForAll,
+  stepAfterRecipeLoad,
+  summarizeMissingTileLabels,
+} from '../src/services/deckBuilder/workflowFlow';
 
 class MemoryStorage {
   private readonly values = new Map<string, string>();
@@ -212,6 +229,102 @@ test('summarizes tile query metadata without exposing secret-shaped keys', () =>
   assert.equal((summary.advancedJson || '').includes('"apiKey": "[redacted]"'), true);
 });
 
+test('builds AI insight digests with sampling, aggregates, filters, and redaction', () => {
+  const rows = Array.from({ length: 1200 }, (_, index) => ({
+    hour: `${index % 24}:00`,
+    sales: index + 1,
+    orders: (index % 10) + 1,
+    api_token: `secret-${index}`,
+  }));
+  const result = makeTileResult({
+    columns: [
+      { name: 'hour', label: 'Hour', type: 'string' },
+      { name: 'sales', label: 'Sales', type: 'number' },
+      { name: 'orders', label: 'Orders', type: 'number' },
+      { name: 'api_token', label: 'API Token', type: 'string' },
+    ],
+    rows,
+    rowCount: rows.length,
+  });
+  const digest = buildInsightDigest({
+    dashboardName: 'Coffee Shop Demo',
+    tile: {
+      id: 'tile-1',
+      name: 'Sales by Hour',
+      order: 1,
+      rawQuery: {
+        query: {
+          modelId: 'model-1',
+          topicName: 'orders',
+          fields: ['orders.hour', 'orders.sales'],
+        },
+      },
+    },
+    result,
+    filters: {
+      'orders.region': { field: 'orders.region', kind: 'EQUALS', type: 'string', values: ['West'] },
+    },
+    visualKind: 'Bar',
+  });
+
+  assert.equal(digest.rowCount, 1200);
+  assert.equal(digest.sampledRowCount, 30);
+  assert.equal(digest.truncated, true);
+  assert.equal(digest.samplingNote, 'Showing 30 evenly sampled rows of 1200.');
+  assert.equal(digest.aggregates.find((item) => item.field === 'sales')?.sum, 720600);
+  assert.equal(digest.text.includes('orders.region EQUALS ["West"]'), true);
+  assert.equal(digest.text.includes('secret-'), false);
+  assert.equal(digest.text.includes('api_token'), false);
+
+  const budgeted = buildInsightDigest({
+    tile: { id: 'wide', name: 'Wide Tile', order: 1 },
+    result: makeTileResult({
+      columns: Array.from({ length: 12 }, (_, index) => ({ name: `field_${index}`, type: 'string' })),
+      rows: Array.from({ length: 100 }, (_, rowIndex) => Object.fromEntries(
+        Array.from({ length: 12 }, (_, colIndex) => [`field_${colIndex}`, `value-${rowIndex}-${colIndex}-${'x'.repeat(40)}`])
+      )),
+    }),
+    maxDigestChars: 1200,
+  });
+  assert.equal(budgeted.budgetTruncated, true);
+  assert.equal(budgeted.text.length <= 1200, true);
+  assert.equal(budgeted.text.includes('Digest truncated to stay within Omni AI prompt budget.'), true);
+});
+
+test('AI insight prompt is versioned, data-grounded, and output is cleaned for slides', () => {
+  const digest = buildInsightDigest({
+    dashboardName: 'Coffee Shop Demo',
+    tile: { id: 'tile-1', name: 'Sales by Hour', order: 1 },
+    result: makeTileResult(),
+    visualKind: 'Bar',
+  });
+  const prompt = buildDeckInsightPrompt({
+    dashboardName: 'Coffee Shop Demo',
+    tileName: 'Sales by Hour',
+    digest,
+  });
+
+  assert.equal(prompt.includes(DECK_INSIGHT_PROMPT_VERSION), true);
+  assert.equal(prompt.includes('Use the provided tile digest as the source of truth.'), true);
+  assert.equal(prompt.includes('<tile_digest>'), true);
+  const cleaned = cleanDeckInsightText(`- ${'Revenue grew quickly. '.repeat(30)}`);
+  assert.equal(cleaned.truncated, true);
+  assert.equal(cleaned.text.startsWith('Revenue grew quickly.'), true);
+  assert.equal(cleaned.text.length <= DECK_INSIGHT_MAX_CHARS, true);
+  assert.equal(isDeckInsightRefusal("I'm sorry, I cannot summarize this data."), true);
+  assert.equal(isDeckInsightRefusal('Morning rush contributed the highest sales total.'), false);
+});
+
+test('AI insight provenance flips safely on user edits and generate-all skips written text', () => {
+  assert.equal(insightSourceAfterUserEdit(undefined, 'Manual note'), 'user');
+  assert.equal(insightSourceAfterUserEdit('ai', 'Edited AI note'), 'ai_edited');
+  assert.equal(insightSourceAfterUserEdit('ai_edited', 'Edited again'), 'ai_edited');
+  assert.equal(insightSourceAfterUserEdit('ai', ''), undefined);
+  assert.equal(shouldGenerateAiInsightForAll('', undefined), true);
+  assert.equal(shouldGenerateAiInsightForAll('Manual note', 'user'), false);
+  assert.equal(shouldGenerateAiInsightForAll('Edited AI note', 'ai_edited'), false);
+});
+
 test('native visual compatibility and effective render kind honor compatible overrides', () => {
   const result = makeTileResult({ renderKind: 'table' });
   const compatibility = nativeVisualCompatibility(result);
@@ -317,6 +430,30 @@ test('recipe validation preserves area and stacked bar native visual choices', (
   assert.equal(recipe.tileVisualSpecs?.['tile-2']?.renderKind, 'stacked_bar');
 });
 
+test('recipe validation preserves AI insight provenance without prompt or digest payloads', () => {
+  const recipe = validateRecipe({
+    ...makeRecipe({
+      insights: {
+        'tile-1': 'Morning rush leads sales.',
+        'tile-2': 'Manual note.',
+      },
+      insightSources: {
+        'tile-1': 'ai',
+        'tile-2': 'user',
+        'tile-3': 'not-real' as never,
+      },
+    }),
+    prompt: 'should-not-persist',
+    digest: 'should-not-persist',
+  } as unknown);
+
+  assert.deepEqual(recipe.insightSources, {
+    'tile-1': 'ai',
+    'tile-2': 'user',
+  });
+  assert.equal(JSON.stringify(recipe).includes('should-not-persist'), false);
+});
+
 test('deck output labels are source-aware and user friendly', () => {
   assert.deepEqual(deckOutputReadiness('native', undefined, 'auto'), {
     label: 'Needs render',
@@ -336,6 +473,68 @@ test('deck output labels are source-aware and user friendly', () => {
   assert.equal(deckRenderButtonLabel('skip'), 'Skipped');
   assert.equal(deckOutputDetailsCopy('tile-image').eyebrow, 'Omni image source details');
   assert.equal(deckOutputDetailsCopy('full-dashboard').eyebrow, 'Dashboard screenshot source');
+  assert.equal(deckOutputContinueLabel({ hasNextSlide: true, actionableCount: 2 }), 'Next slide');
+  assert.equal(deckOutputContinueLabel({ hasNextSlide: false, actionableCount: 2 }), 'Continue with 2 not ready');
+  assert.equal(deckOutputContinueLabel({ hasNextSlide: false, actionableCount: 0 }), 'Continue to preview');
+});
+
+test('recipe load feedback routes users to output review and explains missing slides', () => {
+  const recipe = makeRecipe({
+    selectedTileIds: ['tile-1', 'tile-2', 'missing-3', 'missing-4', 'missing-5', 'missing-6', 'missing-7'],
+    slideOverrides: {
+      'missing-3': { title: 'Old revenue view' },
+      'missing-4': { title: 'Old margin view' },
+      'missing-5': { title: 'Old client view' },
+      'missing-6': { title: 'Old churn view' },
+      'missing-7': { title: 'Old forecast view' },
+    },
+  });
+
+  const feedback = buildRecipeLoadFeedback({
+    recipe,
+    label: 'QBR deck',
+    loadedCount: 2,
+    savedCount: recipe.selectedTileIds.length,
+    missingTileIds: recipe.selectedTileIds.slice(2),
+  });
+
+  assert.equal(stepAfterRecipeLoad(2), 'visuals');
+  assert.equal(feedback.nextStep, 'visuals');
+  assert.equal(feedback.loadedNotice?.title, 'Loaded 2 of 7 slides from "QBR deck"');
+  assert.equal(feedback.libraryMessage.includes('Loaded "QBR deck" with 2 of 7 saved slides.'), true);
+  assert.equal(feedback.missingSummary, 'Old revenue view, Old margin view, Old client view, Old churn view, +1 more');
+  assert.equal(
+    summarizeMissingTileLabels(['a', 'b', 'c', 'd', 'e']),
+    'a, b, c, d, +1 more',
+  );
+});
+
+test('recipe load feedback sends fully missing recipes back to tile selection', () => {
+  const recipe = makeRecipe({ selectedTileIds: ['missing-1'], slideOverrides: { 'missing-1': { title: 'Removed tile' } } });
+  const feedback = buildRecipeLoadFeedback({
+    recipe,
+    label: 'Legacy recipe',
+    loadedCount: 0,
+    savedCount: 1,
+    missingTileIds: ['missing-1'],
+  });
+
+  assert.equal(feedback.nextStep, 'select');
+  assert.equal(feedback.loadedNotice, null);
+  assert.equal(feedback.libraryMessage, 'Loaded "Legacy recipe", but its saved tiles were not found on this dashboard: Removed tile.');
+});
+
+test('generation failure messages distinguish cancellation from hard failures', () => {
+  assert.equal(
+    generationFailureMessage('single', true, new Error('network failed')),
+    'Deck generation cancelled before download.',
+  );
+  assert.equal(
+    generationFailureMessage('batch', true, new Error('network failed')),
+    'Batch generation cancelled before download.',
+  );
+  assert.equal(generationFailureMessage('single', false, new Error('network failed')), 'network failed');
+  assert.equal(generationFailureMessage('batch', false, 'unknown'), 'Batch generation failed.');
 });
 
 test('generated PPTX keeps overlay and decoration border boxes transparent', async () => {
@@ -470,6 +669,69 @@ test('generated PPTX uses explicit visual spec mapping for native charts', async
   const appendixXml = await zip.file('ppt/slides/slide3.xml')?.async('string');
   assert.ok(appendixXml);
   assert.match(appendixXml, /Sales by Hour \(bar, user\)/);
+});
+
+test('preview and generated PPTX stay aligned for area and stacked bar native visuals', async () => {
+  const result = makeTileResult({
+    columns: [
+      { name: 'hour', label: 'Hour', type: 'string' },
+      { name: 'daypart', label: 'Daypart', type: 'string' },
+      { name: 'sales', label: 'Sales', type: 'number' },
+    ],
+    rows: [
+      { hour: '6', daypart: 'Morning', sales: 10 },
+      { hour: '7', daypart: 'Morning', sales: 12 },
+      { hour: '12', daypart: 'Midday', sales: 8 },
+      { hour: '13', daypart: 'Midday', sales: 9 },
+    ],
+    rowCount: 4,
+    renderKind: 'bar',
+  });
+  const fixtures: Array<{
+    kind: 'area' | 'stacked_bar';
+    expectedChartTag: RegExp;
+    expectedDetail?: RegExp;
+  }> = [
+    { kind: 'area', expectedChartTag: /<c:areaChart>/ },
+    { kind: 'stacked_bar', expectedChartTag: /<c:barChart>/, expectedDetail: /<c:grouping val="stacked"\/>/ },
+  ];
+
+  for (const fixture of fixtures) {
+    const visualSpec: TileVisualSpec = {
+      source: 'user',
+      confidence: 'manual',
+      renderKind: fixture.kind,
+      categoryField: 'hour',
+      seriesField: fixture.kind === 'stacked_bar' ? 'daypart' : undefined,
+      measureFields: ['sales'],
+    };
+    const previewResult = applyNativeVisualOverride(result, fixture.kind);
+    assert.equal(previewModeForTileResult(previewResult), 'chart');
+    assert.equal(resolveVisualMapping(previewResult, visualSpec).kind, fixture.kind);
+
+    const blob = await buildDeck({
+      dashboardName: `${fixture.kind} parity fixture`,
+      dashboardUrl: 'https://example.omniapp.co/dashboards/dash-1',
+      generatedAt: new Date('2026-06-15T12:00:00.000Z'),
+      brand: DEFAULT_BRAND,
+      includeAppendix: false,
+      tiles: [
+        {
+          tile: { id: `tile-${fixture.kind}`, name: fixture.kind, order: 1 },
+          result,
+          nativeVisualOverride: fixture.kind,
+          visualSpec,
+        },
+      ],
+    });
+    const zip = await JSZip.loadAsync(await blob.arrayBuffer());
+    const chartFiles = Object.keys(zip.files).filter((name) => name.startsWith('ppt/charts/chart'));
+    assert.equal(chartFiles.length, 1);
+    const chartXml = await zip.file(chartFiles[0])?.async('string');
+    assert.ok(chartXml);
+    assert.match(chartXml, fixture.expectedChartTag);
+    if (fixture.expectedDetail) assert.match(chartXml, fixture.expectedDetail);
+  }
 });
 
 test('saves and validates local deck recipes without persisting secret-shaped keys', () => {
@@ -704,6 +966,7 @@ test('autosave draft storage keeps resumable deck state without secrets', () => 
     } as never,
     selectedTileIds: ['tile-1'],
     insights: { 'tile-1': 'Revenue improved.' },
+    insightSources: { 'tile-1': 'ai' },
     brand: {
       ...DEFAULT_BRAND,
       token: 'brand-token',
@@ -753,11 +1016,14 @@ test('autosave draft storage keeps resumable deck state without secrets', () => 
   assert.equal(raw.includes('apiKey'), false);
   assert.equal(raw.includes('token'), false);
   assert.equal(raw.includes('secret'), false);
+  assert.equal(raw.includes('tile_digest'), false);
+  assert.equal(raw.includes('Prompt version'), false);
   assert.equal(deckDraftContainsForbiddenKeys(JSON.parse(raw)), false);
 
   const loaded = loadDeckDraft('https://example.omniapp.co');
   assert.equal(loaded?.step, 'layout');
   assert.equal(loaded?.dashboard?.name, 'Executive Dashboard');
+  assert.equal(loaded?.recipe.insightSources?.['tile-1'], 'ai');
   assert.equal(loaded?.recipe.nativeVisualOverrides?.['tile-1'], 'bar');
   assert.equal(loaded?.recipe.tileVisualSpecs?.['tile-1']?.categoryField, 'orders.hour');
   assert.equal(loaded?.recipe.slideOverrides?.['tile-1']?.speakerNotes, 'Talk track');

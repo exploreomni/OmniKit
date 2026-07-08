@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { OmniClient, OmniClientError, type OmniDocumentRecord, type OmniModelBranchResult, type OmniModelQueryViewRecord, type OmniModelYamlResponse, type OmniValidationIssue } from './omniClient';
+import { OmniClient, OmniClientError, type DocumentV2Patch, type OmniDocumentRecord, type OmniModelBranchResult, type OmniModelQueryViewRecord, type OmniModelYamlResponse, type OmniValidationIssue } from './omniClient';
 import {
   getInstance,
   type PostMigrationAction,
@@ -45,6 +45,7 @@ export type MigrationWorkflow = 'dashboard' | 'model';
 export type JobItemKind =
   | 'delete'
   | 'export'
+  | 'update'
   | 'import'
   | 'metadata'
   | 'field_prepare'
@@ -167,11 +168,14 @@ export interface MigrationTarget {
   targetModelName?: string;
   targetFolderId?: string;
   targetFolderPath?: string;
+  sameNamedStrategy?: SameNamedStrategy;
   topicMappings?: MigrationTopicMapping[];
   queryViewMappings?: MigrationQueryViewMapping[];
   fieldMappings?: MigrationFieldMapping[];
   semanticPatches?: MigrationSemanticPatch[];
 }
+
+export type SameNamedStrategy = 'update' | 'replace';
 
 export interface MigrationRouteGroup {
   id: string;
@@ -1162,13 +1166,27 @@ function semanticPatchForQueryViewMapping(input: {
 	  const targetFileName = input.mapping.targetFileName
 	    || targetQueryView?.fileName
 	    || `${input.mapping.targetQueryViewName}.query.view`;
-	  const safety = updatePatchSafety({
+	  const baseSafety = updatePatchSafety({
 	    currentYaml: targetQueryView?.yaml,
 	    previousChecksum: targetQueryView?.checksum,
 	    destructive: input.mapping.action === 'update_existing',
 	    createCategory: 'safe_create',
 	    updateCategory: 'safe_update',
 	  });
+	  const targetOnlyFields = input.mapping.action === 'update_existing'
+	    ? targetOnlyQueryViewFields(sourceQueryView, targetQueryView)
+	    : [];
+	  const targetOnlyWarning = targetOnlyFields.length > 0
+	    ? `Target query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Use Code review to merge those target-only fields intentionally, or choose Use existing unchanged.`
+	    : undefined;
+	  const safety = targetOnlyWarning
+	    ? {
+	      ...baseSafety,
+	      status: 'blocked' as const,
+	      safetyCategory: 'blocked' as const,
+	      warnings: [...baseSafety.warnings, targetOnlyWarning],
+	    }
+	    : baseSafety;
 	  const warnings = [
 	    ...(input.mapping.action === 'update_existing'
 	      ? [`Updates existing query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName}.`]
@@ -1193,8 +1211,10 @@ function semanticPatchForQueryViewMapping(input: {
 	    destructive: input.mapping.action === 'update_existing',
 	    status: safety.status,
 	    safetyCategory: safety.safetyCategory,
-	    recommendedAction: input.mapping.action === 'update_existing'
-	      ? `Update existing destination query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName} from the source query-view YAML.`
+	    recommendedAction: targetOnlyWarning
+	      ? `Review and merge destination query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName}; the source copy would remove target-only fields.`
+	      : input.mapping.action === 'update_existing'
+	        ? `Update existing destination query view ${targetQueryView?.label || targetQueryView?.name || input.mapping.targetQueryViewName} from the source query-view YAML.`
 	      : `Create destination query view ${input.mapping.targetQueryViewName} from source query-view YAML.`,
 	    dependencyPath: [
 	      { kind: 'query_view', label: input.mapping.sourceQueryViewName, ref: input.mapping.sourceFileName || input.mapping.sourceQueryViewName, detail: 'Topic or dashboard references this query view.' },
@@ -2059,6 +2079,15 @@ function queryViewFieldRefs(queryView: Pick<OmniModelQueryViewRecord, 'fileName'
   return extractFieldsFromViewYaml(queryView.fileName, queryView.yaml).sort();
 }
 
+function targetOnlyQueryViewFields(
+  sourceQueryView: Pick<OmniModelQueryViewRecord, 'fileName' | 'yaml'> | undefined,
+  targetQueryView: Pick<OmniModelQueryViewRecord, 'fileName' | 'yaml'> | undefined,
+): string[] {
+  const sourceFields = new Set(queryViewFieldRefs(sourceQueryView).map((field) => field.toLowerCase()));
+  if (sourceFields.size === 0) return [];
+  return queryViewFieldRefs(targetQueryView).filter((field) => !sourceFields.has(field.toLowerCase()));
+}
+
 function queryViewPrepFailureDetails(message: string): Record<string, unknown> | undefined {
   const targetOnlyMatch = message.match(/^Target query view\s+(.+?)\s+has fields not present in the source copy:\s+(.+?)\.\s+/);
   if (targetOnlyMatch) {
@@ -2646,6 +2675,241 @@ function rewriteDashboardTopicReferences(payload: Record<string, unknown>, mappi
   };
 }
 
+const DOCUMENT_V2_PRESENTATION_CHUNK_LIMIT = 48;
+const DOCUMENT_V2_NONPORTABLE_PRESENTATION_TYPES = new Set(['csv', 'spreadsheet', 'dbt', 'app']);
+const QUERY_VIEW_REFERENCE_KEYS = new Set([
+  'editingmodelobjectname',
+  'modelobjectname',
+  'view',
+  'viewname',
+  'view_name',
+  'queryview',
+  'queryviewname',
+  'query_view_name',
+  'queryviewname',
+]);
+
+interface DocumentV2UpdatePatchPlan {
+  patches: DocumentV2Patch[];
+  tileCount: number;
+  deletedTileCount: number;
+  modelRewriteCount: number;
+  topicRewriteCount: number;
+  queryViewRewriteCount: number;
+  warnings: string[];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
+}
+
+function documentV2Presentations(state: Record<string, unknown>): Record<string, unknown> {
+  const raw = state.queryPresentations;
+  if (isRecord(raw) && isRecord(raw.data)) return raw.data;
+  if (isRecord(raw)) return raw;
+  return {};
+}
+
+function documentV2PresentationPatch(entries: Array<[string, unknown | null]>): Record<string, unknown> {
+  return { data: Object.fromEntries(entries) };
+}
+
+function documentV2MetadataString(state: Record<string, unknown>, ...keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = state[key];
+    if (typeof value === 'string' && value.trim()) return value.trim();
+  }
+  return undefined;
+}
+
+function documentV2Summary(sourceLabel: string, jobId: string): string {
+  return redactSensitiveText(`OmniKit migration from ${sourceLabel} · job ${jobId}`).slice(0, 255);
+}
+
+function buildQueryViewRewriteMap(mappings: MigrationQueryViewMapping[]): Map<string, string> {
+  const rewriteMap = new Map<string, string>();
+  for (const mapping of mappings) {
+    const target = normalizeTopicValue(mapping.targetQueryViewName)
+      || (mapping.targetFileName ? queryViewNameFromFilePath(mapping.targetFileName) : undefined);
+    if (!target) continue;
+    for (const source of [
+      mapping.sourceQueryViewName,
+      mapping.sourceFileName,
+      mapping.sourceFileName ? queryViewNameFromFilePath(mapping.sourceFileName) : undefined,
+    ]) {
+      const sourceKey = queryViewKey(source);
+      if (sourceKey && sourceKey !== queryViewKey(target)) rewriteMap.set(sourceKey, target);
+    }
+  }
+  return rewriteMap;
+}
+
+function rewriteQueryViewReferences(value: unknown, rewriteMap: Map<string, string>, keyHint = '', stats = { replacements: 0 }, maxDepth = 16): unknown {
+  if (rewriteMap.size === 0 || maxDepth <= 0) return value;
+  const normalizedKey = keyHint.toLowerCase();
+  if (typeof value === 'string') {
+    if (!QUERY_VIEW_REFERENCE_KEYS.has(normalizedKey)) return value;
+    const target = rewriteMap.get(queryViewKey(value) || '');
+    if (!target) return value;
+    stats.replacements += 1;
+    return target;
+  }
+  if (Array.isArray(value)) return value.map((item) => rewriteQueryViewReferences(item, rewriteMap, keyHint, stats, maxDepth - 1));
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([key, item]) => [
+    key,
+    rewriteQueryViewReferences(item, rewriteMap, key, stats, maxDepth - 1),
+  ]));
+}
+
+function rewriteDocumentV2Presentation(input: {
+  presentationKey: string;
+  presentation: unknown;
+  sourceModelId?: string;
+  targetModelId: string;
+  topicMappings: MigrationTopicMapping[];
+  queryViewMappings: MigrationQueryViewMapping[];
+}): { presentation: unknown; modelRewriteCount: number; topicRewriteCount: number; queryViewRewriteCount: number; warnings: string[] } {
+  if (!isRecord(input.presentation)) {
+    return {
+      presentation: input.presentation,
+      modelRewriteCount: 0,
+      topicRewriteCount: 0,
+      queryViewRewriteCount: 0,
+      warnings: [`Presentation ${input.presentationKey} is not an object; it was copied without reference rewrites.`],
+    };
+  }
+
+  const warnings: string[] = [];
+  const presentationType = normalizeTopicValue(
+    input.presentation.type
+      || input.presentation.presentationType
+      || input.presentation.presentation_type
+      || input.presentation.kind,
+  )?.toLowerCase();
+  if (presentationType && DOCUMENT_V2_NONPORTABLE_PRESENTATION_TYPES.has(presentationType)) {
+    warnings.push(`Presentation ${input.presentationKey} uses non-portable type ${presentationType}; it was copied but may need review in Omni.`);
+  }
+
+  let nextPresentation: Record<string, unknown> = { ...input.presentation };
+  let modelRewriteCount = 0;
+  if (input.sourceModelId && input.targetModelId && isRecord(nextPresentation.query)) {
+    const rewritten = rewriteQueryModelReferences(nextPresentation.query, input.sourceModelId, input.targetModelId);
+    nextPresentation = { ...nextPresentation, query: rewritten.query };
+    modelRewriteCount += rewritten.replacements;
+  } else if (!input.sourceModelId && isRecord(nextPresentation.query)) {
+    warnings.push(`Presentation ${input.presentationKey} has a query but the source model ID was not detected; model references were not rewritten.`);
+  }
+
+  const topicRewrite = rewriteDashboardTopicReferences(nextPresentation, input.topicMappings);
+  nextPresentation = topicRewrite.payload;
+  const queryViewStats = { replacements: 0 };
+  nextPresentation = rewriteQueryViewReferences(
+    nextPresentation,
+    buildQueryViewRewriteMap(input.queryViewMappings),
+    '',
+    queryViewStats,
+  ) as Record<string, unknown>;
+
+  return {
+    presentation: nextPresentation,
+    modelRewriteCount,
+    topicRewriteCount: topicRewrite.replacementCount,
+    queryViewRewriteCount: queryViewStats.replacements,
+    warnings,
+  };
+}
+
+function chunkDocumentV2PresentationEntries(entries: Array<[string, unknown | null]>): Array<Array<[string, unknown | null]>> {
+  const chunks: Array<Array<[string, unknown | null]>> = [];
+  let current: Array<[string, unknown | null]> = [];
+  let nonNullCount = 0;
+  for (const entry of entries) {
+    const isNonNull = entry[1] !== null && entry[1] !== undefined;
+    if (isNonNull && nonNullCount >= DOCUMENT_V2_PRESENTATION_CHUNK_LIMIT) {
+      chunks.push(current);
+      current = [];
+      nonNullCount = 0;
+    }
+    current.push(entry);
+    if (isNonNull) nonNullCount += 1;
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
+}
+
+function buildDocumentV2UpdatePatchPlan(input: {
+  sourceState: Record<string, unknown>;
+  destinationState: Record<string, unknown>;
+  sourceModelId?: string;
+  targetModelId: string;
+  topicMappings: MigrationTopicMapping[];
+  queryViewMappings: MigrationQueryViewMapping[];
+  sourceLabel: string;
+  jobId: string;
+}): DocumentV2UpdatePatchPlan {
+  const sourcePresentations = documentV2Presentations(input.sourceState);
+  const destinationPresentations = documentV2Presentations(input.destinationState);
+  const sourceKeys = new Set(Object.keys(sourcePresentations));
+  const entries: Array<[string, unknown | null]> = [];
+  const warnings: string[] = [];
+  let modelRewriteCount = 0;
+  let topicRewriteCount = 0;
+  let queryViewRewriteCount = 0;
+
+  for (const [key, presentation] of Object.entries(sourcePresentations)) {
+    const rewritten = rewriteDocumentV2Presentation({
+      presentationKey: key,
+      presentation,
+      sourceModelId: input.sourceModelId,
+      targetModelId: input.targetModelId,
+      topicMappings: input.topicMappings,
+      queryViewMappings: input.queryViewMappings,
+    });
+    entries.push([key, rewritten.presentation]);
+    modelRewriteCount += rewritten.modelRewriteCount;
+    topicRewriteCount += rewritten.topicRewriteCount;
+    queryViewRewriteCount += rewritten.queryViewRewriteCount;
+    warnings.push(...rewritten.warnings);
+  }
+
+  for (const key of Object.keys(destinationPresentations)) {
+    if (!sourceKeys.has(key)) entries.push([key, null]);
+  }
+
+  const chunks = chunkDocumentV2PresentationEntries(entries);
+  const patches: DocumentV2Patch[] = [];
+  const firstPatch: DocumentV2Patch = {
+    summary: documentV2Summary(input.sourceLabel, input.jobId),
+  };
+  const name = documentV2MetadataString(input.sourceState, 'name', 'title');
+  if (name) firstPatch.name = name;
+  if ('description' in input.sourceState) {
+    firstPatch.description = typeof input.sourceState.description === 'string' ? input.sourceState.description : null;
+  }
+  if (chunks[0]?.length) firstPatch.queryPresentations = documentV2PresentationPatch(chunks[0]);
+  patches.push(firstPatch);
+  for (const chunk of chunks.slice(1)) {
+    patches.push({ queryPresentations: documentV2PresentationPatch(chunk) });
+  }
+
+  const finalPatch: DocumentV2Patch = {};
+  for (const key of ['controls', 'settings', 'containers'] as const) {
+    if (key in input.sourceState) finalPatch[key] = input.sourceState[key];
+  }
+  if (Object.keys(finalPatch).length > 0) patches.push(finalPatch);
+
+  return {
+    patches,
+    tileCount: Object.keys(sourcePresentations).length,
+    deletedTileCount: Math.max(0, Object.keys(destinationPresentations).filter((key) => !sourceKeys.has(key)).length),
+    modelRewriteCount,
+    topicRewriteCount,
+    queryViewRewriteCount,
+    warnings: [...new Set(warnings)],
+  };
+}
+
 function normalizeTargets(input: {
   targets?: MigrationTarget[];
   destinationIds?: string[];
@@ -2671,6 +2935,7 @@ function normalizeTargets(input: {
         targetModelName: target.targetModelName?.trim() || targetModelId,
         targetFolderId: explicitFolderId || (explicitFolderPath ? undefined : destination.defaultFolderId),
         targetFolderPath: explicitFolderPath || destination.defaultFolderPath,
+        sameNamedStrategy: target.sameNamedStrategy === 'replace' ? 'replace' : 'update',
         topicMappings: normalizeTopicMappings(target.topicMappings),
         queryViewMappings: normalizeQueryViewMappings(target.queryViewMappings),
         fieldMappings: normalizeFieldMappings(target.fieldMappings),
@@ -2693,6 +2958,7 @@ function normalizeTargets(input: {
       targetModelName: destination.defaultModelId,
       targetFolderId: destination.defaultFolderId,
       targetFolderPath: destination.defaultFolderPath,
+      sameNamedStrategy: 'update',
       topicMappings: [],
       queryViewMappings: [],
       fieldMappings: [],
@@ -2809,6 +3075,7 @@ export async function buildMigrationPlan(input: {
   const sourceQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
   const sourceModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
   const targetModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
+  const documentV2ProbeCache = new Map<string, Promise<{ supported: boolean; warning?: string }>>();
 
   function cachedInstanceRead<T>(instanceId: string, key: string, loader: () => Promise<T>) {
     return readThroughCache(
@@ -2816,6 +3083,34 @@ export async function buildMigrationPlan(input: {
       loader,
       { enabled: previewCacheEnabled },
     );
+  }
+
+  function probeDocumentV2Support(destination: SavedInstance, client: OmniClient, documentId: string) {
+    const key = `${destination.id}:${documentId}`;
+    const cached = documentV2ProbeCache.get(key);
+    if (cached) return cached;
+    const next = cachedInstanceRead(
+      destination.id,
+      `document-v2-probe:${documentId}`,
+      async () => {
+        try {
+          await client.getDocumentStateV2(documentId);
+          return { supported: true };
+        } catch (error) {
+          const status = error instanceof OmniClientError ? error.status : undefined;
+          const reason = error instanceof Error ? error.message : String(error);
+          const routeUnsupported = status === 404 || status === 405 || status === 501;
+          return {
+            supported: false,
+            warning: routeUnsupported
+              ? 'This Omni instance does not support in-place dashboard updates yet; falling back to replace.'
+              : `In-place dashboard update support could not be verified for ${destination.label}: ${reason}. Falling back to replace.`,
+          };
+        }
+      },
+    );
+    documentV2ProbeCache.set(key, next);
+    return next;
   }
 
   function sourceTopicCatalog(modelId: string) {
@@ -2982,8 +3277,58 @@ export async function buildMigrationPlan(input: {
       return targetQueryViews;
     }
 
+    const updateMatchesBySourceIdentifier = new Map<string, {
+      destinationDocumentId: string;
+      destinationDocumentName: string;
+    }>();
+    const replacementDocumentKeys = new Set<string>();
+    const replacementFallbackWarningsBySourceIdentifier = new Map<string, string>();
+
+    function markReplacementDocument(document: OmniDocumentRecord): void {
+      if (document.identifier) replacementDocumentKeys.add(document.identifier);
+      if (document.id) replacementDocumentKeys.add(document.id);
+    }
+
+    function isReplacementDocument(document: OmniDocumentRecord): boolean {
+      return Boolean(
+        (document.identifier && replacementDocumentKeys.has(document.identifier))
+        || (document.id && replacementDocumentKeys.has(document.id)),
+      );
+    }
+
+    if (!input.emptyFirst && replaceSameNamed) {
+      const existingByName = new Map<string, OmniDocumentRecord>();
+      for (const existingDoc of existing) {
+        if (selectedNames.has(existingDoc.name) && !existingByName.has(existingDoc.name)) {
+          existingByName.set(existingDoc.name, existingDoc);
+        }
+      }
+      for (const doc of groupSelected) {
+        const existingDoc = existingByName.get(doc.name);
+        if (!existingDoc) continue;
+        if (destination.id === source.id && documentKeyMatches(existingDoc, selectedSourceDocumentKeys)) {
+          cleanupNotices.push(`Skipped target cleanup for selected source dashboard ${existingDoc.name} because source and target are the same Omni instance.`);
+          continue;
+        }
+        if ((target.sameNamedStrategy || 'update') === 'replace') {
+          markReplacementDocument(existingDoc);
+          continue;
+        }
+        const probe = await probeDocumentV2Support(destination, destinationClient, existingDoc.identifier || existingDoc.id);
+        if (probe.supported) {
+          updateMatchesBySourceIdentifier.set(doc.identifier, {
+            destinationDocumentId: existingDoc.identifier || existingDoc.id,
+            destinationDocumentName: existingDoc.name,
+          });
+          continue;
+        }
+        markReplacementDocument(existingDoc);
+        if (probe.warning) replacementFallbackWarningsBySourceIdentifier.set(doc.identifier, probe.warning);
+      }
+    }
+
     for (const existingDoc of existing) {
-      const replacingExistingDoc = !input.emptyFirst && replaceSameNamed && selectedNames.has(existingDoc.name);
+      const replacingExistingDoc = !input.emptyFirst && replaceSameNamed && isReplacementDocument(existingDoc);
       if (!input.emptyFirst && !replacingExistingDoc) continue;
       if (destination.id === source.id && documentKeyMatches(existingDoc, selectedSourceDocumentKeys)) {
         cleanupNotices.push(`Skipped target cleanup for selected source dashboard ${existingDoc.name} because source and target are the same Omni instance.`);
@@ -3012,6 +3357,7 @@ export async function buildMigrationPlan(input: {
 
     for (const doc of groupSelected) {
       const cleanupStepNotices = [...new Set(cleanupNotices)];
+      const updateMatch = updateMatchesBySourceIdentifier.get(doc.identifier);
       let compatibilityWarnings = [...destinationWarnings];
       let compatibilityNotices: string[] = [];
       let queryViewWarnings = [...targetQueryViewWarnings];
@@ -3033,6 +3379,8 @@ export async function buildMigrationPlan(input: {
       const relationshipBlockers: string[] = [];
       const topicBlockers: string[] = [];
       const topicCompatibilityBlockers: string[] = [];
+      const fallbackWarning = replacementFallbackWarningsBySourceIdentifier.get(doc.identifier);
+      if (fallbackWarning) compatibilityWarnings.push(fallbackWarning);
       try {
         let refs = fieldRefCache.get(doc.identifier);
         let payload = exportCache.get(doc.identifier);
@@ -3484,6 +3832,13 @@ export async function buildMigrationPlan(input: {
         ...semanticDetails,
       };
       if (resolvedTopicMappings.length > 0) importDetails.topicMappings = resolvedTopicMappings;
+      if (updateMatch) {
+        importDetails.sameNamedStrategy = 'update';
+        importDetails.destinationDocumentId = updateMatch.destinationDocumentId;
+        importDetails.destinationDocumentName = updateMatch.destinationDocumentName;
+      } else {
+        importDetails.sameNamedStrategy = target.sameNamedStrategy || 'update';
+      }
       steps.push({
         routeGroupId: routeGroup.id,
         routeGroupName: routeGroup.name,
@@ -3495,7 +3850,7 @@ export async function buildMigrationPlan(input: {
         targetModelName: target.targetModelName,
         targetFolderId: target.targetFolderId,
         targetFolderPath: target.targetFolderPath,
-        kind: 'import',
+        kind: updateMatch ? 'update' : 'import',
         documentId: doc.identifier,
         documentName: doc.name,
         warnings: compatibilityWarnings.length > 0 ? compatibilityWarnings : undefined,
@@ -4085,9 +4440,9 @@ function isDashboardPrepKind(kind: JobItemKind): boolean {
 function isDashboardRetryItem(item: MigrationJobItem, destinationId?: string): boolean {
   if (destinationId && item.destinationId !== destinationId) return false;
   if (item.status === 'failed') {
-    return item.kind === 'import' || item.kind === 'export' || isDashboardPrepKind(item.kind);
+    return item.kind === 'import' || item.kind === 'update' || item.kind === 'export' || isDashboardPrepKind(item.kind);
   }
-  if (item.status !== 'skipped' || item.kind !== 'import') return false;
+  if (item.status !== 'skipped' || (item.kind !== 'import' && item.kind !== 'update')) return false;
   return /preparation (failed|skipped).*dependent (step|import) skipped/i.test(item.error || '');
 }
 
@@ -4847,7 +5202,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
   const sourceDocumentDetails = new Map<string, { baseModelId?: string; topicNames?: string[]; topicIds?: string[] }>();
   const sourceLabels = new Map<string, { color?: string | null; description?: string | null }>();
   const destinationClientCache = new Map<string, OmniClient>();
-  const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string }>();
+  const importedByDestinationAndSource = new Map<string, { identifier: string; documentId: string; updatedInPlace?: boolean }>();
   const destinationLabelCache = new Map<string, Set<string>>();
   const preparedTopicKeys = new Set<string>();
   const preparedQueryViewKeys = new Set<string>();
@@ -4991,10 +5346,45 @@ async function executeJob(job: MigrationJob): Promise<void> {
   function skipDependentItems(documentId: string, reason: string): void {
     for (const item of job.items) {
       if (item.documentId !== documentId) continue;
-      if ((item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
+      if ((item.kind === 'field_prepare' || item.kind === 'query_view_prepare' || item.kind === 'relationship_prepare' || item.kind === 'topic_prepare' || item.kind === 'import' || item.kind === 'update' || item.kind === 'metadata' || item.kind === 'source_delete') && item.status === 'pending') {
         markAndPersistItem(item, 'skipped', { error: reason });
       }
     }
+  }
+
+  function itemMatchesDependencyScope(candidate: MigrationJobItem, dependency: MigrationJobItem): boolean {
+    if (!candidate.documentId || candidate.documentId !== dependency.documentId) return false;
+    if (candidate.destinationId !== dependency.destinationId) return false;
+    if (candidate.targetId && dependency.targetId && candidate.targetId === dependency.targetId) return true;
+    if (!candidate.routeGroupId || !dependency.routeGroupId || candidate.routeGroupId !== dependency.routeGroupId) return false;
+    const candidateModel = candidate.targetModelId || '';
+    const dependencyModel = dependency.targetModelId || '';
+    return Boolean(candidateModel && dependencyModel && candidateModel === dependencyModel);
+  }
+
+  function dashboardPrepLabel(kind: JobItemKind): string {
+    if (kind === 'field_prepare') return 'Field preparation';
+    if (kind === 'query_view_prepare') return 'Query-view preparation';
+    if (kind === 'relationship_prepare') return 'Relationship preparation';
+    if (kind === 'topic_prepare') return 'Topic preparation';
+    return 'Dependency preparation';
+  }
+
+  function blockingPrepForWrite(item: MigrationJobItem): MigrationJobItem | undefined {
+    if (item.kind !== 'import' && item.kind !== 'update') return undefined;
+    return job.items.find((candidate) => (
+      isDashboardPrepKind(candidate.kind)
+      && itemMatchesDependencyScope(item, candidate)
+      && candidate.status !== 'succeeded'
+      && candidate.status !== 'warning'
+    ));
+  }
+
+  function skipWriteForBlockingPrep(item: MigrationJobItem, blockingPrep: MigrationJobItem): void {
+    const writeLabel = item.kind === 'update' ? 'dashboard update' : 'dashboard import';
+    const reason = `${dashboardPrepLabel(blockingPrep.kind)} did not complete; ${writeLabel} skipped.${blockingPrep.error ? ` ${blockingPrep.error}` : ''}`;
+    markAndPersistItem(item, 'skipped', { error: reason });
+    if (item.kind === 'import') releaseExportConsumer(item.documentId);
   }
 
   function skipDestinationDocumentItems(failedItem: MigrationJobItem, reason: string): void {
@@ -5002,8 +5392,8 @@ async function executeJob(job: MigrationJob): Promise<void> {
     for (const item of job.items) {
       if (item.status !== 'pending') continue;
       if (item.documentId !== failedItem.documentId) continue;
-      if (item.targetId !== failedItem.targetId || item.destinationId !== failedItem.destinationId) continue;
-      if (item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'metadata') continue;
+      if (!itemMatchesDependencyScope(item, failedItem)) continue;
+      if (item.kind !== 'field_prepare' && item.kind !== 'query_view_prepare' && item.kind !== 'relationship_prepare' && item.kind !== 'topic_prepare' && item.kind !== 'import' && item.kind !== 'update' && item.kind !== 'metadata') continue;
       markAndPersistItem(item, 'skipped', { error: reason });
       if (item.kind === 'import') releaseExportConsumer(item.documentId);
     }
@@ -5459,8 +5849,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
 	            });
 	            continue;
 	          }
-	          const sourceFields = new Set(queryViewFieldRefs(sourceQueryView).map((field) => field.toLowerCase()));
-	          const targetOnlyFields = queryViewFieldRefs(latestTargetQueryView).filter((field) => !sourceFields.has(field.toLowerCase()));
+		          const targetOnlyFields = targetOnlyQueryViewFields(sourceQueryView, latestTargetQueryView);
 	          if (targetOnlyFields.length > 0) {
 	            throw new Error(`Target query view ${latestTargetQueryView.name} has fields not present in the source copy: ${formatFieldList(targetOnlyFields)}. Choose Use existing unchanged in Step 4 to preserve target-only fields, or manually merge the target query view before retrying.`);
 	          }
@@ -5649,8 +6038,97 @@ async function executeJob(job: MigrationJob): Promise<void> {
           warnings: warnings.length > 0 ? warnings : undefined,
           details: { ...(item.details || {}), ...prepared.details },
         });
+      } else if (item.kind === 'update') {
+        if (!item.documentId) throw new Error('Update item missing source document id.');
+        const blockingPrep = blockingPrepForWrite(item);
+        if (blockingPrep) {
+          skipWriteForBlockingPrep(item, blockingPrep);
+          return;
+        }
+        const targetModelId = item.targetModelId || destination.defaultModelId;
+        if (!targetModelId) throw new Error(`${destination.label} has no target model selected.`);
+        const destinationDocumentId = detailString(item.details, 'destinationDocumentId');
+        if (!destinationDocumentId) throw new Error('Update item missing destination document id.');
+        const topicMappings = detailTopicMappings(item.details).length > 0
+          ? detailTopicMappings(item.details)
+          : targetForItem(item)?.topicMappings || [];
+        const queryViewMappings = detailQueryViewMappings(item.details).length > 0
+          ? detailQueryViewMappings(item.details)
+          : targetForItem(item)?.queryViewMappings || [];
+        const cached = exports.get(item.documentId);
+        const sourceDoc = sourceDocumentDetails.get(item.documentId);
+        const sourceModelId = sourceDoc?.baseModelId
+          || detailString(item.details, 'sourceModelId')
+          || (cached ? extractDashboardModelId(cached.payload) : undefined);
+        let sourceState: Record<string, unknown>;
+        let destinationState: Record<string, unknown>;
+        try {
+          [sourceState, destinationState] = await Promise.all([
+            sourceClient.getDocumentStateV2(item.documentId),
+            destinationClient.getDocumentStateV2(destinationDocumentId),
+          ]);
+        } catch (error) {
+          if (error instanceof OmniClientError && error.status === 404) {
+            throw new Error(`Documents V2 state could not be loaded for update-in-place. Falling back requires rerunning with Replace selected for this destination. ${error.message}`);
+          }
+          throw error;
+        }
+        const patchPlan = buildDocumentV2UpdatePatchPlan({
+          sourceState,
+          destinationState,
+          sourceModelId,
+          targetModelId,
+          topicMappings,
+          queryViewMappings,
+          sourceLabel: job.sourceLabel,
+          jobId: job.id,
+        });
+        let draftIdentifier = '';
+        try {
+          const [firstPatch, ...remainingPatches] = patchPlan.patches;
+          if (!firstPatch) throw new Error('No Documents V2 patch was prepared for update-in-place.');
+          const draft = await destinationClient.createDocumentDraft(destinationDocumentId, firstPatch);
+          draftIdentifier = draft.draftIdentifier;
+          if (!draftIdentifier) throw new Error('Documents V2 did not return a draft identifier.');
+          for (const patch of remainingPatches) {
+            await destinationClient.patchDocumentDraft(destinationDocumentId, draftIdentifier, patch);
+          }
+          await destinationClient.publishDocumentDraft(destinationDocumentId);
+        } catch (error) {
+          if (error instanceof OmniClientError && error.status === 409) {
+            throw new Error('The destination dashboard has an unpublished draft. Publish or discard it in Omni, then retry this destination.');
+          }
+          throw error;
+        }
+        const warnings = [...(item.warnings || []), ...patchPlan.warnings];
+        importedByDestinationAndSource.set(`${item.targetId || destination.id}:${item.documentId}`, {
+          identifier: destinationDocumentId,
+          documentId: destinationDocumentId,
+          updatedInPlace: true,
+        });
+        markAndPersistItem(item, warnings.length > 0 ? 'warning' : 'succeeded', {
+          importedIdentifier: destinationDocumentId,
+          importedDocumentId: destinationDocumentId,
+          warnings: warnings.length > 0 ? warnings : undefined,
+          details: {
+            ...(item.details || {}),
+            draftIdentifier,
+            publishedAt: new Date().toISOString(),
+            tileCount: patchPlan.tileCount,
+            deletedTileCount: patchPlan.deletedTileCount,
+            modelRewriteCount: patchPlan.modelRewriteCount,
+            topicRewriteCount: patchPlan.topicRewriteCount,
+            queryViewRewriteCount: patchPlan.queryViewRewriteCount,
+            updateInPlace: true,
+          },
+        });
       } else if (item.kind === 'import') {
         if (!item.documentId) throw new Error('Import item missing document id.');
+        const blockingPrep = blockingPrepForWrite(item);
+        if (blockingPrep) {
+          skipWriteForBlockingPrep(item, blockingPrep);
+          return;
+        }
         const cached = exports.get(item.documentId);
         if (!cached) {
           markAndPersistItem(item, 'skipped', { error: 'Export payload unavailable; import skipped.' });
@@ -5730,7 +6208,7 @@ async function executeJob(job: MigrationJob): Promise<void> {
         }
         const meta = sourceMeta.get(item.documentId);
         const warnings: string[] = [];
-        if (meta?.description) {
+        if (meta?.description && !imported.updatedInPlace) {
           try {
             await destinationClient.patchDocument(imported.identifier, { description: meta.description, clearExistingDraft: true });
           } catch (error) {
@@ -5841,9 +6319,9 @@ async function executeJob(job: MigrationJob): Promise<void> {
     )));
   }
 
-  function sourceDocumentImportSucceeded(documentId: string | undefined): boolean {
+function sourceDocumentImportSucceeded(documentId: string | undefined): boolean {
     if (!documentId) return false;
-    const imports = job.items.filter((item) => item.kind === 'import' && item.documentId === documentId);
+    const imports = job.items.filter((item) => (item.kind === 'import' || item.kind === 'update') && item.documentId === documentId);
     return imports.length > 0 && imports.every((item) => item.status === 'succeeded' || item.status === 'warning');
   }
 
@@ -5929,6 +6407,19 @@ async function runJobPostActions(job: MigrationJob): Promise<void> {
     };
     job.items.push(item);
     updateJobItem(item);
+    if (action.kind === 'refresh-schema' && action.destinationInstanceId && action.targetModelId) {
+      const writes = job.items.filter((jobItem) => (
+        (jobItem.kind === 'import' || jobItem.kind === 'update')
+        && jobItem.destinationId === action.destinationInstanceId
+        && (jobItem.targetModelId || '') === action.targetModelId
+      ));
+      if (writes.length > 0 && writes.some((jobItem) => jobItem.status !== 'succeeded' && jobItem.status !== 'warning')) {
+        markAndPersistItem(item, 'skipped', {
+          error: 'Schema refresh skipped because a dashboard write for this destination model did not complete successfully.',
+        });
+        continue;
+      }
+    }
     const result = action.kind === 'refresh-schema'
       ? await runSchemaRefreshAction(action)
       : await runPostMigrationAction(action);

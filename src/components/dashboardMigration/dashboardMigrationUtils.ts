@@ -139,6 +139,7 @@ export interface PreflightRouteTargetRow {
   notices: string[];
   deleteCount: number;
   replaceCount: number;
+  updateCount: number;
   status: PreflightTargetRow['status'];
   error?: string;
 }
@@ -158,6 +159,7 @@ export interface PreflightRouteGroupRow {
   noticeCount: number;
   deleteCount: number;
   replaceCount: number;
+  updateCount: number;
   status: PreflightTargetRow['status'];
   error?: string;
 }
@@ -172,6 +174,7 @@ export interface DashboardMigrationReviewImpactSummary {
   destinationCount: number;
   dashboardGroupCount: number;
   replacementCount: number;
+  updateCount: number;
   targetDeleteCount: number;
   queryViewActionCount: number;
   fieldActionCount: number;
@@ -269,6 +272,10 @@ function messagesFromPlanSteps(steps: MigrationPlanStep[], key: 'warnings' | 'no
   return steps.flatMap((step) => step[key] || []);
 }
 
+function isDestinationWriteStep(step: Pick<MigrationPlanStep, 'kind'>) {
+  return step.kind === 'import' || step.kind === 'update';
+}
+
 export function dashboardMigrationReviewImpactSummary(
   plan: MigrationPlan | null,
   options: {
@@ -283,6 +290,7 @@ export function dashboardMigrationReviewImpactSummary(
   const destinationCount = plan?.targets.length || 0;
   const dashboardGroupCount = routeGroups.length || plan?.routeGroups?.length || (plan ? 1 : 0);
   const replacementCount = routeGroups.reduce((sum, route) => sum + route.replaceCount, 0);
+  const updateCount = routeGroups.reduce((sum, route) => sum + route.updateCount, 0);
   const targetDeleteCount = routeGroups.reduce((sum, route) => sum + route.deleteCount, 0);
   const queryViewActionCount = routeGroups.reduce((sum, route) => sum + route.queryViewActionCount, 0);
   const fieldActionCount = routeGroups.reduce((sum, route) => sum + route.fieldActionCount, 0);
@@ -300,6 +308,9 @@ export function dashboardMigrationReviewImpactSummary(
   } else {
     const groupSuffix = dashboardGroupCount > 1 ? ` across ${pluralize(dashboardGroupCount, 'dashboard group')}` : '';
     impactStatements.push(`You are about to copy ${pluralize(dashboardCount, 'dashboard')} to ${pluralize(destinationCount, 'destination')}${groupSuffix}.`);
+    if (updateCount > 0) {
+      impactStatements.push(`${pluralize(updateCount, 'same-name target dashboard')} will be updated in place, preserving its destination ID, slug, permissions, embeds, favorites, schedules, and history.`);
+    }
     if (targetDeleteCount > 0) {
       if (plan.emptyFirst) {
         impactStatements.push(`${pluralize(targetDeleteCount, 'existing target dashboard')} will be moved to Trash before import.`);
@@ -308,8 +319,8 @@ export function dashboardMigrationReviewImpactSummary(
       } else {
         impactStatements.push(`${pluralize(targetDeleteCount, 'target dashboard')} will be moved to Trash before import.`);
       }
-    } else if (plan.replaceSameNamed) {
-      impactStatements.push('Same-name replacement is on; no matching dashboards were found in the selected destination folders.');
+    } else if (plan.replaceSameNamed && updateCount === 0) {
+      impactStatements.push('Same-name handling is on; no matching dashboards were found in the selected destination folders.');
     }
     impactStatements.push(options.deleteSourceOnSuccess
       ? `Source delete is on. ${pluralize(dashboardCount, 'original source dashboard')} will move to Trash only after every destination succeeds and selected post-actions do not fail.`
@@ -336,6 +347,7 @@ export function dashboardMigrationReviewImpactSummary(
     destinationCount,
     dashboardGroupCount,
     replacementCount,
+    updateCount,
     targetDeleteCount,
     queryViewActionCount,
     fieldActionCount,
@@ -1055,7 +1067,7 @@ export function queryViewRequirementsByRouteTargetFromPlan(plan: MigrationPlan |
   if (!plan) return {};
   const byRouteTarget: DashboardMigrationQueryViewRequirementsByRouteTarget = {};
   for (const step of plan.steps) {
-    if (step.kind !== 'import') continue;
+    if (!isDestinationWriteStep(step)) continue;
     const requiredQueryViews = queryViewRequirementsFromStepDetails(step.details);
     if (requiredQueryViews.length === 0) continue;
     const routeGroupId = step.routeGroupId || 'default-route';
@@ -1206,7 +1218,7 @@ function stepBlockerMessages(step: Pick<MigrationPlanStep, 'blocked' | 'details'
 export function routeFieldActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteFieldActionSummary[] {
   const summaries = new Map<string, RouteFieldActionSummary>();
   for (const step of steps) {
-    if (step.kind !== 'field_prepare' && step.kind !== 'import') continue;
+    if (step.kind !== 'field_prepare' && !isDestinationWriteStep(step)) continue;
     const fieldDependencies = fieldDependenciesFromStepDetails(step.details);
     const fieldMappings = fieldMappingsFromStepDetails(step.details);
     if (fieldDependencies.length === 0 && fieldMappings.length === 0) continue;
@@ -1242,7 +1254,7 @@ export function routeFieldActionSummariesFromSteps(steps: MigrationPlanStep[]): 
 export function routeQueryViewActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteQueryViewActionSummary[] {
   const summaries = new Map<string, RouteQueryViewActionSummary>();
   for (const step of steps) {
-    if (step.kind !== 'query_view_prepare' && step.kind !== 'import') continue;
+    if (step.kind !== 'query_view_prepare' && !isDestinationWriteStep(step)) continue;
     const queryViewMappings = queryViewMappingsFromStepDetails(step.details);
     if (queryViewMappings.length === 0) continue;
     const key = `${step.routeGroupId || 'default-route'}:${step.documentId || 'document'}:${step.targetId || step.destinationId}`;
@@ -1272,7 +1284,7 @@ export function routeQueryViewActionSummariesFromSteps(steps: MigrationPlanStep[
 export function routeRelationshipActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteRelationshipActionSummary[] {
   const summaries = new Map<string, RouteRelationshipActionSummary>();
   for (const step of steps) {
-    if (step.kind !== 'relationship_prepare' && step.kind !== 'import') continue;
+    if (step.kind !== 'relationship_prepare' && !isDestinationWriteStep(step)) continue;
     const relationshipEdges = relationshipEdgesFromStepDetails(step.details);
     const blockers = stepBlockerMessages(step, ['relationshipBlockers']);
     if (relationshipEdges.length === 0 && blockers.length === 0) continue;
@@ -1305,7 +1317,7 @@ export function routeRelationshipActionSummariesFromSteps(steps: MigrationPlanSt
 export function routeTopicActionSummariesFromSteps(steps: MigrationPlanStep[]): RouteTopicActionSummary[] {
   const summaries = new Map<string, RouteTopicActionSummary>();
   for (const step of steps) {
-    if (step.kind !== 'topic_prepare' && step.kind !== 'import') continue;
+    if (step.kind !== 'topic_prepare' && !isDestinationWriteStep(step)) continue;
     const topicMappings = topicMappingsFromStepDetails(step.details);
     const blockers = stepBlockerMessages(step, ['topicCompatibilityBlockers']);
     if (topicMappings.length === 0 && blockers.length === 0) continue;
@@ -1583,6 +1595,7 @@ export function summarizePlanByTarget(plan: MigrationPlan | null) {
     const blocker = steps.find((step) => step.blocked || step.error);
     const deletes = steps.filter((step) => step.kind === 'delete').length;
     const replacements = steps.filter((step) => step.kind === 'delete' && step.replacement).length;
+    const updates = steps.filter((step) => step.kind === 'update').length;
     return {
       target,
       steps,
@@ -1592,6 +1605,7 @@ export function summarizePlanByTarget(plan: MigrationPlan | null) {
       notices,
       deleteCount: deletes,
       replaceCount: replacements,
+      updateCount: updates,
       status: blocker ? 'blocked' : warnings.length > 0 ? 'warning' : 'ready',
       error: blocker?.error,
     };
@@ -1609,6 +1623,7 @@ export function preflightRowsFromPlan(plan: MigrationPlan | null): PreflightTarg
     noticeCount: summary.noticeCount,
     deleteCount: summary.deleteCount,
     replaceCount: summary.replaceCount,
+    updateCount: summary.updateCount,
     error: summary.error,
   }));
 }
@@ -1698,6 +1713,7 @@ export function preflightRouteGroupsFromPlan(plan: MigrationPlan | null): Prefli
         notices,
         deleteCount: steps.filter((step) => step.kind === 'delete').length,
         replaceCount: steps.filter((step) => step.kind === 'delete' && step.replacement).length,
+        updateCount: steps.filter((step) => step.kind === 'update').length,
         status: statusFromSteps(steps),
         error: blocker?.error,
       };
@@ -1721,6 +1737,7 @@ export function preflightRouteGroupsFromPlan(plan: MigrationPlan | null): Prefli
       noticeCount: routeNotices.length,
       deleteCount: routeTargets.reduce((sum, target) => sum + target.deleteCount, 0),
       replaceCount: routeTargets.reduce((sum, target) => sum + target.replaceCount, 0),
+      updateCount: routeTargets.reduce((sum, target) => sum + target.updateCount, 0),
       status: blocker ? 'blocked' : hasWarning ? 'warning' : 'ready',
       error: blocker?.error,
     };

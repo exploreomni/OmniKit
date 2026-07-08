@@ -7,7 +7,7 @@ import { afterEach, beforeEach, mock, test } from 'node:test';
 import instancesHandler from '../server/handlers/instances';
 import migrationJobsHandler from '../server/handlers/migration-jobs';
 import { buildMigrationPlan, createMigrationJob, getJob, retryMigrationJob, validateDashboardMigrationPatches } from '../server/services/migrationJobs';
-import { OmniClient, type OmniDocumentRecord } from '../server/services/omniClient';
+import { OmniClient, OmniClientError, type OmniDocumentRecord } from '../server/services/omniClient';
 import {
   lockVault,
   resetVault,
@@ -58,7 +58,9 @@ async function waitForJob(id: string) {
     if (job && terminal.has(job.status)) return job;
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
-  throw new Error(`Job ${id} did not finish in time.`);
+  const job = getJob(id);
+  const itemSummary = job?.items.map((item) => `${item.kind}:${item.status}${item.error ? `:${item.error}` : ''}`).join(', ');
+  throw new Error(`Job ${id} did not finish in time. Status: ${job?.status || 'missing'}. Items: ${itemSummary || 'none'}`);
 }
 
 test('omni client lists query views from authored model yaml', async () => {
@@ -1462,11 +1464,11 @@ test('planner blocks create-new query views on protected models and warns for gi
     }
     return [];
   });
-  mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
-    return clientLabel(this) === 'Source'
-      ? [{
-          name: 'whataburger_metrics',
-          fileName: 'whataburger_metrics.query.view',
+	  mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
+	    return clientLabel(this) === 'Source'
+	      ? [{
+	          name: 'whataburger_metrics',
+	          fileName: 'whataburger_metrics.query.view',
           yaml: 'label: Whataburger Metrics\nquery:\n  base_view: orders\n',
         }]
       : [];
@@ -1653,6 +1655,7 @@ test('planner replaces same-named default target dashboards without deleting sel
       destinationInstanceId: 'atx',
       targetConnectionId: 'atx-connection',
       targetModelId: 'target-model',
+      sameNamedStrategy: 'replace',
     }],
     documentIds: ['nfl-superstar-team-motion-lab-v34'],
     emptyFirst: false,
@@ -1667,6 +1670,154 @@ test('planner replaces same-named default target dashboards without deleting sel
   const importStep = plan.steps.find((step) => step.kind === 'import');
   assert.equal(importStep?.warnings, undefined);
   assert.equal(importStep?.notices, undefined);
+});
+
+test('planner updates same-named dashboards in place by default when Documents V2 is available', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultFolderPath: 'Target Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+        id: 'source-doc',
+        identifier: 'source-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }]
+      : [{
+        id: 'target-doc',
+        identifier: 'target-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Target Dashboards',
+        baseModelId: 'target-model',
+      }];
+  });
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => ({ queryPresentations: { data: {} } }));
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n',
+  }));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    sharedModelId: 'source-model',
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      id: 'target-row',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'dest-connection',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Target Dashboards',
+    }],
+    documentIds: ['source-doc'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const updateStep = plan.steps.find((step) => step.kind === 'update');
+
+  assert.equal(plan.steps.some((step) => step.kind === 'delete'), false);
+  assert.equal(plan.steps.some((step) => step.kind === 'import'), false);
+  assert.equal(updateStep?.documentId, 'source-doc');
+  assert.equal(updateStep?.details?.destinationDocumentId, 'target-doc');
+  assert.equal(updateStep?.details?.sameNamedStrategy, 'update');
+  assert.equal(updateStep?.warnings, undefined);
+});
+
+test('planner falls back to replacement when same-name update support is unavailable', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultFolderPath: 'Target Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+        id: 'source-doc',
+        identifier: 'source-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }]
+      : [{
+        id: 'target-doc',
+        identifier: 'target-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Target Dashboards',
+        baseModelId: 'target-model',
+      }];
+  });
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => {
+    throw new OmniClientError(404, 'https://dest.example.omniapp.co/api/v2/documents/target-doc/state', 'missing');
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n',
+  }));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    sharedModelId: 'source-model',
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+
+  const plan = await buildMigrationPlan({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      id: 'target-row',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'dest-connection',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Target Dashboards',
+    }],
+    documentIds: ['source-doc'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+  });
+
+  const deleteStep = plan.steps.find((step) => step.kind === 'delete');
+  const importStep = plan.steps.find((step) => step.kind === 'import');
+
+  assert.equal(plan.steps.some((step) => step.kind === 'update'), false);
+  assert.equal(deleteStep?.documentId, 'target-doc');
+  assert.equal(deleteStep?.replacement, true);
+  assert.equal(importStep?.details?.sameNamedStrategy, 'update');
+  assert.match(importStep?.warnings?.join('\n') || '', /does not support in-place dashboard updates/i);
 });
 
 test('planner can source selected dashboards across all folders for a connection-scoped job', async () => {
@@ -1855,6 +2006,7 @@ test('same-instance default replacement scan without a root match does not turn 
       destinationInstanceId: 'atx',
       targetConnectionId: 'atx-connection',
       targetModelId: 'target-model',
+      sameNamedStrategy: 'replace',
     }],
     documentIds: ['nfl-superstar-team-motion-lab-v34'],
     emptyFirst: false,
@@ -1931,6 +2083,7 @@ test('same-instance default replacement deletes exact-name root target before im
       destinationInstanceId: 'atx',
       targetConnectionId: 'atx-connection',
       targetModelId: 'target-model',
+      sameNamedStrategy: 'replace',
     }],
     documentIds: ['nfl-superstar-team-motion-lab-v34'],
     emptyFirst: false,
@@ -1948,6 +2101,384 @@ test('same-instance default replacement deletes exact-name root target before im
   assert.equal(deleteItem?.status, 'succeeded');
   assert.equal(deleteItem?.replacement, true);
   assert.equal(importItem?.status, 'succeeded');
+});
+
+test('dashboard migration updates same-named destination document through Documents V2 draft publish', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultFolderPath: 'Target Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  const sourcePresentations = Object.fromEntries(Array.from({ length: 50 }, (_, index) => [
+    `tile_${index}`,
+    {
+      type: 'bar',
+      query: {
+        modelId: 'source-model',
+        topicName: 'source_topic',
+        queryViewName: 'source_view',
+        fields: ['orders.id'],
+      },
+    },
+  ]));
+  const sourceState = {
+    name: 'WhataDashboard',
+    description: 'Source description',
+    queryPresentations: { data: sourcePresentations },
+    controls: { region: 'Texas' },
+    settings: { theme: 'whataburger' },
+    containers: { root: ['tile_0'] },
+  };
+  const destinationState = {
+    name: 'WhataDashboard',
+    queryPresentations: {
+      data: {
+        tile_0: {
+          type: 'table',
+          query: { modelId: 'target-model', topicName: 'old_topic', queryViewName: 'old_view' },
+        },
+        stale_tile: {
+          type: 'table',
+          query: { modelId: 'target-model' },
+        },
+      },
+    },
+  };
+  const firstPatches: Array<Record<string, unknown>> = [];
+  const draftPatches: Array<Record<string, unknown>> = [];
+  const publishedDocuments: string[] = [];
+  const imports: string[] = [];
+  const deletes: string[] = [];
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+        id: 'source-doc',
+        identifier: 'source-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }]
+      : [{
+        id: 'target-doc',
+        identifier: 'target-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Target Dashboards',
+        baseModelId: 'target-model',
+      }];
+  });
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    return clientLabel(this) === 'Source' || documentId === 'source-doc' ? sourceState : destinationState;
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n',
+  }));
+  mock.method(OmniClient.prototype, 'listModelTopics', async () => [{
+    name: 'target_topic',
+    label: 'Target Topic',
+  }]);
+  mock.method(OmniClient.prototype, 'listModelQueryViews', async () => [{
+    name: 'target_view',
+    label: 'Target View',
+  }]);
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    sharedModelId: 'source-model',
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+  mock.method(OmniClient.prototype, 'importDocument', async (input: { documentName?: string }) => {
+    imports.push(input.documentName || 'unknown');
+    throw new Error('import should not run for update-in-place');
+  });
+  mock.method(OmniClient.prototype, 'requestDeleteDocument', async (documentId: string) => {
+    deletes.push(documentId);
+  });
+  mock.method(OmniClient.prototype, 'createDocumentDraft', async (documentId: string, patch: Record<string, unknown>) => {
+    firstPatches.push(patch);
+    return { identifier: documentId, draftIdentifier: 'draft-target-doc', raw: {} };
+  });
+  mock.method(OmniClient.prototype, 'patchDocumentDraft', async (_documentId: string, _draftId: string, patch: Record<string, unknown>) => {
+    draftPatches.push(patch);
+  });
+  mock.method(OmniClient.prototype, 'publishDocumentDraft', async (documentId: string) => {
+    publishedDocuments.push(documentId);
+  });
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      id: 'target-row',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'dest-connection',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Target Dashboards',
+      topicMappings: [{
+        sourceTopicName: 'source_topic',
+        sourceTopicId: 'source_topic',
+        action: 'map_existing',
+        targetTopicName: 'target_topic',
+      }],
+      queryViewMappings: [{
+        sourceQueryViewName: 'source_view',
+        action: 'map_existing',
+        targetQueryViewName: 'target_view',
+      }],
+    }],
+    documentIds: ['source-doc'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+  });
+
+  const job = await waitForJob(created.id);
+  const updateItem = job.items.find((item) => item.kind === 'update');
+  const presentationPatches = [firstPatches[0], ...draftPatches]
+    .map((patch) => patch?.queryPresentations as { data?: Record<string, unknown | null> } | undefined)
+    .filter((patch): patch is { data: Record<string, unknown | null> } => Boolean(patch?.data));
+  const firstTile = presentationPatches[0].data.tile_0 as { query?: Record<string, unknown> };
+  const staleTilePatch = presentationPatches.find((patch) => Object.hasOwn(patch.data, 'stale_tile'));
+
+  assert.equal(job.status, 'succeeded');
+  assert.equal(updateItem?.status, 'succeeded');
+  assert.equal(updateItem?.importedDocumentId, 'target-doc');
+  assert.equal(updateItem?.details?.updateInPlace, true);
+  assert.equal(updateItem?.details?.tileCount, 50);
+  assert.equal(updateItem?.details?.deletedTileCount, 1);
+  assert.equal(updateItem?.details?.modelRewriteCount, 50);
+  assert.equal(updateItem?.details?.topicRewriteCount, 50);
+  assert.equal(updateItem?.details?.queryViewRewriteCount, 50);
+  assert.deepEqual(imports, []);
+  assert.deepEqual(deletes, []);
+  assert.deepEqual(publishedDocuments, ['target-doc']);
+  assert.equal(firstPatches[0].name, 'WhataDashboard');
+  assert.equal(firstPatches[0].description, 'Source description');
+  assert.equal(firstTile.query?.modelId, 'target-model');
+  assert.equal(firstTile.query?.topicName, 'target_topic');
+  assert.equal(firstTile.query?.queryViewName, 'target_view');
+  assert.equal(staleTilePatch?.data.stale_tile, null);
+  assert.equal(draftPatches.some((patch) => patch.controls && patch.settings && patch.containers), true);
+  for (const patch of presentationPatches) {
+    const nonNullCount = Object.values(patch.data).filter((value) => value !== null && value !== undefined).length;
+    assert.ok(nonNullCount <= 48);
+  }
+});
+
+test('dashboard migration retry reruns failed update-in-place items', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultFolderPath: 'Target Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  let failDraft = true;
+  let draftCalls = 0;
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+        id: 'source-doc',
+        identifier: 'source-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }]
+      : [{
+        id: 'target-doc',
+        identifier: 'target-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Target Dashboards',
+        baseModelId: 'target-model',
+      }];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
+      return {
+        name: 'WhataDashboard',
+        queryPresentations: {
+          data: {
+            tile_1: { query: { modelId: 'source-model', fields: ['orders.id'] } },
+          },
+        },
+      };
+    }
+    return {
+      name: 'WhataDashboard',
+      queryPresentations: { data: {} },
+    };
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n',
+  }));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    sharedModelId: 'source-model',
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+  mock.method(OmniClient.prototype, 'createDocumentDraft', async (documentId: string) => {
+    draftCalls += 1;
+    if (failDraft) throw new Error('Draft create failed.');
+    return { identifier: documentId, draftIdentifier: 'draft-target-doc', raw: {} };
+  });
+  mock.method(OmniClient.prototype, 'patchDocumentDraft', async () => undefined);
+  mock.method(OmniClient.prototype, 'publishDocumentDraft', async () => undefined);
+  mock.method(OmniClient.prototype, 'importDocument', async () => {
+    throw new Error('import should not run for update retry');
+  });
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      id: 'target-row',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'dest-connection',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Target Dashboards',
+    }],
+    documentIds: ['source-doc'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+  });
+
+  const failedJob = await waitForJob(created.id);
+  const failedUpdate = failedJob.items.find((item) => item.kind === 'update');
+  failDraft = false;
+
+  const retry = await retryMigrationJob(failedJob.id);
+  const retriedJob = await waitForJob(retry.id);
+
+  assert.equal(failedUpdate?.status, 'failed');
+  assert.match(failedUpdate?.error || '', /Draft create failed/);
+  assert.equal(retry.items.some((item) => item.kind === 'update'), true);
+  assert.equal(retry.items.some((item) => item.kind === 'import'), false);
+  assert.equal(retriedJob.items.find((item) => item.kind === 'update')?.status, 'succeeded');
+  assert.ok(draftCalls >= 2);
+});
+
+test('dashboard migration update-in-place reports unpublished draft conflicts clearly', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultFolderPath: 'Target Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+        id: 'source-doc',
+        identifier: 'source-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Source Dashboards',
+        baseModelId: 'source-model',
+      }]
+      : [{
+        id: 'target-doc',
+        identifier: 'target-doc',
+        name: 'WhataDashboard',
+        folderPath: 'Target Dashboards',
+        baseModelId: 'target-model',
+      }];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
+      return {
+        name: 'WhataDashboard',
+        queryPresentations: {
+          data: {
+            tile_1: { query: { modelId: 'source-model', fields: ['orders.id'] } },
+          },
+        },
+      };
+    }
+    return {
+      name: 'WhataDashboard',
+      queryPresentations: { data: {} },
+    };
+  });
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
+    'orders.view': 'dimensions:\n  id:\n',
+  }));
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    sharedModelId: 'source-model',
+    tiles: [{ fields: ['orders.id'] }],
+  }));
+  mock.method(OmniClient.prototype, 'createDocumentDraft', async () => {
+    throw new OmniClientError(409, 'https://dest.example.omniapp.co/api/v2/documents/target-doc/drafts', 'draft exists');
+  });
+
+  const created = await createMigrationJob({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    targets: [{
+      id: 'target-row',
+      destinationInstanceId: 'dest-1',
+      targetConnectionId: 'dest-connection',
+      targetModelId: 'target-model',
+      targetFolderPath: 'Target Dashboards',
+    }],
+    documentIds: ['source-doc'],
+    emptyFirst: false,
+    replaceSameNamed: true,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+  });
+
+  const job = await waitForJob(created.id);
+  const updateItem = job.items.find((item) => item.kind === 'update');
+
+  assert.equal(updateItem?.status, 'failed');
+  assert.equal(updateItem?.error, 'The destination dashboard has an unpublished draft. Publish or discard it in Omni, then retry this destination.');
 });
 
 test('planner still skips empty-first cleanup when target folder is unscoped', async () => {
@@ -2669,25 +3200,25 @@ test('dashboard migration creates selected source fields before dashboard import
   });
   mock.method(OmniClient.prototype, 'moveDocument', async () => ({}));
 
-  const created = await createMigrationJob({
-    sourceId: 'source-1',
-    targets: [{
-      id: 'target-1',
-      destinationInstanceId: 'dest-1',
-      targetConnectionId: 'target-connection-1',
-      targetModelId: 'target-model',
-      fieldMappings: [{
-        sourceFieldRef: 'orders.semantic_total_sales',
-        action: 'create_from_source',
+	  const created = await createMigrationJob({
+	    sourceId: 'source-1',
+	    targets: [{
+	      id: 'target-1',
+	      destinationInstanceId: 'dest-1',
+	      targetConnectionId: 'target-connection-1',
+	      targetModelId: 'target-model',
+	      fieldMappings: [{
+	        sourceFieldRef: 'orders.semantic_total_sales',
+	        action: 'create_from_source',
         sourceFileName: 'orders.view',
         targetFileName: 'orders.view',
       }],
     }],
     documentIds: ['source-doc-1'],
-    emptyFirst: false,
-    replaceSameNamed: false,
-    postMigrationActions: [],
-  });
+	    emptyFirst: false,
+	    replaceSameNamed: false,
+	    postMigrationActions: [],
+	  });
 
   const job = await waitForJob(created.id);
   const fieldPrep = job.items.find((item) => item.kind === 'field_prepare');
@@ -4437,26 +4968,26 @@ test('dashboard migration updates existing query-view YAML only on explicit upda
   });
   mock.method(OmniClient.prototype, 'importDocument', async () => ({ identifier: 'imported-doc-1', documentId: 'imported-doc-1' }));
 
-  const created = await createMigrationJob({
-    sourceId: 'source-1',
-    targets: [{
-      id: 'target-1',
-      destinationInstanceId: 'dest-1',
-      targetConnectionId: 'target-connection-1',
-      targetModelId: 'target-model-1',
-      queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
-        action: 'update_existing',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
-      }],
-    }],
-    documentIds: ['source-doc-1'],
-    emptyFirst: false,
-    replaceSameNamed: false,
-    postMigrationActions: [],
-  });
+	  const created = await createMigrationJob({
+	    sourceId: 'source-1',
+	    targets: [{
+	      id: 'target-1',
+	      destinationInstanceId: 'dest-1',
+	      targetConnectionId: 'target-connection-1',
+	      targetModelId: 'target-model-1',
+	      queryViewMappings: [{
+	        sourceQueryViewName: 'whataburger_metrics',
+	        sourceFileName: 'whataburger_metrics.query.view',
+	        action: 'update_existing',
+	        targetQueryViewName: 'whataburger_metrics',
+	        targetFileName: 'whataburger_metrics.query.view',
+	      }],
+	    }],
+	    documentIds: ['source-doc-1'],
+	    emptyFirst: false,
+	    replaceSameNamed: false,
+	    postMigrationActions: [],
+	  });
 
   const job = await waitForJob(created.id);
   const queryViewPrep = job.items.find((item) => item.kind === 'query_view_prepare');
@@ -4540,61 +5071,79 @@ test('dashboard migration refuses query-view updates that would remove target-on
           label: 'Whataburger Metrics',
           fileName: 'whataburger_metrics.query.view',
           yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\n  legacy_margin:\nquery:\n  base_view: orders\n',
-          checksum: 'target-checksum-1',
-        }];
-  });
-  mock.method(OmniClient.prototype, 'updateModelYamlFile', async () => {
-    yamlWriteCalls += 1;
-  });
-  mock.method(OmniClient.prototype, 'importDocument', async () => {
-    throw new Error('Import should have been skipped.');
-  });
+	          checksum: 'target-checksum-1',
+	        }];
+	  });
+	  mock.method(OmniClient.prototype, 'updateModelYamlFile', async () => {
+	    yamlWriteCalls += 1;
+	  });
+	  mock.method(OmniClient.prototype, 'importDocument', async () => {
+	    throw new Error('Import should have been skipped.');
+	  });
 
-  const created = await createMigrationJob({
-    sourceId: 'source-1',
-    targets: [{
-      id: 'target-1',
-      destinationInstanceId: 'dest-1',
-      targetConnectionId: 'target-connection-1',
-      targetModelId: 'target-model-1',
-      queryViewMappings: [{
-        sourceQueryViewName: 'whataburger_metrics',
-        sourceFileName: 'whataburger_metrics.query.view',
-        action: 'update_existing',
-        targetQueryViewName: 'whataburger_metrics',
-        targetFileName: 'whataburger_metrics.query.view',
-      }],
-    }],
-    documentIds: ['source-doc-1'],
-    emptyFirst: false,
-    replaceSameNamed: false,
-    postMigrationActions: [],
-  });
+	  const plan = await buildMigrationPlan({
+	    sourceId: 'source-1',
+	    targets: [{
+	      id: 'target-1',
+	      destinationInstanceId: 'dest-1',
+	      targetConnectionId: 'target-connection-1',
+	      targetModelId: 'target-model-1',
+	      queryViewMappings: [{
+	        sourceQueryViewName: 'whataburger_metrics',
+	        sourceFileName: 'whataburger_metrics.query.view',
+	        action: 'update_existing',
+	        targetQueryViewName: 'whataburger_metrics',
+	        targetFileName: 'whataburger_metrics.query.view',
+	      }],
+	    }],
+	    documentIds: ['source-doc-1'],
+	    emptyFirst: false,
+	    replaceSameNamed: false,
+	  });
+	  const plannedQueryViewPrep = plan.steps.find((step) => step.kind === 'query_view_prepare');
+	  const plannedImport = plan.steps.find((step) => step.kind === 'import');
+	  const plannedPatches = plannedQueryViewPrep?.details?.semanticPatches as Array<{
+	    artifactType?: string;
+	    sourceName?: string;
+	    status?: string;
+	    safetyCategory?: string;
+	    recommendedAction?: string;
+	    warnings?: string[];
+	  }> | undefined;
+	  const plannedQueryViewPatch = plannedPatches?.find((patch) => (
+	    patch.artifactType === 'query_view' && patch.sourceName === 'whataburger_metrics'
+	  ));
 
-  const job = await waitForJob(created.id);
-  const queryViewPrep = job.items.find((item) => item.kind === 'query_view_prepare');
-  const importItem = job.items.find((item) => item.kind === 'import');
-  const failureDetails = queryViewPrep?.details as {
-    recoveryCode?: string;
-    recommendedAction?: string;
-    targetQueryViewName?: string;
-    targetOnlyFields?: string[];
-    recoveryHint?: string;
-  } | undefined;
+	  assert.equal(plannedQueryViewPrep?.blocked, true);
+	  assert.match(plannedQueryViewPrep?.error || '', /Query view whataburger_metrics needs resolution/);
+	  assert.equal(plannedImport?.blocked, true);
+	  assert.equal(plannedQueryViewPatch?.status, 'blocked');
+	  assert.equal(plannedQueryViewPatch?.safetyCategory, 'blocked');
+	  assert.match(plannedQueryViewPatch?.recommendedAction || '', /Review and merge/);
+	  assert.match((plannedQueryViewPatch?.warnings || []).join(' '), /legacy_margin/);
 
-  assert.equal(queryViewPrep?.status, 'failed');
-  assert.match(queryViewPrep?.error || '', /fields not present in the source copy/);
-  assert.equal(failureDetails?.recoveryCode, 'target_query_view_has_extra_fields');
-  assert.equal(failureDetails?.recommendedAction, 'use_existing_unchanged');
-  assert.equal(failureDetails?.targetQueryViewName, 'whataburger_metrics');
-  assert.deepEqual(failureDetails?.targetOnlyFields, [
-    'whataburger_metrics.legacy_margin',
-    'whataburger_metrics.query.legacy_margin',
-  ]);
-  assert.match(failureDetails?.recoveryHint || '', /Use existing unchanged/);
-  assert.equal(importItem?.status, 'skipped');
-  assert.equal(yamlWriteCalls, 0);
-});
+		  await assert.rejects(() => createMigrationJob({
+		    sourceId: 'source-1',
+		    targets: [{
+		      id: 'target-1',
+		      destinationInstanceId: 'dest-1',
+		      targetConnectionId: 'target-connection-1',
+		      targetModelId: 'target-model-1',
+		      queryViewMappings: [{
+		        sourceQueryViewName: 'whataburger_metrics',
+		        sourceFileName: 'whataburger_metrics.query.view',
+		        action: 'update_existing',
+		        targetQueryViewName: 'whataburger_metrics',
+		        targetFileName: 'whataburger_metrics.query.view',
+		      }],
+		    }],
+		    documentIds: ['source-doc-1'],
+		    emptyFirst: false,
+		    replaceSameNamed: false,
+		    postMigrationActions: [],
+		  }), /Query view whataburger_metrics needs resolution/);
+	  assert.equal(yamlWriteCalls, 0);
+	});
 
 test('dashboard migration refuses to overwrite query views discovered after preflight', async () => {
   upsertInstance({
@@ -4928,6 +5477,192 @@ test('source delete is skipped when query-view preparation fails', async () => {
   assert.equal(sourceDelete?.status, 'skipped');
   assert.equal(sourceDeleteCalls, 0);
 });
+
+test('query-view preparation blockers prevent sibling update-in-place jobs from starting', async () => {
+  upsertInstance({
+    id: 'source-1',
+    label: 'Source',
+    role: 'source',
+    baseUrl: 'https://source.example.omniapp.co',
+    apiKey: 'source-key',
+    defaultFolderPath: 'Source Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+  upsertInstance({
+    id: 'dest-1',
+    label: 'Destination',
+    role: 'destination',
+    baseUrl: 'https://dest.example.omniapp.co',
+    apiKey: 'dest-key',
+    defaultFolderPath: 'Target Dashboards',
+    metricFilter: emptyMetricFilter(),
+    postMigrationActions: [],
+  });
+
+  let draftCalls = 0;
+  let refreshCalls = 0;
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          id: 'source-doc-1',
+          identifier: 'source-doc-1',
+          name: 'WhataDashboard',
+          folderPath: 'Source Dashboards',
+          baseModelId: 'source-model',
+        }]
+      : [{
+          id: 'target-doc-1',
+          identifier: 'target-doc-1',
+          name: 'WhataDashboard',
+          folderPath: 'Target Dashboards',
+          baseModelId: 'target-model-1',
+        }, {
+          id: 'target-doc-2',
+          identifier: 'target-doc-2',
+          name: 'WhataDashboard',
+          folderPath: 'Target Dashboards Copy',
+          baseModelId: 'target-model-1',
+        }];
+  });
+  mock.method(OmniClient.prototype, 'listLabels', async () => []);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return clientLabel(this) === 'Source'
+      ? {
+          'whataburger_metrics.query.view': 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+        }
+      : { 'orders.view': 'dimensions:\n  id:\n' };
+  });
+  mock.method(OmniClient.prototype, 'listModels', async () => [{
+    id: 'target-model-1',
+    name: 'Target Model',
+  }]);
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    sharedModelId: 'source-model',
+    tiles: [{ fields: ['whataburger_metrics.revenue'] }],
+  }));
+  mock.method(OmniClient.prototype, 'listModelQueryViews', async function listModelQueryViews() {
+    return clientLabel(this) === 'Source'
+      ? [{
+          name: 'whataburger_metrics',
+          fileName: 'whataburger_metrics.query.view',
+          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\nquery:\n  base_view: orders\n',
+        }]
+      : [{
+          name: 'whataburger_metrics',
+          label: 'Whataburger Metrics',
+          fileName: 'whataburger_metrics.query.view',
+          yaml: 'label: Whataburger Metrics\ndimensions:\n  revenue:\n  legacy_margin:\nquery:\n  base_view: orders\n',
+          checksum: 'target-checksum-1',
+        }];
+  });
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => ({
+    name: 'WhataDashboard',
+    queryPresentations: {
+      data: {
+        tile_1: { query: { modelId: 'source-model', fields: ['whataburger_metrics.revenue'] } },
+      },
+    },
+  }));
+  mock.method(OmniClient.prototype, 'createDocumentDraft', async () => {
+    draftCalls += 1;
+    throw new Error('Dashboard update should have been skipped.');
+  });
+  mock.method(OmniClient.prototype, 'refreshModel', async () => {
+    refreshCalls += 1;
+    return { jobId: 'refresh-1', status: 'running' };
+  });
+
+	  const plan = await buildMigrationPlan({
+	    sourceId: 'source-1',
+	    sourceConnectionId: 'source-connection',
+	    routeGroups: [{
+	      id: 'route-whataburger',
+	      name: 'Whataburger route',
+      documentIds: ['source-doc-1'],
+      targets: [{
+        id: 'target-query-view-owner',
+        destinationInstanceId: 'dest-1',
+        targetConnectionId: 'target-connection-1',
+        targetModelId: 'target-model-1',
+        targetFolderPath: 'Target Dashboards',
+        queryViewMappings: [{
+          sourceQueryViewName: 'whataburger_metrics',
+          sourceFileName: 'whataburger_metrics.query.view',
+          action: 'update_existing',
+          targetQueryViewName: 'whataburger_metrics',
+          targetFileName: 'whataburger_metrics.query.view',
+        }],
+      }, {
+        id: 'target-sibling-folder',
+        destinationInstanceId: 'dest-1',
+        targetConnectionId: 'target-connection-1',
+        targetModelId: 'target-model-1',
+        targetFolderPath: 'Target Dashboards Copy',
+      }],
+    }],
+    targets: [],
+    documentIds: ['source-doc-1'],
+    emptyFirst: false,
+	    replaceSameNamed: true,
+	    deleteSourceOnSuccess: false,
+	  });
+	  const plannedQueryViewPrep = plan.steps.find((item) => item.kind === 'query_view_prepare');
+	  const plannedUpdates = plan.steps.filter((item) => item.kind === 'update');
+
+	  assert.equal(plannedQueryViewPrep?.blocked, true);
+	  assert.match(plannedQueryViewPrep?.error || '', /Query view whataburger_metrics needs resolution/);
+	  assert.equal(plannedUpdates.length, 2);
+	  assert.equal(plannedUpdates.some((item) => item.blocked), true);
+
+	  await assert.rejects(() => createMigrationJob({
+	    sourceId: 'source-1',
+	    sourceConnectionId: 'source-connection',
+	    routeGroups: [{
+	      id: 'route-whataburger',
+	      name: 'Whataburger route',
+	      documentIds: ['source-doc-1'],
+	      targets: [{
+	        id: 'target-query-view-owner',
+	        destinationInstanceId: 'dest-1',
+	        targetConnectionId: 'target-connection-1',
+	        targetModelId: 'target-model-1',
+	        targetFolderPath: 'Target Dashboards',
+	        queryViewMappings: [{
+	          sourceQueryViewName: 'whataburger_metrics',
+	          sourceFileName: 'whataburger_metrics.query.view',
+	          action: 'update_existing',
+	          targetQueryViewName: 'whataburger_metrics',
+	          targetFileName: 'whataburger_metrics.query.view',
+	        }],
+	      }, {
+	        id: 'target-sibling-folder',
+	        destinationInstanceId: 'dest-1',
+	        targetConnectionId: 'target-connection-1',
+	        targetModelId: 'target-model-1',
+	        targetFolderPath: 'Target Dashboards Copy',
+	      }],
+	    }],
+	    targets: [],
+	    documentIds: ['source-doc-1'],
+	    emptyFirst: false,
+	    replaceSameNamed: true,
+	    deleteSourceOnSuccess: false,
+	    postMigrationActions: [{
+	      kind: 'refresh-schema',
+	      name: 'Destination: refresh schema target-model-1',
+	      method: 'POST',
+	      url: '',
+      headers: {},
+      body: '',
+      destinationInstanceId: 'dest-1',
+	      targetModelId: 'target-model-1',
+	      targetModelName: 'Target Model',
+	    }],
+	  }), /Query view whataburger_metrics needs resolution/);
+	  assert.equal(draftCalls, 0);
+	  assert.equal(refreshCalls, 0);
+	});
 
 test('dashboard migration copies source topic YAML before dashboard import', async () => {
   upsertInstance({

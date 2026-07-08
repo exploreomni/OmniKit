@@ -240,6 +240,7 @@ function parseTargets(value: unknown): MigrationTarget[] {
         targetModelName: cleanString(target.targetModelName),
         targetFolderId: cleanString(target.targetFolderId),
         targetFolderPath: cleanString(target.targetFolderPath),
+        sameNamedStrategy: target.sameNamedStrategy === 'replace' ? 'replace' as const : 'update' as const,
         topicMappings: parseTopicMappings(target.topicMappings),
         queryViewMappings: parseQueryViewMappings(target.queryViewMappings),
         fieldMappings: parseFieldMappings(target.fieldMappings),

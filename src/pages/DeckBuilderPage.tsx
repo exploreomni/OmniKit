@@ -18,14 +18,18 @@ import {
   Eraser,
   History,
   LayoutDashboard,
+  Lock,
+  ShieldCheck,
 } from 'lucide-react';
 import { useConnection } from '@/contexts/ConnectionContext';
 import { useLogOperation } from '@/contexts/OperationLogContext';
 import { useConnectionRequestGuard } from '@/hooks/useConnectionRequestGuard';
+import { useVaultSession } from '@/hooks/useVaultSession';
 import { PageHeader } from '@/components/layout/PageHeader';
 import { Blobby } from '@/components/ui/Blobby';
 import { DownloadAnimation } from '@/components/ui/DownloadAnimation';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import {
   selectedBadgeClass,
@@ -54,6 +58,12 @@ import {
   nativeVisualLabel,
   resolveEffectiveRenderKind,
 } from '@/services/deckBuilder/nativeVisuals';
+import { buildDeckInsightPrompt } from '@/services/deckBuilder/prompts';
+import { buildInsightDigest } from '@/services/deckBuilder/querySummary';
+import {
+  DeckInsightCancelledError,
+  generateDeckInsight,
+} from '@/services/deckBuilder/insightWriter';
 import {
   buildRecipe,
   downloadJson,
@@ -79,6 +89,8 @@ import type {
   DashboardFilter,
   DashboardTile,
   FilterOverride,
+  InsightGenerationStatus,
+  InsightSource,
   LayoutKit,
   NativeVisualOverride,
   RenderStrategy,
@@ -121,6 +133,14 @@ import {
   saveDeckDraft,
   type DeckBuilderDraft,
 } from '@/services/deckBuilder/deckDraftStorage';
+import {
+  buildRecipeLoadFeedback,
+  generationFailureMessage,
+  insightSourceAfterUserEdit,
+  shouldGenerateAiInsightForAll,
+  type DeckBuilderStepId,
+  type LoadedDeckNotice,
+} from '@/services/deckBuilder/workflowFlow';
 import { ingestPptxTemplate } from '@/services/deckBuilder/pptxTemplateIngest';
 import { DashboardSearch } from '@/components/deckBuilder/DashboardSearch';
 import { DeckOutputStep } from '@/components/deckBuilder/DeckOutputStep';
@@ -128,7 +148,7 @@ import { FilterEditor } from '@/components/deckBuilder/FilterEditor';
 import { BatchSetup } from '@/components/deckBuilder/BatchSetup';
 import { SlideLayoutPreview } from '@/components/deckBuilder/SlideLayoutPreview';
 
-type StepId = 'inspect' | 'select' | 'visuals' | 'filters' | 'brand' | 'layout' | 'generate';
+type StepId = DeckBuilderStepId;
 
 type ConfirmDialogState = {
   title: string;
@@ -150,11 +170,6 @@ type TextPromptState = {
   secondaryPlaceholder?: string;
   confirmLabel: string;
   onConfirm: (value: string, secondaryValue?: string) => void;
-};
-
-type LoadedDeckNotice = {
-  title: string;
-  message: string;
 };
 
 const STEPS: Array<{ id: StepId; label: string; description: string }> = [
@@ -219,21 +234,6 @@ function dashboardIdFromRecipeUrl(dashboardUrl: string): string | undefined {
   }
 }
 
-function stepAfterRecipeLoad(_recipe: ReturnType<typeof validateRecipe>, validTileCount: number): StepId {
-  if (validTileCount === 0) return 'select';
-  return 'visuals';
-}
-
-function recipeTileLabel(recipe: ReturnType<typeof validateRecipe>, tileId: string): string {
-  return recipe.slideOverrides?.[tileId]?.title?.trim() || tileId;
-}
-
-function summarizeMissingTileLabels(labels: string[]): string {
-  if (labels.length === 0) return '';
-  const visible = labels.slice(0, 4).join(', ');
-  return labels.length > 4 ? `${visible}, +${labels.length - 4} more` : visible;
-}
-
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
   const units = ['B', 'KB', 'MB', 'GB'];
@@ -262,9 +262,15 @@ function estimateRemainingDuration(startedAt: number | null, now: number | null,
   return formatDuration(msPerUnit * Math.max(0, total - completed));
 }
 
+function shortenLogId(value?: string): string {
+  if (!value) return 'not returned';
+  return value.length > 18 ? `${value.slice(0, 8)}...${value.slice(-6)}` : value;
+}
+
 export function DeckBuilderPage() {
   const { connection } = useConnection();
   const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
+  const { status: vaultSessionState, unlock: unlockVaultSession } = useVaultSession();
   const logOp = useLogOperation();
 
   const [step, setStep] = useState<StepId>('inspect');
@@ -301,6 +307,9 @@ export function DeckBuilderPage() {
   const [recipeVaultLocked, setRecipeVaultLocked] = useState(false);
   const [recipeLibraryMessage, setRecipeLibraryMessage] = useState('');
   const [recipeLibraryError, setRecipeLibraryError] = useState('');
+  const [recipeVaultPassphrase, setRecipeVaultPassphrase] = useState('');
+  const [recipeVaultUnlocking, setRecipeVaultUnlocking] = useState(false);
+  const [recipeVaultUnlockError, setRecipeVaultUnlockError] = useState('');
   const [pendingDraft, setPendingDraft] = useState<DeckBuilderDraft | null>(null);
   const [loadedDeckNotice, setLoadedDeckNotice] = useState<LoadedDeckNotice | null>(null);
 
@@ -334,6 +343,9 @@ export function DeckBuilderPage() {
   const [logoUploadError, setLogoUploadError] = useState<string | null>(null);
 
   const [insights, setInsights] = useState<Record<string, string>>({});
+  const [insightSources, setInsightSources] = useState<Record<string, InsightSource>>({});
+  const [insightGenerationStatuses, setInsightGenerationStatuses] = useState<Record<string, InsightGenerationStatus>>({});
+  const [insightGenerationProgress, setInsightGenerationProgress] = useState('');
   const [includeAppendix, setIncludeAppendix] = useState(true);
 
   const [exportStates, setExportStates] = useState<Record<string, TileExportState>>({});
@@ -353,6 +365,7 @@ export function DeckBuilderPage() {
   const [renderStrategy, setRenderStrategy] = useState<'native' | 'tile-image' | 'full-dashboard'>('native');
   const [expandedErrors, setExpandedErrors] = useState<Record<string, boolean>>({});
   const abortRef = useRef<AbortController | null>(null);
+  const insightAbortRef = useRef<AbortController | null>(null);
 
   const recipeFileInput = useRef<HTMLInputElement | null>(null);
   const brandFileInput = useRef<HTMLInputElement | null>(null);
@@ -617,6 +630,25 @@ export function DeckBuilderPage() {
     void refreshRecipes();
   }, [refreshRecipes]);
 
+  const handleUnlockRecipeVault = useCallback(async () => {
+    const passphrase = recipeVaultPassphrase.trim();
+    if (!passphrase || recipeVaultUnlocking) return;
+    setRecipeVaultUnlocking(true);
+    setRecipeVaultUnlockError('');
+    try {
+      await unlockVaultSession(passphrase);
+      setRecipeVaultPassphrase('');
+      setRecipeVaultLocked(false);
+      await refreshRecipes();
+      setRecipeLibraryError('');
+      setRecipeLibraryMessage('Vault unlocked. Saved deck recipes are available again.');
+    } catch (error) {
+      setRecipeVaultUnlockError(error instanceof Error ? error.message : 'Could not unlock the native vault.');
+    } finally {
+      setRecipeVaultUnlocking(false);
+    }
+  }, [recipeVaultPassphrase, recipeVaultUnlocking, refreshRecipes, unlockVaultSession]);
+
   useEffect(() => {
     if (!connection.baseUrl || !dashboard) return;
     saveDeckDraft(connectionKey, {
@@ -625,6 +657,7 @@ export function DeckBuilderPage() {
       dashboardUrl: dashboard.url,
       selectedTileIds: selectedIds,
       insights,
+      insightSources: Object.keys(insightSources).length > 0 ? insightSources : undefined,
       brand,
       includeAppendix,
       generatedFrom: connection.baseUrl,
@@ -645,6 +678,7 @@ export function DeckBuilderPage() {
     step,
     selectedIds,
     insights,
+    insightSources,
     brand,
     includeAppendix,
     filterOverrides,
@@ -849,6 +883,10 @@ export function DeckBuilderPage() {
       setNativeVisualOverrides({});
       setTileVisualSpecs({});
       setSlideOverrides({});
+      setInsights({});
+      setInsightSources({});
+      setInsightGenerationStatuses({});
+      setInsightGenerationProgress('');
       setPreviewStates({});
       setPreviewError('');
       setPendingDraft(null);
@@ -1099,6 +1137,7 @@ export function DeckBuilderPage() {
       setUrl(recipe.dashboardUrl);
       setBrand(recipe.brand);
       setInsights(recipe.insights);
+      setInsightSources(recipe.insightSources || {});
       setIncludeAppendix(recipe.includeAppendix);
       if (recipe.templateId) {
         const kit = getTemplate(recipe.templateId);
@@ -1130,10 +1169,15 @@ export function DeckBuilderPage() {
         const validIds = new Set(summary.tiles.map((t) => t.id));
         const validSelectedIds = recipe.selectedTileIds.filter((id) => validIds.has(id));
         const missingTileIds = recipe.selectedTileIds.filter((id) => !validIds.has(id));
-        const missingTileLabels = missingTileIds.map((id) => recipeTileLabel(recipe, id));
-        const missingSummary = summarizeMissingTileLabels(missingTileLabels);
         const loadedCount = validSelectedIds.length;
         const savedCount = recipe.selectedTileIds.length;
+        const recipeFeedback = buildRecipeLoadFeedback({
+          recipe,
+          label,
+          loadedCount,
+          savedCount,
+          missingTileIds,
+        });
         setSelectedIds(validSelectedIds);
         const liveSeed = seedOverridesFromDashboardFilters(next.filters);
         setDashboardDefaults(liveSeed);
@@ -1153,26 +1197,9 @@ export function DeckBuilderPage() {
         }
         loadSavedFilterSets(parsed.dashboardId);
         setRecipeLibraryError('');
-        setRecipeLibraryMessage(
-          loadedCount > 0 && missingTileIds.length > 0
-            ? `Loaded "${label}" with ${loadedCount} of ${savedCount} saved slide${savedCount === 1 ? '' : 's'}. Missing: ${missingSummary}.`
-            : loadedCount > 0
-            ? `Loaded "${label}". Review output choices before previewing the deck.`
-            : `Loaded "${label}", but its saved tiles were not found on this dashboard${missingSummary ? `: ${missingSummary}` : ''}.`,
-        );
-        setLoadedDeckNotice(
-          loadedCount > 0
-            ? {
-                title: missingTileIds.length > 0
-                  ? `Loaded ${loadedCount} of ${savedCount} slides from "${label}"`
-                  : `Loaded "${label}"`,
-                message: missingTileIds.length > 0
-                  ? `This recipe still restored the matching slides, branding, notes, and output preferences. Missing saved slides: ${missingSummary}.`
-                  : 'Recipes restore slide choices, branding, notes, and output preferences. Review the output choices first, then continue to deck preview when the slides are ready.',
-              }
-            : null,
-        );
-        setStep(stepAfterRecipeLoad(recipe, validSelectedIds.length));
+        setRecipeLibraryMessage(recipeFeedback.libraryMessage);
+        setLoadedDeckNotice(recipeFeedback.loadedNotice);
+        setStep(recipeFeedback.nextStep);
       } finally {
         setInspecting(false);
       }
@@ -1222,6 +1249,7 @@ export function DeckBuilderPage() {
     setDashboard(nextDashboard);
     setBrand(recipe.brand);
     setInsights(recipe.insights);
+    setInsightSources(recipe.insightSources || {});
     setIncludeAppendix(recipe.includeAppendix);
     if (recipe.templateId) {
       const kit = getTemplate(recipe.templateId);
@@ -1452,7 +1480,7 @@ export function DeckBuilderPage() {
         failureCount: failedCount,
       });
     } catch (err) {
-      setGenerationError(abortRef.current?.signal.aborted ? 'Deck generation cancelled before download.' : err instanceof Error ? err.message : 'Deck generation failed.');
+      setGenerationError(generationFailureMessage('single', Boolean(abortRef.current?.signal.aborted), err));
     } finally {
       setGenerating(false);
       setGenerationPhase('');
@@ -1565,7 +1593,7 @@ export function DeckBuilderPage() {
         failureCount: result.failed,
       });
     } catch (err) {
-      setGenerationError(abortRef.current?.signal.aborted ? 'Batch generation cancelled before download.' : err instanceof Error ? err.message : 'Batch generation failed.');
+      setGenerationError(generationFailureMessage('batch', Boolean(abortRef.current?.signal.aborted), err));
     } finally {
       setGenerating(false);
       setGenerationPhase('');
@@ -1662,9 +1690,9 @@ export function DeckBuilderPage() {
     } finally {
       setPreviewing(false);
     }
-  }, [
-    dashboard,
-    selectedTiles,
+	  }, [
+	    dashboard,
+	    selectedTiles,
     filterOverrides,
     batchEnabled,
     batchField,
@@ -1672,8 +1700,217 @@ export function DeckBuilderPage() {
     renderStrategy,
     connection.baseUrl,
     connection.apiKey,
-    tileVisualSources,
-  ]);
+	    tileVisualSources,
+	  ]);
+
+  const handleInsightsChange = useCallback((next: Record<string, string>) => {
+    setInsights((prev) => {
+      setInsightSources((current) => {
+        const updated = { ...current };
+        const keys = new Set([...Object.keys(prev), ...Object.keys(next)]);
+        for (const key of keys) {
+          if ((prev[key] || '') === (next[key] || '')) continue;
+          const source = insightSourceAfterUserEdit(current[key], next[key] || '');
+          if (source) updated[key] = source;
+          else delete updated[key];
+        }
+        return updated;
+      });
+      return next;
+    });
+  }, []);
+
+  const discardAiInsight = useCallback((tileId: string) => {
+    setInsights((prev) => {
+      const next = { ...prev };
+      delete next[tileId];
+      return next;
+    });
+    setInsightSources((prev) => {
+      const next = { ...prev };
+      delete next[tileId];
+      return next;
+    });
+    setInsightGenerationStatuses((prev) => ({
+      ...prev,
+      [tileId]: { state: 'idle', message: 'AI draft discarded.' },
+    }));
+  }, []);
+
+  const previewFilterOverridesForInsights = useCallback(() => {
+    const previewOverrides: Record<string, FilterOverride> = { ...filterOverrides };
+    if (dashboard && batchEnabled && batchField && batchValues.length > 0) {
+      const filterMeta = dashboard.filters.find((f) => f.field === batchField);
+      previewOverrides[batchField] = {
+        field: batchField,
+        kind: filterMeta?.kind ?? 'EQUALS',
+        type: filterMeta?.type ?? 'string',
+        values: [batchValues[0]],
+      };
+    }
+    return previewOverrides;
+  }, [batchEnabled, batchField, batchValues, dashboard, filterOverrides]);
+
+  const runAiInsightForTile = useCallback(async (tile: DashboardTile, controller: AbortController, sequenceLabel?: string) => {
+    if (!dashboard) throw new Error('Inspect a dashboard before generating AI insights.');
+    const startedAt = Date.now();
+    const preview = previewStates[tile.id];
+    const result = preview?.result;
+    if (!result) {
+      throw new Error('Render this slide first so OmniKit has data to summarize.');
+    }
+    const effective = resolveEffectiveRenderKind(result, nativeVisualOverrides[tile.id] || 'auto');
+    const digest = buildInsightDigest({
+      tile,
+      result,
+      filters: previewFilterOverridesForInsights(),
+      visualKind: nativeVisualLabel(effective.kind),
+      dashboardName: dashboard.name,
+    });
+    if (digest.empty) {
+      throw new Error('No data was returned for this tile, so there is no trend to summarize.');
+    }
+    const modelId = digest.modelId || dashboard.modelId || '';
+    if (!modelId) {
+      throw new Error('This tile does not expose a model ID for Omni AI.');
+    }
+    const prompt = buildDeckInsightPrompt({
+      dashboardName: dashboard.name,
+      tileName: tile.name,
+      digest,
+    });
+    setInsightGenerationStatuses((prev) => ({
+      ...prev,
+      [tile.id]: { state: 'running', message: sequenceLabel || 'Creating AI insight...' },
+    }));
+    const outcome = await generateDeckInsight({
+      baseUrl: connection.baseUrl,
+      apiKey: connection.apiKey,
+      modelId,
+      topicName: digest.topic || dashboard.topics[0],
+      prompt,
+      signal: controller.signal,
+      onStatus: (message) => {
+        setInsightGenerationStatuses((prev) => ({
+          ...prev,
+          [tile.id]: { ...prev[tile.id], state: 'running', message },
+        }));
+      },
+      onJobId: (jobId) => {
+        setInsightGenerationStatuses((prev) => ({
+          ...prev,
+          [tile.id]: { ...prev[tile.id], state: 'running', jobId, message: prev[tile.id]?.message },
+        }));
+      },
+    });
+    setInsights((prev) => ({ ...prev, [tile.id]: outcome.text }));
+    setInsightSources((prev) => ({ ...prev, [tile.id]: 'ai' }));
+    setInsightGenerationStatuses((prev) => ({
+      ...prev,
+      [tile.id]: {
+        state: 'success',
+        message: outcome.truncated ? 'AI draft ready. Trimmed to fit the slide box.' : 'AI draft ready.',
+        jobId: outcome.jobId,
+        truncated: outcome.truncated,
+      },
+    }));
+    logOp('ai_query', `Deck Builder insight succeeded: ${tile.name}, job ${shortenLogId(outcome.jobId)}`, {
+      durationMs: Date.now() - startedAt,
+      successCount: 1,
+      failureCount: 0,
+    });
+  }, [connection.apiKey, connection.baseUrl, dashboard, logOp, nativeVisualOverrides, previewFilterOverridesForInsights, previewStates]);
+
+  const handleCancelInsightGeneration = useCallback(() => {
+    setInsightGenerationProgress('Cancelling AI insight generation...');
+    insightAbortRef.current?.abort();
+  }, []);
+
+  const startInsightGeneration = useCallback(async (tileId: string) => {
+    const tile = selectedTiles.find((item) => item.id === tileId);
+    if (!tile || insightAbortRef.current) return;
+    const controller = new AbortController();
+    insightAbortRef.current = controller;
+    setInsightGenerationProgress('');
+    try {
+      await runAiInsightForTile(tile, controller);
+    } catch (error) {
+      const state = error instanceof DeckInsightCancelledError || controller.signal.aborted ? 'cancelled' : 'error';
+      setInsightGenerationStatuses((prev) => ({
+        ...prev,
+        [tile.id]: {
+          state,
+          message: state === 'cancelled' ? 'AI insight generation cancelled.' : error instanceof Error ? error.message : 'AI insight generation failed.',
+        },
+      }));
+      logOp('ai_query', `Deck Builder insight ${state}: ${tile.name}`, {
+        successCount: 0,
+        failureCount: state === 'cancelled' ? 0 : 1,
+      });
+    } finally {
+      insightAbortRef.current = null;
+      setInsightGenerationProgress('');
+    }
+  }, [logOp, runAiInsightForTile, selectedTiles]);
+
+  const handleGenerateInsight = useCallback((tileId: string) => {
+    const currentText = insights[tileId]?.trim();
+    const currentSource = insightSources[tileId];
+    if (currentText && (currentSource === 'user' || currentSource === 'ai_edited')) {
+      setConfirmDialog({
+        title: 'Replace this written insight?',
+        message: 'This will replace the current insight with a new AI draft. Your existing text will not be recoverable from OmniKit after replacement.',
+        confirmLabel: 'Replace with AI',
+        cancelLabel: 'Keep current',
+        onConfirm: () => void startInsightGeneration(tileId),
+      });
+      return;
+    }
+    void startInsightGeneration(tileId);
+  }, [insightSources, insights, startInsightGeneration]);
+
+  const handleGenerateAllInsights = useCallback(async () => {
+    if (insightAbortRef.current) return;
+    const eligibleTiles = selectedTiles.filter((tile) => shouldGenerateAiInsightForAll(insights[tile.id], insightSources[tile.id]));
+    if (eligibleTiles.length === 0) {
+      setInsightGenerationProgress('All selected slides already have user-written, edited, or AI draft insights.');
+      return;
+    }
+    const controller = new AbortController();
+    insightAbortRef.current = controller;
+    let completed = 0;
+    try {
+      for (let index = 0; index < eligibleTiles.length; index += 1) {
+        const tile = eligibleTiles[index];
+        if (controller.signal.aborted) throw new DeckInsightCancelledError();
+        const label = `Writing insight ${index + 1} of ${eligibleTiles.length}...`;
+        setInsightGenerationProgress(label);
+        try {
+          await runAiInsightForTile(tile, controller, label);
+          completed += 1;
+        } catch (error) {
+          if (error instanceof DeckInsightCancelledError || controller.signal.aborted) throw error;
+          setInsightGenerationStatuses((prev) => ({
+            ...prev,
+            [tile.id]: {
+              state: 'error',
+              message: error instanceof Error ? error.message : 'AI insight generation failed.',
+            },
+          }));
+          logOp('ai_query', `Deck Builder insight failed: ${tile.name}`, {
+            successCount: 0,
+            failureCount: 1,
+          });
+        }
+      }
+      setInsightGenerationProgress(`Generated ${completed} AI insight${completed === 1 ? '' : 's'}.`);
+      window.setTimeout(() => setInsightGenerationProgress(''), 4000);
+    } catch {
+      setInsightGenerationProgress(`AI insight generation cancelled after ${completed} insight${completed === 1 ? '' : 's'}.`);
+    } finally {
+      insightAbortRef.current = null;
+    }
+  }, [insightSources, insights, logOp, runAiInsightForTile, selectedTiles]);
 
   const buildCurrentRecipe = useCallback(() => {
     if (!dashboard) return;
@@ -1683,6 +1920,7 @@ export function DeckBuilderPage() {
       dashboardName: dashboard.name,
       selectedTileIds: selectedIds,
       insights,
+      insightSources: Object.keys(insightSources).length > 0 ? insightSources : undefined,
       brand,
       includeAppendix,
       generatedFrom: connection.baseUrl,
@@ -1694,7 +1932,7 @@ export function DeckBuilderPage() {
       tileVisualSpecs: Object.keys(tileVisualSpecs).length > 0 ? tileVisualSpecs : undefined,
       slideOverrides: Object.keys(slideOverrides).length > 0 ? slideOverrides : undefined,
     });
-  }, [dashboard, selectedIds, insights, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides]);
+  }, [dashboard, selectedIds, insights, insightSources, brand, includeAppendix, connection.baseUrl, filterOverrides, batchEnabled, batchField, batchValues, currentTemplate, tileVisualSources, nativeVisualOverrides, tileVisualSpecs, slideOverrides]);
 
   const handleExportRecipe = useCallback(() => {
     if (!dashboard) return;
@@ -2069,7 +2307,13 @@ export function DeckBuilderPage() {
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {localRecipeCount > 0 && (
-                  <button onClick={() => void handleMoveLocalRecipesToVault()} className="btn-secondary" type="button" disabled={recipesLoading || recipeVaultLocked}>
+                  <button
+                    onClick={() => void handleMoveLocalRecipesToVault()}
+                    className="btn-secondary"
+                    type="button"
+                    disabled={recipesLoading || recipeVaultLocked}
+                    title={recipeVaultLocked ? 'Unlock the vault below before moving browser recipes.' : undefined}
+                  >
                     <Upload size={14} />
                     Move {localRecipeCount} browser recipe{localRecipeCount === 1 ? '' : 's'} to vault
                   </button>
@@ -2105,13 +2349,52 @@ export function DeckBuilderPage() {
               </div>
             )}
             {recipeVaultLocked && (
-              <div className="flex flex-col gap-2 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-[12px] text-amber-900 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <span className="font-semibold">Recipe vault locked.</span> Vault save/load actions require unlock, but local JSON import/export and browser-only recipes still work.
+              <div className="rounded-card border border-amber-200 bg-amber-50 p-3 text-[12px] text-amber-900">
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                  <div className="flex items-start gap-2">
+                    <span className="mt-0.5 flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-button bg-white text-amber-700">
+                      <Lock size={14} />
+                    </span>
+                    <div>
+                      <div className="font-semibold">Recipe vault locked.</div>
+                      <p className="mt-0.5 text-amber-800">
+                        Vault save/load actions require unlock, but local JSON import/export and browser-only recipes still work here.
+                      </p>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 sm:min-w-[340px]">
+                    <div className="flex flex-col gap-2 sm:flex-row">
+                      <PassphraseInput
+                        value={recipeVaultPassphrase}
+                        onChange={setRecipeVaultPassphrase}
+                        placeholder={vaultSessionState === 'no-vault' ? 'Create a vault on Home first' : 'Enter vault passphrase'}
+                        disabled={recipeVaultUnlocking || vaultSessionState === 'no-vault'}
+                        className="min-w-0 flex-1"
+                        inputClassName="h-9 bg-white text-[12px]"
+                        onSubmit={handleUnlockRecipeVault}
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void handleUnlockRecipeVault()}
+                        disabled={recipeVaultUnlocking || vaultSessionState === 'no-vault' || !recipeVaultPassphrase.trim()}
+                        className="btn-secondary btn-sm justify-center"
+                      >
+                        {recipeVaultUnlocking ? <Loader2 size={12} className="animate-spin" /> : <ShieldCheck size={12} />}
+                        Unlock here
+                      </button>
+                    </div>
+                    {recipeVaultUnlockError && (
+                      <div role="alert" className="text-[11px] font-medium text-red-700">
+                        {recipeVaultUnlockError}
+                      </div>
+                    )}
+                    {vaultSessionState === 'no-vault' && (
+                      <div className="text-[11px] text-amber-800">
+                        Create a native vault on Home or Instance Manager before saving recipe libraries.
+                      </div>
+                    )}
+                  </div>
                 </div>
-                <a href="/instances" className="btn-secondary btn-sm flex-shrink-0">
-                  Unlock vault
-                </a>
               </div>
             )}
 
@@ -2129,7 +2412,7 @@ export function DeckBuilderPage() {
                     onClick={() => void handleMoveLocalRecipesToVault()}
                     disabled={recipeVaultLocked || recipesLoading}
                     className="btn-secondary btn-sm flex-shrink-0"
-                    title={recipeVaultLocked ? 'Unlock the vault before moving browser recipes.' : undefined}
+                    title={recipeVaultLocked ? 'Unlock the vault in the Recipes section before moving browser recipes.' : undefined}
                   >
                     <Upload size={12} />
                     Move all to vault
@@ -2145,7 +2428,7 @@ export function DeckBuilderPage() {
                             <div className="truncate text-[13px] font-semibold text-content-primary">{record.name}</div>
                             <div className="truncate text-[10px] text-content-tertiary">{dashboardLabel}</div>
                           </div>
-                          <span className="rounded-full bg-amber-50 px-2 py-0.5 text-[10px] font-semibold text-amber-700">browser</span>
+                          <StatusChip status="warning" label="Browser" size="xs" showDot={false} />
                         </div>
                         <div className="text-[10px] text-content-tertiary">
                           {record.recipe.selectedTileIds.length} tile(s) · updated {new Date(record.updatedAt).toLocaleDateString()}
@@ -2154,7 +2437,13 @@ export function DeckBuilderPage() {
                           <button onClick={() => void handleLoadLocalRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting}>
                             Load
                           </button>
-                          <button onClick={() => void handleMoveLocalRecipesToVault([record])} className="btn-ghost btn-sm" type="button" disabled={recipeVaultLocked || recipesLoading}>
+                          <button
+                            onClick={() => void handleMoveLocalRecipesToVault([record])}
+                            className="btn-ghost btn-sm"
+                            type="button"
+                            disabled={recipeVaultLocked || recipesLoading}
+                            title={recipeVaultLocked ? 'Unlock the vault in the Recipes section before moving this browser recipe.' : undefined}
+                          >
                             Move to vault
                           </button>
                           <button onClick={() => handleExportRecipeRecord(record)} className="btn-ghost btn-sm" type="button">
@@ -2220,9 +2509,7 @@ export function DeckBuilderPage() {
                         </div>
                       </div>
                       {visualChoiceCount > 0 && (
-                        <div className="inline-flex rounded-full bg-omni-50 px-2 py-1 text-[10px] font-medium text-omni-700">
-                          Native visuals customized
-                        </div>
+                        <StatusChip status="info" label="Native visuals customized" size="xs" showDot={false} />
                       )}
                       <div className="flex flex-wrap gap-1.5">
                         <button onClick={() => void handleLoadRecipeRecord(record)} className="btn-primary btn-sm" type="button" disabled={inspecting || recipeVaultLocked}>
@@ -2835,10 +3122,17 @@ export function DeckBuilderPage() {
             template={currentTemplate}
             brand={brand}
             overrides={slideOverrides}
-            onChange={setSlideOverrides}
-            insights={insights}
-            onInsightsChange={setInsights}
-            includeAppendix={includeAppendix}
+	            onChange={setSlideOverrides}
+	            insights={insights}
+	            insightSources={insightSources}
+	            insightGenerationStatuses={insightGenerationStatuses}
+	            insightGenerationProgress={insightGenerationProgress}
+	            onInsightsChange={handleInsightsChange}
+	            onGenerateInsight={handleGenerateInsight}
+	            onGenerateAllInsights={handleGenerateAllInsights}
+	            onCancelInsightGeneration={handleCancelInsightGeneration}
+	            onDiscardAiInsight={discardAiInsight}
+	            includeAppendix={includeAppendix}
             onIncludeAppendixChange={setIncludeAppendix}
             tileVisualSources={tileVisualSources}
             nativeVisualOverrides={nativeVisualOverrides}
@@ -3080,18 +3374,12 @@ export function DeckBuilderPage() {
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-1.5 text-[11px]">
-                    <span className="rounded-full bg-green-50 px-2 py-1 font-medium text-green-700">
-                      {batchProgressSummary.succeededDecks} done
-                    </span>
+                    <StatusChip status="success" label={`${batchProgressSummary.succeededDecks} done`} size="xs" />
                     {batchProgressSummary.failedDecks > 0 && (
-                      <span className="rounded-full bg-red-50 px-2 py-1 font-medium text-red-700">
-                        {batchProgressSummary.failedDecks} failed
-                      </span>
+                      <StatusChip status="error" label={`${batchProgressSummary.failedDecks} failed`} size="xs" />
                     )}
                     {batchProgressSummary.cancelledDecks > 0 && (
-                      <span className="rounded-full bg-surface-secondary px-2 py-1 font-medium text-content-secondary">
-                        {batchProgressSummary.cancelledDecks} cancelled
-                      </span>
+                      <StatusChip status="skipped" label={`${batchProgressSummary.cancelledDecks} cancelled`} size="xs" />
                     )}
                   </div>
                 </div>

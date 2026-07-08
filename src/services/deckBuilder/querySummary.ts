@@ -1,4 +1,4 @@
-import type { DashboardTile } from './types';
+import type { DashboardTile, FilterOverride, TileColumn, TileResult } from './types';
 
 export interface TileQuerySummary {
   kind: 'query' | 'markdown' | 'unsupported';
@@ -11,6 +11,28 @@ export interface TileQuerySummary {
   queryPath?: string;
   advancedJson?: string;
   message?: string;
+}
+
+export interface InsightDigest {
+  text: string;
+  empty: boolean;
+  rowCount: number;
+  sampledRowCount: number;
+  truncated: boolean;
+  budgetTruncated: boolean;
+  samplingNote?: string;
+  modelId?: string;
+  topic?: string;
+  visualKind: string;
+  aggregates: Array<{
+    field: string;
+    label: string;
+    count: number;
+    min: number;
+    max: number;
+    sum: number;
+    average: number;
+  }>;
 }
 
 const SECRET_KEY_RE = /(api[_-]?key|token|secret|password|passphrase|authorization|auth)/i;
@@ -136,6 +158,162 @@ function safeAdvancedJson(body: Record<string, unknown>): string {
   }
 }
 
+function formatNumber(value: number): string {
+  if (!Number.isFinite(value)) return '0';
+  const abs = Math.abs(value);
+  if (abs >= 1000 || (abs > 0 && abs < 0.01)) {
+    return new Intl.NumberFormat('en-US', { maximumFractionDigits: 2 }).format(value);
+  }
+  return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/\.?0+$/, '');
+}
+
+function compactCellValue(key: string, value: unknown, maxLength = 96): string {
+  if (SECRET_KEY_RE.test(key)) return '[redacted]';
+  return compactText(sanitizeForPreview(value), maxLength);
+}
+
+function columnLabel(column: TileColumn): string {
+  return column.label || column.name;
+}
+
+function columnLooksNumeric(column: TileColumn, rows: Array<Record<string, unknown>>): boolean {
+  const type = (column.type || '').toLowerCase();
+  if (/number|int|float|double|decimal|numeric|bigint|long/.test(type)) return true;
+  return rows.some((row) => typeof row[column.name] === 'number' && Number.isFinite(row[column.name] as number));
+}
+
+function sampleRows(rows: Array<Record<string, unknown>>, maxRows: number): Array<Record<string, unknown>> {
+  if (rows.length <= maxRows) return rows;
+  if (maxRows <= 1) return rows.slice(0, 1);
+  const out: Array<Record<string, unknown>> = [];
+  const seen = new Set<number>();
+  for (let i = 0; i < maxRows; i += 1) {
+    const index = Math.round((i * (rows.length - 1)) / (maxRows - 1));
+    if (!seen.has(index)) {
+      seen.add(index);
+      out.push(rows[index]);
+    }
+  }
+  return out;
+}
+
+function summarizeFilterOverrides(filters: Record<string, FilterOverride> | undefined): string[] {
+  if (!filters) return [];
+  return Object.entries(filters).map(([field, filter]) => {
+    const values = compactCellValue(field, filter.values, 120);
+    const operator = filter.kind || filter.type || 'filter';
+    return `${field} ${operator} ${values}`.trim();
+  });
+}
+
+function buildMeasureAggregates(result: TileResult) {
+  return result.columns
+    .filter((column) => !SECRET_KEY_RE.test(column.name) && columnLooksNumeric(column, result.rows))
+    .map((column) => {
+      const values = result.rows
+        .map((row) => row[column.name])
+        .filter((value): value is number => typeof value === 'number' && Number.isFinite(value));
+      if (values.length === 0) return null;
+      const sum = values.reduce((acc, value) => acc + value, 0);
+      return {
+        field: column.name,
+        label: columnLabel(column),
+        count: values.length,
+        min: Math.min(...values),
+        max: Math.max(...values),
+        sum,
+        average: sum / values.length,
+      };
+    })
+    .filter((entry): entry is NonNullable<typeof entry> => Boolean(entry));
+}
+
+export function buildInsightDigest({
+  tile,
+  result,
+  filters,
+  visualKind,
+  dashboardName,
+  maxRows = 30,
+  maxDigestChars = 8000,
+}: {
+  tile: DashboardTile;
+  result: TileResult;
+  filters?: Record<string, FilterOverride>;
+  visualKind?: string;
+  dashboardName?: string;
+  maxRows?: number;
+  maxDigestChars?: number;
+}): InsightDigest {
+  const query = summarizeTileQuery(tile);
+  const boundedMaxRows = Math.max(1, Math.min(50, Math.floor(maxRows)));
+  const sampledRows = sampleRows(result.rows, boundedMaxRows);
+  const safeColumns = result.columns.filter((column) => !SECRET_KEY_RE.test(column.name) && !SECRET_KEY_RE.test(column.label || ''));
+  const truncated = result.rows.length > sampledRows.length;
+  const samplingNote = truncated
+    ? `Showing ${sampledRows.length} evenly sampled rows of ${result.rows.length}.`
+    : undefined;
+  const aggregates = buildMeasureAggregates(result);
+  const filterLines = Array.from(new Set([
+    ...query.filters,
+    ...summarizeFilterOverrides(filters),
+  ])).slice(0, 20);
+
+  const lines: string[] = [
+    `Dashboard: ${dashboardName || 'Untitled dashboard'}`,
+    `Tile: ${tile.name || tile.id}`,
+    `Visual kind: ${visualKind || result.renderKind}`,
+    query.modelId ? `Model ID: ${query.modelId}` : '',
+    query.topic ? `Topic: ${query.topic}` : '',
+    `Rows: ${result.rows.length}`,
+    samplingNote || '',
+    `Columns: ${safeColumns.map((column) => `${columnLabel(column)} (${column.name}, ${column.type || 'unknown'})`).join('; ') || 'none'}`,
+    filterLines.length > 0 ? `Filters: ${filterLines.join('; ')}` : 'Filters: none detected',
+  ].filter(Boolean);
+
+  if (result.rows.length === 0) {
+    lines.push('No rows are available for this tile result. Do not invent a trend or conclusion.');
+  } else {
+    if (aggregates.length > 0) {
+      lines.push('Measure aggregates:');
+      for (const aggregate of aggregates.slice(0, 12)) {
+        lines.push(
+          `- ${aggregate.label}: count ${aggregate.count}, min ${formatNumber(aggregate.min)}, max ${formatNumber(aggregate.max)}, sum ${formatNumber(aggregate.sum)}, avg ${formatNumber(aggregate.average)}`
+        );
+      }
+    }
+    lines.push('Sample rows:');
+    sampledRows.forEach((row, rowIndex) => {
+      const cells = safeColumns.slice(0, 12).map((column) => {
+        return `${columnLabel(column)}=${compactCellValue(column.name, row[column.name])}`;
+      });
+      lines.push(`${rowIndex + 1}. ${cells.join('; ')}`);
+    });
+  }
+
+  const rawText = lines.join('\n');
+  const budget = Math.max(1000, Math.floor(maxDigestChars));
+  const budgetNote = '\nDigest truncated to stay within Omni AI prompt budget.';
+  const budgetTruncated = rawText.length > budget;
+  const text = budgetTruncated
+    ? `${rawText.slice(0, Math.max(0, budget - budgetNote.length)).replace(/\n[^\n]*$/, '')}${budgetNote}`
+    : rawText;
+
+  return {
+    text,
+    empty: result.rows.length === 0,
+    rowCount: result.rows.length,
+    sampledRowCount: sampledRows.length,
+    truncated,
+    budgetTruncated,
+    samplingNote,
+    modelId: query.modelId,
+    topic: query.topic,
+    visualKind: visualKind || result.renderKind,
+    aggregates,
+  };
+}
+
 export function summarizeTileQuery(tile: DashboardTile): TileQuerySummary {
   if (tile.markdown || /markdown|text/i.test(tile.tileType || '')) {
     return {
@@ -181,4 +359,3 @@ export function summarizeTileQuery(tile: DashboardTile): TileQuerySummary {
     advancedJson: safeAdvancedJson(body),
   };
 }
-

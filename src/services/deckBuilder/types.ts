@@ -76,6 +76,17 @@ export type SlideFitMode = 'contain' | 'cover' | 'stretch';
 
 export type InsightFormat = 'paragraph' | 'bullets';
 
+export type InsightSource = 'ai' | 'user' | 'ai_edited';
+
+export type InsightGenerationState = 'idle' | 'running' | 'success' | 'error' | 'cancelled';
+
+export interface InsightGenerationStatus {
+  state: InsightGenerationState;
+  message?: string;
+  jobId?: string;
+  truncated?: boolean;
+}
+
 export type SlideOverlayType = 'text' | 'arrow' | 'line' | 'box' | 'symbol';
 
 export interface SlideBox {
@@ -252,6 +263,7 @@ export interface DeckRecipe {
   dashboardName?: string;
   selectedTileIds: string[];
   insights: Record<string, string>;
+  insightSources?: Record<string, InsightSource>;
   brand: BrandConfig;
   includeAppendix: boolean;
   generatedFrom?: string;

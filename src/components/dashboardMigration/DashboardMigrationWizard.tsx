@@ -267,6 +267,7 @@ function emptyTargetRow(): DashboardMigrationTargetDraft {
     targetModelName: '',
     targetFolderPath: '',
     targetFolderId: '',
+    sameNamedStrategy: 'update',
     topicMappings: [],
     queryViewMappings: [],
     fieldMappings: [],
@@ -322,6 +323,7 @@ function kindLabel(kind: MigrationJobItem['kind']) {
   if (kind === 'field_prepare') return 'FIELD PREP';
   if (kind === 'relationship_prepare') return 'RELATIONSHIP PREP';
   if (kind === 'topic_prepare') return 'TOPIC PREP';
+  if (kind === 'update') return 'UPDATE';
   return kind.toUpperCase();
 }
 
@@ -410,14 +412,16 @@ function queryViewMappingStep4Status(mapping: DashboardMigrationQueryViewMapping
   if (mapping.action === 'unresolved' && (mapping.targetQueryViewName || mapping.sourceFileName)) return 'auto';
   if (mapping.action === 'unresolved' || !mapping.targetQueryViewName) return 'needs';
   if (mapping.status === 'blocked') return 'blocked';
-  if (mapping.action === 'use_existing_unverified' || mapping.status === 'warning') return 'manual';
+  if (mapping.action === 'use_existing_unverified') return 'ready';
+  if (mapping.status === 'warning') return 'manual';
   return 'ready';
 }
 
 function fieldMappingStep4Status(mapping: DashboardMigrationFieldMappingDraft): Step4DependencyStatus {
   if (mapping.action === 'unresolved') return 'needs';
   if (mapping.status === 'blocked') return 'blocked';
-  if (mapping.action === 'ignore' || mapping.status === 'warning') return 'manual';
+  if (mapping.action === 'ignore') return 'ready';
+  if (mapping.status === 'warning') return 'manual';
   if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return 'needs';
   if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return 'blocked';
   return 'ready';
@@ -533,7 +537,7 @@ function fieldDependenciesForRouteTarget(plan: MigrationPlan | null, routeGroupI
   if (!plan) return [];
   const dependencies = new Map<string, MigrationFieldDependency>();
   for (const step of plan.steps) {
-    if (step.kind !== 'field_prepare' && step.kind !== 'import' && step.kind !== 'topic_prepare') continue;
+    if (step.kind !== 'field_prepare' && step.kind !== 'import' && step.kind !== 'update' && step.kind !== 'topic_prepare') continue;
     if (step.routeGroupId && step.routeGroupId !== routeGroupId) continue;
     if (step.targetId !== targetId) continue;
     for (const dependency of fieldDependenciesFromDetails(step.details)) {
@@ -575,6 +579,16 @@ function semanticAuditLines(item: MigrationJobItem): string[] {
     return [
       created.length > 0 ? `Created topics: ${created.join(', ')}` : '',
       mapped.length > 0 ? `Mapped topics: ${mapped.join(', ')}` : '',
+    ].filter(Boolean);
+  }
+  if (item.kind === 'update') {
+    return [
+      typeof details.tileCount === 'number' ? `Updated in place: ${details.tileCount} source tile${details.tileCount === 1 ? '' : 's'}.` : '',
+      typeof details.deletedTileCount === 'number' && details.deletedTileCount > 0 ? `Removed ${details.deletedTileCount} destination-only tile${details.deletedTileCount === 1 ? '' : 's'}.` : '',
+      typeof details.modelRewriteCount === 'number' && details.modelRewriteCount > 0 ? `Rewrote ${details.modelRewriteCount} model reference${details.modelRewriteCount === 1 ? '' : 's'}.` : '',
+      typeof details.topicRewriteCount === 'number' && details.topicRewriteCount > 0 ? `Rewrote ${details.topicRewriteCount} topic reference${details.topicRewriteCount === 1 ? '' : 's'}.` : '',
+      typeof details.queryViewRewriteCount === 'number' && details.queryViewRewriteCount > 0 ? `Rewrote ${details.queryViewRewriteCount} query-view reference${details.queryViewRewriteCount === 1 ? '' : 's'}.` : '',
+      typeof details.draftIdentifier === 'string' ? `Draft ${details.draftIdentifier} published.` : '',
     ].filter(Boolean);
   }
   if (item.kind === 'import' && typeof details.topicRewriteCount === 'number' && details.topicRewriteCount > 0) {
@@ -1553,7 +1567,10 @@ export function DashboardMigrationWizard() {
         if (!queryViewCatalog?.loaded) {
           return `Load destination query views for route ${routeLabel} before review.`;
         }
-        const unresolved = existingMappings.find((mapping) => !mapping.targetQueryViewName || mapping.status === 'blocked' || mapping.action === 'unresolved');
+        const unresolved = existingMappings.find((mapping) => {
+          const status = queryViewMappingStep4Status(mapping);
+          return status === 'auto' || status === 'needs' || status === 'blocked' || status === 'destructive';
+        });
         if (unresolved) {
           return unresolvedQueryViewMappingRouteMessage({
             sourceQueryViewName: unresolved.sourceQueryViewName,
@@ -1752,6 +1769,8 @@ export function DashboardMigrationWizard() {
   const jobDone = job ? isTerminalJobStatus(job.status) : false;
   const exportItems = job?.items.filter((item) => item.kind === 'export') || [];
   const importItems = job?.items.filter((item) => item.kind === 'import') || [];
+  const updateItems = job?.items.filter((item) => item.kind === 'update') || [];
+  const dashboardWriteItems = [...importItems, ...updateItems];
   const queryViewPrepareItems = job?.items.filter((item) => item.kind === 'query_view_prepare') || [];
   const relationshipPrepareItems = job?.items.filter((item) => item.kind === 'relationship_prepare') || [];
   const topicPrepareItems = job?.items.filter((item) => item.kind === 'topic_prepare') || [];
@@ -1761,7 +1780,7 @@ export function DashboardMigrationWizard() {
   const completedItems = job ? terminalCount(job.items) : 0;
   const failedItems = job?.items.filter((item) => item.status === 'failed') || [];
   const warningItems = job?.items.filter((item) => item.status === 'warning' || (item.warnings?.length || 0) > 0) || [];
-  const importedDashboardLinks = importItems
+  const importedDashboardLinks = dashboardWriteItems
     .filter((item) => item.importedIdentifier && (item.status === 'succeeded' || item.status === 'warning'))
     .map((item) => {
       const instance = instances.find((candidate) => candidate.id === item.destinationId);
@@ -3678,7 +3697,10 @@ export function DashboardMigrationWizard() {
     if (queryViewCatalog?.loading) return `Checking destination query views for route ${routePathLabel(activeRouteGroup, row)} before review.`;
     if (queryViewCatalog?.error) return `Route ${routePathLabel(activeRouteGroup, row)}: ${queryViewCatalog.error}`;
     if (!queryViewCatalog?.loaded) return `Load destination query views for route ${routePathLabel(activeRouteGroup, row)} before review.`;
-    const unresolved = routeMappings.find((mapping) => !mapping.targetQueryViewName || mapping.status === 'blocked' || mapping.action === 'unresolved');
+    const unresolved = routeMappings.find((mapping) => {
+      const status = queryViewMappingStep4Status(mapping);
+      return status === 'auto' || status === 'needs' || status === 'blocked' || status === 'destructive';
+    });
     return unresolved
       ? unresolvedQueryViewMappingRouteMessage({
           sourceQueryViewName: unresolved.sourceQueryViewName,
@@ -5363,6 +5385,41 @@ export function DashboardMigrationWizard() {
                         />
                       </div>
                     </div>
+                    <div className="mt-4 rounded-card border border-border-subtle bg-surface-secondary/40 p-3">
+                      <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+                        <div>
+                          <div className="text-sm font-semibold text-content-primary">Same-name dashboard strategy</div>
+                          <p className="mt-1 text-xs text-content-secondary">
+                            Used only when this destination already has a dashboard with the same name in the selected folder.
+                          </p>
+                        </div>
+                        <div className="grid gap-2 sm:grid-cols-2 md:min-w-[34rem]">
+                          <button
+                            type="button"
+                            onClick={() => patchTargetRow(row.id, { sameNamedStrategy: 'update' })}
+                            disabled={!replaceSameNamed || emptyFirst}
+                            className={`rounded-card border px-3 py-2 text-left text-xs ${row.sameNamedStrategy !== 'replace' ? 'border-omni-300 bg-omni-50 text-omni-800' : 'border-border-subtle bg-white text-content-secondary'}`}
+                          >
+                            <span className="block font-semibold">Update in place</span>
+                            <span className="mt-1 block">Preserves destination ID, permissions, embed links, favorites, schedules, and history.</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => patchTargetRow(row.id, { sameNamedStrategy: 'replace' })}
+                            disabled={!replaceSameNamed || emptyFirst}
+                            className={`rounded-card border px-3 py-2 text-left text-xs ${row.sameNamedStrategy === 'replace' ? 'border-omni-300 bg-omni-50 text-omni-800' : 'border-border-subtle bg-white text-content-secondary'}`}
+                          >
+                            <span className="block font-semibold">Replace</span>
+                            <span className="mt-1 block">Moves the same-named dashboard to Trash, then creates a new dashboard with a new ID.</span>
+                          </button>
+                        </div>
+                      </div>
+                      {(!replaceSameNamed || emptyFirst) && (
+                        <div className="mt-3 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
+                          Same-name strategy is paused while same-name rerun handling is off or empty-folder cleanup is selected.
+                        </div>
+                      )}
+                    </div>
                   </div>
                 );
               })}
@@ -5719,13 +5776,13 @@ export function DashboardMigrationWizard() {
                         resetPlan();
                       }}
                       disabled={emptyFirst}
-                      aria-label="Replace same-named target dashboards"
+                      aria-label="Handle same-named target dashboards"
                       className="mt-1 accent-omni-600"
                     />
                     <span>
-                      <span className="block text-sm font-semibold text-content-primary">Replace same-named target dashboards</span>
+                      <span className="block text-sm font-semibold text-content-primary">Handle same-named target dashboards</span>
                       <span className="mt-1 block text-xs text-content-secondary">
-                        Looks only in each selected destination folder and moves same-name dashboards there to Trash before import. If target-folder scope is unsafe, OmniKit skips the cleanup and explains why in Review.
+                        Looks only in each selected destination folder. Each destination chooses whether matching dashboards are updated in place or replaced.
                       </span>
                       {emptyFirst && (
                         <span className="mt-1 block text-xs text-content-secondary">
@@ -5886,9 +5943,10 @@ export function DashboardMigrationWizard() {
                       : 'Ready'}
                 />
               </div>
-              <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-9">
+              <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-10">
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.dashboardCount}</span><br />Dashboards</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.destinationCount}</span><br />Destinations</div>
+                <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.updateCount}</span><br />In-place updates</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.replacementCount}</span><br />Replacements</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{refreshSchemaOnComplete ? 'On' : 'Off'}</span><br />Schema refresh</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{deleteSourceOnSuccess ? 'On' : 'Off'}</span><br />Source delete</div>
@@ -5947,9 +6005,11 @@ export function DashboardMigrationWizard() {
                   <span>
                     {targetDeleteCount > 0
                       ? `${targetDeleteCount} existing target dashboard${targetDeleteCount === 1 ? '' : 's'} will be moved to Trash in scoped target folders before import.`
+                      : reviewImpactSummary.updateCount > 0
+                        ? `${reviewImpactSummary.updateCount} same-named target dashboard${reviewImpactSummary.updateCount === 1 ? '' : 's'} will be updated in place.`
                       : replaceSameNamed
-                        ? 'Same-name replacement is on, but no scoped target replacements were found in this preview.'
-                        : 'Same-name replacement is off, so existing target dashboards will not be touched.'}
+                        ? 'Same-name handling is on, but no scoped target matches were found in this preview.'
+                        : 'Same-name handling is off, so existing target dashboards will not be touched.'}
                   </span>
                 </li>
                 <li className="flex gap-2">
@@ -6012,6 +6072,9 @@ export function DashboardMigrationWizard() {
                       : routeTarget.deleteCount > 0
                         ? `${routeTarget.deleteCount} target Trash move${routeTarget.deleteCount === 1 ? '' : 's'}`
                         : 'None';
+                    const sameNameStrategyLabel = target.sameNamedStrategy === 'replace'
+                      ? 'Replace if same name exists'
+                      : 'Update in place if same name exists';
                     const queryViewActionLabel = routeTarget.queryViewActionCount > 0
                       ? `${routeTarget.queryViewActionCount} query-view action${routeTarget.queryViewActionCount === 1 ? '' : 's'}`
                       : 'None';
@@ -6080,6 +6143,10 @@ export function DashboardMigrationWizard() {
                           <div className="rounded-card bg-white p-2">
                             <span className="font-semibold">{replacementLabel}</span><br />
                             Replacement summary
+                          </div>
+                          <div className="rounded-card bg-white p-2">
+                            <span className="font-semibold">{sameNameStrategyLabel}</span><br />
+                            Same-name strategy
                           </div>
                           <div className="rounded-card bg-white p-2">
                             <span className="font-semibold">{schemaRefreshLabel}</span><br />
@@ -6153,9 +6220,10 @@ export function DashboardMigrationWizard() {
                         label={route.status === 'blocked' ? 'Blocked' : route.status === 'ready' ? 'Ready' : `${route.warningCount} warnings`}
                       />
                     </div>
-                    <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-11">
+                    <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-12">
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.dashboardCount}</span><br />Dashboards</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.targetCount}</span><br />Destinations</div>
+                      <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.updateCount}</span><br />In-place updates</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{route.replaceCount}</span><br />Replacements</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{refreshSchemaOnComplete ? 'Yes' : 'No'}</span><br />Schema refresh</div>
                       <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{sourceDeleteLabel}</span><br />Source delete</div>
@@ -6197,9 +6265,10 @@ export function DashboardMigrationWizard() {
                                 label={routeTarget.status === 'blocked' ? 'Blocked' : routeTarget.status === 'ready' ? 'Ready' : `${routeTarget.warningCount} warnings`}
                               />
                             </div>
-                            <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-9">
+                            <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3 lg:grid-cols-10">
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.dashboardCount}</span><br />Dashboards</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.deleteCount}</span><br />Trash moves</div>
+                              <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.updateCount}</span><br />In-place updates</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.replaceCount}</span><br />Replacements</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.queryViewActionCount || 'None'}</span><br />Query-view actions</div>
                               <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{routeTarget.fieldActionCount || 'None'}</span><br />Field actions</div>
@@ -6340,6 +6409,12 @@ export function DashboardMigrationWizard() {
                                   : `${routeTarget.replaceCount} same-named target dashboard${routeTarget.replaceCount === 1 ? '' : 's'} will be moved to Trash before import.`}
                               </div>
                             )}
+                            {routeTarget.updateCount > 0 && (
+                              <div className="mt-3 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+                                <Info size={13} className="mr-1 inline-block" />
+                                {`${routeTarget.updateCount} same-named target dashboard${routeTarget.updateCount === 1 ? '' : 's'} will be updated in place, preserving destination ID, slug, sharing settings, embeds, schedules, favorites, and history.`}
+                              </div>
+                            )}
                             {routeTarget.error && (
                               <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-800">
                                 <AlertTriangle size={13} className="mr-1 inline-block" />
@@ -6395,7 +6470,7 @@ export function DashboardMigrationWizard() {
               <div className="mt-3 grid gap-2 text-xs">
                 <div className="rounded-card bg-surface-secondary p-3">
                   <div className="font-semibold text-content-primary">{replaceSameNamed ? 'On' : 'Off'}</div>
-                  <div className="text-content-secondary">Replace same-named dashboards</div>
+                  <div className="text-content-secondary">Handle same-named dashboards</div>
                 </div>
                 <div className="rounded-card bg-surface-secondary p-3">
                   <div className="font-semibold text-content-primary">{emptyFirst ? 'On' : 'Off'}</div>
@@ -6548,8 +6623,8 @@ export function DashboardMigrationWizard() {
                     </div>
                     <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
                       <div className="rounded-card bg-white p-3">
-                        <span className="font-semibold text-content-primary">{importItems.length}</span><br />
-                        Dashboard import route{importItems.length === 1 ? '' : 's'}
+                        <span className="font-semibold text-content-primary">{dashboardWriteItems.length}</span><br />
+                        Dashboard write route{dashboardWriteItems.length === 1 ? '' : 's'}
                       </div>
                       <div className="rounded-card bg-white p-3">
                         <span className="font-semibold text-content-primary">{queryViewPrepareItems.length ? terminalCount(queryViewPrepareItems) : 'None'}</span><br />
@@ -6605,8 +6680,8 @@ export function DashboardMigrationWizard() {
                     <div className="mt-2 text-xl font-semibold text-content-primary">{terminalCount(exportItems)}/{exportItems.length}</div>
                   </div>
                   <div className="rounded-card border border-border-subtle p-4">
-                    <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Imports</div>
-                    <div className="mt-2 text-xl font-semibold text-content-primary">{terminalCount(importItems)}/{importItems.length}</div>
+                    <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Dashboard writes</div>
+                    <div className="mt-2 text-xl font-semibold text-content-primary">{terminalCount(dashboardWriteItems)}/{dashboardWriteItems.length}</div>
                   </div>
                   <div className="rounded-card border border-border-subtle p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Query views</div>

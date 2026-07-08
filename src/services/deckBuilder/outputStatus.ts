@@ -88,6 +88,18 @@ export function deckRenderButtonLabel(source: TileVisualSource): string {
   return 'Render native visual';
 }
 
+export function deckOutputContinueLabel({
+  hasNextSlide,
+  actionableCount,
+}: {
+  hasNextSlide: boolean;
+  actionableCount: number;
+}): string {
+  if (hasNextSlide) return 'Next slide';
+  if (actionableCount > 0) return `Continue with ${actionableCount} not ready`;
+  return 'Continue to preview';
+}
+
 export function deckOutputDetailsCopy(source: TileVisualSource): { eyebrow: string; title: string; helper: string } {
   if (source === 'tile-image') {
     return {

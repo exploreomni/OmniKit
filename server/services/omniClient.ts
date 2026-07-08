@@ -163,6 +163,23 @@ export interface OmniCreateWorkbookResult {
   raw: unknown;
 }
 
+export interface DocumentV2Patch {
+  name?: string;
+  description?: string | null;
+  summary?: string;
+  branchId?: string;
+  queryPresentations?: unknown;
+  controls?: unknown;
+  settings?: unknown;
+  containers?: unknown;
+}
+
+export interface OmniDocumentDraftResult {
+  identifier: string;
+  draftIdentifier: string;
+  raw: unknown;
+}
+
 export interface OmniDashboardDownloadTile {
   id: string;
   name: string;
@@ -1210,6 +1227,36 @@ export class OmniClient {
 
   async patchDocument(identifier: string, body: { description?: string | null; clearExistingDraft?: boolean }): Promise<void> {
     await this.request('PATCH', `/api/v1/documents/${encodeURIComponent(identifier)}`, { body });
+  }
+
+  async getDocumentStateV2(documentId: string): Promise<Record<string, unknown>> {
+    const response = await this.request('GET', `/api/v2/documents/${encodeURIComponent(documentId)}`);
+    return await response.json().catch(() => ({})) as Record<string, unknown>;
+  }
+
+  async createDocumentDraft(documentId: string, patch: DocumentV2Patch): Promise<OmniDocumentDraftResult> {
+    const response = await this.request('PATCH', `/api/v2/documents/${encodeURIComponent(documentId)}/draft`, { body: patch });
+    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const draftIdentifier = firstString(
+      raw.draftIdentifier,
+      raw.draft_identifier,
+      raw.identifier,
+      nested(raw, 'draft', 'identifier'),
+      nested(raw, 'draft', 'id'),
+    ) ?? '';
+    return {
+      identifier: firstString(raw.identifier, raw.documentIdentifier, raw.document_identifier, nested(raw, 'document', 'identifier')) ?? documentId,
+      draftIdentifier,
+      raw,
+    };
+  }
+
+  async patchDocumentDraft(documentId: string, draftId: string, patch: DocumentV2Patch): Promise<void> {
+    await this.request('PATCH', `/api/v2/documents/${encodeURIComponent(documentId)}/draft/${encodeURIComponent(draftId)}`, { body: patch });
+  }
+
+  async publishDocumentDraft(documentId: string): Promise<void> {
+    await this.request('POST', `/api/v2/documents/${encodeURIComponent(documentId)}/draft/publish`);
   }
 
   async requestDeleteDocument(identifier: string): Promise<void> {

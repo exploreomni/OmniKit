@@ -24,6 +24,7 @@ import {
 } from '@/services/deckBuilder/nativeVisuals';
 import {
   deckOutputDetailsCopy,
+  deckOutputContinueLabel,
   deckOutputReadiness,
   deckOutputSourceLabel,
   deckOutputSummary,
@@ -247,16 +248,16 @@ function fieldLabel(column: TileColumn): string {
 
 function SpecConfidenceBadge({ spec }: { spec?: TileVisualSpec }) {
   if (!spec) {
-    return <span className="rounded-full bg-surface-secondary px-2 py-0.5 text-[10px] font-semibold text-content-tertiary">Awaiting render</span>;
+    return <StatusChip status="pending" label="Awaiting render" size="xs" showDot={false} />;
   }
-  const tone =
+  const status =
     spec.source === 'user'
-      ? 'bg-blue-50 text-blue-700'
+      ? 'info'
       : spec.source === 'omni' && spec.confidence === 'high'
-      ? 'bg-green-50 text-green-700'
+      ? 'success'
       : spec.confidence === 'unsupported'
-      ? 'bg-red-50 text-red-700'
-      : 'bg-amber-50 text-amber-700';
+      ? 'error'
+      : 'warning';
   const label =
     spec.source === 'user'
       ? 'User customized'
@@ -265,7 +266,7 @@ function SpecConfidenceBadge({ spec }: { spec?: TileVisualSpec }) {
       : spec.confidence === 'unsupported'
       ? 'Unsupported'
       : 'Inferred';
-  return <span className={`rounded-full px-2 py-0.5 text-[10px] font-semibold ${tone}`}>{label}</span>;
+  return <StatusChip status={status} label={label} size="xs" showDot={false} />;
 }
 
 export function DeckOutputStep({
@@ -290,11 +291,22 @@ export function DeckOutputStep({
   const activeTile = selectedTiles.find((tile) => tile.id === activeTileId) || selectedTiles[0];
   const activeIndex = activeTile ? selectedTiles.findIndex((tile) => tile.id === activeTile.id) : -1;
   const largeDeck = selectedTiles.length > 30;
+  const source = activeTile
+    ? resolveTileVisualSource(renderStrategy, tileVisualSources, activeTile.id)
+    : 'native';
+  const lastNonNativeSourceRef = useRef<Record<string, TileVisualSource>>({});
 
   useEffect(() => {
     if (!activeTile?.id) return;
     slideButtonRefs.current[activeTile.id]?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }, [activeTile?.id]);
+
+  useEffect(() => {
+    if (!activeTile?.id) return;
+    if (source !== 'native' && source !== 'skip') {
+      lastNonNativeSourceRef.current[activeTile.id] = source;
+    }
+  }, [activeTile?.id, source]);
 
   if (!activeTile) {
     return (
@@ -310,7 +322,6 @@ export function DeckOutputStep({
     );
   }
 
-  const source = resolveTileVisualSource(renderStrategy, tileVisualSources, activeTile.id);
   const querySummary = summarizeTileQuery(activeTile);
   const previewState = previewStates[activeTile.id];
   const result = previewState?.result;
@@ -327,6 +338,7 @@ export function DeckOutputStep({
   const readiness = deckOutputReadiness(source, previewState, selectedOverride);
   const renderButtonLabel = deckRenderButtonLabel(source);
   const detailsCopy = deckOutputDetailsCopy(source);
+  const previousNonNativeSource = lastNonNativeSourceRef.current[activeTile.id];
   const hasPreviousSlide = activeIndex > 0;
   const hasNextSlide = activeIndex >= 0 && activeIndex < selectedTiles.length - 1;
   const numericColumns = result?.columns.filter(isNumericColumn) || [];
@@ -342,11 +354,7 @@ export function DeckOutputStep({
   const actionableCount = readinessBuckets
     .filter((bucket) => bucket.tone === 'pending' || bucket.tone === 'failed' || bucket.tone === 'running')
     .reduce((sum, bucket) => sum + bucket.count, 0);
-  const continueLabel = hasNextSlide
-    ? 'Next slide'
-    : actionableCount > 0
-    ? `Continue with ${actionableCount} not ready`
-    : 'Continue to preview';
+  const continueLabel = deckOutputContinueLabel({ hasNextSlide, actionableCount });
 
   function updateVisualSpec(patch: Partial<TileVisualSpec>) {
     if (!effectiveResult) return;
@@ -533,6 +541,17 @@ export function DeckOutputStep({
                   Reset to Auto
                 </button>
               )}
+              {source === 'native' && previousNonNativeSource && (
+                <button
+                  type="button"
+                  onClick={() => onTileVisualSourceChange(activeTile.id, previousNonNativeSource)}
+                  className="btn-ghost btn-sm"
+                  title={`Return this slide to ${deckOutputSourceLabel(previousNonNativeSource)}.`}
+                >
+                  <RotateCcw size={12} />
+                  Back to {deckOutputSourceLabel(previousNonNativeSource)}
+                </button>
+              )}
               <OutputStatusBadge readiness={readiness} />
               <button
                 type="button"
@@ -552,16 +571,29 @@ export function DeckOutputStep({
                 <div className="text-[11px] font-semibold uppercase tracking-wider text-content-tertiary">Output preview</div>
                 <div className="text-sm font-semibold text-content-primary">{summary}</div>
               </div>
-              {source !== 'tile-image' && source !== 'skip' && (
-                <button
-                  type="button"
-                  onClick={() => onTileVisualSourceChange(activeTile.id, 'tile-image')}
-                  className="btn-secondary btn-sm"
-                >
-                  <ImageIcon size={12} />
-                  Use Omni PNG instead
-                </button>
-              )}
+              <div className="flex flex-wrap gap-1.5">
+                {source !== 'native' && source !== 'skip' && (
+                  <button
+                    type="button"
+                    onClick={() => onTileVisualSourceChange(activeTile.id, 'native')}
+                    className="btn-secondary btn-sm"
+                    title="Try an editable PowerPoint chart, table, or KPI for this tile."
+                  >
+                    <BarChart3 size={12} />
+                    Try Native editable
+                  </button>
+                )}
+                {source !== 'tile-image' && source !== 'skip' && (
+                  <button
+                    type="button"
+                    onClick={() => onTileVisualSourceChange(activeTile.id, 'tile-image')}
+                    className="btn-secondary btn-sm"
+                  >
+                    <ImageIcon size={12} />
+                    Use Omni PNG instead
+                  </button>
+                )}
+              </div>
             </div>
             <div className="h-[360px] overflow-hidden rounded-card border border-border bg-white p-2">
               <RenderedOutput
@@ -829,8 +861,11 @@ export function DeckOutputStep({
                   </div>
                 </div>
               ) : (
-                <div className="rounded-card border border-border bg-surface-secondary px-3 py-2 text-[11px] text-content-secondary">
-                  <div>Native chart controls are hidden because this slide uses {deckOutputSourceLabel(source)}.</div>
+                <div className="rounded-card border border-blue-100 bg-blue-50 px-3 py-2 text-[11px] text-blue-800">
+                  <div className="font-semibold">Editable Native output may be available for this tile.</div>
+                  <p className="mt-0.5">
+                    This slide currently uses {deckOutputSourceLabel(source)}. Try Native editable to compare an editable PowerPoint visual, then switch back if the PNG is a better fit.
+                  </p>
                   {source !== 'skip' && (
                     <button
                       type="button"

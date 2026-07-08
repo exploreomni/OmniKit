@@ -180,6 +180,7 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
       targetModelName: target.targetModelName || '',
       targetFolderPath: target.targetFolderPath || '',
       targetFolderId: target.targetFolderId || '',
+      sameNamedStrategy: target.sameNamedStrategy === 'replace' ? 'replace' : 'update',
       topicMappings: sanitizeTopicMappings(target.topicMappings),
       queryViewMappings: sanitizeQueryViewMappings(target.queryViewMappings),
       fieldMappings: sanitizeFieldMappings(target.fieldMappings),

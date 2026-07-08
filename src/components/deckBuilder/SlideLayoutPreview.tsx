@@ -1,23 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import {
+  AlertCircle,
   AlignCenter,
   AlignLeft,
   AlignRight,
   ArrowUpRight,
   BarChart3,
   CaseSensitive,
+  CheckCircle,
   Image as ImageIcon,
+  Loader2,
   Maximize2,
   Minus,
   Move,
   RotateCcw,
   Shapes,
+  Sparkles,
   Square,
   StickyNote,
   Table2,
   Type,
+  XCircle,
 } from 'lucide-react';
+import { StatusChip } from '@/components/ui/StatusChip';
 import { layoutForRole } from '@/services/deckBuilder/templateStore';
 import {
   previewModeForTileExportState,
@@ -28,6 +34,8 @@ import { resolveTileVisualSpec, resolveVisualMapping } from '@/services/deckBuil
 import type {
   BrandConfig,
   DashboardTile,
+  InsightGenerationStatus,
+  InsightSource,
   LayoutKit,
   NativeVisualOverride,
   SlideBox,
@@ -52,7 +60,14 @@ interface Props {
   overrides: Record<string, SlideOverride>;
   onChange: (next: Record<string, SlideOverride>) => void;
   insights: Record<string, string>;
+  insightSources?: Record<string, InsightSource>;
+  insightGenerationStatuses?: Record<string, InsightGenerationStatus>;
+  insightGenerationProgress?: string;
   onInsightsChange: (next: Record<string, string>) => void;
+  onGenerateInsight?: (tileId: string) => void;
+  onGenerateAllInsights?: () => void;
+  onCancelInsightGeneration?: () => void;
+  onDiscardAiInsight?: (tileId: string) => void;
   includeAppendix: boolean;
   onIncludeAppendixChange: (value: boolean) => void;
   tileVisualSources: Record<string, TileVisualSource>;
@@ -606,7 +621,14 @@ export function SlideLayoutPreview({
   overrides,
   onChange,
   insights,
+  insightSources = {},
+  insightGenerationStatuses = {},
+  insightGenerationProgress = '',
   onInsightsChange,
+  onGenerateInsight,
+  onGenerateAllInsights,
+  onCancelInsightGeneration,
+  onDiscardAiInsight,
   includeAppendix,
   onIncludeAppendixChange,
   tileVisualSources,
@@ -640,6 +662,9 @@ export function SlideLayoutPreview({
   const activeNotes = activeOverride.speakerNotes || '';
   const activeNotesFormat = activeOverride.speakerNotesFormat || 'paragraph';
   const activeInsight = activeTile ? insights[activeTile.id] || '' : '';
+  const activeInsightSource = activeTile ? insightSources[activeTile.id] : undefined;
+  const activeInsightStatus = activeTile ? insightGenerationStatuses[activeTile.id] : undefined;
+  const anyInsightRunning = Object.values(insightGenerationStatuses).some((status) => status.state === 'running');
   const activeInsightDisplayText =
     activeInsightFormat === 'bullets'
       ? normalizeInsightLines(activeInsight).map((line) => `• ${line}`).join('\n')
@@ -651,6 +676,8 @@ export function SlideLayoutPreview({
   );
   const activeSource = activeTile ? visualSourceFor(activeTile, tileVisualSources, renderStrategy) : 'native';
   const activePreview = activeTile ? previewStates[activeTile.id] : undefined;
+  const activeInsightCanGenerate = Boolean(activePreview?.result);
+  const emptyInsightCount = tiles.filter((tile) => !(insights[tile.id] || '').trim()).length;
   const activeNativeVisualOverride = activeTile ? nativeVisualOverrides[activeTile.id] : undefined;
   const activeVisualSpec = activeTile ? tileVisualSpecs[activeTile.id] : undefined;
   const activeEffectiveRender = activePreview?.result
@@ -894,10 +921,22 @@ export function SlideLayoutPreview({
         </div>
         <div className="relative flex-1 min-h-0">
           <div className="space-y-1.5 h-full overflow-y-auto pr-0.5">
-            {tiles.map((tile, idx) => {
-              const active = tile.id === activeTile.id;
-              const source = visualSourceFor(tile, tileVisualSources, renderStrategy);
-              const customized = Boolean(
+	            {tiles.map((tile, idx) => {
+	              const active = tile.id === activeTile.id;
+	              const source = visualSourceFor(tile, tileVisualSources, renderStrategy);
+	              const insightStatus = insightGenerationStatuses[tile.id];
+	              const insightSource = insightSources[tile.id];
+	              const railInsightChip =
+	                insightStatus?.state === 'running'
+	                  ? { status: 'in_progress', label: 'Writing' }
+	                  : insightStatus?.state === 'error'
+	                  ? { status: 'error', label: 'AI error' }
+	                  : insightSource === 'ai'
+	                  ? { status: 'info', label: 'AI' }
+	                  : insightSource === 'ai_edited'
+	                  ? { status: 'warning', label: 'Edited' }
+	                  : null;
+	              const customized = Boolean(
                 overrides[tile.id]?.title ||
                 overrides[tile.id]?.bodyBox ||
                 overrides[tile.id]?.insightBox ||
@@ -928,10 +967,15 @@ export function SlideLayoutPreview({
                     </span>
                     <span className="min-w-0 flex-1">
                       <span className="block text-[12px] font-medium text-content-primary truncate">{tile.name}</span>
-                      <span className="block text-[9px] uppercase tracking-wider text-content-tertiary truncate">
-                        {sourceLabel(source)}
-                      </span>
-                    </span>
+	                      <span className="block text-[9px] uppercase tracking-wider text-content-tertiary truncate">
+	                        {sourceLabel(source)}
+	                      </span>
+	                      {railInsightChip && (
+	                        <span className="mt-1 inline-flex max-w-full">
+	                          <StatusChip status={railInsightChip.status} label={railInsightChip.label} size="xs" showDot={false} />
+	                        </span>
+	                      )}
+	                    </span>
                     {customized && (
                       <span className="ml-auto h-2 w-2 rounded-full bg-omni-500 flex-shrink-0" title="Customized" />
                     )}
@@ -1338,20 +1382,78 @@ export function SlideLayoutPreview({
         {controlSection === 'insights' && (
           <div className="space-y-3 min-w-0">
             <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
-                <StickyNote size={13} /> Insights
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-[12px] font-semibold text-content-primary">
+                  <StickyNote size={13} /> Insights
+                  {activeInsightSource === 'ai' && <StatusChip status="info" label="AI draft" size="xs" showDot={false} />}
+                  {activeInsightSource === 'ai_edited' && <StatusChip status="warning" label="AI edited" size="xs" showDot={false} />}
+                  {activeInsightSource === 'user' && <StatusChip status="success" label="User written" size="xs" showDot={false} />}
+                </div>
+                <p className="mt-1 text-[11px] text-content-tertiary">
+                  Draft slide takeaways from rendered tile data, then edit them like normal text.
+                </p>
+              </div>
+              <div className="flex flex-wrap justify-end gap-1.5">
+                {anyInsightRunning ? (
+                  <button type="button" onClick={onCancelInsightGeneration} className="btn-ghost btn-sm">
+                    <XCircle size={12} /> Cancel
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={onGenerateAllInsights}
+                    className="btn-ghost btn-sm"
+                    disabled={!onGenerateAllInsights || emptyInsightCount === 0}
+                    title={emptyInsightCount === 0 ? 'Every selected slide already has insight text.' : undefined}
+                  >
+                    <Sparkles size={12} /> Generate all empty
+                  </button>
+                )}
               </div>
             </div>
+            {(insightGenerationProgress || activeInsightStatus?.message) && (
+              <div className={`rounded-card border px-3 py-2 text-[11px] ${
+                activeInsightStatus?.state === 'error'
+                  ? 'border-red-200 bg-red-50 text-red-700'
+                  : activeInsightStatus?.state === 'success'
+                  ? 'border-green-200 bg-green-50 text-green-700'
+                  : 'border-border bg-surface-secondary text-content-secondary'
+              }`}>
+                <div className="flex items-start gap-2">
+                  {activeInsightStatus?.state === 'running' ? (
+                    <Loader2 size={13} className="mt-0.5 animate-spin" />
+                  ) : activeInsightStatus?.state === 'success' ? (
+                    <CheckCircle size={13} className="mt-0.5" />
+                  ) : activeInsightStatus?.state === 'error' ? (
+                    <AlertCircle size={13} className="mt-0.5" />
+                  ) : (
+                    <Sparkles size={13} className="mt-0.5" />
+                  )}
+                  <span>{activeInsightStatus?.message || insightGenerationProgress}</span>
+                </div>
+              </div>
+            )}
             <div className="grid grid-rows-[24px_32px_auto] gap-2">
               <div className="flex h-6 items-center justify-between gap-2">
                 <label className="flex items-center gap-2 text-[11px] font-medium text-content-secondary">
                   <StickyNote size={12} /> Insight panel
                 </label>
-                {activeInsight && (
-                  <button type="button" onClick={() => setInsight(activeTile.id, '')} className="btn-ghost btn-sm">
-                    Clear
-                  </button>
-                )}
+                <div className="flex items-center gap-1.5">
+                  {activeInsightSource === 'ai' && activeInsight && (
+                    <button
+                      type="button"
+                      onClick={() => activeTile && onDiscardAiInsight?.(activeTile.id)}
+                      className="btn-ghost btn-sm"
+                    >
+                      Discard AI draft
+                    </button>
+                  )}
+                  {activeInsight && (
+                    <button type="button" onClick={() => setInsight(activeTile.id, '')} className="btn-ghost btn-sm">
+                      Clear
+                    </button>
+                  )}
+                </div>
               </div>
               <div className="grid grid-cols-2 gap-1.5">
                 <button
@@ -1376,6 +1478,36 @@ export function SlideLayoutPreview({
                 placeholder="Add insight here..."
                 className="input-field text-sm min-h-[128px] h-full"
               />
+            </div>
+            <div className="rounded-card border border-border bg-surface-secondary p-3 text-[11px] text-content-secondary">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="font-semibold text-content-primary">
+                    {activeInsightCanGenerate ? 'AI can draft from this rendered slide.' : 'Render this slide first.'}
+                  </div>
+                  <p className="mt-0.5">
+                    {activeInsightCanGenerate
+                      ? "Sends this tile's compact result digest to your organization's Omni AI provider."
+                      : 'AI insights need the Native query result from the Output step before OmniKit can summarize the tile.'}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => activeTile && onGenerateInsight?.(activeTile.id)}
+                  className="btn-secondary btn-sm"
+                  disabled={!activeTile || !activeInsightCanGenerate || anyInsightRunning || !onGenerateInsight}
+                  title={!activeInsightCanGenerate ? 'Render this slide first.' : undefined}
+                >
+                  {activeInsightStatus?.state === 'running' ? (
+                    <Loader2 size={12} className="animate-spin" />
+                  ) : activeInsight ? (
+                    <RotateCcw size={12} />
+                  ) : (
+                    <Sparkles size={12} />
+                  )}
+                  {activeInsight ? activeInsightSource === 'ai' ? 'Regenerate' : 'Replace with AI' : 'Generate insight'}
+                </button>
+              </div>
             </div>
           </div>
         )}
