@@ -12,6 +12,7 @@ dependencies = [
     "lkml>=1.3",
     "httpx>=0.27",
     "pbixray>=0.13",
+    "numpy>=1.26,<2.5",
 ]
 
 [project.optional-dependencies]

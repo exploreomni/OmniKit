@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "recordedAt": "2026-07-17",
+  "recordedAt": "2026-07-20",
   "source": {
     "repository": "https://github.com/exploreomni/omni-migrator",
     "commit": "1e773399766dfc46e76fb84ac5f6f80bb7d1a607",
@@ -8,9 +8,9 @@
     "canonicalArchiveSha256": "1a5fafb38f2657362b8ff12db337da44cf89e4f93d0fabfcf3cce13483dc3d8c"
   },
   "sourceFiles": {
-    "requirements.lock": "8605c444e45adc6a52c52bcd1e22609c076d08edd6b338fdaf8b20a8696b8672",
-    "uv.lock": "d21aa5422820a647b86b745aae7bcf41ae99c183368490f2be73d89921a4f168",
-    "pyproject.toml": "918ae51ebcf1a281399bcdd77fc628881a2d31bfce3c62482aa492dc6abd04c6",
+    "requirements.lock": "e9d0d8a766810df6fb53eca106b1df39eb5b9a28eccfd040f284092446051546",
+    "uv.lock": "a76429e618dbfea35f5420f1f7b4525516d47b318932c05d4d13425664a2d96d",
+    "pyproject.toml": "3247916c08e786a7c3d7e0d4d75829956364a7484a5913a04d482e599201be29",
     "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
     "contracts/omnikit.migration.bundle.v1.schema.json": "64dc590f50a50c4407d07b238df0f9d34950a0e4c261a8ebedf2dad6dd63c02f",
     "contracts/fixtures/omnikit.migration.bundle.v1.valid.json": "650db951d5304c11cae92f10a2da1deccc2359905de4c27c5eb676c0b6ee829e",
