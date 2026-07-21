@@ -435,23 +435,20 @@ export async function updateModelYamlFiles(
   }
 ) {
   if (params.files.length === 0) return { success: true };
-  const result = await omniProxy<{ success?: boolean }>(
-    baseUrl,
-    apiKey,
-    'POST',
-    `/v1/models/${params.modelId}/yaml`,
-    {
-      body: {
-        files: params.files,
-        mode: params.mode || 'combined',
-        branchId: params.branchId,
-        commitMessage: params.commitMessage,
-        fullyResolved: params.fullyResolved,
-      },
-    }
-  );
-  clearMetadataCache(`${cacheScope(baseUrl, apiKey)}|model-yaml|${params.modelId}|`);
-  return result;
+  const files = [];
+  for (const file of params.files) {
+    files.push(await updateModelYamlFile(baseUrl, apiKey, {
+      modelId: params.modelId,
+      fileName: file.fileName as 'model' | 'relationships' | `${string}.topic` | `${string}.view`,
+      yaml: file.yaml,
+      mode: params.mode,
+      branchId: params.branchId,
+      commitMessage: params.commitMessage,
+      previousChecksum: file.previousChecksum,
+      fullyResolved: params.fullyResolved,
+    }));
+  }
+  return { success: true, files };
 }
 
 export async function deleteModelYamlFile(

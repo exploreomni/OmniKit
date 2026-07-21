@@ -785,6 +785,20 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
         targetFileName: 'phone_212-555-0199_metric.query.view',
         targetQueryViewLabel: '4111 1111 1111 1111',
       }],
+      semanticPatches: [{
+        id: 'field:orders.revenue:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.revenue',
+        targetFileName: 'orders.view',
+        currentYaml: 'dimensions:\n  revenue:\n    sql: ${TABLE}.private_revenue\n',
+        acceptedYaml: 'measures:\n  revenue:\n    sql: ${orders.private_revenue}\n',
+        resolution: 'custom_edit',
+      }],
+      queryValidationWaivers: [{
+        documentId: 'doc-1',
+        queryId: 'tile-1',
+        reason: 'Approved while token=secret-waiver-token-value is rotated.',
+      }],
     }],
     documentIds: ['doc-1'],
     emptyFirst: false,
@@ -853,6 +867,8 @@ test('job history sanitizer removes secrets and common sensitive data', () => {
   assert.equal(serialized.includes('abc123'), false);
   assert.equal(serialized.includes('on_sql'), false);
   assert.equal(serialized.includes('private_customer_table'), false);
+  assert.equal(serialized.includes('private_revenue'), false);
+  assert.equal(serialized.includes('secret-waiver-token-value'), false);
   assert.equal(serialized.includes('draft-customer'), false);
   assert.equal(serialized.includes('relationshipType'), true);
   assert.equal(serialized.includes('updateInPlace'), true);
@@ -909,6 +925,19 @@ test('local job history file does not store plaintext secrets or common sensitiv
       targetModelId: 'model-1',
       targetModelName: `Finance ${email}`,
       targetFolderPath: 'Customers/212-555-0199',
+      semanticPatches: [{
+        id: 'field:orders.revenue:orders.view',
+        artifactType: 'field',
+        sourceName: 'orders.revenue',
+        targetFileName: 'orders.view',
+        acceptedYaml: 'measures:\n  revenue:\n    sql: ${orders.private_revenue}\n',
+        resolution: 'custom_edit',
+      }],
+      queryValidationWaivers: [{
+        documentId: 'doc-1',
+        queryId: 'tile-1',
+        reason: 'Approved while api_key=waiver-persistence-secret is rotated.',
+      }],
     }],
     documentIds: ['doc-1'],
     emptyFirst: false,
@@ -942,6 +971,8 @@ test('local job history file does not store plaintext secrets or common sensitiv
   assert.equal(dbContents.includes('212-555-0199'), false);
   assert.equal(dbContents.includes('supersecret'), false);
   assert.equal(dbContents.includes('abc123'), false);
+  assert.equal(dbContents.includes('private_revenue'), false);
+  assert.equal(dbContents.includes('waiver-persistence-secret'), false);
 });
 
 test('model migration job reload preserves details and retry lineage', () => {
@@ -1079,6 +1110,7 @@ test('migration patch validation redacts Omni validation issue details', async (
   const originalCreateModelBranch = OmniClient.prototype.createModelBranch;
   const originalUpdateModelYamlFiles = OmniClient.prototype.updateModelYamlFiles;
   const originalValidateModel = OmniClient.prototype.validateModel;
+  const originalValidateModelContent = OmniClient.prototype.validateModelContent;
   const originalDeleteModelBranch = OmniClient.prototype.deleteModelBranch;
   try {
     OmniClient.prototype.listModels = async () => [{
@@ -1093,6 +1125,7 @@ test('migration patch validation redacts Omni validation issue details', async (
       message: 'Validation failed with token omni_secret_live_123456 and admin@example.com',
       yaml_path: 'orders.view',
     }];
+    OmniClient.prototype.validateModelContent = async () => ({ issues: [] });
     OmniClient.prototype.deleteModelBranch = async () => ({ ok: true });
 
     const response = await migrationJobsHandler(new Request('http://127.0.0.1/api/migration-jobs/validate-patches', {
@@ -1132,6 +1165,7 @@ test('migration patch validation redacts Omni validation issue details', async (
     OmniClient.prototype.createModelBranch = originalCreateModelBranch;
     OmniClient.prototype.updateModelYamlFiles = originalUpdateModelYamlFiles;
     OmniClient.prototype.validateModel = originalValidateModel;
+    OmniClient.prototype.validateModelContent = originalValidateModelContent;
     OmniClient.prototype.deleteModelBranch = originalDeleteModelBranch;
   }
 });

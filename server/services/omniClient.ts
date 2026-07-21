@@ -143,6 +143,12 @@ export interface OmniDocumentQueryRecord {
   description?: string;
 }
 
+export interface OmniQueryExecutionSummary {
+  jobId?: string;
+  status: string;
+  rowCount?: number;
+}
+
 export interface OmniCreateWorkbookInput {
   modelId: string;
   name: string;
@@ -284,6 +290,46 @@ function firstString(...values: unknown[]): string | undefined {
     if (typeof value === 'string' && value.trim()) return value;
   }
   return undefined;
+}
+
+function firstNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && value.trim()) {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+  }
+  return undefined;
+}
+
+function queryResultRowCount(payload: Record<string, unknown>): number | undefined {
+  const summaryCount = firstNumber(
+    nested(payload, 'summary', 'total_rows'),
+    nested(payload, 'summary', 'totalRows'),
+    nested(payload, 'summary', 'row_count'),
+    nested(payload, 'summary', 'rowCount'),
+  );
+  if (summaryCount !== undefined) return summaryCount;
+  if (typeof payload.result !== 'string' || !payload.result.trim()) return undefined;
+  try {
+    const parsed = JSON.parse(payload.result) as unknown;
+    if (Array.isArray(parsed)) return parsed.length;
+    if (parsed && typeof parsed === 'object') {
+      const record = parsed as Record<string, unknown>;
+      for (const key of ['rows', 'data', 'records']) {
+        if (Array.isArray(record[key])) return record[key].length;
+      }
+    }
+  } catch {
+    // Arrow/base64 and other result formats intentionally remain opaque.
+  }
+  return undefined;
+}
+
+function queryTimedOut(payload: Record<string, unknown>): boolean {
+  return payload.timed_out === true
+    || (typeof payload.timed_out === 'string' && payload.timed_out.toLowerCase() === 'true');
 }
 
 function extractTopLevelYamlScalar(yaml: string, key: string): string | undefined {
@@ -567,6 +613,7 @@ export class OmniClient {
     query?: Record<string, string | number | boolean | undefined>;
     body?: unknown;
     accept?: string;
+    allowStatuses?: number[];
   } = {}): Promise<Response> {
     const url = this.buildUrl(path, options.query);
     const headers: Record<string, string> = {
@@ -594,7 +641,7 @@ export class OmniClient {
           await sleep(retryAfterMs(response.headers.get('retry-after'), attempt));
           continue;
         }
-        if (!response.ok) {
+        if (!response.ok && !options.allowStatuses?.includes(response.status)) {
           const text = await response.text().catch(() => '');
           throw new OmniClientError(response.status, url, text.slice(0, 500) || response.statusText);
         }
@@ -1104,19 +1151,18 @@ export class OmniClient {
     commitMessage?: string;
   }): Promise<unknown> {
     if (input.files.length === 0) return {};
-    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
-      body: {
-        mode: 'combined',
+    const results: unknown[] = [];
+    for (const file of input.files) {
+      results.push(await this.updateModelYamlFile({
+        modelId: input.modelId,
         branchId: input.branchId,
+        fileName: file.fileName,
+        yaml: file.yaml,
+        previousChecksum: file.previousChecksum,
         commitMessage: input.commitMessage,
-        files: input.files.map((file) => ({
-          fileName: file.fileName,
-          yaml: file.yaml,
-          previousChecksum: file.previousChecksum,
-        })),
-      },
-    });
-    return response.json().catch(() => ({}));
+      }));
+    }
+    return { files: results };
   }
 
   async deleteModelYamlFile(input: {
@@ -1286,6 +1332,60 @@ export class OmniClient {
         description: firstString(row.description),
       };
     }).filter((query) => query.id || Object.keys(query.query).length > 0);
+  }
+
+  async runQuery(query: Record<string, unknown>, options: {
+    branchId?: string;
+    userId?: string;
+    cache?: 'Standard' | 'SkipRequery' | 'SkipCache';
+    maxWaitAttempts?: number;
+  } = {}): Promise<OmniQueryExecutionSummary> {
+    const response = await this.request('POST', '/api/v1/query/run', {
+      body: {
+        query,
+        branchId: options.branchId,
+        userId: options.userId,
+        cache: options.cache || 'SkipCache',
+        resultType: 'json',
+        formatResults: false,
+      },
+      allowStatuses: [408],
+    });
+    let payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    let remainingJobIds = Array.isArray(payload.remaining_job_ids)
+      ? payload.remaining_job_ids.filter((value): value is string => typeof value === 'string' && Boolean(value))
+      : [];
+    if (response.status === 408 && remainingJobIds.length === 0) {
+      throw new Error('Query validation timed out without a pollable Omni job ID.');
+    }
+    const maxWaitAttempts = Math.max(1, Math.min(30, options.maxWaitAttempts || 12));
+    let waitAttempt = 0;
+    while ((response.status === 408 || queryTimedOut(payload) || remainingJobIds.length > 0) && remainingJobIds.length > 0) {
+      if (waitAttempt >= maxWaitAttempts) {
+        throw new Error(`Query validation timed out after ${maxWaitAttempts} wait attempts.`);
+      }
+      waitAttempt += 1;
+      const waitResponse = await this.request('GET', '/api/v1/query/wait', {
+        query: { job_ids: JSON.stringify(remainingJobIds) },
+      });
+      payload = await waitResponse.json().catch(() => ({})) as Record<string, unknown>;
+      remainingJobIds = Array.isArray(payload.remaining_job_ids)
+        ? payload.remaining_job_ids.filter((value): value is string => typeof value === 'string' && Boolean(value))
+        : [];
+    }
+
+    if (remainingJobIds.length > 0 || queryTimedOut(payload)) {
+      throw new Error('Query validation timed out before Omni returned a terminal result.');
+    }
+    const status = (firstString(payload.status, nested(payload, 'completedJob', 'status')) || 'COMPLETE').toUpperCase();
+    if (!['COMPLETE', 'COMPLETED', 'SUCCESS', 'SUCCEEDED', 'DONE'].includes(status)) {
+      throw new Error(`Omni query execution finished with non-success status ${status}.`);
+    }
+    return {
+      jobId: firstString(payload.job_id, payload.jobId, nested(payload, 'completedJob', 'job_id')),
+      status,
+      rowCount: queryResultRowCount(payload),
+    };
   }
 
   async createWorkbookDocument(input: OmniCreateWorkbookInput): Promise<OmniCreateWorkbookResult> {

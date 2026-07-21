@@ -79,6 +79,9 @@ import {
   createDashboardRouteGroupsFromSelection,
   dashboardDocumentModelLabel,
   dashboardMigrationFieldDecisionForDependency,
+  dashboardMigrationFieldAwaitingQueryViewVerification,
+  dashboardMigrationFieldAwaitingSemanticPatchVerification,
+  dashboardMigrationRecommendedFieldCandidate,
   dashboardMigrationFieldSuppliedByQueryView,
   dashboardMigrationQueryViewUpdateIsSafeRecommendation,
   dashboardMigrationRoutePathLabel,
@@ -178,6 +181,21 @@ interface Step4DependencyGroupSummary {
   counts: Record<Step4DependencyStatus, number>;
 }
 
+interface QueryValidationRequirement {
+  queryId: string;
+  name: string;
+  kind: 'query' | 'non_query';
+}
+
+interface FunctionalQueryResult {
+  queryId: string;
+  name: string;
+  status: 'passed' | 'failed' | 'waived' | 'not_applicable';
+  error?: string;
+  rowCount?: number;
+  waiver?: { reason?: string; acknowledgedAt?: string };
+}
+
 interface QueryViewRecoveryFocus {
   groupId?: string;
   queryViewName?: string;
@@ -272,6 +290,7 @@ function emptyTargetRow(): DashboardMigrationTargetDraft {
     queryViewMappings: [],
     fieldMappings: [],
     semanticPatches: [],
+    queryValidationWaivers: [],
   };
 }
 
@@ -285,6 +304,7 @@ function defaultRouteGroup(documentIds: string[], targetRowIds: string[]): Dashb
     queryViewMappingsByTargetId: {},
     fieldMappingsByTargetId: {},
     semanticPatchesByTargetId: {},
+    queryValidationWaiversByTargetId: {},
   };
 }
 
@@ -316,6 +336,24 @@ function terminalCount(items: MigrationJobItem[]) {
   return items.filter(completedItem).length;
 }
 
+function proofOutcomeSummary(items: MigrationJobItem[]) {
+  if (items.length === 0) return 'None';
+  const counts = {
+    passed: items.filter((item) => item.status === 'succeeded').length,
+    exceptions: items.filter((item) => item.status === 'warning').length,
+    failed: items.filter((item) => item.status === 'failed').length,
+    notRun: items.filter((item) => item.status === 'skipped').length,
+    pending: items.filter((item) => item.status === 'pending' || item.status === 'running').length,
+  };
+  return [
+    counts.passed > 0 ? `${counts.passed} passed` : '',
+    counts.exceptions > 0 ? `${counts.exceptions} exception${counts.exceptions === 1 ? '' : 's'}` : '',
+    counts.failed > 0 ? `${counts.failed} failed` : '',
+    counts.notRun > 0 ? `${counts.notRun} not run` : '',
+    counts.pending > 0 ? `${counts.pending} pending` : '',
+  ].filter(Boolean).join(' · ');
+}
+
 function kindLabel(kind: MigrationJobItem['kind']) {
   if (kind === 'source_delete') return 'SOURCE DELETE';
   if (kind === 'post_action') return 'POST ACTION';
@@ -323,6 +361,9 @@ function kindLabel(kind: MigrationJobItem['kind']) {
   if (kind === 'field_prepare') return 'FIELD PREP';
   if (kind === 'relationship_prepare') return 'RELATIONSHIP PREP';
   if (kind === 'topic_prepare') return 'TOPIC PREP';
+  if (kind === 'semantic_validate') return 'MODEL VALIDATION';
+  if (kind === 'query_validate') return 'QUERY VALIDATION';
+  if (kind === 'document_verify') return 'FINAL VERIFICATION';
   if (kind === 'update') return 'UPDATE';
   return kind.toUpperCase();
 }
@@ -397,13 +438,14 @@ function semanticPatchCanApplyRecommended(patch: Pick<MigrationSemanticPatch, 'a
 
 function semanticPatchStep4Status(patch: MigrationSemanticPatch): Step4DependencyStatus {
   if (patch.checksumStale) return 'blocked';
+  if (patch.resolution === 'keep_target') return 'ready';
   if (patch.resolution === 'custom_edit' && !patch.acceptedYaml) return 'blocked';
   if (patch.status === 'blocked' || patch.safetyCategory === 'blocked') return 'blocked';
   if (patch.destructive && !patch.confirmedDestructive) return 'destructive';
   if (patch.safetyCategory === 'destructive_update' && !patch.confirmedDestructive) return 'destructive';
-  if (patch.safetyCategory === 'manual_review' && !patch.acceptedYaml && patch.resolution !== 'keep_target') return 'manual';
+  if (patch.safetyCategory === 'manual_review' && !patch.acceptedYaml) return 'manual';
   if (semanticPatchCanApplyRecommended(patch)) return 'auto';
-  if (patch.resolution === 'keep_target' || patch.acceptedYaml) return 'ready';
+  if (patch.acceptedYaml) return 'ready';
   return 'needs';
 }
 
@@ -431,7 +473,10 @@ function fieldDependencyStep4Status(
   mapping: DashboardMigrationFieldMappingDraft,
   dependency: MigrationFieldDependency,
 ): Step4DependencyStatus {
-  if (mapping.action === 'unresolved' && (dependency.targetCandidates.length > 0 || dependency.sourceFileName)) return 'auto';
+  if (
+    mapping.action === 'unresolved'
+    && (dashboardMigrationRecommendedFieldCandidate(dependency) || dependency.sourceFileName)
+  ) return 'auto';
   return fieldMappingStep4Status(mapping);
 }
 
@@ -513,6 +558,38 @@ function detailStringArray(details: Record<string, unknown> | undefined, key: st
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0) : [];
 }
 
+function queryRequirementsFromDetails(details: Record<string, unknown> | undefined): QueryValidationRequirement[] {
+  const value = details?.queryRequirements;
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is QueryValidationRequirement => (
+    Boolean(item)
+    && typeof item === 'object'
+    && !Array.isArray(item)
+    && typeof item.queryId === 'string'
+    && typeof item.name === 'string'
+    && (item.kind === 'query' || item.kind === 'non_query')
+  ));
+}
+
+function functionalQueryResults(item: MigrationJobItem): FunctionalQueryResult[] {
+  const validation = item.details?.functionalValidation;
+  if (!validation || typeof validation !== 'object' || Array.isArray(validation)) return [];
+  const results = (validation as Record<string, unknown>).results;
+  if (!Array.isArray(results)) return [];
+  return results.filter((result): result is FunctionalQueryResult => (
+    Boolean(result)
+    && typeof result === 'object'
+    && !Array.isArray(result)
+    && typeof result.queryId === 'string'
+    && typeof result.name === 'string'
+    && ['passed', 'failed', 'waived', 'not_applicable'].includes(String(result.status))
+  ));
+}
+
+function queryWaiverKey(item: Pick<MigrationJobItem, 'routeGroupId' | 'targetId' | 'documentId'>, queryId: string) {
+  return [item.routeGroupId || 'route', item.targetId || 'target', item.documentId || 'document', queryId].join('::');
+}
+
 function planStepBlockerMessages(step: Pick<MigrationPlanStep, 'details' | 'error'>, detailKeys: string[]): string[] {
   const messages = new Set<string>();
   for (const key of detailKeys) {
@@ -581,6 +658,24 @@ function semanticAuditLines(item: MigrationJobItem): string[] {
       mapped.length > 0 ? `Mapped topics: ${mapped.join(', ')}` : '',
     ].filter(Boolean);
   }
+  if (item.kind === 'semantic_validate') {
+    const validation = details.semanticValidation;
+    if (!validation || typeof validation !== 'object' || Array.isArray(validation)) return [];
+    const evidence = validation as Record<string, unknown>;
+    const errorCount = typeof evidence.errorCount === 'number' ? evidence.errorCount : 0;
+    const warningCount = typeof evidence.warningCount === 'number' ? evidence.warningCount : 0;
+    return [`Model validation completed: ${errorCount} errors, ${warningCount} warnings.`];
+  }
+  if (item.kind === 'query_validate' || item.kind === 'document_verify') {
+    const validation = details.functionalValidation;
+    if (!validation || typeof validation !== 'object' || Array.isArray(validation)) return [];
+    const evidence = validation as Record<string, unknown>;
+    const passed = typeof evidence.passedCount === 'number' ? evidence.passedCount : 0;
+    const waived = typeof evidence.waivedCount === 'number' ? evidence.waivedCount : 0;
+    const notApplicable = typeof evidence.notApplicableCount === 'number' ? evidence.notApplicableCount : 0;
+    const zeroRows = typeof evidence.zeroRowCount === 'number' ? evidence.zeroRowCount : 0;
+    return [`${item.kind === 'document_verify' ? 'Final verification' : 'Pre-publish query validation'}: ${passed} passed, ${waived} waived, ${notApplicable} not applicable, ${zeroRows} zero-row.`];
+  }
   if (item.kind === 'update') {
     return [
       typeof details.tileCount === 'number' ? `Updated in place: ${details.tileCount} source tile${details.tileCount === 1 ? '' : 's'}.` : '',
@@ -626,6 +721,7 @@ export function DashboardMigrationWizard() {
   const [collapsedDependencyGroups, setCollapsedDependencyGroups] = useState<string[]>([]);
   const [expandedResolvedQueryViewKeys, setExpandedResolvedQueryViewKeys] = useState<string[]>([]);
   const [queryViewRecoveryFocus, setQueryViewRecoveryFocus] = useState<QueryViewRecoveryFocus | null>(null);
+  const [queryWaiverReasons, setQueryWaiverReasons] = useState<Record<string, string>>({});
   const [targetInstanceSelectionIds, setTargetInstanceSelectionIds] = useState<string[]>([]);
   const [targetCatalogs, setTargetCatalogs] = useState<Record<string, DashboardMigrationTargetCatalog>>({});
   const [targetModelCatalogs, setTargetModelCatalogs] = useState<Record<string, DashboardMigrationModelCatalog>>({});
@@ -936,6 +1032,19 @@ export function DashboardMigrationWizard() {
   const activeRouteGroup = routeGroups.find((group) => group.id === activeRouteGroupId) || routeGroups[0] || defaultRouteGroup(selectedDocumentIds, targetRowIds);
   const activeRouteDocuments = documents.filter((document) => activeRouteGroup.documentIds.includes(document.identifier));
   const activeRouteSourceTopics = useMemo(() => collectDashboardSourceTopics(activeRouteDocuments), [activeRouteDocuments]);
+  const activeQueryValidationSteps = useMemo(() => (
+    (plan?.steps || []).filter((planStep) => (
+      planStep.kind === 'query_validate'
+      && planStep.routeGroupId === activeRouteGroup.id
+    ))
+  ), [activeRouteGroup.id, plan]);
+  const activeFailedQueryValidationItems = useMemo(() => (
+    (job?.items || []).filter((item) => (
+      (item.kind === 'query_validate' || item.kind === 'document_verify')
+      && item.routeGroupId === activeRouteGroup.id
+      && functionalQueryResults(item).some((result) => result.status === 'failed' || result.status === 'waived')
+    ))
+  ), [activeRouteGroup.id, job]);
 
   const activeTargetRowsWithQueryViewMappings = useMemo<DashboardMigrationTargetDraft[]>(() => (
     targetRows.map((row) => ({
@@ -1172,7 +1281,6 @@ export function DashboardMigrationWizard() {
       sourceFileName: dependency.sourceFileName,
       action: 'unresolved',
       status: 'blocked',
-      warnings: dependency.reason ? [dependency.reason] : ['Choose how to resolve this missing field.'],
     }
   ), [activeRouteGroup.fieldMappingsByTargetId]);
 
@@ -1606,8 +1714,11 @@ export function DashboardMigrationWizard() {
         const existingMappings = group.fieldMappingsByTargetId?.[targetRowId] || [];
         if (existingMappings.length === 0 || !row?.destinationInstanceId || !row.targetModelId) continue;
         const queryViewMappings = group.queryViewMappingsByTargetId?.[targetRowId] || [];
+        const semanticPatches = group.semanticPatchesByTargetId?.[targetRowId] || [];
         const unresolved = existingMappings.find((mapping) => {
           if (dashboardMigrationFieldSuppliedByQueryView(queryViewMappings, mapping.sourceFieldRef)) return false;
+          if (dashboardMigrationFieldAwaitingQueryViewVerification(queryViewMappings, mapping.sourceFieldRef)) return false;
+          if (dashboardMigrationFieldAwaitingSemanticPatchVerification(semanticPatches, mapping.sourceFieldRef)) return false;
           if (mapping.action === 'unresolved' || mapping.status === 'blocked') return true;
           if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return true;
           if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return true;
@@ -1721,7 +1832,10 @@ export function DashboardMigrationWizard() {
     sum + Object.entries(group.fieldMappingsByTargetId || {}).reduce((innerSum, [targetRowId, mappings]) => (
       innerSum + mappings.filter((mapping) => {
         const queryViewMappings = group.queryViewMappingsByTargetId?.[targetRowId] || [];
+        const semanticPatches = group.semanticPatchesByTargetId?.[targetRowId] || [];
         if (dashboardMigrationFieldSuppliedByQueryView(queryViewMappings, mapping.sourceFieldRef)) return false;
+        if (dashboardMigrationFieldAwaitingQueryViewVerification(queryViewMappings, mapping.sourceFieldRef)) return false;
+        if (dashboardMigrationFieldAwaitingSemanticPatchVerification(semanticPatches, mapping.sourceFieldRef)) return false;
         if (mapping.action === 'unresolved' || mapping.status === 'blocked') return true;
         if (mapping.action === 'map_existing' && !mapping.targetFieldRef) return true;
         if (mapping.action === 'create_from_source' && !mapping.sourceFileName) return true;
@@ -1786,6 +1900,9 @@ export function DashboardMigrationWizard() {
   const updateItems = job?.items.filter((item) => item.kind === 'update') || [];
   const dashboardWriteItems = [...importItems, ...updateItems];
   const queryViewPrepareItems = job?.items.filter((item) => item.kind === 'query_view_prepare') || [];
+  const semanticValidationItems = job?.items.filter((item) => item.kind === 'semantic_validate') || [];
+  const queryValidationItems = job?.items.filter((item) => item.kind === 'query_validate') || [];
+  const documentVerificationItems = job?.items.filter((item) => item.kind === 'document_verify') || [];
   const relationshipPrepareItems = job?.items.filter((item) => item.kind === 'relationship_prepare') || [];
   const topicPrepareItems = job?.items.filter((item) => item.kind === 'topic_prepare') || [];
   const refreshItems = job?.items.filter((item) => item.kind === 'post_action') || [];
@@ -2263,18 +2380,21 @@ export function DashboardMigrationWizard() {
         && !group.fieldDependenciesByTargetId?.[rowId]
         && !group.fieldMappingsByTargetId?.[rowId]
         && !group.semanticPatchesByTargetId?.[rowId]
+        && !group.queryValidationWaiversByTargetId?.[rowId]
       ) return group;
       const topicMappingsByTargetId = { ...group.topicMappingsByTargetId };
       const queryViewMappingsByTargetId = { ...group.queryViewMappingsByTargetId };
       const fieldDependenciesByTargetId = { ...group.fieldDependenciesByTargetId };
       const fieldMappingsByTargetId = { ...group.fieldMappingsByTargetId };
       const semanticPatchesByTargetId = { ...group.semanticPatchesByTargetId };
+      const queryValidationWaiversByTargetId = { ...group.queryValidationWaiversByTargetId };
       delete topicMappingsByTargetId[rowId];
       delete queryViewMappingsByTargetId[rowId];
       delete fieldDependenciesByTargetId[rowId];
       delete fieldMappingsByTargetId[rowId];
       delete semanticPatchesByTargetId[rowId];
-      return { ...group, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldDependenciesByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId };
+      delete queryValidationWaiversByTargetId[rowId];
+      return { ...group, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldDependenciesByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId, queryValidationWaiversByTargetId };
     }));
   }
 
@@ -2381,11 +2501,16 @@ export function DashboardMigrationWizard() {
 
   function updateQueryViewMapping(row: DashboardMigrationTargetDraft, nextMapping: DashboardMigrationQueryViewMappingDraft) {
     expandDependencyGroup(row);
-    const nextKey = queryViewMappingKey(nextMapping);
+    const unverifiedMapping: DashboardMigrationQueryViewMappingDraft = {
+      ...nextMapping,
+      suppliedFieldRefs: undefined,
+      fieldEvidence: undefined,
+    };
+    const nextKey = queryViewMappingKey(unverifiedMapping);
     setExpandedResolvedQueryViewKeys((current) => current.filter((key) => !key.endsWith(`:${nextKey}`)));
     setQueryViewRecoveryFocus((current) => {
       if (!current) return current;
-      const matches = [nextMapping.sourceQueryViewName, nextMapping.targetQueryViewName, nextMapping.targetQueryViewLabel]
+      const matches = [unverifiedMapping.sourceQueryViewName, unverifiedMapping.targetQueryViewName, unverifiedMapping.targetQueryViewLabel]
         .filter(Boolean)
         .some((value) => (
           value?.toLowerCase() === current.queryViewName?.toLowerCase()
@@ -2403,8 +2528,8 @@ export function DashboardMigrationWizard() {
       for (const targetRowId of peerRowIds) {
         const currentMappings = queryViewMappingsByTargetId[targetRowId] || [];
         queryViewMappingsByTargetId[targetRowId] = currentMappings.some((mapping) => queryViewMappingKey(mapping) === nextKey)
-          ? currentMappings.map((mapping) => queryViewMappingKey(mapping) === nextKey ? nextMapping : mapping)
-          : [...currentMappings, nextMapping];
+          ? currentMappings.map((mapping) => queryViewMappingKey(mapping) === nextKey ? unverifiedMapping : mapping)
+          : [...currentMappings, unverifiedMapping];
       }
       return {
         ...group,
@@ -2688,12 +2813,13 @@ export function DashboardMigrationWizard() {
       for (const dependency of semanticGroup.fieldDependencies) {
         const mapping = fieldMappingForDependency(semanticGroup.primaryRow, dependency);
         if (fieldDependencyStep4Status(mapping, dependency) !== 'auto') continue;
-        const nextMapping: DashboardMigrationFieldMappingDraft = dependency.targetCandidates[0]
+        const recommendedCandidate = dashboardMigrationRecommendedFieldCandidate(dependency);
+        const nextMapping: DashboardMigrationFieldMappingDraft = recommendedCandidate
           ? {
               sourceFieldRef: dependency.sourceFieldRef,
               sourceFileName: dependency.sourceFileName,
               action: 'map_existing',
-              targetFieldRef: dependency.targetCandidates[0].fieldRef,
+              targetFieldRef: recommendedCandidate.fieldRef,
               status: 'ready',
             }
           : {
@@ -2844,6 +2970,12 @@ export function DashboardMigrationWizard() {
           patches.map((patch) => ({ ...patch })),
         ]),
       ),
+      queryValidationWaiversByTargetId: Object.fromEntries(
+        Object.entries(activeRouteGroup.queryValidationWaiversByTargetId || {}).map(([targetRowId, waivers]) => [
+          targetRowId,
+          waivers.map((waiver) => ({ ...waiver })),
+        ]),
+      ),
     };
     setRouteGroups((current) => [...current.filter((group) => group.id !== DEFAULT_ROUTE_GROUP_ID), duplicate]);
     setActiveRouteGroupId(duplicate.id);
@@ -2884,11 +3016,13 @@ export function DashboardMigrationWizard() {
       const queryViewMappingsByTargetId = { ...(group.queryViewMappingsByTargetId || {}) };
       const fieldMappingsByTargetId = { ...(group.fieldMappingsByTargetId || {}) };
       const semanticPatchesByTargetId = { ...(group.semanticPatchesByTargetId || {}) };
+      const queryValidationWaiversByTargetId = { ...(group.queryValidationWaiversByTargetId || {}) };
       if (!included) delete topicMappingsByTargetId[rowId];
       if (!included) delete queryViewMappingsByTargetId[rowId];
       if (!included) delete fieldMappingsByTargetId[rowId];
       if (!included) delete semanticPatchesByTargetId[rowId];
-      return { ...group, targetRowIds, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId };
+      if (!included) delete queryValidationWaiversByTargetId[rowId];
+      return { ...group, targetRowIds, topicMappingsByTargetId, queryViewMappingsByTargetId, fieldMappingsByTargetId, semanticPatchesByTargetId, queryValidationWaiversByTargetId };
     }));
     resetPlan();
   }
@@ -2909,6 +3043,9 @@ export function DashboardMigrationWizard() {
       ),
       semanticPatchesByTargetId: Object.fromEntries(
         Object.entries(group.semanticPatchesByTargetId || {}).filter(([targetRowId]) => targetRowIds.includes(targetRowId)),
+      ),
+      queryValidationWaiversByTargetId: Object.fromEntries(
+        Object.entries(group.queryValidationWaiversByTargetId || {}).filter(([targetRowId]) => targetRowIds.includes(targetRowId)),
       ),
     })));
     resetPlan();
@@ -3092,7 +3229,6 @@ export function DashboardMigrationWizard() {
             sourceFileName: dependency.sourceFileName,
             action: 'unresolved',
             status: 'blocked',
-            warnings: dependency.reason ? [dependency.reason] : ['Choose how to resolve this missing field.'],
           });
           existingKeys.add(key);
           fieldAddedCount += 1;
@@ -3148,15 +3284,16 @@ export function DashboardMigrationWizard() {
       );
       setPreflightStatus('Checking query-view, field, and topic dependencies from the readiness result...');
       const dependencySync = await syncDetectedDependenciesFromPlan(res.plan);
+      const freshRows = preflightRowsFromPlan(res.plan);
       setPlan(res.plan);
-      setPlanRows(preflightRowsFromPlan(res.plan));
+      setPlanRows(freshRows);
       lastReadinessSignatureRef.current = readinessSignature;
-      if (dependencySync.queryView.needsReview || dependencySync.field.needsReview) {
+      const blocked = freshRows.some((row) => row.status === 'blocked');
+      if (dependencySync.queryView.needsReview || dependencySync.field.needsReview || blocked) {
         const dependencyLabels = [
           dependencySync.queryView.needsReview ? 'query-view mappings' : '',
           dependencySync.field.needsReview ? 'field and measure dependencies' : '',
         ].filter(Boolean);
-        const blocked = dependencySync.queryView.blockedCount > 0 || dependencySync.field.blockedCount > 0;
         setStep(3);
         setMessage(blocked
           ? `${dependencyLabels.join(' and ')} need attention before review. Resolve them in Step 4, then check readiness again.`
@@ -3338,6 +3475,39 @@ export function DashboardMigrationWizard() {
       setQueryViewRecoveryFocus(null);
     }
     setMessage(`Focused Step 4 on the failed ${kindLabel(item.kind).toLowerCase()} item. Resolve the dependency and retry the migration.`);
+  }
+
+  function saveQueryValidationWaiver(item: MigrationJobItem, result: FunctionalQueryResult) {
+    if (!item.routeGroupId || !item.targetId || !item.documentId) {
+      setError('This query failure is missing route audit metadata and cannot be waived safely.');
+      return;
+    }
+    const key = queryWaiverKey(item, result.queryId);
+    const reason = (queryWaiverReasons[key] || '').trim();
+    if (reason.length < 10) {
+      setError('Enter at least 10 characters explaining why this specific query may proceed.');
+      return;
+    }
+    const acknowledgedAt = new Date().toISOString();
+    setRouteGroups((current) => current.map((group) => {
+      if (group.id !== item.routeGroupId) return group;
+      const queryValidationWaiversByTargetId = { ...(group.queryValidationWaiversByTargetId || {}) };
+      const currentWaivers = queryValidationWaiversByTargetId[item.targetId!] || [];
+      const nextWaiver = {
+        documentId: item.documentId!,
+        queryId: result.queryId,
+        reason,
+        acknowledgedAt,
+      };
+      queryValidationWaiversByTargetId[item.targetId!] = [
+        ...currentWaivers.filter((waiver) => !(waiver.documentId === item.documentId && waiver.queryId === result.queryId)),
+        nextWaiver,
+      ];
+      return { ...group, queryValidationWaiversByTargetId };
+    }));
+    setQueryWaiverReasons((current) => ({ ...current, [key]: '' }));
+    setError('');
+    setMessage(`Saved a scoped waiver for ${result.name}. Retry failed steps when you are ready. Source deletion will remain disabled for this dashboard.`);
   }
 
   function focusPatchValidationArtifact(artifactType: DependencyArtifactFilter, searchValue: string) {
@@ -4499,6 +4669,111 @@ export function DashboardMigrationWizard() {
             </div>
           )}
 
+          {step === 3 && planRows.length > 0 && (
+            <div className="card p-5">
+              <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                <div>
+                  <h2 className="text-base font-semibold text-content-primary">Functional query proof</h2>
+                  <p className="mt-1 text-sm text-content-secondary">
+                    OmniKit will execute every query-backed tile against the prepared destination model before publishing. Zero rows pass; tiles without queries are marked not applicable.
+                  </p>
+                </div>
+                <span className="rounded-chip bg-surface-secondary px-3 py-1 text-xs font-semibold text-content-secondary">
+                  {activeQueryValidationSteps.reduce((sum, planStep) => sum + queryRequirementsFromDetails(planStep.details).filter((item) => item.kind === 'query').length, 0)} queries planned
+                </span>
+              </div>
+
+              {activeQueryValidationSteps.length > 0 ? (
+                <div className="mt-4 grid gap-3 lg:grid-cols-2">
+                  {activeQueryValidationSteps.map((planStep) => {
+                    const requirements = queryRequirementsFromDetails(planStep.details);
+                    const queryCount = requirements.filter((item) => item.kind === 'query').length;
+                    const nonQueryCount = requirements.length - queryCount;
+                    return (
+                      <div key={`query-proof:${planStep.routeGroupId}:${planStep.targetId}:${planStep.documentId}`} className="rounded-card border border-border-subtle bg-surface-secondary/40 p-3">
+                        <div className="text-sm font-semibold text-content-primary">{planStep.documentName || planStep.documentId || 'Dashboard'}</div>
+                        <div className="mt-1 text-xs text-content-secondary">
+                          {planStep.destinationLabel} · {planStep.targetModelName || planStep.targetModelId}
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-2 text-[11px] font-semibold">
+                          <span className="rounded-chip bg-white px-2 py-0.5 text-content-secondary">{queryCount} query-backed</span>
+                          <span className="rounded-chip bg-white px-2 py-0.5 text-content-secondary">{nonQueryCount} not applicable</span>
+                          <span className={`rounded-chip px-2 py-0.5 ${planStep.blocked ? 'bg-red-50 text-red-700' : 'bg-green-50 text-green-700'}`}>
+                            {planStep.blocked ? 'Blocked' : 'Runs before publish'}
+                          </span>
+                        </div>
+                        {requirements.length > 0 && (
+                          <div className="mt-2 line-clamp-2 text-xs text-content-secondary">
+                            {requirements.map((item) => item.name).join(', ')}
+                          </div>
+                        )}
+                        {planStep.error && <div className="mt-2 text-xs text-red-700">{planStep.error}</div>}
+                      </div>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="mt-4 rounded-card border border-dashed border-border-subtle p-4 text-sm text-content-secondary">
+                  Recheck readiness to load the dashboard query inventory.
+                </div>
+              )}
+
+              {activeFailedQueryValidationItems.length > 0 && (
+                <div className="mt-5 border-t border-border-subtle pt-4">
+                  <h3 className="text-sm font-semibold text-content-primary">Queries that need a decision</h3>
+                  <p className="mt-1 text-xs text-content-secondary">
+                    Fix the model, topic, or query view when possible. A waiver is an explicit exception for one query and never authorizes source deletion.
+                  </p>
+                  <div className="mt-3 space-y-3">
+                    {activeFailedQueryValidationItems.flatMap((item) => functionalQueryResults(item)
+                      .filter((result) => result.status === 'failed' || result.status === 'waived')
+                      .map((result) => {
+                        const key = queryWaiverKey(item, result.queryId);
+                        const savedWaiver = activeRouteGroup.queryValidationWaiversByTargetId?.[item.targetId || '']
+                          ?.find((waiver) => waiver.documentId === item.documentId && waiver.queryId === result.queryId);
+                        return (
+                          <div key={`${item.id}:${result.queryId}`} className="rounded-card border border-yellow-200 bg-yellow-50/40 p-4">
+                            <div className="flex flex-col gap-2 md:flex-row md:items-start md:justify-between">
+                              <div>
+                                <div className="text-sm font-semibold text-content-primary">{result.name}</div>
+                                <div className="mt-1 text-xs text-content-secondary">
+                                  {item.documentName} · {item.destinationLabel} · {item.kind === 'document_verify' ? 'Final verification' : 'Pre-publish validation'}
+                                </div>
+                              </div>
+                              <StatusChip status={result.status === 'waived' || savedWaiver ? 'warning' : 'failed'} label={result.status === 'waived' || savedWaiver ? 'Waived' : 'Failed'} />
+                            </div>
+                            {result.error && <div className="mt-2 text-xs text-red-700">{result.error}</div>}
+                            {savedWaiver || result.waiver ? (
+                              <div className="mt-3 rounded-card border border-yellow-200 bg-white px-3 py-2 text-xs text-yellow-900">
+                                <span className="font-semibold">Exception reason:</span> {savedWaiver?.reason || result.waiver?.reason}
+                              </div>
+                            ) : (
+                              <div className="mt-3 grid gap-2 md:grid-cols-[1fr_auto] md:items-end">
+                                <label className="text-xs font-semibold text-content-secondary">
+                                  Reason for allowing this query to proceed
+                                  <textarea
+                                    value={queryWaiverReasons[key] || ''}
+                                    onChange={(event) => setQueryWaiverReasons((current) => ({ ...current, [key]: event.target.value }))}
+                                    rows={2}
+                                    maxLength={500}
+                                    className="input-field mt-1 resize-y text-sm"
+                                    placeholder="Explain the accepted impact and planned follow-up."
+                                  />
+                                </label>
+                                <button type="button" onClick={() => saveQueryValidationWaiver(item, result)} className="btn-secondary text-xs text-yellow-900">
+                                  Save query waiver
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      }))}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
           {step === 3 && dependencyReviewMode === 'code' && (
             <div className="card p-5">
               <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -4706,6 +4981,7 @@ export function DashboardMigrationWizard() {
 	                                      acceptedYaml: event.target.value,
 	                                      destructive: patch.destructive || Boolean(patch.currentYaml),
 	                                      confirmedDestructive: semanticPatchWritesExistingTarget(patch) ? false : patch.confirmedDestructive,
+	                                      safetyCategory: semanticPatchWritesExistingTarget(patch) ? 'destructive_update' : 'manual_review',
 	                                      status: event.target.value.trim() ? 'ready' : 'blocked',
 	                                    })}
                                     className="min-h-72 w-full rounded-card border border-border-subtle bg-white p-3 font-mono text-[11px] leading-relaxed text-content-primary"
@@ -4746,6 +5022,9 @@ export function DashboardMigrationWizard() {
 	                    ? `Destinations ${semanticGroup.routeIndexes.join(' & ')}`
 	                    : `Destination ${semanticGroup.routeIndexes[0] || '?'}`;
 	                  const routeMappings = semanticGroup.queryViewMappings;
+	                  const verifiedSuppliedFields = [...new Set(routeMappings
+	                    .filter((mapping) => mapping.fieldEvidence?.verified)
+	                    .flatMap((mapping) => mapping.suppliedFieldRefs || []))].sort();
 	                  const recommendedQueryViewCount = routeMappings.filter((mapping) => recommendedQueryViewMapping(row, mapping)).length;
 	                  return (
 	                    <div key={`query-view-route-${activeRouteGroup.id}-${semanticGroup.id}`} className="rounded-card border border-border-subtle bg-white p-4">
@@ -4796,6 +5075,17 @@ export function DashboardMigrationWizard() {
 	                      {routeBlocker && (
 	                        <div className="mt-3 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
 	                          {routeBlocker}
+	                        </div>
+	                      )}
+	                      {verifiedSuppliedFields.length > 0 && (
+	                        <div className="mt-3 rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
+	                          <div className="font-semibold">
+	                            {verifiedSuppliedFields.length} dashboard field{verifiedSuppliedFields.length === 1 ? '' : 's'} verified in the planned query-view YAML
+	                          </div>
+	                          <div className="mt-1 break-words font-mono text-[11px]">
+	                            {verifiedSuppliedFields.slice(0, 8).join(', ')}{verifiedSuppliedFields.length > 8 ? `, +${verifiedSuppliedFields.length - 8} more` : ''}
+	                          </div>
+	                          <div className="mt-1">These fields need no separate model-field decision.</div>
 	                        </div>
 	                      )}
 	                      {!collapsedDependencyGroups.includes(semanticGroup.id) && queryViewCatalog?.loaded && routeMappings.length > 0 && (
@@ -4959,7 +5249,7 @@ export function DashboardMigrationWizard() {
 	                                  />
 	                                )}
 	                              </div>
-	                              <div className="lg:col-span-3">
+		                              <div className="lg:col-span-3">
 	                                {mapping.action === 'map_existing' && mapping.targetQueryViewName && queryViewMappingIsExactMatch(mapping) && (
 	                                  <div className="text-xs text-green-700">
 	                                    Already matched to destination query view {mapping.targetQueryViewLabel || mapping.targetQueryViewName}.
@@ -4977,9 +5267,17 @@ export function DashboardMigrationWizard() {
 	                                {mapping.action === 'copy_source' && mapping.status !== 'blocked' && (
 	                                  <div className="text-xs text-green-700">Will create destination query view {mapping.targetQueryViewName} before topic preparation.</div>
 	                                )}
-	                                {mapping.action === 'unresolved' && (
+		                                {mapping.action === 'unresolved' && (
 	                                  <div className="text-xs text-red-700">Choose an existing destination query view or create a new one before review.</div>
-	                                )}
+		                                )}
+		                                {mapping.fieldEvidence?.verified && (
+		                                  <div className="mt-2 grid gap-2 rounded-card border border-green-200 bg-green-50 p-3 text-xs text-green-900 md:grid-cols-4">
+		                                    <div><span className="font-semibold">Source:</span> {mapping.sourceFileName || mapping.sourceQueryViewName}</div>
+		                                    <div><span className="font-semibold">Target:</span> {mapping.fieldEvidence.fileName}</div>
+		                                    <div><span className="font-semibold">Planned:</span> {mapping.action.replace(/_/g, ' ')}</div>
+		                                    <div><span className="font-semibold">Verification:</span> {mapping.suppliedFieldRefs?.length || 0}/{mapping.requiredFieldRefs?.length || 0} required fields found in {mapping.fieldEvidence.source.replace(/_/g, ' ')}</div>
+		                                  </div>
+		                                )}
 	                                {!mapping.sourceFileName && (
 	                                  <div className="mt-1 text-xs text-red-700">Source YAML was not found, so create-new is unavailable for this query view.</div>
 	                                )}
@@ -5062,14 +5360,16 @@ export function DashboardMigrationWizard() {
                         {semanticGroup.fieldDependencies.map((dependency) => {
                           const mapping = fieldMappingForDependency(row, dependency);
                           const suppliedByQueryView = fieldDependencySuppliedByQueryView(row, dependency);
+                          const recommendedCandidate = dashboardMigrationRecommendedFieldCandidate(dependency);
                           const compatibleDecisionCount = compatibleFieldDecisionTargets(row, mapping).length;
                           return (
                             <div key={`${semanticGroup.id}:${dependency.sourceFieldRef}`} className="grid gap-3 rounded-card border border-border-subtle bg-surface-primary p-3 lg:grid-cols-[minmax(0,0.9fr)_minmax(0,0.9fr)_minmax(0,1.1fr)]">
                               <div className="min-w-0">
                                 <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Source field</div>
-                                <div className="mt-1 truncate font-mono text-sm font-semibold text-content-primary">{dependency.sourceFieldRef}</div>
-                                <div className="truncate text-xs text-content-secondary">
-                                  {[dependency.fieldKind, dependency.sourceFileName].filter(Boolean).join(' · ') || 'Field metadata unavailable'}
+                                <div className="mt-1 break-all font-mono text-sm font-semibold text-content-primary" title={dependency.sourceFieldRef}>{dependency.sourceFieldRef}</div>
+                                <div className="mt-1 break-words text-xs text-content-secondary">
+                                  {dependency.fieldKind === 'unknown' ? 'Field type unavailable' : dependency.fieldKind}
+                                  {dependency.sourceFileName ? ` · ${dependency.sourceFileName}` : ''}
                                 </div>
                                 <span className={`mt-2 inline-flex rounded-chip px-2 py-0.5 text-[11px] font-semibold ${suppliedByQueryView ? 'bg-green-50 text-green-700' : fieldMappingStatus(mapping).className}`}>
                                   {suppliedByQueryView ? 'Supplied by query view' : fieldMappingStatus(mapping).label}
@@ -5079,7 +5379,7 @@ export function DashboardMigrationWizard() {
                                 <div className="mb-1 block text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Action</div>
                                 {suppliedByQueryView ? (
                                   <div className="rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
-                                    No separate field action is needed because {suppliedByQueryView.sourceQueryViewName} will be {suppliedByQueryView.action === 'copy_source' ? 'created' : 'updated'} before import.
+                                    No separate field action is needed because this exact field was found in the query-view YAML selected for migration.
                                   </div>
                                 ) : <div className="inline-flex flex-wrap rounded-card border border-border-subtle bg-white p-1 text-xs">
                                   <button
@@ -5088,9 +5388,9 @@ export function DashboardMigrationWizard() {
                                       sourceFieldRef: dependency.sourceFieldRef,
                                       sourceFileName: dependency.sourceFileName,
                                       action: 'map_existing',
-                                      targetFieldRef: dependency.targetCandidates[0]?.fieldRef || '',
-                                      status: dependency.targetCandidates[0] ? 'ready' : 'blocked',
-                                      warnings: dependency.targetCandidates[0] ? undefined : ['Choose an existing target field.'],
+                                      targetFieldRef: recommendedCandidate?.fieldRef || '',
+                                      status: recommendedCandidate ? 'ready' : 'blocked',
+                                      warnings: recommendedCandidate ? undefined : ['Choose an existing target field.'],
                                     })}
                                     disabled={dependency.targetCandidates.length === 0}
                                     className={`rounded-card px-3 py-1 font-semibold disabled:cursor-not-allowed disabled:opacity-50 ${mapping.action === 'map_existing' ? 'bg-omni-600 text-white' : 'text-content-secondary'}`}
@@ -5135,14 +5435,19 @@ export function DashboardMigrationWizard() {
                                     Apply to {compatibleDecisionCount} similar
                                   </button>
                                 )}
-                                {!suppliedByQueryView && dependency.targetCandidates.length === 0 && (
+                                {!suppliedByQueryView && dependency.targetCandidates.length === 0 && !dependency.sourceFileName && (
                                   <div className="mt-2 text-xs text-content-secondary">
-                                    No similar target field was detected, so map-existing is unavailable until the target model exposes a candidate.
+                                    OmniKit could not verify source YAML or find a compatible target field. Revisit the query-view choice, add the field to the destination model, or intentionally ignore it and repair the tile later.
                                   </div>
                                 )}
-                                {!suppliedByQueryView && !dependency.sourceFileName && (
+                                {!suppliedByQueryView && dependency.targetCandidates.length === 0 && dependency.sourceFileName && (
                                   <div className="mt-2 text-xs text-content-secondary">
-                                    Source YAML was not found for this field, so create-from-source is unavailable.
+                                    No compatible target field was detected. Create from source remains available.
+                                  </div>
+                                )}
+                                {!suppliedByQueryView && dependency.targetCandidates.length > 0 && !dependency.sourceFileName && (
+                                  <div className="mt-2 text-xs text-content-secondary">
+                                    Source YAML was not verified. Select a compatible target field manually or intentionally ignore this dependency.
                                   </div>
                                 )}
                               </div>
@@ -5152,7 +5457,7 @@ export function DashboardMigrationWizard() {
                                 </label>
                                 {suppliedByQueryView ? (
                                   <div className="rounded-card border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-800">
-                                    {dependency.sourceFieldRef} will be available after the query-view preparation step writes {suppliedByQueryView.sourceQueryViewName}.
+                                    Verified in {suppliedByQueryView.fieldEvidence?.fileName}. OmniKit will still execute the dashboard query before publishing the destination document.
                                   </div>
                                 ) : mapping.action === 'map_existing' ? (
                                   <ComboBox
@@ -5171,7 +5476,7 @@ export function DashboardMigrationWizard() {
                                   />
                                 ) : mapping.action === 'create_from_source' ? (
                                   <div className="rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-800">
-                                    OmniKit will create this {dependency.fieldKind} in the target model before query views, topics, and dashboard import.
+                                    OmniKit will create this {dependency.fieldKind === 'unknown' ? 'field' : dependency.fieldKind} in the target {dependency.sourceFileName?.endsWith('.query.view') ? 'query view' : 'model'} before topics and dashboard import.
                                   </div>
                                 ) : mapping.action === 'ignore' ? (
                                   <div className="rounded-card border border-yellow-200 bg-yellow-50 px-3 py-2 text-xs text-yellow-800">
@@ -5185,7 +5490,7 @@ export function DashboardMigrationWizard() {
                               </div>
                               <div className="lg:col-span-3">
                                 {suppliedByQueryView && (
-                                  <div className="text-xs text-green-700">Will be supplied by query-view preparation for {suppliedByQueryView.sourceQueryViewName}.</div>
+                                  <div className="text-xs text-green-700">Parsed YAML evidence confirms {dependency.sourceFieldRef} is present in the planned query view.</div>
                                 )}
                                 {mapping.action === 'map_existing' && mapping.targetFieldRef && (
                                   <div className="text-xs text-green-700">Will map {dependency.sourceFieldRef} to {mapping.targetFieldRef}.</div>
@@ -5196,7 +5501,7 @@ export function DashboardMigrationWizard() {
                                 {dependency.reason && mapping.action === 'unresolved' && (
                                   <div className="text-xs text-red-700">{dependency.reason}</div>
                                 )}
-                                {mapping.warnings?.map((warning) => (
+                                {mapping.warnings?.filter((warning) => warning !== dependency.reason && warning !== 'Choose how to resolve this missing field.').map((warning) => (
                                   <div key={warning} className="mt-1 text-xs text-red-700">{warning}</div>
                                 ))}
                               </div>
@@ -5948,7 +6253,7 @@ export function DashboardMigrationWizard() {
                       : 'Ready'}
                 />
               </div>
-              <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-10">
+              <div className="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-4">
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.dashboardCount}</span><br />Dashboards</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.destinationCount}</span><br />Destinations</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.updateCount}</span><br />In-place updates</div>
@@ -5959,6 +6264,15 @@ export function DashboardMigrationWizard() {
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.fieldActionCount || 'None'}</span><br />Field actions</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.relationshipActionCount || 'None'}</span><br />Relationship actions</div>
                 <div className="rounded-card bg-white p-2"><span className="font-semibold">{reviewImpactSummary.topicActionCount || 'None'}</span><br />Topic actions</div>
+                <div className="rounded-card bg-white p-2">
+                  <span className="font-semibold">{(plan?.steps || []).filter((planStep) => planStep.kind === 'query_validate').reduce((sum, planStep) => sum + queryRequirementsFromDetails(planStep.details).filter((item) => item.kind === 'query').length, 0)}</span><br />Queries to execute
+                </div>
+                <div className="rounded-card bg-white p-2">
+                  <span className="font-semibold">{compiledRouteGroups.reduce((sum, route) => sum + route.targets.reduce((targetSum, target) => targetSum + (target.queryValidationWaivers?.length || 0), 0), 0) || 'None'}</span><br />Explicit query waivers
+                </div>
+              </div>
+              <div className="mt-3 rounded-card border border-blue-200 bg-blue-50 px-3 py-2 text-xs text-blue-900">
+                <span className="font-semibold">Execution gate:</span> prepare dependencies → validate target model → execute dashboard queries → publish dashboard → verify published queries. A failed required query stops publication unless that exact query has a reasoned waiver.
               </div>
               <div className="mt-3 space-y-2 text-sm text-content-primary">
                 {reviewImpactSummary.impactStatements.map((statement) => (
@@ -6613,12 +6927,14 @@ export function DashboardMigrationWizard() {
                             ? 'Migration needs attention'
                             : warningItems.length > 0 || job.status === 'partial'
                               ? 'Migration landed with warnings'
-                              : 'Landed successfully'}
+                              : 'Functionally verified'}
                         </h3>
                         <p className="mt-1 text-sm text-content-secondary">
                           {failedItems.length > 0
                             ? `${failedItems.length} step${failedItems.length === 1 ? '' : 's'} failed. Open the item log below for the exact route and retry details.`
-                            : 'The selected dashboards finished their route. Review the target links below, then open the dashboard in Omni when you are ready.'}
+                            : warningItems.length > 0 || job.status === 'partial'
+                              ? `${warningItems.length} recorded exception${warningItems.length === 1 ? '' : 's'} require review. Published targets remain available, but this run is not recorded as fully verified.`
+                              : 'Every required semantic check and query-backed tile completed for the published targets. Review the target links below, then open the dashboard in Omni when you are ready.'}
                         </p>
                       </div>
                       <StatusChip
@@ -6626,10 +6942,22 @@ export function DashboardMigrationWizard() {
                         label={failedItems.length > 0 ? 'Needs attention' : warningItems.length > 0 || job.status === 'partial' ? 'Warnings' : 'Complete'}
                       />
                     </div>
-                    <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-5">
+                    <div className="mt-4 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-4">
                       <div className="rounded-card bg-white p-3">
                         <span className="font-semibold text-content-primary">{dashboardWriteItems.length}</span><br />
                         Dashboard write route{dashboardWriteItems.length === 1 ? '' : 's'}
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{proofOutcomeSummary(semanticValidationItems)}</span><br />
+                        Models validated
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{proofOutcomeSummary(queryValidationItems)}</span><br />
+                        Pre-publish query gates
+                      </div>
+                      <div className="rounded-card bg-white p-3">
+                        <span className="font-semibold text-content-primary">{proofOutcomeSummary(documentVerificationItems)}</span><br />
+                        Published dashboards verified
                       </div>
                       <div className="rounded-card bg-white p-3">
                         <span className="font-semibold text-content-primary">{queryViewPrepareItems.length ? terminalCount(queryViewPrepareItems) : 'None'}</span><br />
@@ -6675,7 +7003,7 @@ export function DashboardMigrationWizard() {
                     )}
                   </div>
                 )}
-                <div className="grid gap-3 lg:grid-cols-8">
+                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                   <div className="rounded-card border border-border-subtle p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Destinations</div>
                     <div className="mt-2 text-xl font-semibold text-content-primary">{job.targets?.length || targetRows.length}</div>
@@ -6687,6 +7015,18 @@ export function DashboardMigrationWizard() {
                   <div className="rounded-card border border-border-subtle p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Dashboard writes</div>
                     <div className="mt-2 text-xl font-semibold text-content-primary">{terminalCount(dashboardWriteItems)}/{dashboardWriteItems.length}</div>
+                  </div>
+                  <div className="rounded-card border border-border-subtle p-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Model validation</div>
+                    <div className="mt-2 text-sm font-semibold leading-5 text-content-primary">{proofOutcomeSummary(semanticValidationItems)}</div>
+                  </div>
+                  <div className="rounded-card border border-border-subtle p-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Query validation</div>
+                    <div className="mt-2 text-sm font-semibold leading-5 text-content-primary">{proofOutcomeSummary(queryValidationItems)}</div>
+                  </div>
+                  <div className="rounded-card border border-border-subtle p-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Final verification</div>
+                    <div className="mt-2 text-sm font-semibold leading-5 text-content-primary">{proofOutcomeSummary(documentVerificationItems)}</div>
                   </div>
                   <div className="rounded-card border border-border-subtle p-4">
                     <div className="text-xs font-semibold uppercase tracking-[0.14em] text-content-secondary">Query views</div>
@@ -6721,7 +7061,10 @@ export function DashboardMigrationWizard() {
                           || item.kind === 'query_view_prepare'
                           || item.kind === 'relationship_prepare'
                           || item.kind === 'topic_prepare'
+                          || item.kind === 'query_validate'
+                          || item.kind === 'document_verify'
                         );
+	                      const functionalResults = functionalQueryResults(item);
 	                      return (
 	                        <div key={item.id} className="border-b border-border-subtle px-4 py-3 text-xs last:border-b-0">
 	                          <div className="flex items-start justify-between gap-2">
@@ -6746,6 +7089,18 @@ export function DashboardMigrationWizard() {
 	                            </div>
 	                          ))}
 	                          {item.error && <div className="mt-1 text-red-700">{item.error}</div>}
+                            {functionalResults.length > 0 && (
+                              <div className="mt-2 space-y-1">
+                                {functionalResults.map((result) => (
+                                  <div key={`${item.id}:${result.queryId}`} className="flex flex-col gap-1 rounded-card bg-surface-secondary/70 px-2 py-1 sm:flex-row sm:items-center sm:justify-between">
+                                    <span className="font-semibold text-content-primary">{result.name}</span>
+                                    <span className={result.status === 'failed' ? 'text-red-700' : result.status === 'waived' ? 'text-yellow-800' : 'text-content-secondary'}>
+                                      {result.status.replace('_', ' ')}{typeof result.rowCount === 'number' ? ` · ${result.rowCount} rows` : ''}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
                             {canFixInStep4 && (
                               <button
                                 type="button"

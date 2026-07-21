@@ -6,12 +6,14 @@ import type {
   MigrationJobInput,
   MigrationJob,
   MigrationJobItem,
+  MigrationFieldCandidate,
   MigrationFieldDependency,
   MigrationFieldMapping,
   MigrationPlan,
   MigrationPlanStep,
   MigrationQueryViewMapping,
   MigrationRouteGroup,
+  MigrationSemanticPatch,
   MigrationTopicMapping,
   MigrationTarget,
   PostMigrationAction,
@@ -41,6 +43,49 @@ export const TARGET_FOLDER_COMBOBOX_CONFIG = {
   allowFreeText: true,
   emptyLabel: 'No folders found; type a new folder path',
 } as const;
+
+function normalizedFieldToken(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+function normalizedFieldTokenVariants(value: string): Set<string> {
+  const normalized = normalizedFieldToken(value);
+  const variants = new Set([normalized]);
+  if (normalized.startsWith('semantic') && normalized.length > 'semantic'.length) {
+    variants.add(normalized.slice('semantic'.length));
+  }
+  return variants;
+}
+
+function splitFieldRef(value: string): { viewName: string; fieldName: string } {
+  const [viewName, ...fieldParts] = value.trim().split('.');
+  return { viewName: viewName || '', fieldName: fieldParts.join('.') };
+}
+
+export function dashboardMigrationRecommendedFieldCandidate(
+  dependency: MigrationFieldDependency,
+): MigrationFieldCandidate | null {
+  const source = splitFieldRef(dependency.sourceFieldRef);
+  const sourceView = normalizedFieldToken(dependency.sourceViewName || source.viewName);
+  const sourceFieldNames = normalizedFieldTokenVariants(dependency.sourceFieldName || source.fieldName);
+
+  for (const candidate of dependency.targetCandidates) {
+    const kindCompatible = dependency.fieldKind === 'unknown'
+      || !candidate.fieldKind
+      || candidate.fieldKind === 'unknown'
+      || candidate.fieldKind === dependency.fieldKind;
+    if (!kindCompatible) continue;
+    if (candidate.matchType === 'exact' && candidate.fieldRef.toLowerCase() === dependency.sourceFieldRef.toLowerCase()) {
+      return candidate;
+    }
+    if (candidate.matchType !== 'field_name' && candidate.matchType !== 'normalized') continue;
+    const target = splitFieldRef(candidate.fieldRef);
+    if (normalizedFieldToken(target.viewName) !== sourceView) continue;
+    const targetFieldNames = normalizedFieldTokenVariants(target.fieldName);
+    if ([...targetFieldNames].some((name) => sourceFieldNames.has(name))) return candidate;
+  }
+  return null;
+}
 
 export interface RouteTopicActionSummary {
   routeGroupId?: string;
@@ -114,6 +159,9 @@ export interface DashboardMigrationRequiredQueryView {
   status: DashboardMigrationRequiredQueryViewStatus;
   sources: string[];
   referencedBy: string[];
+  requiredFieldRefs: string[];
+  suppliedFieldRefs?: string[];
+  fieldEvidence?: DashboardMigrationQueryViewMappingDraft['fieldEvidence'];
   reason?: string;
   compatibility?: DashboardMigrationQueryViewCompatibility;
 }
@@ -370,22 +418,6 @@ function normalizedFieldRef(value?: string | null) {
   return cleanDashboardModelMetadata(value)?.toLowerCase();
 }
 
-function queryViewRefKey(value?: string | null) {
-  const cleaned = cleanDashboardModelMetadata(value?.split('/').pop()?.replace(/\.query\.view$/i, ''));
-  return cleaned?.toLowerCase();
-}
-
-function fieldViewRefKey(value?: string | null) {
-  const cleaned = cleanDashboardModelMetadata(value?.split('.')[0]);
-  return cleaned?.toLowerCase();
-}
-
-function queryViewSourceKeys(mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'sourceFileName' | 'sourceQueryViewName'>) {
-  return [mapping.sourceQueryViewName, mapping.sourceFileName]
-    .map(queryViewRefKey)
-    .filter((value): value is string => Boolean(value));
-}
-
 export function dashboardMigrationQueryViewUpdateIsSafeRecommendation(
   mapping: Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'targetQueryViewName' | 'warnings' | 'status'>,
 ): boolean {
@@ -397,16 +429,58 @@ export function dashboardMigrationQueryViewUpdateIsSafeRecommendation(
 }
 
 export function dashboardMigrationFieldSuppliedByQueryView(
-  mappings: Array<Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status'>>,
+  mappings: Array<Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status' | 'suppliedFieldRefs' | 'fieldEvidence'>>,
   sourceFieldRef: string,
-): Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status'> | null {
-  const fieldViewKey = fieldViewRefKey(sourceFieldRef);
-  if (!fieldViewKey) return null;
+): Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceFileName' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status' | 'suppliedFieldRefs' | 'fieldEvidence'> | null {
+  const sourceFieldKey = normalizedFieldRef(sourceFieldRef);
+  if (!sourceFieldKey) return null;
   return mappings.find((mapping) => {
     if (mapping.status === 'blocked') return false;
-    if (mapping.action !== 'update_existing' && mapping.action !== 'copy_source') return false;
     if (!mapping.targetQueryViewName) return false;
-    return queryViewSourceKeys(mapping).includes(fieldViewKey);
+    if (mapping.fieldEvidence?.verified !== true) return false;
+    return (mapping.suppliedFieldRefs || []).some((fieldRef) => normalizedFieldRef(fieldRef) === sourceFieldKey);
+  }) || null;
+}
+
+export function dashboardMigrationFieldAwaitingQueryViewVerification(
+  mappings: Array<Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status' | 'requiredFieldRefs' | 'fieldEvidence'>>,
+  sourceFieldRef: string,
+): Pick<DashboardMigrationQueryViewMappingDraft, 'action' | 'sourceQueryViewName' | 'targetQueryViewName' | 'status' | 'requiredFieldRefs' | 'fieldEvidence'> | null {
+  const sourceFieldKey = normalizedFieldRef(sourceFieldRef);
+  if (!sourceFieldKey) return null;
+  const [sourceViewKey] = sourceFieldKey.split('.');
+  return mappings.find((mapping) => {
+    if (mapping.status === 'blocked' || !mapping.targetQueryViewName) return false;
+    if (mapping.action !== 'copy_source' && mapping.action !== 'update_existing') return false;
+    if (mapping.fieldEvidence?.verified === true) return false;
+    const requiredFieldRefs = mapping.requiredFieldRefs || [];
+    if (requiredFieldRefs.some((fieldRef) => normalizedFieldRef(fieldRef) === sourceFieldKey)) return true;
+
+    // Older or partially enriched previews may omit requiredFieldRefs. An explicit
+    // query-view write can still advance to server verification for fields owned by
+    // that source view; preflight remains authoritative about actual YAML coverage.
+    return requiredFieldRefs.length === 0
+      && normalizedFieldRef(mapping.sourceQueryViewName) === sourceViewKey;
+  }) || null;
+}
+
+export function dashboardMigrationFieldAwaitingSemanticPatchVerification(
+  patches: Array<Pick<MigrationSemanticPatch, 'artifactType' | 'sourceName' | 'targetFileName' | 'acceptedYaml' | 'resolution' | 'destructive' | 'confirmedDestructive' | 'status'>>,
+  sourceFieldRef: string,
+): Pick<MigrationSemanticPatch, 'artifactType' | 'sourceName' | 'targetFileName' | 'acceptedYaml' | 'resolution' | 'destructive' | 'confirmedDestructive' | 'status'> | null {
+  const { viewName, fieldName } = splitFieldRef(sourceFieldRef);
+  const normalizedViewName = normalizedFieldToken(viewName);
+  if (!normalizedViewName || !fieldName) return null;
+  const escapedFieldName = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const fieldDefinitionPattern = new RegExp(`(?:^|\\n)[ \\t]{2}${escapedFieldName}:`);
+
+  return patches.find((patch) => {
+    if (patch.artifactType !== 'query_view') return false;
+    if (patch.resolution === 'keep_target' || !patch.acceptedYaml?.trim()) return false;
+    const targetFileLeaf = patch.targetFileName.split('/').pop()?.replace(/\.query\.view$|\.view$/i, '') || '';
+    const patchViewNames = [patch.sourceName || '', targetFileLeaf].map(normalizedFieldToken).filter(Boolean);
+    if (!patchViewNames.includes(normalizedViewName)) return false;
+    return fieldDefinitionPattern.test(patch.acceptedYaml);
   }) || null;
 }
 
@@ -592,6 +666,11 @@ export function buildDashboardQueryViewMappings(
     const targetMatch = current?.targetQueryViewName
       ? targetQueryViews.find((queryView) => queryView.name === current.targetQueryViewName)
       : undefined;
+    const fieldCoverage = {
+      requiredFieldRefs: requiredQueryView.requiredFieldRefs,
+      suppliedFieldRefs: requiredQueryView.suppliedFieldRefs,
+      fieldEvidence: requiredQueryView.fieldEvidence,
+    };
 
 	    if (current?.action === 'copy_source') {
 	      const targetQueryViewName = typeof current.targetQueryViewName === 'string'
@@ -604,8 +683,9 @@ export function buildDashboardQueryViewMappings(
 	        targetQueryViewName,
 	        targetFileName: current.targetFileName,
 	      });
-	      return {
-	        ...current,
+		      return {
+		        ...current,
+		        ...fieldCoverage,
 	        sourceQueryViewName: requiredQueryView.name,
 	        sourceFileName: requiredQueryView.sourceFileName,
 	        targetQueryViewName,
@@ -625,6 +705,7 @@ export function buildDashboardQueryViewMappings(
       if (current.action === 'map_existing' && needsChoice) {
         return {
           ...current,
+          ...fieldCoverage,
           sourceQueryViewName: requiredQueryView.name,
           sourceFileName: requiredQueryView.sourceFileName,
           targetQueryViewName: targetMatch.name,
@@ -636,6 +717,7 @@ export function buildDashboardQueryViewMappings(
       }
       return {
         ...current,
+        ...fieldCoverage,
         sourceQueryViewName: requiredQueryView.name,
         sourceFileName: requiredQueryView.sourceFileName,
         targetQueryViewName: targetMatch.name,
@@ -651,6 +733,7 @@ export function buildDashboardQueryViewMappings(
     if ((current?.action === 'map_existing' || current?.action === 'use_existing_unverified' || current?.action === 'update_existing') && current.targetQueryViewName && targetQueryViews.length > 0 && !targetMatch) {
       return {
         ...current,
+        ...fieldCoverage,
         sourceQueryViewName: requiredQueryView.name,
         sourceFileName: requiredQueryView.sourceFileName,
         status: 'blocked',
@@ -662,6 +745,7 @@ export function buildDashboardQueryViewMappings(
     if (exact || requiredQueryView.status === 'exact_target_match') {
       const needsChoice = queryViewCompatibilityNeedsChoice(requiredQueryView);
       return {
+        ...fieldCoverage,
         sourceQueryViewName: requiredQueryView.name,
         sourceFileName: requiredQueryView.sourceFileName,
         action: needsChoice ? 'unresolved' : 'map_existing',
@@ -677,6 +761,7 @@ export function buildDashboardQueryViewMappings(
       const targetQueryViewName = defaultCreatedQueryViewName(requiredQueryView);
       const exists = targetQueryViewNameExists(targetQueryViewName, targetQueryViews);
       return {
+        ...fieldCoverage,
         sourceQueryViewName: requiredQueryView.name,
         sourceFileName: requiredQueryView.sourceFileName,
         action: 'copy_source',
@@ -689,6 +774,7 @@ export function buildDashboardQueryViewMappings(
     }
 
     return {
+      ...fieldCoverage,
       sourceQueryViewName: requiredQueryView.name,
       sourceFileName: requiredQueryView.sourceFileName,
       action: 'unresolved',
@@ -742,6 +828,7 @@ export function buildRouteGroupsBySourceScope(
     targetRowIds,
     topicMappingsByTargetId: {},
     queryViewMappingsByTargetId: {},
+    queryValidationWaiversByTargetId: {},
   }));
 }
 
@@ -805,6 +892,10 @@ export function normalizeDashboardRouteGroups(input: {
       Object.entries(group.semanticPatchesByTargetId || {})
         .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
     );
+    const queryValidationWaiversByTargetId = Object.fromEntries(
+      Object.entries(group.queryValidationWaiversByTargetId || {})
+        .filter(([targetRowId]) => assignedTargetRowIdSet.has(targetRowId)),
+    );
     const id = uniqueRouteGroupId(group.id || `dashboard-group-${index + 1}`, usedIds);
     usedIds.add(id);
     return {
@@ -817,6 +908,7 @@ export function normalizeDashboardRouteGroups(input: {
       queryViewMappingsByTargetId,
       ...(Object.keys(fieldMappingsByTargetId).length > 0 ? { fieldMappingsByTargetId } : {}),
       ...(Object.keys(semanticPatchesByTargetId).length > 0 ? { semanticPatchesByTargetId } : {}),
+      ...(Object.keys(queryValidationWaiversByTargetId).length > 0 ? { queryValidationWaiversByTargetId } : {}),
     };
   }).filter((group) => group.documentIds.length > 0);
 
@@ -1042,6 +1134,15 @@ function queryViewRequirementsFromStepDetails(details?: Record<string, unknown>)
         status,
         sources: Array.isArray(queryView.sources) ? queryView.sources.filter((source): source is string => typeof source === 'string') : [],
         referencedBy: Array.isArray(queryView.referencedBy) ? queryView.referencedBy.filter((source): source is string => typeof source === 'string') : [],
+        requiredFieldRefs: Array.isArray(queryView.requiredFieldRefs)
+          ? queryView.requiredFieldRefs.filter((field): field is string => typeof field === 'string')
+          : [],
+        suppliedFieldRefs: Array.isArray(queryView.suppliedFieldRefs)
+          ? queryView.suppliedFieldRefs.filter((field): field is string => typeof field === 'string')
+          : undefined,
+        fieldEvidence: queryView.fieldEvidence && typeof queryView.fieldEvidence === 'object' && !Array.isArray(queryView.fieldEvidence)
+          ? queryView.fieldEvidence as DashboardMigrationQueryViewMappingDraft['fieldEvidence']
+          : undefined,
         reason: typeof queryView.reason === 'string' ? queryView.reason : undefined,
         ...(compatibilityStatus ? {
           compatibility: {
@@ -1086,6 +1187,9 @@ export function queryViewRequirementsByRouteTargetFromPlan(plan: MigrationPlan |
         ...current,
         sources: [...new Set([...current.sources, ...queryView.sources])].sort(),
         referencedBy: [...new Set([...current.referencedBy, ...queryView.referencedBy])].sort(),
+        requiredFieldRefs: [...new Set([...current.requiredFieldRefs, ...queryView.requiredFieldRefs])].sort(),
+        suppliedFieldRefs: [...new Set([...(current.suppliedFieldRefs || []), ...(queryView.suppliedFieldRefs || [])])].sort(),
+        fieldEvidence: queryView.fieldEvidence || current.fieldEvidence,
         reason: current.reason || queryView.reason,
         compatibility: current.compatibility?.status === 'missing_required_fields' || current.compatibility?.status === 'missing_required_dependencies'
           ? current.compatibility
@@ -1130,6 +1234,11 @@ function queryViewMappingsFromStepDetails(details?: Record<string, unknown>): Mi
       targetQueryViewName: typeof mapping.targetQueryViewName === 'string' ? mapping.targetQueryViewName : '',
       targetFileName: typeof mapping.targetFileName === 'string' ? mapping.targetFileName : undefined,
       targetQueryViewLabel: typeof mapping.targetQueryViewLabel === 'string' ? mapping.targetQueryViewLabel : undefined,
+      requiredFieldRefs: Array.isArray(mapping.requiredFieldRefs) ? mapping.requiredFieldRefs.filter((field): field is string => typeof field === 'string') : undefined,
+      suppliedFieldRefs: Array.isArray(mapping.suppliedFieldRefs) ? mapping.suppliedFieldRefs.filter((field): field is string => typeof field === 'string') : undefined,
+      fieldEvidence: mapping.fieldEvidence && typeof mapping.fieldEvidence === 'object' && !Array.isArray(mapping.fieldEvidence)
+        ? mapping.fieldEvidence as MigrationQueryViewMapping['fieldEvidence']
+        : undefined,
     }))
     .filter((mapping) => mapping.sourceQueryViewName && mapping.targetQueryViewName);
 }

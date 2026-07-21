@@ -6,6 +6,7 @@ import {
   type DashboardMigrationSemanticPatchDraft,
   type DashboardMigrationTopicMappingDraft,
 } from './dashboardMigrationTypes';
+import type { MigrationQueryValidationWaiver } from '@/services/opsConsole';
 
 const FORBIDDEN_DRAFT_KEYS = new Set(['apiKey', 'api_key', 'token', 'secret', 'passphrase', 'baseUrl', 'base_url']);
 
@@ -21,6 +22,28 @@ function uniqueStrings(value: unknown): string[] {
   return Array.isArray(value)
     ? [...new Set(value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0))]
     : [];
+}
+
+function sanitizeWaiverReason(value: unknown): string {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/\b(sk-[a-z0-9_-]{12,}|api[_-]?key\s*[:=]\s*\S+|bearer\s+\S+)\b/gi, '[redacted]')
+    .trim()
+    .slice(0, 500);
+}
+
+function sanitizeQueryValidationWaivers(value: unknown): MigrationQueryValidationWaiver[] {
+  if (!Array.isArray(value)) return [];
+  const waivers = value
+    .filter((waiver): waiver is Record<string, unknown> => Boolean(waiver) && typeof waiver === 'object' && !Array.isArray(waiver))
+    .map((waiver) => ({
+      documentId: typeof waiver.documentId === 'string' ? waiver.documentId.trim() : '',
+      queryId: typeof waiver.queryId === 'string' ? waiver.queryId.trim() : '',
+      reason: sanitizeWaiverReason(waiver.reason),
+      acknowledgedAt: typeof waiver.acknowledgedAt === 'string' ? waiver.acknowledgedAt.trim() : undefined,
+    }))
+    .filter((waiver) => waiver.documentId && waiver.queryId && waiver.reason.length >= 10);
+  return [...new Map(waivers.map((waiver) => [`${waiver.documentId}:${waiver.queryId}`, waiver])).values()];
 }
 
 function sanitizeTopicMappings(value: unknown): DashboardMigrationTopicMappingDraft[] {
@@ -51,6 +74,17 @@ function sanitizeQueryViewMappings(value: unknown): DashboardMigrationQueryViewM
     targetQueryViewName: mapping.targetQueryViewName || '',
     targetFileName: mapping.targetFileName || undefined,
     targetQueryViewLabel: mapping.targetQueryViewLabel || undefined,
+    requiredFieldRefs: uniqueStrings(mapping.requiredFieldRefs),
+    suppliedFieldRefs: uniqueStrings(mapping.suppliedFieldRefs),
+    fieldEvidence: mapping.fieldEvidence && typeof mapping.fieldEvidence === 'object'
+      && ['source_yaml', 'target_yaml', 'accepted_patch'].includes(mapping.fieldEvidence.source)
+      && typeof mapping.fieldEvidence.fileName === 'string'
+      ? {
+        source: mapping.fieldEvidence.source,
+        fileName: mapping.fieldEvidence.fileName,
+        verified: mapping.fieldEvidence.verified === true,
+      }
+      : undefined,
     status: mapping.status,
     warnings: uniqueStrings(mapping.warnings),
   })).filter((mapping) => mapping.sourceQueryViewName) : [];
@@ -185,6 +219,7 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
       queryViewMappings: sanitizeQueryViewMappings(target.queryViewMappings),
       fieldMappings: sanitizeFieldMappings(target.fieldMappings),
       semanticPatches: sanitizeSemanticPatches(target.semanticPatches),
+      queryValidationWaivers: sanitizeQueryValidationWaivers(target.queryValidationWaivers),
     })) : [],
     routeGroups: Array.isArray(input.routeGroups) ? input.routeGroups.map((group, index) => {
       const topicMappingsByTargetId = Object.fromEntries(
@@ -207,6 +242,11 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
           .map(([targetRowId, patches]) => [targetRowId, sanitizeSemanticPatches(patches)] as const)
           .filter(([, patches]) => patches.length > 0),
       );
+      const queryValidationWaiversByTargetId = Object.fromEntries(
+        Object.entries(group.queryValidationWaiversByTargetId || {})
+          .map(([targetRowId, waivers]) => [targetRowId, sanitizeQueryValidationWaivers(waivers)] as const)
+          .filter(([, waivers]) => waivers.length > 0),
+      );
       return {
         id: group.id || `route-group-${index + 1}`,
         name: group.name || `Route group ${index + 1}`,
@@ -216,6 +256,7 @@ export function sanitizeDashboardMigrationDraftForStorage(input: DashboardMigrat
         queryViewMappingsByTargetId,
         fieldMappingsByTargetId,
         ...(Object.keys(semanticPatchesByTargetId).length > 0 ? { semanticPatchesByTargetId } : {}),
+        ...(Object.keys(queryValidationWaiversByTargetId).length > 0 ? { queryValidationWaiversByTargetId } : {}),
       };
     }).filter((group) => group.documentIds.length > 0) : [],
     routeAssignmentsCustomized: input.routeAssignmentsCustomized === true,

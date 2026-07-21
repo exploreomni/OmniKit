@@ -55,6 +55,36 @@ export function sanitizePostMigrationAction(action: PostMigrationAction): PostMi
   };
 }
 
+function sanitizeTargetSemanticPatches(
+  patches: MigrationTarget['semanticPatches'],
+): MigrationTarget['semanticPatches'] {
+  if (!Array.isArray(patches)) return patches;
+  return patches.map((patch) => ({
+    id: redactSensitiveText(patch.id),
+    artifactType: patch.artifactType,
+    sourceName: patch.sourceName ? redactSensitiveText(patch.sourceName) : undefined,
+    sourceFileName: patch.sourceFileName ? redactSensitiveText(patch.sourceFileName) : undefined,
+    targetFileName: redactSensitiveText(patch.targetFileName),
+    targetModelId: patch.targetModelId ? redactSensitiveText(patch.targetModelId) : undefined,
+    previousChecksum: patch.previousChecksum ? redactSensitiveText(patch.previousChecksum) : undefined,
+    latestChecksum: patch.latestChecksum ? redactSensitiveText(patch.latestChecksum) : undefined,
+    checksumStale: patch.checksumStale === true,
+    resolution: patch.resolution,
+    destructive: patch.destructive === true,
+    confirmedDestructive: patch.confirmedDestructive === true,
+    status: patch.status,
+    safetyCategory: patch.safetyCategory,
+    recommendedAction: patch.recommendedAction ? redactSensitiveText(patch.recommendedAction) : undefined,
+    dependencyPath: patch.dependencyPath?.map((node) => ({
+      kind: node.kind,
+      label: redactSensitiveText(node.label),
+      ref: node.ref ? redactSensitiveText(node.ref) : undefined,
+      detail: node.detail ? redactSensitiveText(node.detail) : undefined,
+    })),
+    warnings: patch.warnings?.map(redactSensitiveText),
+  }));
+}
+
 export function sanitizeJobItem(item: MigrationJobItem): MigrationJobItem {
   const details = sanitizeJobItemDetails(item.details);
   return {
@@ -92,6 +122,13 @@ export function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarge
       targetQueryViewName: redactSensitiveText(mapping.targetQueryViewName),
       targetFileName: mapping.targetFileName ? redactSensitiveText(mapping.targetFileName) : mapping.targetFileName,
       targetQueryViewLabel: mapping.targetQueryViewLabel ? redactSensitiveText(mapping.targetQueryViewLabel) : mapping.targetQueryViewLabel,
+    })),
+    semanticPatches: sanitizeTargetSemanticPatches(target.semanticPatches),
+    queryValidationWaivers: target.queryValidationWaivers?.map((waiver) => ({
+      documentId: redactSensitiveText(waiver.documentId),
+      queryId: redactSensitiveText(waiver.queryId),
+      reason: redactSensitiveText(waiver.reason),
+      acknowledgedAt: waiver.acknowledgedAt ? redactSensitiveText(waiver.acknowledgedAt) : undefined,
     })),
   };
 }

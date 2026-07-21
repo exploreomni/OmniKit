@@ -20,6 +20,9 @@ import {
   dashboardMigrationRoutePathLabel,
   dashboardMigrationReviewImpactSummary,
   dashboardMigrationFieldDecisionForDependency,
+  dashboardMigrationFieldAwaitingQueryViewVerification,
+  dashboardMigrationFieldAwaitingSemanticPatchVerification,
+  dashboardMigrationRecommendedFieldCandidate,
   dashboardDestinationsEmptyState,
   dashboardGroupSelectionAriaLabel,
   dashboardMigrationFieldSuppliedByQueryView,
@@ -118,6 +121,45 @@ test('target drafts convert to migration targets without secrets', () => {
   assert.equal(target.targetFolderPath, 'Executive/Migrated');
   assert.deepEqual(target.topicMappings, []);
   assert.equal(JSON.stringify(target).includes('omni****1234'), false);
+});
+
+test('route targets preserve only reasoned query validation waivers', () => {
+  const group = routeGroupDraftToMigrationRouteGroup({
+    id: 'route-1',
+    name: 'Executive dashboards',
+    documentIds: ['dashboard-1'],
+    targetRowIds: ['target-1'],
+    queryValidationWaiversByTargetId: {
+      'target-1': [
+        {
+          documentId: 'dashboard-1',
+          queryId: 'tile-1',
+          reason: 'The tile is intentionally unavailable until the next data load.',
+          acknowledgedAt: '2026-07-20T12:00:00.000Z',
+        },
+        {
+          documentId: 'dashboard-1',
+          queryId: 'tile-2',
+          reason: 'short',
+        },
+      ],
+    },
+  }, [{
+    id: 'target-1',
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
+    targetModelId: 'model-1',
+    targetModelName: 'Executive Model',
+    targetFolderPath: 'Executive',
+    targetFolderId: 'folder-1',
+  }], [destination]);
+
+  assert.deepEqual(group.targets[0].queryValidationWaivers, [{
+    documentId: 'dashboard-1',
+    queryId: 'tile-1',
+    reason: 'The tile is intentionally unavailable until the next data load.',
+    acknowledgedAt: '2026-07-20T12:00:00.000Z',
+  }]);
 });
 
 test('target drafts default same-name dashboards to update in place and preserve explicit replacement', () => {
@@ -286,26 +328,119 @@ test('target drafts convert accepted semantic patches to migration targets', () 
     ],
   }, [destination]);
 
-  assert.deepEqual(target.semanticPatches, [{
-    id: 'field:orders.semantic_total_sales:orders.view',
-    artifactType: 'field',
-    sourceName: 'orders.semantic_total_sales',
-    sourceFileName: undefined,
-    targetFileName: 'orders.view',
+  assert.deepEqual(target.semanticPatches, [
+    {
+      id: 'field:orders.semantic_total_sales:orders.view',
+      artifactType: 'field',
+      sourceName: 'orders.semantic_total_sales',
+      sourceFileName: undefined,
+      targetFileName: 'orders.view',
+      targetModelId: 'model-1',
+      acceptedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+      recommendedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+      previousChecksum: 'checksum-1',
+      resolution: 'custom_edit',
+      destructive: false,
+      confirmedDestructive: false,
+      status: 'ready',
+      safetyCategory: 'safe_update',
+      recommendedAction: 'Create semantic_total_sales from source model YAML.',
+      dependencyPath: [
+        { kind: 'model_field', label: 'orders.semantic_total_sales', ref: 'orders.semantic_total_sales' },
+        { kind: 'model_file', label: 'orders.view', ref: 'orders.view' },
+      ],
+      warnings: undefined,
+    },
+    {
+      id: 'topic:orders:orders.topic',
+      artifactType: 'topic',
+      sourceName: 'orders',
+      sourceFileName: undefined,
+      targetFileName: 'orders.topic',
+      targetModelId: 'model-1',
+      acceptedYaml: undefined,
+      recommendedYaml: 'views: {}\n',
+      previousChecksum: undefined,
+      resolution: 'keep_target',
+      destructive: false,
+      confirmedDestructive: false,
+      status: undefined,
+      safetyCategory: undefined,
+      recommendedAction: undefined,
+      dependencyPath: undefined,
+      warnings: undefined,
+    },
+  ]);
+});
+
+test('route groups preserve confirmed custom query-view patches in the migration request', () => {
+  const acceptedYaml = [
+    'dimensions:',
+    '  order_channel:',
+    '    sql: ${orders.meal_location}',
+    '',
+  ].join('\n');
+  const targetDraft = createDashboardMigrationTargetDraft('target-1', destination);
+  Object.assign(targetDraft, {
+    destinationInstanceId: destination.id,
+    targetConnectionId: 'connection-1',
     targetModelId: 'model-1',
-    acceptedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
-    recommendedYaml: 'dimensions:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n',
+    targetModelName: 'Executive Model',
+  });
+  const queryViewPatch = {
+    id: 'query_view:orders:custom/orders.query.view',
+    artifactType: 'query_view' as const,
+    sourceName: 'orders',
+    sourceFileName: 'source/orders.query.view',
+    targetFileName: 'custom/orders.query.view',
+    currentYaml: 'dimensions:\n  meal_location: {}\n',
+    acceptedYaml,
+    previousChecksum: 'checksum-1',
+    resolution: 'custom_edit' as const,
+    destructive: true,
+    confirmedDestructive: true,
+    status: 'ready' as const,
+    safetyCategory: 'destructive_update' as const,
+  };
+
+  const routeGroup = routeGroupDraftToMigrationRouteGroup({
+    id: 'route-1',
+    name: 'All selected dashboards',
+    documentIds: ['dashboard-1'],
+    targetRowIds: [targetDraft.id],
+    semanticPatchesByTargetId: {
+      [targetDraft.id]: [queryViewPatch],
+    },
+  }, [targetDraft], [destination]);
+  const input = buildDashboardMigrationJobInput({
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection-1',
+    targets: routeGroup.targets,
+    routeGroups: [routeGroup],
+    documentIds: ['dashboard-1'],
+    emptyFirst: false,
+    replaceSameNamed: false,
+    deleteSourceOnSuccess: false,
+    postMigrationActions: [],
+  });
+
+  assert.deepEqual(input.routeGroups?.[0].targets[0].semanticPatches, [{
+    id: queryViewPatch.id,
+    artifactType: 'query_view',
+    sourceName: 'orders',
+    sourceFileName: 'source/orders.query.view',
+    targetFileName: 'custom/orders.query.view',
+    targetModelId: 'model-1',
+    acceptedYaml,
+    recommendedYaml: undefined,
     previousChecksum: 'checksum-1',
     resolution: 'custom_edit',
-    destructive: false,
-    confirmedDestructive: false,
+    destructive: true,
+    confirmedDestructive: true,
     status: 'ready',
-    safetyCategory: 'safe_update',
-    recommendedAction: 'Create semantic_total_sales from source model YAML.',
-    dependencyPath: [
-      { kind: 'model_field', label: 'orders.semantic_total_sales', ref: 'orders.semantic_total_sales' },
-      { kind: 'model_file', label: 'orders.view', ref: 'orders.view' },
-    ],
+    safetyCategory: 'destructive_update',
+    recommendedAction: undefined,
+    dependencyPath: undefined,
     warnings: undefined,
   }]);
 });
@@ -401,6 +536,58 @@ test('dashboard migration field decision reuse supports create and ignore outcom
     status: 'warning',
     warnings: ['Proceeding by choice.'],
   });
+});
+
+test('dashboard migration only recommends strongly compatible field candidates', () => {
+  const dependency: MigrationFieldDependency = {
+    sourceFieldRef: 'orders.semantic_order_channel',
+    sourceViewName: 'orders',
+    sourceFieldName: 'semantic_order_channel',
+    sourceFileName: 'orders.view',
+    fieldKind: 'dimension',
+    targetCandidates: [
+      {
+        fieldRef: 'orders.meal_location',
+        label: 'Order Channel',
+        fieldKind: 'dimension',
+        matchType: 'label',
+      },
+      {
+        fieldRef: 'other_view.order_channel',
+        fieldKind: 'dimension',
+        matchType: 'normalized',
+      },
+      {
+        fieldRef: 'orders.order_channel',
+        fieldKind: 'dimension',
+        matchType: 'normalized',
+      },
+    ],
+    status: 'unresolved',
+  };
+
+  assert.equal(
+    dashboardMigrationRecommendedFieldCandidate({
+      ...dependency,
+      targetCandidates: dependency.targetCandidates.slice(0, 2),
+    }),
+    null,
+  );
+  assert.equal(
+    dashboardMigrationRecommendedFieldCandidate(dependency)?.fieldRef,
+    'orders.order_channel',
+  );
+  assert.equal(
+    dashboardMigrationRecommendedFieldCandidate({
+      ...dependency,
+      targetCandidates: [{
+        fieldRef: 'orders.order_channel',
+        fieldKind: 'measure',
+        matchType: 'normalized',
+      }],
+    }),
+    null,
+  );
 });
 
 test('target drafts preserve explicit query view override and update actions', () => {
@@ -1227,6 +1414,12 @@ test('dashboard migration field dependencies can be supplied by accepted query-v
     sourceFileName: 'northstar/northstar__daily_grill_report.query.view',
     action: 'update_existing' as const,
     targetQueryViewName: 'northstar__daily_grill_report',
+    suppliedFieldRefs: ['northstar__daily_grill_report.avg_attach_rate'],
+    fieldEvidence: {
+      source: 'accepted_patch' as const,
+      fileName: 'northstar/northstar__daily_grill_report.query.view',
+      verified: true,
+    },
     status: 'ready' as const,
   };
 
@@ -1246,8 +1439,116 @@ test('dashboard migration field dependencies can be supplied by accepted query-v
   );
   assert.equal(
     dashboardMigrationFieldSuppliedByQueryView(
-      [{ ...supplyingMapping, action: 'map_existing' as const }],
+      [supplyingMapping],
+      'northstar__daily_grill_report.field_not_in_yaml',
+    ),
+    null,
+  );
+  assert.equal(
+    dashboardMigrationFieldSuppliedByQueryView(
+      [{ ...supplyingMapping, fieldEvidence: { ...supplyingMapping.fieldEvidence, verified: false } }],
       'northstar__daily_grill_report.avg_attach_rate',
+    ),
+    null,
+  );
+});
+
+test('dashboard migration can recheck fields awaiting planned query-view verification', () => {
+  const plannedUpdate = {
+    sourceQueryViewName: 'northstar__daily_grill_report',
+    action: 'update_existing' as const,
+    targetQueryViewName: 'northstar__daily_grill_report',
+    requiredFieldRefs: ['northstar__daily_grill_report.avg_attach_rate'],
+    status: 'ready' as const,
+  };
+
+  assert.equal(
+    dashboardMigrationFieldAwaitingQueryViewVerification(
+      [plannedUpdate],
+      'northstar__daily_grill_report.avg_attach_rate',
+    )?.sourceQueryViewName,
+    'northstar__daily_grill_report',
+  );
+  assert.equal(
+    dashboardMigrationFieldAwaitingQueryViewVerification(
+      [plannedUpdate],
+      'northstar__daily_grill_report.field_not_requested',
+    ),
+    null,
+  );
+  assert.equal(
+    dashboardMigrationFieldAwaitingQueryViewVerification(
+      [{ ...plannedUpdate, status: 'blocked' as const }],
+      'northstar__daily_grill_report.avg_attach_rate',
+    ),
+    null,
+  );
+  assert.equal(
+    dashboardMigrationFieldAwaitingQueryViewVerification(
+      [{ ...plannedUpdate, fieldEvidence: { source: 'source_yaml' as const, fileName: 'northstar__daily_grill_report.query.view', verified: true } }],
+      'northstar__daily_grill_report.avg_attach_rate',
+    ),
+    null,
+  );
+
+  const partiallyEnrichedUpdate = {
+    ...plannedUpdate,
+    requiredFieldRefs: undefined,
+  };
+  assert.equal(
+    dashboardMigrationFieldAwaitingQueryViewVerification(
+      [partiallyEnrichedUpdate],
+      'northstar__daily_grill_report.avg_attach_rate',
+    )?.sourceQueryViewName,
+    'northstar__daily_grill_report',
+  );
+  assert.equal(
+    dashboardMigrationFieldAwaitingQueryViewVerification(
+      [partiallyEnrichedUpdate],
+      'northstar__menu_item_pnl.margin_pct',
+    ),
+    null,
+  );
+});
+
+test('dashboard migration can recheck fields staged in a confirmed query-view patch', () => {
+  const confirmedPatch = {
+    artifactType: 'query_view' as const,
+    sourceName: 'northstar__daily_grill_report',
+    targetFileName: 'northstar/northstar__daily_grill_report.query.view',
+    acceptedYaml: [
+      'dimensions:',
+      '  store_number:',
+      '    sql: STORE_NUMBER',
+      'measures:',
+      '  avg_attach_rate:',
+      '    sql: ${northstar__daily_grill_report.attach_rate}',
+      '    aggregate_type: average',
+    ].join('\n'),
+    resolution: 'custom_edit' as const,
+    destructive: true,
+    confirmedDestructive: true,
+    status: 'ready' as const,
+  };
+
+  assert.equal(
+    dashboardMigrationFieldAwaitingSemanticPatchVerification(
+      [confirmedPatch],
+      'northstar__daily_grill_report.avg_attach_rate',
+    )?.targetFileName,
+    confirmedPatch.targetFileName,
+  );
+  assert.equal(
+    dashboardMigrationFieldAwaitingSemanticPatchVerification(
+      [{ ...confirmedPatch, confirmedDestructive: false }],
+      'northstar__daily_grill_report.avg_attach_rate',
+    )?.targetFileName,
+    confirmedPatch.targetFileName,
+  );
+  assert.equal(
+    dashboardMigrationFieldAwaitingSemanticPatchVerification(
+      [confirmedPatch],
+      'northstar__daily_grill_report.missing_alias',
     ),
     null,
   );
@@ -2684,6 +2985,37 @@ test('dashboard migration draft strips custom YAML bodies and blocks resumed cus
   assert.equal(targetPatch?.warnings?.some((warning) => /Custom YAML is not stored/i.test(warning)), true);
   assert.equal(routePatch?.status, 'blocked');
   assert.equal(routePatch?.warnings?.some((warning) => /Custom YAML is not stored/i.test(warning)), true);
+});
+
+test('dashboard migration draft redacts secrets from query waiver reasons', () => {
+  const sanitized = sanitizeDashboardMigrationDraftForStorage({
+    step: 3,
+    sourceId: 'source-1',
+    sourceConnectionId: 'source-connection',
+    selectedDocumentIds: ['dashboard-1'],
+    targets: [],
+    routeGroups: [{
+      id: 'route-1',
+      name: 'Executive dashboards',
+      documentIds: ['dashboard-1'],
+      targetRowIds: ['target-1'],
+      queryValidationWaiversByTargetId: {
+        'target-1': [{
+          documentId: 'dashboard-1',
+          queryId: 'tile-1',
+          reason: 'Proceed while api_key=super-secret-value-12345 is rotated.',
+        }],
+      },
+    }],
+    replaceSameNamed: true,
+    emptyFirst: false,
+    refreshSchemaOnComplete: false,
+    deleteSourceOnSuccess: false,
+  });
+
+  const waiver = sanitized.routeGroups?.[0].queryValidationWaiversByTargetId?.['target-1']?.[0];
+  assert.equal(waiver?.reason.includes('super-secret'), false);
+  assert.equal(waiver?.reason.includes('[redacted]'), true);
 });
 
 test('dashboard migration draft preserves Step 2 groups before destinations exist', () => {

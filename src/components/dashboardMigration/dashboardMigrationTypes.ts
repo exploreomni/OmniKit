@@ -7,6 +7,7 @@ import type {
   MigrationPlan,
   MigrationPlanStep,
   MigrationFieldMapping,
+  MigrationQueryValidationWaiver,
   MigrationSemanticPatch,
   MigrationRouteGroup,
   MigrationTarget,
@@ -46,6 +47,13 @@ export interface DashboardMigrationQueryViewMappingDraft {
   targetQueryViewName: string;
   targetFileName?: string;
   targetQueryViewLabel?: string;
+  requiredFieldRefs?: string[];
+  suppliedFieldRefs?: string[];
+  fieldEvidence?: {
+    source: 'source_yaml' | 'target_yaml' | 'accepted_patch';
+    fileName: string;
+    verified: boolean;
+  };
   status?: 'ready' | 'warning' | 'blocked';
   warnings?: string[];
 }
@@ -87,6 +95,7 @@ export interface DashboardMigrationTargetDraft {
   queryViewMappings?: DashboardMigrationQueryViewMappingDraft[];
   fieldMappings?: DashboardMigrationFieldMappingDraft[];
   semanticPatches?: DashboardMigrationSemanticPatchDraft[];
+  queryValidationWaivers?: MigrationQueryValidationWaiver[];
 }
 
 export function createDashboardMigrationTargetDraft(
@@ -106,6 +115,7 @@ export function createDashboardMigrationTargetDraft(
     queryViewMappings: [],
     fieldMappings: [],
     semanticPatches: [],
+    queryValidationWaivers: [],
   };
 }
 
@@ -119,6 +129,7 @@ export interface DashboardMigrationRouteGroupDraft {
   fieldDependenciesByTargetId?: Record<string, MigrationFieldDependency[]>;
   fieldMappingsByTargetId?: Record<string, DashboardMigrationFieldMappingDraft[]>;
   semanticPatchesByTargetId?: Record<string, DashboardMigrationSemanticPatchDraft[]>;
+  queryValidationWaiversByTargetId?: Record<string, MigrationQueryValidationWaiver[]>;
 }
 
 export interface DashboardMigrationTargetCatalog {
@@ -212,6 +223,7 @@ export function targetDraftToMigrationTarget(
   queryViewMappings: DashboardMigrationQueryViewMappingDraft[] = target.queryViewMappings || [],
   fieldMappings: DashboardMigrationFieldMappingDraft[] = target.fieldMappings || [],
   semanticPatches: DashboardMigrationSemanticPatchDraft[] = target.semanticPatches || [],
+  queryValidationWaivers: MigrationQueryValidationWaiver[] = target.queryValidationWaivers || [],
 ): MigrationTarget {
   const destination = instances.find((instance) => instance.id === target.destinationInstanceId);
   return {
@@ -248,6 +260,9 @@ export function targetDraftToMigrationTarget(
         targetQueryViewName: mapping.targetQueryViewName || mapping.sourceQueryViewName,
         targetFileName: mapping.targetFileName || undefined,
         targetQueryViewLabel: mapping.targetQueryViewLabel || undefined,
+        ...(mapping.requiredFieldRefs?.length ? { requiredFieldRefs: mapping.requiredFieldRefs } : {}),
+        ...(mapping.suppliedFieldRefs?.length ? { suppliedFieldRefs: mapping.suppliedFieldRefs } : {}),
+        ...(mapping.fieldEvidence ? { fieldEvidence: mapping.fieldEvidence } : {}),
       })),
     fieldMappings: fieldMappings
       .filter((mapping) => mapping.sourceFieldRef && mapping.action !== 'unresolved')
@@ -263,7 +278,11 @@ export function targetDraftToMigrationTarget(
         targetFileName: mapping.targetFileName || undefined,
       })),
     semanticPatches: semanticPatches
-      .filter((patch) => patch.id && patch.targetFileName && patch.resolution !== 'keep_target' && Boolean(patch.acceptedYaml))
+      .filter((patch) => (
+        patch.id
+        && patch.targetFileName
+        && (patch.resolution === 'keep_target' || Boolean(patch.acceptedYaml))
+      ))
       .map((patch): MigrationSemanticPatch => ({
         id: patch.id,
         artifactType: patch.artifactType,
@@ -274,11 +293,13 @@ export function targetDraftToMigrationTarget(
         acceptedYaml: patch.acceptedYaml || undefined,
         recommendedYaml: patch.recommendedYaml || undefined,
         previousChecksum: patch.previousChecksum || undefined,
-        resolution: patch.resolution === 'use_source'
-          ? 'use_source'
-          : patch.resolution === 'custom_edit'
-            ? 'custom_edit'
-            : 'recommended',
+        resolution: patch.resolution === 'keep_target'
+          ? 'keep_target'
+          : patch.resolution === 'use_source'
+            ? 'use_source'
+            : patch.resolution === 'custom_edit'
+              ? 'custom_edit'
+              : 'recommended',
         destructive: patch.destructive === true,
         confirmedDestructive: patch.confirmedDestructive === true,
         status: patch.status,
@@ -286,6 +307,14 @@ export function targetDraftToMigrationTarget(
         recommendedAction: patch.recommendedAction || undefined,
         dependencyPath: patch.dependencyPath || undefined,
         warnings: patch.warnings || undefined,
+      })),
+    queryValidationWaivers: queryValidationWaivers
+      .filter((waiver) => waiver.documentId && waiver.queryId && waiver.reason.trim().length >= 10)
+      .map((waiver) => ({
+        documentId: waiver.documentId,
+        queryId: waiver.queryId,
+        reason: waiver.reason.trim().slice(0, 500),
+        acknowledgedAt: waiver.acknowledgedAt,
       })),
   };
 }
@@ -311,6 +340,7 @@ export function routeGroupDraftToMigrationRouteGroup(
           group.queryViewMappingsByTargetId?.[targetRowId] || [],
           group.fieldMappingsByTargetId?.[targetRowId] || [],
           group.semanticPatchesByTargetId?.[targetRowId] || [],
+          group.queryValidationWaiversByTargetId?.[targetRowId] || [],
         );
       })
       .filter((target): target is MigrationTarget => Boolean(target)),
