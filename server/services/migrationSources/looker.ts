@@ -642,7 +642,7 @@ export async function prepareLookerEvidence(context: MigrationSourceCollectorCon
     && stats.errors.length === 0
     && unresolvedDashboardTileDependencies.length === 0
     && selectedDefinitionsAcquired >= expectedSelectedDefinitions;
-  const status: MigrationPreparedEvidenceResult['status'] = collectionComplete && missingCount === 0 ? 'partial' : 'failed';
+  const status: MigrationPreparedEvidenceResult['status'] = collectionComplete ? 'partial' : missingCount > 0 && selectedDefinitionsAcquired > 0 ? 'partial' : 'failed';
   const evidenceContract: MigrationPreparedEvidenceResult['evidenceContract'] = {
     schemaVersion: 'omnikit.source-evidence.v2',
     sourceTool: 'looker',

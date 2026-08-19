@@ -749,6 +749,7 @@ export function SemanticMigrationImportPanel({
   const [assetScope, setAssetScope] = useState<Record<string, MigrationAssetScopeDecision>>({});
   const [selectedSourceDashboardIds, setSelectedSourceDashboardIds] = useState<string[]>([]);
   const [selectedSourceRootIds, setSelectedSourceRootIds] = useState<string[]>([]);
+  const [sourceRootSearch, setSourceRootSearch] = useState('');
   const [dashboardSearch, setDashboardSearch] = useState('');
   const [dashboardCoverageFilter, setDashboardCoverageFilter] = useState<'all' | 'complete' | 'partial' | 'export_required'>('all');
   const [capabilityCoverageAcknowledged, setCapabilityCoverageAcknowledged] = useState(false);
@@ -5467,8 +5468,21 @@ ${stringifySemanticMigrationPromptPayload(plan)}`;
                   <button type="button" className="btn-secondary text-xs" onClick={() => changeSelectedSourceRoots([])} disabled={selectedSourceRootIds.length === 0}>Clear</button>
                 </div>
               </div>
+              <div className="border-b border-border px-4 py-2">
+                <input
+                  type="text"
+                  className="input-field w-full text-sm"
+                  placeholder="Search by name or ID..."
+                  value={sourceRootSearch}
+                  onChange={(event) => setSourceRootSearch(event.target.value)}
+                />
+              </div>
               <div className="max-h-[420px] divide-y divide-border overflow-auto">
-                {selectablePreparedSourceRoots.slice(0, 500).map((item) => {
+                {selectablePreparedSourceRoots.filter((item) => {
+                  if (!sourceRootSearch.trim()) return true;
+                  const needle = sourceRootSearch.trim().toLowerCase();
+                  return item.name.toLowerCase().includes(needle) || item.id.toLowerCase().includes(needle) || item.kind.toLowerCase().includes(needle);
+                }).slice(0, 500).map((item) => {
                   const selected = selectedSourceRootIds.includes(item.id);
                   return (
                     <label key={item.id} className={`flex cursor-pointer items-start gap-3 px-4 py-3 ${selected ? 'bg-omni-50' : 'hover:bg-surface-secondary'}`}>
