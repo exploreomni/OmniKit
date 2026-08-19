@@ -24,7 +24,7 @@ const MAX_SELECTED_ROOTS = 200;
 const MAX_ARTIFACT_BYTES = 10 * 1024 * 1024;
 const REQUEST_DEADLINE_MS = 30_000;
 const DISCOVERY_DEADLINE_MS = 90_000;
-const DISCOVERY_PAGE_SIZE = 200;
+const DISCOVERY_PAGE_SIZE = 50;
 const MAX_DISCOVERY_ITEMS_PER_KIND = 1_000;
 // Five data pages plus one terminal probe prove an exact 1,000-item boundary.
 const MAX_DISCOVERY_PAGES_PER_KIND = Math.ceil(MAX_DISCOVERY_ITEMS_PER_KIND / DISCOVERY_PAGE_SIZE) + 1;
@@ -373,10 +373,13 @@ async function listLookerDiscoveryPages(
   let previousPageSignature = '';
 
   for (let page = 0; page < MAX_DISCOVERY_PAGES_PER_KIND; page += 1) {
+    const discoveryFields = resource === 'dashboards'
+      ? '&fields=id,title,name,folder(name),folder_path,user_name,updated_at,view_count,dashboard_elements(query(model,view,fields,filters)),dashboard_filters(dimension,name)'
+      : '&fields=id,title,name,folder(name),folder_path,user_name,updated_at';
     const response = await requestLookerJson(
       context,
       stats,
-      `${base}/${resource}/search?deleted=false&limit=${DISCOVERY_PAGE_SIZE}&offset=${offset}&sorts=id`,
+      `${base}/${resource}/search?deleted=false&limit=${DISCOVERY_PAGE_SIZE}&offset=${offset}&sorts=id${discoveryFields}`,
       accessToken,
       `Looker ${resource === 'dashboards' ? 'dashboard' : 'Look'} discovery page ${page + 1}`,
       { deadlineMs: DISCOVERY_DEADLINE_MS },
