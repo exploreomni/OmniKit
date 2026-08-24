@@ -2039,8 +2039,8 @@ export type UserModelRoleName = typeof USER_MODEL_ROLE_NAMES[number];
 export interface UserModelRoleRecord {
   roleName: string;
   baseRole: string;
-  connectionId: string;
-  modelId: string;
+  connectionId: string | null;
+  modelId: string | null;
   priority: number;
   resolved: boolean;
   from: {
@@ -2056,8 +2056,8 @@ export interface UserModelRoleListResponse {
 export interface UserModelRoleAssignmentProof {
   userId: string;
   roleName: UserModelRoleName;
-  connectionId: string;
-  modelId: string;
+  connectionId: string | null;
+  modelId: string | null;
 }
 
 export interface UserModelRoleAssignmentResponse extends UserModelRoleListResponse {

@@ -13,10 +13,10 @@ permissions:
   contents: read
 
 jobs:
-  # Per-PR gate. Security only, with the production migration-engine install
-  # required for complete license and SBOM provenance. Test/audit-only Python
-  # dependencies and the Playwright suite stay in the full gate so this remains
-  # focused on dependency, credential, SSRF and redaction boundaries.
+  # Per-PR gate. Static type checks plus security, with the production
+  # migration-engine install required for complete license and SBOM provenance.
+  # Test/audit-only Python dependencies and the Playwright suite stay in the
+  # full gate so this remains a bounded change-validation path.
   security-gate:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -41,6 +41,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Run static type checks
+        run: npm run typecheck && npm run typecheck:node
+
       - name: Install first-party migration engine
         env:
           OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
@@ -52,10 +55,10 @@ jobs:
       - name: Run the security gate
         run: npm run security:gate
 
-  # Full suite, on demand and weekly. Everything the security gate leaves out
-  # lives here: the Python dependency audit, typecheck, lint, build, bundle
-  # budgets, every unit contract, and the Playwright suite. Run it from the
-  # Actions tab before a release, or let the Monday cron catch drift.
+  # Full suite, on demand and weekly. It repeats the static checks and adds the
+  # Python dependency audit, lint, build, bundle budgets, every unit contract,
+  # and the Playwright suite. Run it from the Actions tab before a release, or
+  # let the Monday cron catch drift.
   full-gate:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest

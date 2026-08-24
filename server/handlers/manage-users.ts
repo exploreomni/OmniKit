@@ -14,8 +14,8 @@ export type UserModelRoleName = typeof USER_MODEL_ROLE_NAMES[number];
 export interface UserModelRoleRecord {
   roleName: string;
   baseRole: string;
-  modelId: string;
-  connectionId: string;
+  modelId: string | null;
+  connectionId: string | null;
   priority: number;
   resolved: boolean;
   from: {
@@ -31,8 +31,8 @@ export interface UserModelRoleListResponse {
 interface UserModelRoleAssignmentProof {
   userId: string;
   roleName: UserModelRoleName;
-  modelId: string;
-  connectionId: string;
+  modelId: string | null;
+  connectionId: string | null;
 }
 
 export interface ManageUsersDependencies {
@@ -252,33 +252,53 @@ function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserMo
   if (!isRecord(value)) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
+  const roleName = isSafeModelRoleString(value.roleName) ? value.roleName : undefined;
+  const baseRole = isSafeModelRoleString(value.baseRole) ? value.baseRole : undefined;
+  const modelId = isOmniIdOrNull(value.modelId) ? value.modelId : undefined;
+  const connectionId = isOmniIdOrNull(value.connectionId) ? value.connectionId : undefined;
+  const priority = Number.isSafeInteger(value.priority) && Number(value.priority) >= 0
+    ? Number(value.priority)
+    : undefined;
+  const resolved = typeof value.resolved === "boolean" ? value.resolved : undefined;
+  const fromType = isRecord(value.from) && isSafeRoleSourceType(value.from.type)
+    ? value.from.type
+    : undefined;
   const failures: string[] = [];
-  if (!isSafeModelRoleString(value.roleName)) failures.push(`roleName=${JSON.stringify(value.roleName)}`);
-  if (!isSafeModelRoleString(value.baseRole)) failures.push(`baseRole=${JSON.stringify(value.baseRole)}`);
-  if (!isOmniIdOrNull(value.modelId)) failures.push(`modelId=${JSON.stringify(value.modelId)}`);
-  if (!isOmniIdOrNull(value.connectionId)) failures.push(`connectionId=${JSON.stringify(value.connectionId)}`);
+  if (roleName === undefined) failures.push(`roleName=${JSON.stringify(value.roleName)}`);
+  if (baseRole === undefined) failures.push(`baseRole=${JSON.stringify(value.baseRole)}`);
+  if (modelId === undefined) failures.push(`modelId=${JSON.stringify(value.modelId)}`);
+  if (connectionId === undefined) failures.push(`connectionId=${JSON.stringify(value.connectionId)}`);
   if (!Number.isSafeInteger(value.priority)) failures.push(`priority=${JSON.stringify(value.priority)}`);
   else if (Number(value.priority) < 0) failures.push(`priority_negative=${value.priority}`);
-  if (typeof value.resolved !== "boolean") failures.push(`resolved=${JSON.stringify(value.resolved)}`);
+  if (resolved === undefined) failures.push(`resolved=${JSON.stringify(value.resolved)}`);
   if (!isRecord(value.from)) failures.push(`from=${JSON.stringify(value.from)}`);
-  else if (!isSafeRoleSourceType(value.from.type)) failures.push(`from.type=${JSON.stringify(value.from.type)}`);
-  if (failures.length > 0) {
+  else if (fromType === undefined) failures.push(`from.type=${JSON.stringify(value.from.type)}`);
+  if (
+    failures.length > 0
+    || roleName === undefined
+    || baseRole === undefined
+    || modelId === undefined
+    || connectionId === undefined
+    || priority === undefined
+    || resolved === undefined
+    || fromType === undefined
+  ) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE", failures.join("; "));
   }
-  if (scope.modelId && value.modelId !== scope.modelId) {
+  if (scope.modelId && modelId !== scope.modelId) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
-  if (scope.connectionId && value.connectionId !== scope.connectionId) {
+  if (scope.connectionId && connectionId !== scope.connectionId) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
   return {
-    roleName: value.roleName,
-    baseRole: value.baseRole,
-    modelId: value.modelId,
-    connectionId: value.connectionId,
-    priority: value.priority as number,
-    resolved: value.resolved,
-    from: { type: value.from.type },
+    roleName,
+    baseRole,
+    modelId,
+    connectionId,
+    priority,
+    resolved,
+    from: { type: fromType },
   };
 }
 
@@ -492,8 +512,8 @@ export default async function handler(
 
         const verificationScope = {
           userId: scope.userId,
-          modelId: assignment.modelId,
-          connectionId: assignment.connectionId,
+          ...(assignment.modelId ? { modelId: assignment.modelId } : {}),
+          ...(assignment.connectionId ? { connectionId: assignment.connectionId } : {}),
         };
         const verifiedRoles = await readModelRoles(req, cleanUrl, authHeaders, verificationScope, dependencies);
         const role = verifiedRoles.results.find((candidate) => (
