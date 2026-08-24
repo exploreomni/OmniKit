@@ -29,6 +29,26 @@ export interface DashboardSafeCopyQueryViewMappingDraft {
   targetFileName?: string;
 }
 
+type DashboardSafeCopyExecutableTopicMapping = Omit<DashboardSafeCopyTopicMappingDraft, 'action'> & {
+  action: 'map_existing' | 'copy_source';
+};
+
+type DashboardSafeCopyExecutableQueryViewMapping = Omit<DashboardSafeCopyQueryViewMappingDraft, 'action'> & {
+  action: 'map_existing' | 'copy_source';
+};
+
+function isExecutableTopicMapping(
+  mapping: DashboardSafeCopyTopicMappingDraft,
+): mapping is DashboardSafeCopyExecutableTopicMapping {
+  return mapping.action === 'map_existing' || mapping.action === 'copy_source';
+}
+
+function isExecutableQueryViewMapping(
+  mapping: DashboardSafeCopyQueryViewMappingDraft,
+): mapping is DashboardSafeCopyExecutableQueryViewMapping {
+  return mapping.action === 'map_existing' || mapping.action === 'copy_source';
+}
+
 export interface DashboardSafeCopyDestinationDraft {
   targetId: string;
   instanceId: string;
@@ -1130,12 +1150,12 @@ export function dashboardSafeCopyIntentFromDraft(
         ...(instance?.defaultFolderPath ? { folderPath: instance.defaultFolderPath } : {}),
         ...(row.topicMappings?.length ? {
           topicMappings: row.topicMappings
-            .filter((m) => m.action !== 'unresolved')
+            .filter(isExecutableTopicMapping)
             .map((m) => ({ sourceTopicName: m.sourceTopicName, action: m.action, targetTopicName: m.targetTopicName })),
         } : {}),
         ...(row.queryViewMappings?.length ? {
           queryViewMappings: row.queryViewMappings
-            .filter((m) => m.action !== 'unresolved')
+            .filter(isExecutableQueryViewMapping)
             .map((m) => ({ sourceQueryViewName: m.sourceQueryViewName, action: m.action, targetQueryViewName: m.targetQueryViewName })),
         } : {}),
       };
