@@ -39,6 +39,7 @@ export interface ManageUsersDependencies {
   fetchImpl?: typeof fetch;
   assertSafeUrl?: (url: string) => Promise<void>;
   timeoutMs?: number;
+  verificationDelaysMs?: readonly number[];
 }
 
 interface RequestBody {
@@ -66,6 +67,8 @@ const OMNI_ID_PATTERN = /^[\w-]+$/;
 const MAX_MODEL_ROLE_RECORDS = 1_000;
 const MAX_MODEL_ROLE_RESPONSE_BYTES = 512 * 1024;
 const MODEL_ROLE_TIMEOUT_MS = 15_000;
+const MODEL_ROLE_VERIFICATION_DELAYS_MS = [0, 250, 750] as const;
+const RETRYABLE_MODEL_ROLE_VERIFICATION_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 class ModelRoleRequestError extends Error {}
 
@@ -159,7 +162,10 @@ function assignmentRole(body: RequestBody, scope: UserModelRoleScope): UserModel
 
 function isSafeModelRoleString(value: unknown): value is string {
   if (typeof value !== "string" || !value || value.trim() !== value || value.length > 160) return false;
-  if (/[@<>\u0000-\u001f\u007f]/.test(value)) return false;
+  if (value.includes('@') || value.includes('<') || value.includes('>') || [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  })) return false;
   if (/(?:https?:\/\/|\bbearer\s+|\b(?:api[_ -]?key|authorization|token|secret|password|signature)\b\s*[:=])/i.test(value)) {
     return false;
   }
@@ -264,15 +270,14 @@ function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserMo
     ? value.from.type
     : undefined;
   const failures: string[] = [];
-  if (roleName === undefined) failures.push(`roleName=${JSON.stringify(value.roleName)}`);
-  if (baseRole === undefined) failures.push(`baseRole=${JSON.stringify(value.baseRole)}`);
-  if (modelId === undefined) failures.push(`modelId=${JSON.stringify(value.modelId)}`);
-  if (connectionId === undefined) failures.push(`connectionId=${JSON.stringify(value.connectionId)}`);
-  if (!Number.isSafeInteger(value.priority)) failures.push(`priority=${JSON.stringify(value.priority)}`);
-  else if (Number(value.priority) < 0) failures.push(`priority_negative=${value.priority}`);
-  if (resolved === undefined) failures.push(`resolved=${JSON.stringify(value.resolved)}`);
-  if (!isRecord(value.from)) failures.push(`from=${JSON.stringify(value.from)}`);
-  else if (fromType === undefined) failures.push(`from.type=${JSON.stringify(value.from.type)}`);
+  if (roleName === undefined) failures.push('roleName');
+  if (baseRole === undefined) failures.push('baseRole');
+  if (modelId === undefined) failures.push('modelId');
+  if (connectionId === undefined) failures.push('connectionId');
+  if (!Number.isSafeInteger(value.priority) || Number(value.priority) < 0) failures.push('priority');
+  if (resolved === undefined) failures.push('resolved');
+  if (!isRecord(value.from)) failures.push('from');
+  else if (fromType === undefined) failures.push('from.type');
   if (
     failures.length > 0
     || roleName === undefined
@@ -283,7 +288,7 @@ function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserMo
     || resolved === undefined
     || fromType === undefined
   ) {
-    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE", failures.join("; "));
+    throw new ModelRoleResponseError('INVALID_MODEL_ROLE_RESPONSE', `invalid_fields=${failures.join(',')}`);
   }
   if (scope.modelId && modelId !== scope.modelId) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
@@ -347,7 +352,7 @@ async function readModelRoles(
   if (!isRecord(payload) || !Array.isArray(payload.results) || payload.results.length > MAX_MODEL_ROLE_RECORDS) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
-  if (!isOmniId(payload.membershipId) || payload.membershipId !== scope.userId) {
+  if (!isOmniId(payload.membershipId)) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
   const roles = payload.results.map((role) => parseModelRoleRecord(role, scope));
@@ -355,6 +360,73 @@ async function readModelRoles(
     membershipId: payload.membershipId,
     results: roles,
   };
+}
+
+function directAssignedModelRole(
+  roles: UserModelRoleRecord[],
+  assignment: UserModelRoleAssignmentProof,
+  roleName: UserModelRoleName,
+): UserModelRoleRecord | undefined {
+  return roles.find((candidate) => (
+    candidate.roleName === roleName
+    && candidate.modelId === assignment.modelId
+    && candidate.connectionId === assignment.connectionId
+    && (candidate.from.type === "USER" || candidate.from.type === "User Role")
+  ));
+}
+
+async function waitForModelRoleVerification(req: Request, delayMs: number): Promise<void> {
+  if (delayMs <= 0) return;
+  if (req.signal.aborted) throw new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED");
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      req.signal.removeEventListener("abort", abort);
+      resolve();
+    }, delayMs);
+    const abort = () => {
+      clearTimeout(timeout);
+      reject(new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED"));
+    };
+    req.signal.addEventListener("abort", abort, { once: true });
+  });
+}
+
+async function verifyAssignedModelRole(
+  req: Request,
+  cleanUrl: string,
+  authHeaders: Record<string, string>,
+  scope: UserModelRoleScope,
+  assignment: UserModelRoleAssignmentProof,
+  roleName: UserModelRoleName,
+  dependencies: ManageUsersDependencies,
+): Promise<{ verifiedRoles: UserModelRoleListResponse; role: UserModelRoleRecord }> {
+  const requestedDelays = dependencies.verificationDelaysMs;
+  const delays = requestedDelays && requestedDelays.length > 0
+    ? requestedDelays.slice(0, 5).map((delay) => (
+      Number.isFinite(delay) ? Math.min(Math.max(delay, 0), 2_000) : 0
+    ))
+    : MODEL_ROLE_VERIFICATION_DELAYS_MS;
+
+  for (let attempt = 0; attempt < delays.length; attempt += 1) {
+    await waitForModelRoleVerification(req, delays[attempt]);
+    try {
+      const verifiedRoles = await readModelRoles(req, cleanUrl, authHeaders, scope, dependencies);
+      const role = directAssignedModelRole(verifiedRoles.results, assignment, roleName);
+      if (role) return { verifiedRoles, role };
+    } catch (error) {
+      const canRetry = error instanceof ModelRoleUpstreamHttpError
+        && RETRYABLE_MODEL_ROLE_VERIFICATION_STATUSES.has(error.status)
+        && attempt < delays.length - 1;
+      if (canRetry) continue;
+      if (error instanceof ModelRoleUpstreamHttpError) {
+        throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED");
+      }
+      throw error;
+    }
+  }
+
+  throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED");
 }
 
 export default async function handler(
@@ -515,14 +587,15 @@ export default async function handler(
           ...(assignment.modelId ? { modelId: assignment.modelId } : {}),
           ...(assignment.connectionId ? { connectionId: assignment.connectionId } : {}),
         };
-        const verifiedRoles = await readModelRoles(req, cleanUrl, authHeaders, verificationScope, dependencies);
-        const role = verifiedRoles.results.find((candidate) => (
-          candidate.roleName === roleName
-          && candidate.modelId === assignment.modelId
-          && candidate.connectionId === assignment.connectionId
-          && (candidate.from?.type === "USER" || candidate.from?.type === "User Role")
-        ));
-        if (!role) throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED");
+        const { verifiedRoles, role } = await verifyAssignedModelRole(
+          req,
+          cleanUrl,
+          authHeaders,
+          verificationScope,
+          assignment,
+          roleName,
+          dependencies,
+        );
         return json({ ...verifiedRoles, assignment, role, verified: true });
       }
 

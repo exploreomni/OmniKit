@@ -1,9 +1,0 @@
-{
-  "views": [
-    { "name": "northstar_sales", "fields": ["order_id", "business_date", "store_number", "net_sales"], "measures": ["Total Revenue"] },
-    { "name": "northstar_locations", "fields": ["store_number", "location_name"], "measures": [] }
-  ],
-  "relationships": [{ "from": "northstar_sales", "to": "northstar_locations" }],
-  "dashboards": [{ "name": "NorthstarDashboard", "fields": ["Location Name", "Total Revenue"], "filters": ["Business Date"] }],
-  "caveats": ["MBQL translation, permissions, subscriptions, and visualization parity require review."]
-}

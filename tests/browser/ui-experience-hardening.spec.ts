@@ -19,7 +19,6 @@ const PRIMARY_ROUTES: PrimaryRoute[] = [
   { path: '/models/migrate', heading: 'Choose an instance to unlock Model Migrator', requiresSavedInstance: true },
   { path: '/models', heading: 'Choose an instance to unlock Model & Topic Health', requiresSavedInstance: true },
   { path: '/topics', heading: 'Choose an instance to unlock AI Semantic Studio', requiresSavedInstance: true },
-  { path: '/semantic-migrations', heading: 'Choose an instance to unlock BI Migration Studio', requiresSavedInstance: true },
   { path: '/admin/fleet/instances', heading: 'Instance Manager' },
   { path: '/admin/fleet/connections', heading: 'Choose an instance to unlock Connection Health', requiresSavedInstance: true },
   { path: '/admin/content/uploads', heading: 'Choose an instance to unlock Upload Governance', requiresSavedInstance: true },
@@ -2947,7 +2946,7 @@ test('Omni instance switcher is truthful, keyboard-safe, and keeps credentials s
       }),
     });
   });
-  await page.goto('/semantic-migrations');
+  await page.goto('/models');
   await closeWalkthrough(page);
   const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
   const trigger = sidebar.getByRole('button', {
@@ -2977,7 +2976,7 @@ test('Omni instance switcher is truthful, keyboard-safe, and keeps credentials s
 
   await trigger.press('Space');
   await expect(options).toBeVisible();
-  await page.getByRole('heading', { name: 'BI Migration Studio', exact: true }).click();
+  await page.getByRole('heading', { name: 'Model & Topic Health', exact: true }).click();
   await expect(options).toBeHidden();
 
   await trigger.click();
@@ -3087,7 +3086,7 @@ test('overlapping Omni instance switches keep the latest human intent when an ol
     }).catch(() => undefined);
   });
 
-  await page.goto('/semantic-migrations');
+  await page.goto('/models');
   await closeWalkthrough(page);
   const sidebar = page.getByRole('complementary', { name: 'Main navigation' });
   await sidebar.getByRole('button', { name: /Switch Omni instance.*Current race instance/ }).click();

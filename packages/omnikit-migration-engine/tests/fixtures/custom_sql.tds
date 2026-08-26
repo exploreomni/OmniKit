@@ -1,8 +1,0 @@
-<?xml version='1.0' encoding='utf-8' ?>
-<datasource formatted-name='custom_sql' inline='true' version='18.1'>
-  <connection class='postgres' dbname='analytics'>
-    <relation name='Custom SQL Query' type='text'>SELECT id, amount FROM orders WHERE amount &gt; 0</relation>
-  </connection>
-  <column caption='Id' datatype='integer' name='[id]' role='dimension' type='ordinal' />
-  <column caption='Amount' datatype='real' name='[amount]' role='measure' type='quantitative' />
-</datasource>

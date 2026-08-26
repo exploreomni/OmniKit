@@ -7,7 +7,13 @@ import { toast } from '@/services/toast';
 import { Blobby } from '@/components/ui/Blobby';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { WALKTHROUGH_STORAGE_KEY } from '@/services/walkthrough';
-import { clearMigrationJobs, getVaultStatus, resetNativeVault, type VaultStatus } from '@/services/opsConsole';
+import {
+  clearMigrationJobs,
+  getVaultStatus,
+  purgeRetiredBiMigrationCredentials,
+  resetNativeVault,
+  type VaultStatus,
+} from '@/services/opsConsole';
 import {
   clearOmniKitLocalStorage,
   clearOmniKitSessionStorage,
@@ -55,6 +61,7 @@ export function DataPrivacyPage() {
   const [nativeVaultStatus, setNativeVaultStatus] = useState<VaultStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [pendingClear, setPendingClear] = useState<StoreName | 'all' | null>(null);
+  const [pendingRetiredCredentialPurge, setPendingRetiredCredentialPurge] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const refresh = async () => {
     setLoading(true);
@@ -159,6 +166,29 @@ export function DataPrivacyPage() {
     }
   };
 
+  const handleRetiredCredentialPurge = async () => {
+    try {
+      const result = await purgeRetiredBiMigrationCredentials();
+      setNativeVaultStatus(result.status);
+      const removedCount = result.removed.removedProviderProfiles + result.removed.removedSourceConnections;
+      toast({
+        type: 'success',
+        title: 'Retired BI Migration credentials removed',
+        detail: removedCount > 0
+          ? `${removedCount} encrypted profile${removedCount === 1 ? '' : 's'} deleted; active and backup vault generations were sanitized.`
+          : 'Active and backup vault generations were sanitized; no active retired profiles remained.',
+      });
+    } catch (err) {
+      toast({
+        type: 'error',
+        title: 'Retired credential purge failed',
+        detail: err instanceof Error ? err.message : undefined,
+      });
+    } finally {
+      setPendingRetiredCredentialPurge(false);
+    }
+  };
+
   const handleBrowserCacheClear = async () => {
     clearOmniKitLocalStorage();
     await refresh();
@@ -190,18 +220,6 @@ export function DataPrivacyPage() {
         icon={<Blobby mood="governance" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
         actions={<StatusChip status="success" label={`${totalRecords} records stored locally`} />}
       />
-
-      <div className="card p-5 border-omni-100 bg-omni-50">
-        <div className="flex items-start gap-3">
-          <HardDrive size={16} className="mt-0.5 text-omni-700" />
-          <div>
-            <h2 className="text-base font-semibold text-content-primary">AI source handling</h2>
-            <p className="mt-1 text-[13px] leading-relaxed text-omni-700">
-              BI Migration Studio inventories Domo, Power BI, Tableau, Sigma, Looker, WebFOCUS, and MicroStrategy evidence for migration into Omni. AI Semantic Studio remains the separate Omni-native guided builder. Manual uploads and pasted source text stay in page memory only while they are being normalized; they are never written to browser storage or the migration audit ledger. After reviewing normalized evidence, an operator can explicitly release the original source bytes from page memory and continue with retained metadata, mappings, diagnostics, and normalized semantic objects. Replacing the source, changing acquisition paths, reloading, or closing the page clears that in-memory evidence. Local engine extraction uses permission-restricted temporary files that are deleted after success, failure, or cancellation. Provider prompts use normalized task-scoped evidence by default. Power BI raw snippets require explicit opt-in, have per-file and total character limits, and remove principal identity collections, email and user-ID shapes, secret-shaped values, and bearer tokens before prompt construction. Saved provider keys, API source connections, and migration-project metadata live only in the encrypted native vault. Durable migration job metadata stores sanitized status and fingerprints, never prompts, artifacts, generated YAML, full AI responses, or credentials.
-            </p>
-          </div>
-        </div>
-      </div>
 
       <div className="card p-5 border-omni-100 bg-white">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
@@ -248,6 +266,46 @@ export function DataPrivacyPage() {
           >
             <Trash2 size={14} />
             Clear job history
+          </button>
+        </div>
+      </div>
+
+      <div className="card p-5 border-amber-200 bg-amber-50/40">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+          <div className="flex items-start gap-3">
+            <ShieldCheck size={17} className="mt-0.5 text-amber-700" />
+            <div>
+              <h2 className="text-base font-semibold text-content-primary">Retired BI Migration Studio credentials</h2>
+              <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
+                Upgrading does not silently discard saved BI source connections or AI-provider credentials.
+                Existing entries remain encrypted and inaccessible to product workflows until an operator
+                explicitly removes them here. This purge preserves saved Omni instances, deck recipes, and
+                Dashboard or Model Migrator job history.
+              </p>
+              <p className="mt-2 font-mono text-[11px] text-content-tertiary">
+                {nativeVaultStatus?.unlocked
+                  ? `${nativeVaultStatus.retiredBiMigrationProviderCount ?? 0} provider profile(s) · ${nativeVaultStatus.retiredBiMigrationSourceCount ?? 0} source connection(s)`
+                  : 'Unlock the native vault to inspect or purge retired credentials.'}
+              </p>
+              <p className="mt-2 text-[13px] leading-relaxed text-content-secondary">
+                Sanitized legacy job, audit, and run records are not loaded by OmniKit after retirement and
+                are not deleted automatically. Their default local paths are{' '}
+                <span className="font-mono">./data/semantic-migration-jobs.json</span>,{' '}
+                <span className="font-mono">./data/semantic-migration-audit.json</span>, and{' '}
+                <span className="font-mono">./data/bi-migration-runs.jsonl</span> (plus its snapshot).
+                Keep or remove those files according to the operator&apos;s audit-retention policy; configured
+                environments may override each path.
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setPendingRetiredCredentialPurge(true)}
+            disabled={!nativeVaultStatus?.unlocked}
+            className="btn-danger shrink-0 text-sm"
+          >
+            <Trash2 size={14} />
+            Purge retired credentials
           </button>
         </div>
       </div>
@@ -474,6 +532,15 @@ export function DataPrivacyPage() {
         variant="danger"
         onConfirm={performClear}
         onCancel={() => setPendingClear(null)}
+      />
+      <ConfirmDialog
+        open={pendingRetiredCredentialPurge}
+        title="Purge retired BI Migration credentials?"
+        message="This permanently removes every saved BI source connection and external AI-provider credential retained from BI Migration Studio. Saved Omni instances and current migration job history are preserved. This cannot be undone."
+        confirmLabel="Purge credentials"
+        variant="danger"
+        onConfirm={handleRetiredCredentialPurge}
+        onCancel={() => setPendingRetiredCredentialPurge(false)}
       />
     </div>
   );

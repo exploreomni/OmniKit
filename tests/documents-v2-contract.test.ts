@@ -115,7 +115,7 @@ test('Deck Builder keeps the supported document-query loader while AI Content St
   assert.match(deckBuilder, /fetchDashboardSummary/);
   assert.match(app, /path="\/content\/ai-studio"/);
   assert.match(app, /QueryPreservingRedirect to="\/content\/ai-studio"/);
-  assert.match(contracts, /workflows: \['semantic_studio', 'bi_migration_studio', 'ai_content_studio'\]/);
+  assert.match(contracts, /workflows: \['semantic_studio', 'ai_content_studio'\]/);
   assert.match(contracts, /narrative output is not registered as a persistent Omni report artifact/);
   assert.doesNotMatch(contracts, /ai_dashboard_studio/);
 });

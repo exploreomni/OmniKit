@@ -7,7 +7,6 @@ import {
   Clock,
   Database,
   Download,
-  FileInput,
   FileSearch,
   FolderCog,
   GitBranch,
@@ -56,7 +55,6 @@ const sections: NavSection[] = [
       { to: '/models/migrate', icon: <GitBranch size={16} />, label: 'Model Migrator' },
       { to: '/models', icon: <Database size={16} />, label: 'Model & Topic Health' },
       { to: '/topics', icon: <BookOpen size={16} />, label: 'AI Semantic Studio' },
-      { to: '/semantic-migrations', icon: <FileInput size={16} />, label: 'BI Migration Studio' },
     ],
   },
   {

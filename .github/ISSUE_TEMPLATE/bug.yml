@@ -20,7 +20,6 @@ body:
     attributes:
       label: Workflow
       options:
-        - BI Migration Studio
         - Dashboard Migrator
         - Model Migrator
         - Deck Builder

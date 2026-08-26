@@ -694,6 +694,7 @@ test('identity handlers encode opaque path IDs and never forward upstream error 
 const ROLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const ROLE_MODEL_ID = '22222222-2222-4222-8222-222222222222';
 const ROLE_CONNECTION_ID = '33333333-3333-4333-8333-333333333333';
+const ROLE_MEMBERSHIP_ID = '44444444-4444-4444-8444-444444444444';
 
 test('user model-role handler performs a strictly scoped and sanitized list read', async () => {
   let requestedUrl = '';
@@ -709,7 +710,7 @@ test('user model-role handler performs a strictly scoped and sanitized list read
       requestedUrl = String(input);
       requestedInit = init;
       return json({
-        membershipId: ROLE_USER_ID,
+        membershipId: ROLE_MEMBERSHIP_ID,
         privateMetadata: PRIVATE_MARKER,
         results: [{
           roleName: 'QUERIER',
@@ -734,7 +735,7 @@ test('user model-role handler performs a strictly scoped and sanitized list read
   assert.ok(requestedInit?.signal instanceof AbortSignal);
   const payload = await response.json();
   assert.deepEqual(payload, {
-    membershipId: ROLE_USER_ID,
+    membershipId: ROLE_MEMBERSHIP_ID,
     results: [{
       roleName: 'QUERIER',
       baseRole: 'VIEWER',
@@ -746,6 +747,35 @@ test('user model-role handler performs a strictly scoped and sanitized list read
     }],
   });
   assert.equal(JSON.stringify(payload).includes(PRIVATE_MARKER), false);
+});
+
+test('user model-role handler never reflects malformed upstream field values in diagnostics', async () => {
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'list_model_roles',
+    user_id: ROLE_USER_ID,
+    model_id: ROLE_MODEL_ID,
+    connection_id: ROLE_CONNECTION_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: async () => json({
+      membershipId: ROLE_MEMBERSHIP_ID,
+      results: [{
+        roleName: `token=${PRIVATE_MARKER}`,
+        baseRole: 'VIEWER',
+        modelId: ROLE_MODEL_ID,
+        connectionId: ROLE_CONNECTION_ID,
+        priority: 20,
+        resolved: true,
+        from: { type: 'User Role' },
+      }],
+    }),
+  });
+
+  assert.equal(response.status, 502);
+  const serialized = await response.text();
+  assert.doesNotMatch(serialized, new RegExp(PRIVATE_MARKER, 'i'));
+  assert.match(serialized, /invalid_fields=roleName/);
+  assert.match(serialized, /INVALID_MODEL_ROLE_RESPONSE/);
 });
 
 test('user model-role handler validates assignment scope and verifies CONNECTION_ADMIN by exact post-read', async () => {
@@ -773,7 +803,7 @@ test('user model-role handler validates assignment scope and verifies CONNECTION
         });
       }
       return json({
-        membershipId: ROLE_USER_ID,
+        membershipId: ROLE_MEMBERSHIP_ID,
         results: [
           {
             roleName: 'CONNECTION_ADMIN',
@@ -830,7 +860,7 @@ test('user model-role handler validates assignment scope and verifies CONNECTION
     },
   };
   for (const body of [
-    { action: 'list_model_roles', user_id: 'not-a-uuid', model_id: ROLE_MODEL_ID },
+    { action: 'list_model_roles', user_id: 'not/a/valid-id', model_id: ROLE_MODEL_ID },
     { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'QUERIER', connection_id: ROLE_CONNECTION_ID },
     { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'CONNECTION_ADMIN', model_id: ROLE_MODEL_ID },
     { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'ADMIN', model_id: ROLE_MODEL_ID },
@@ -841,6 +871,114 @@ test('user model-role handler validates assignment scope and verifies CONNECTION
   assert.equal(outboundCalls, 0);
 });
 
+test('user model-role handler posts once and retries only scoped reads until the direct role is visible', async () => {
+  const calls: Array<{ url: URL; method: string; body?: unknown }> = [];
+  let verificationReads = 0;
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'assign_model_role',
+    user_id: ROLE_USER_ID,
+    role_name: 'QUERY_TOPICS',
+    model_id: ROLE_MODEL_ID,
+    connection_id: ROLE_CONNECTION_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    verificationDelaysMs: [0, 0],
+    fetchImpl: async (input, init) => {
+      calls.push({
+        url: new URL(String(input)),
+        method: String(init?.method),
+        ...(init?.body ? { body: JSON.parse(String(init.body)) } : {}),
+      });
+      if (init?.method === 'POST') {
+        return json({
+          userId: ROLE_USER_ID,
+          roleName: 'QUERY_TOPICS',
+          modelId: ROLE_MODEL_ID,
+          connectionId: ROLE_CONNECTION_ID,
+        });
+      }
+      verificationReads += 1;
+      return json({
+        membershipId: ROLE_MEMBERSHIP_ID,
+        results: verificationReads === 1
+          ? [{
+              roleName: 'QUERY_TOPICS',
+              baseRole: 'QUERY_TOPICS',
+              modelId: ROLE_MODEL_ID,
+              connectionId: ROLE_CONNECTION_ID,
+              priority: 250,
+              resolved: true,
+              from: { type: 'Group Role' },
+            }]
+          : [{
+              roleName: 'QUERY_TOPICS',
+              baseRole: 'QUERY_TOPICS',
+              modelId: ROLE_MODEL_ID,
+              connectionId: ROLE_CONNECTION_ID,
+              priority: 350,
+              resolved: true,
+              from: { type: 'User Role' },
+            }],
+      });
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(calls.map((call) => call.method), ['POST', 'GET', 'GET']);
+  assert.equal(calls.filter((call) => call.method === 'POST').length, 1);
+  assert.deepEqual(calls[0].body, {
+    roleName: 'QUERY_TOPICS',
+    modelId: ROLE_MODEL_ID,
+    connectionId: ROLE_CONNECTION_ID,
+  });
+  for (const call of calls.filter((entry) => entry.method === 'GET')) {
+    assert.equal(call.url.searchParams.get('modelId'), ROLE_MODEL_ID);
+    assert.equal(call.url.searchParams.get('connectionId'), ROLE_CONNECTION_ID);
+  }
+  const payload = await response.json();
+  assert.equal(payload.membershipId, ROLE_MEMBERSHIP_ID);
+  assert.equal(payload.verified, true);
+  assert.equal(payload.role.roleName, 'QUERY_TOPICS');
+  assert.equal(payload.role.from.type, 'User Role');
+});
+
+test('user model-role handler bounds retryable verification failures without replaying the successful post', async () => {
+  const methods: string[] = [];
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'assign_model_role',
+    user_id: ROLE_USER_ID,
+    role_name: 'QUERY_TOPICS',
+    model_id: ROLE_MODEL_ID,
+    connection_id: ROLE_CONNECTION_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    verificationDelaysMs: [0, 0, 0],
+    fetchImpl: async (_input, init) => {
+      methods.push(String(init?.method));
+      if (init?.method === 'POST') {
+        return json({
+          userId: ROLE_USER_ID,
+          roleName: 'QUERY_TOPICS',
+          modelId: ROLE_MODEL_ID,
+          connectionId: ROLE_CONNECTION_ID,
+        });
+      }
+      return new Response(JSON.stringify({ error: 'rate_limited' }), {
+        status: 429,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(methods, ['POST', 'GET', 'GET', 'GET']);
+  assert.equal(methods.filter((method) => method === 'POST').length, 1);
+  assert.deepEqual(await response.json(), {
+    error: 'Omni did not verify the requested user model-role assignment.',
+    code: 'MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED',
+  });
+});
+
 test('user model-role browser helpers preserve scope, cancellation, and validated assignment results', async (t) => {
   const requests: Array<{ body: Record<string, unknown>; signal?: AbortSignal | null }> = [];
   t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
@@ -849,7 +987,7 @@ test('user model-role browser helpers preserve scope, cancellation, and validate
     requests.push({ body, signal: init?.signal });
     if (body.action === 'list_model_roles') {
       return json({
-        membershipId: ROLE_USER_ID,
+        membershipId: ROLE_MEMBERSHIP_ID,
         results: [{
           roleName: 'QUERIER',
           baseRole: 'QUERIER',
@@ -862,7 +1000,7 @@ test('user model-role browser helpers preserve scope, cancellation, and validate
       });
     }
     return json({
-      membershipId: ROLE_USER_ID,
+      membershipId: ROLE_MEMBERSHIP_ID,
       verified: true,
       assignment: {
         userId: ROLE_USER_ID,
@@ -904,7 +1042,9 @@ test('user model-role browser helpers preserve scope, cancellation, and validate
   }, { signal: controller.signal });
 
   assert.equal(listed.results[0]?.roleName, 'QUERIER');
+  assert.equal(listed.membershipId, ROLE_MEMBERSHIP_ID);
   assert.equal(assigned.verified, true);
+  assert.equal(assigned.membershipId, ROLE_MEMBERSHIP_ID);
   assert.equal(assigned.role.roleName, 'MODELER');
   assert.equal(requests.length, 2);
   assert.equal(requests[0].body.action, 'list_model_roles');

@@ -4,6 +4,7 @@ import {
   changeVaultPassphrase,
   isVaultUnlocked,
   lockVault,
+  purgeRetiredBiMigrationCredentials,
   resetVault,
   touchVaultSession,
   unlockVault,
@@ -80,6 +81,12 @@ export default async function handler(req: Request): Promise<Response> {
       resetVault();
       clearJobs();
       return json({ ok: true, status: vaultStatus() });
+    }
+
+    if (req.method === 'DELETE' && path === 'retired-bi-migration-credentials') {
+      if (!isVaultUnlocked()) return json({ error: 'vault locked' }, 423);
+      const removed = purgeRetiredBiMigrationCredentials();
+      return json({ ok: true, removed, status: vaultStatus() });
     }
 
     return json({ error: `Unknown vault route: ${path}` }, 404);

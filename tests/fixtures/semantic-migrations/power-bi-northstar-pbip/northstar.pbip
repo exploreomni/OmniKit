@@ -1,7 +1,0 @@
-{
-  "version": "1.0",
-  "artifacts": [
-    { "report": { "path": "NorthstarDashboard.Report" } }
-  ],
-  "settings": { "enableAutoRecovery": true }
-}

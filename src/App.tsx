@@ -40,8 +40,8 @@ const DeckBuilderPage = lazy(() => (
   import('@/pages/DeckBuilderPage').then((module) => ({ default: module.DeckBuilderPage }))
 ));
 
-const SemanticMigrationPage = lazy(() => (
-  import('@/pages/SemanticMigrationPage').then((module) => ({ default: module.SemanticMigrationPage }))
+const RetiredBiMigrationPage = lazy(() => (
+  import('@/pages/RetiredBiMigrationPage').then((module) => ({ default: module.RetiredBiMigrationPage }))
 ));
 
 function LazyPageFallback() {
@@ -195,11 +195,9 @@ function AppLayout() {
             <Route
               path="/semantic-migrations"
               element={(
-                <RequireConnection>
-                  <Suspense fallback={<LazyPageFallback />}>
-                    <SemanticMigrationPage />
-                  </Suspense>
-                </RequireConnection>
+                <Suspense fallback={<LazyPageFallback />}>
+                  <RetiredBiMigrationPage />
+                </Suspense>
               )}
             />
             <Route path="/labels" element={<QueryPreservingRedirect to="/admin/content/labels" />} />

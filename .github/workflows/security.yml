@@ -13,10 +13,8 @@ permissions:
   contents: read
 
 jobs:
-  # Per-PR gate. Static type checks plus security, with the production
-  # migration-engine install required for complete license and SBOM provenance.
-  # Test/audit-only Python dependencies and the Playwright suite stay in the
-  # full gate so this remains a bounded change-validation path.
+  # Per-PR gate. Static type checks plus the bounded JavaScript dependency and
+  # application-security checks run for every pull request and push to main.
   security-gate:
     if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -32,22 +30,11 @@ jobs:
           node-version: 22.22.0
           cache: npm
 
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.11"
-          cache: pip
-
       - name: Install dependencies
         run: npm ci
 
       - name: Run static type checks
         run: npm run typecheck && npm run typecheck:node
-
-      - name: Install first-party migration engine
-        env:
-          OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
-        run: npm run setup:migration-engine
 
       - name: Verify canonical release-gate coverage
         run: npm run test:release-gate-coverage
@@ -56,9 +43,9 @@ jobs:
         run: npm run security:gate
 
   # Full suite, on demand and weekly. It repeats the static checks and adds the
-  # Python dependency audit, lint, build, bundle budgets, every unit contract,
-  # and the Playwright suite. Run it from the Actions tab before a release, or
-  # let the Monday cron catch drift.
+  # lint, build, bundle budgets, every unit contract, and the Playwright suite.
+  # Run it from the Actions tab before a release, or let the Monday cron catch
+  # drift.
   full-gate:
     if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
     runs-on: ubuntu-latest
@@ -74,25 +61,8 @@ jobs:
           node-version: 22.22.0
           cache: npm
 
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: "3.11"
-          cache: pip
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Install first-party migration engine
-        env:
-          OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON: python
-        run: npm run setup:migration-engine:test
-
-      - name: Verify first-party migration engine
-        run: npm run verify:migration-engine:internal
-
-      - name: Verify installed first-party migration engine
-        run: npm run verify:migration-engine
 
       - name: Install browser test runtime
         run: npx playwright install --with-deps chromium

@@ -45,9 +45,6 @@ export interface TopicInventoryRecord {
 export const STUDIO_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION', 'BRANCH'] as const;
 export type StudioModelKind = (typeof STUDIO_MODEL_KINDS)[number];
 
-export const DESTINATION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
-export type DestinationModelKind = (typeof DESTINATION_MODEL_KINDS)[number];
-
 export interface StudioModelInventoryRecord {
   id: string;
   kind?: string;
@@ -96,7 +93,7 @@ function invalidStudioModelInventory(): never {
   throw new Error('Studio model inventory response was invalid.');
 }
 
-function invalidDestinationModelInventory(): never {
+function invalidVerifiedModelInventory(): never {
   throw new Error('Destination model inventory response was invalid.');
 }
 
@@ -209,21 +206,12 @@ export async function loadStudioModelInventory<T extends StudioModelInventoryRec
   );
 }
 
-export async function loadDestinationModelInventory<T extends StudioModelInventoryRecord>(
-  loadKind: (kind: DestinationModelKind) => Promise<unknown>,
-): Promise<T[]> {
-  return loadVerifiedStudioModelInventory(
-    DESTINATION_MODEL_KINDS,
-    loadKind,
-    invalidDestinationModelInventory,
-  );
-}
-
-export function parseDestinationModelInventory<T extends StudioModelInventoryRecord>(
+export function parseVerifiedModelInventory<T extends StudioModelInventoryRecord>(
   envelope: unknown,
+  allowedKinds: readonly string[],
 ): T[] {
-  const models = verifiedStudioModelEnvelopeModels<T>(envelope, invalidDestinationModelInventory);
-  const allowedKinds = new Set<string>(DESTINATION_MODEL_KINDS);
+  const models = verifiedStudioModelEnvelopeModels<T>(envelope, invalidVerifiedModelInventory);
+  const allowedKindSet = new Set<string>(allowedKinds);
   const seenIds = new Set<string>();
 
   return models.map((model) => {
@@ -234,9 +222,9 @@ export function parseDestinationModelInventory<T extends StudioModelInventoryRec
       || candidate.id.length === 0
       || candidate.id !== candidate.id.trim()
       || typeof candidate.kind !== 'string'
-      || !allowedKinds.has(candidate.kind)
+      || !allowedKindSet.has(candidate.kind)
       || seenIds.has(candidate.id)
-    ) invalidDestinationModelInventory();
+    ) invalidVerifiedModelInventory();
     seenIds.add(candidate.id);
     return model;
   });

@@ -95,7 +95,10 @@ export function parseEscapedIdentityList(
     if (nextValue.length > options.maxValueLength) {
       throw new Error(`${options.label} values cannot exceed ${options.maxValueLength} characters.`);
     }
-    if (/[\u0000-\u001f\u007f]/.test(nextValue)) {
+    if ([...nextValue].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })) {
       throw new Error(`${options.label} values cannot contain control characters.`);
     }
     const key = nextValue.normalize('NFC').toLowerCase();

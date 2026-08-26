@@ -1,4 +1,0 @@
-role 'Regional Viewer'
-  modelPermission: read
-
-  tablePermission Sales = [Region] = USERPRINCIPALNAME()

@@ -11,8 +11,6 @@ const requiredGovernanceFiles = [
   'CONTRIBUTING.md',
   'THIRD_PARTY_NOTICES.md',
   '.github/CODEOWNERS',
-  'docs/operations/migration-studio-runbook.md',
-  'docs/releases/migration-studio-release-checklist.md',
 ];
 
 function nonEmptyString(value) {

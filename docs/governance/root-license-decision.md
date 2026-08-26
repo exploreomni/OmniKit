@@ -2,9 +2,9 @@
 
 Status: PENDING LEGAL OR REPOSITORY-OWNER APPROVAL
 
-The imported migration-engine package retains its Apache License 2.0 text and
-provenance. That package license does not automatically determine the license
-for the complete OmniKit repository.
+The retired migration-engine package retained its Apache License 2.0 text and
+provenance while it was tracked here. Removing that nested package does not
+determine the license for the complete OmniKit repository.
 
 Before a general-availability release, the repository owner must:
 

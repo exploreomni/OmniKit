@@ -325,7 +325,10 @@ export function BulkIdentityImportPage() {
     downloadCsv('omnikit-identity-import-results.csv', identityResultRows(scope, results));
   }
 
-  const issues = preflight?.issues || plan?.issues || [];
+  const issues = useMemo(
+    () => preflight?.issues || plan?.issues || [],
+    [plan?.issues, preflight?.issues],
+  );
   const errorCount = issues.filter((issue) => issue.severity === 'error').length;
   const warningCount = issues.filter((issue) => issue.severity === 'warning').length;
   const hasDeprovisioning = Boolean(preflight?.changes.usersToDelete);
@@ -460,7 +463,7 @@ export function BulkIdentityImportPage() {
             }}
             className="input-field min-h-48 resize-y font-mono text-xs leading-5 disabled:opacity-60"
             spellCheck={false}
-            placeholder={'action,display_name,email,group,role,connection,model\nadd,Example Analyst,analyst@example.com,"Analytics Users, Finance Users",Restricted Querier,Production Warehouse,Core Analytics\nremove,,former.analyst@example.com,Legacy Users,,,'}
+            placeholder={'action,display_name,email,group,role,connection,model\nadd,Example Analyst,analyst@example.com,"Analytics Users, Finance Users",Restricted Querier,Production Warehouse,\nremove,,former.analyst@example.com,Legacy Users,,,'}
           />
 
           <div className="rounded-card border border-border bg-surface-secondary px-4 py-3 text-xs leading-5 text-content-secondary">
@@ -470,6 +473,9 @@ export function BulkIdentityImportPage() {
             </p>
             <p className="mt-1">
               Roles are Viewer, Restricted Querier, Querier, Modeler, Connection Admin (or Admin), and No Access. Restricted Querier is sent to Omni as QUERY_TOPICS. Admin maps only to Connection Admin; Bulk Import never grants Organization Admin. Omni does not publish a role-clear operation, so remove rows that name a role are blocked rather than converted to No Access. A remove row with groups revokes only those memberships; a remove row with blank group and role revokes the user&apos;s Omni organization membership. Full deprovisioning requires the current display_name and an exact identity match. Supported legacy files remain accepted.
+            </p>
+            <p className="mt-1">
+              For an add row with Restricted Querier, leave model blank to assign the role to every current active shared model in each named connection. The preview expands and lists every model before execution. Models created later are not included automatically. Other model roles still require explicit model names.
             </p>
             <p className="mt-1">
               Omni applies these resource changes separately, so the import is not atomic and OmniKit does not promise rollback. Partial and unverified outcomes stay in the result journal and always require a fresh validation before retrying.
@@ -573,7 +579,7 @@ export function BulkIdentityImportPage() {
               ['Groups ensured', plan.summary.groupsEnsured],
               ['Membership adds', plan.summary.membershipsAdded],
               ['Membership removals', plan.summary.membershipsRemoved],
-              ['Role assignments', plan.summary.rolesAdded],
+              ['Role rows', plan.summary.rolesAdded],
               ['Role removals', plan.summary.rolesRemoved],
             ].map(([label, value]) => (
               <div key={label} className="px-4 py-3 border-b border-border last:border-b-0 sm:border-r lg:border-b-0">

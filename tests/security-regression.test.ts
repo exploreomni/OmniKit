@@ -1,19 +1,26 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { once } from 'node:events';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { Readable, Writable } from 'node:stream';
 import { afterEach, beforeEach, test } from 'node:test';
 import { createCipheriv, randomBytes, scryptSync } from 'node:crypto';
 
 import {
+  decryptVaultBlob,
   getVaultIdleTimeoutMs,
+  listDeckRecipes,
   listInstances,
   lockVault,
   markInstanceValidated,
+  purgeRetiredBiMigrationCredentials,
   resetUnlockThrottleForTests,
   resetVault,
   touchVaultSession,
   unlockVault,
+  upsertDeckRecipe,
   upsertInstance,
   vaultStatus,
 } from '../server/services/nativeVault';
@@ -45,6 +52,7 @@ import {
   type MigrationJobEvent,
 } from '../server/services/jobEvents';
 import {
+  apiMiddleware,
   apiRouteFromUrl,
   apiWebRequestUrl,
   hydrateVaultCredentialReferences,
@@ -272,6 +280,54 @@ test('AI proxy rejects secret-shaped prompts before any outbound request', async
   assert.equal(outboundCalls, 2);
 });
 
+test('retired BI Migration Studio API returns a no-store tombstone without reading the request body', async () => {
+  let bodyRead = false;
+  const request = new Readable({
+    read() {
+      bodyRead = true;
+      this.push(JSON.stringify({
+        base_url: 'https://retired.example.omniapp.co',
+        api_key: '__omnikit_vault_instance__:must-not-be-hydrated',
+      }));
+      this.push(null);
+    },
+  }) as IncomingMessage;
+  request.method = 'POST';
+  request.url = '/api/migration-studio/providers?legacy-client=true';
+  request.headers = {
+    host: '127.0.0.1:5175',
+    origin: 'http://127.0.0.1:5175',
+    'content-type': 'application/json',
+  };
+
+  const responseChunks: Buffer[] = [];
+  const responseHeaders = new Map<string, string>();
+  const response = new Writable({
+    write(chunk, _encoding, callback) {
+      responseChunks.push(Buffer.from(chunk));
+      callback();
+    },
+  }) as unknown as ServerResponse;
+  response.statusCode = 200;
+  response.setHeader = ((name, value) => {
+    responseHeaders.set(String(name).toLowerCase(), String(value));
+    return response;
+  }) as ServerResponse['setHeader'];
+
+  const finished = once(response, 'finish');
+  await apiMiddleware()(request, response);
+  await finished;
+
+  assert.equal(bodyRead, false, 'the retired route consumed or hydrated its request body');
+  assert.equal(response.statusCode, 410);
+  assert.equal(responseHeaders.get('cache-control'), 'no-store');
+  assert.equal(responseHeaders.get('x-content-type-options'), 'nosniff');
+  assert.deepEqual(JSON.parse(Buffer.concat(responseChunks).toString('utf8')), {
+    error: 'BI Migration Studio has been retired from OmniKit.',
+    code: 'BI_MIGRATION_STUDIO_RETIRED',
+  });
+});
+
 test('CSV export helpers neutralize spreadsheet formula cells', () => {
   assert.equal(csvEscapeCell('=IMPORTXML("https://evil.example")'), `"'=IMPORTXML(""https://evil.example"")"`);
   assert.equal(csvEscapeCell(' +SUM(1,1)'), `"' +SUM(1,1)"`);
@@ -350,6 +406,12 @@ function writeLegacyVault(filePath: string, passphrase: string, payload: unknown
   } finally {
     key.fill(0);
   }
+}
+
+function readNativeVaultPayload(filePath: string, passphrase: string): Record<string, unknown> {
+  const parsed = JSON.parse(decryptVaultBlob(passphrase, readFileSync(filePath))) as unknown;
+  assert.ok(parsed && typeof parsed === 'object' && !Array.isArray(parsed));
+  return parsed as Record<string, unknown>;
 }
 
 async function waitForJob(id: string, timeoutMs = 1000): Promise<MigrationJob> {
@@ -2388,6 +2450,133 @@ test('vault persistence is atomic and keeps one recoverable backup generation', 
   resetVault();
   assert.equal(existsSync(vaultPath), false);
   assert.equal(existsSync(backupPath), false, 'reset left the backup ciphertext on disk');
+});
+
+test('retired BI migration credential purge rewrites both vault generations and preserves current records', () => {
+  const vaultPath = process.env.OMNIKIT_VAULT_PATH!;
+  const backupPath = `${vaultPath}.bak`;
+  const passphrase = 'retired credential purge passphrase';
+  const providerSecret = 'retired-provider-secret-not-real';
+  const sourceSecret = 'retired-source-secret-not-real';
+
+  unlockVault(passphrase);
+  const instance = upsertInstance({
+    label: 'Retained Omni workspace',
+    role: 'both',
+    baseUrl: 'https://retained.example.omniapp.co',
+    apiKey: 'retained-omni-key-not-real',
+  });
+  const recipe = upsertDeckRecipe({
+    name: 'Retained deck recipe',
+    savedForInstanceId: instance.id,
+    savedForInstanceLabel: instance.label,
+    savedForBaseUrlHost: 'retained.example.omniapp.co',
+    recipe: buildRecipe({
+      dashboardUrl: 'https://retained.example.omniapp.co/dashboards/retained-dashboard',
+      dashboardId: 'retained-dashboard',
+      dashboardName: 'Retained dashboard',
+      selectedTileIds: ['tile-1'],
+      insights: {},
+      brand: DEFAULT_BRAND,
+      includeAppendix: false,
+    }),
+  });
+  lockVault();
+
+  const legacyPayload = readNativeVaultPayload(vaultPath, passphrase);
+  legacyPayload.llmProviders = [{ id: 'retired-provider', credential: providerSecret }];
+  legacyPayload.platformConnections = [{ id: 'retired-source', credential: sourceSecret }];
+  writeLegacyVault(vaultPath, passphrase, legacyPayload);
+  writeLegacyVault(backupPath, passphrase, legacyPayload);
+
+  unlockVault(passphrase);
+  assert.equal(vaultStatus().retiredBiMigrationProviderCount, 1);
+  assert.equal(vaultStatus().retiredBiMigrationSourceCount, 1);
+  assert.deepEqual(purgeRetiredBiMigrationCredentials(), {
+    removedProviderProfiles: 1,
+    removedSourceConnections: 1,
+  });
+  assert.ok(listInstances().some((record) => record.id === instance.id));
+  assert.ok(listDeckRecipes().some((record) => record.id === recipe.id));
+
+  for (const generationPath of [vaultPath, backupPath]) {
+    assert.ok(existsSync(generationPath), `${generationPath} was not rewritten`);
+    assert.equal(statSync(generationPath).mode & 0o777, 0o600);
+    const payload = readNativeVaultPayload(generationPath, passphrase);
+    assert.deepEqual(payload.llmProviders, []);
+    assert.deepEqual(payload.platformConnections, []);
+    assert.ok(
+      (payload.instances as Array<{ id?: string }>).some((record) => record.id === instance.id),
+      `${generationPath} lost the saved instance`,
+    );
+    assert.ok(
+      (payload.deckRecipes as Array<{ id?: string }>).some((record) => record.id === recipe.id),
+      `${generationPath} lost the deck recipe`,
+    );
+    const serialized = JSON.stringify(payload);
+    assert.equal(serialized.includes(providerSecret), false);
+    assert.equal(serialized.includes(sourceSecret), false);
+  }
+});
+
+test('retired credential purge replaces the recovery generation before the active vault', () => {
+  const vaultPath = process.env.OMNIKIT_VAULT_PATH!;
+  const backupPath = `${vaultPath}.bak`;
+  const passphrase = 'purge ordering test passphrase';
+  const providerFixture = 'fixture-provider-value-not-sensitive';
+  const sourceFixture = 'fixture-source-value-not-sensitive';
+
+  unlockVault(passphrase);
+  upsertInstance({
+    label: 'Purge ordering workspace',
+    role: 'both',
+    baseUrl: 'https://purge-ordering.example.omniapp.co',
+    apiKey: 'omni-purge-ordering-key-not-real',
+  });
+  lockVault();
+
+  const legacyPayload = readNativeVaultPayload(vaultPath, passphrase);
+  legacyPayload.llmProviders = [{ id: 'retired-provider', credential: providerFixture }];
+  legacyPayload.platformConnections = [{ id: 'retired-source', credential: sourceFixture }];
+  writeLegacyVault(vaultPath, passphrase, legacyPayload);
+  writeLegacyVault(backupPath, passphrase, legacyPayload);
+
+  unlockVault(passphrase);
+  const replacedPaths: string[] = [];
+  assert.throws(() => purgeRetiredBiMigrationCredentials({
+    renameFile: (sourcePath, destinationPath) => {
+      replacedPaths.push(String(destinationPath));
+      if (destinationPath === vaultPath) throw new Error('simulated active-generation replacement failure');
+      renameSync(sourcePath, destinationPath);
+    },
+  }), /simulated active-generation replacement failure/);
+
+  assert.deepEqual(replacedPaths, [backupPath, vaultPath]);
+  assert.equal(vaultStatus().retiredBiMigrationProviderCount, 0);
+  assert.equal(vaultStatus().retiredBiMigrationSourceCount, 0);
+
+  const activeAfterFailure = readNativeVaultPayload(vaultPath, passphrase);
+  const backupAfterFailure = readNativeVaultPayload(backupPath, passphrase);
+  assert.equal(activeAfterFailure.llmProviders.length, 1, 'the failed active replacement must remain visible for reconciliation');
+  assert.equal(activeAfterFailure.platformConnections.length, 1, 'the failed active replacement must remain visible for reconciliation');
+  assert.deepEqual(backupAfterFailure.llmProviders, []);
+  assert.deepEqual(backupAfterFailure.platformConnections, []);
+  assert.deepEqual(readdirSync(tempDir).filter((entry) => entry.endsWith('.tmp')), []);
+
+  // A bounded retry starts from the already-purged in-memory authority and
+  // finishes both generations without reintroducing the retired values.
+  assert.deepEqual(purgeRetiredBiMigrationCredentials(), {
+    removedProviderProfiles: 0,
+    removedSourceConnections: 0,
+  });
+  for (const generationPath of [vaultPath, backupPath]) {
+    const payload = readNativeVaultPayload(generationPath, passphrase);
+    assert.deepEqual(payload.llmProviders, []);
+    assert.deepEqual(payload.platformConnections, []);
+    const serialized = JSON.stringify(payload);
+    assert.equal(serialized.includes(providerFixture), false);
+    assert.equal(serialized.includes(sourceFixture), false);
+  }
 });
 
 test('vault unlock throttles repeated wrong passphrases and clears on success', () => {

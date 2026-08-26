@@ -1,17 +1,12 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const packageLock = JSON.parse(readFileSync(join(projectRoot, 'package-lock.json'), 'utf8'));
-const manifestPath = join(projectRoot, 'data', 'migration-engine', 'manifest.json');
 const outputPath = join(projectRoot, 'artifacts', 'security', 'omnikit-sbom.cdx.json');
 
-if (!existsSync(manifestPath)) {
-  throw new Error('The migration-engine manifest is missing. Run npm run setup:migration-engine:test before SBOM generation.');
-}
-const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
 const components = [];
 
 for (const [path, metadata] of Object.entries(packageLock.packages || {})) {
@@ -24,18 +19,6 @@ for (const [path, metadata] of Object.entries(packageLock.packages || {})) {
     version: String(metadata.version),
     purl: `pkg:npm/${encodeURIComponent(name)}@${metadata.version}`,
     licenses: metadata.license ? [{ license: { name: String(metadata.license) } }] : undefined,
-  });
-}
-for (const dependency of manifest.dependencies || []) {
-  const name = String(dependency.name || 'unknown');
-  const version = String(dependency.version || 'unknown');
-  components.push({
-    type: 'library',
-    'bom-ref': `pkg:pypi/${encodeURIComponent(name)}@${version}`,
-    name,
-    version,
-    purl: `pkg:pypi/${encodeURIComponent(name)}@${version}`,
-    licenses: dependency.license ? [{ license: { name: String(dependency.license) } }] : undefined,
   });
 }
 components.sort((left, right) => left['bom-ref'].localeCompare(right['bom-ref']));

@@ -1,6 +1,0 @@
-{
-  "views": [{ "name": "Northstar Sales", "fields": ["Order ID", "Business Date", "Store Number", "Location Name"], "measures": ["Net Sales", "Average Ticket"] }],
-  "relationships": [{ "from": "northstar_sales", "to": "northstar_locations" }],
-  "dashboards": [{ "name": "NorthstarDashboard", "fields": ["Location Name", "Net Sales"], "filters": ["Business Date"] }],
-  "caveats": ["Tableau calculations and layout remain review evidence until target validation and visual reconciliation pass."]
-}

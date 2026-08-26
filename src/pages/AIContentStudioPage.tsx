@@ -68,7 +68,7 @@ import {
   aiContentStudioFormReducer,
   initialAIContentStudioForm,
 } from '@/services/aiContentStudio/studioState';
-import { sha256Text } from '@/services/semanticMigration/sourceEvidence';
+import { sha256Text } from '@/services/contentHash';
 import { hasActiveSavedVaultConnection } from '@/services/connectionGuards';
 import {
   applyStudioConnectionNames,

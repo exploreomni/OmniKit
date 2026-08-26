@@ -54,12 +54,10 @@ test('scanner resolves dynamic Omni endpoints and optional query templates', () 
   );
 });
 
-test('scanner excludes tests, fixtures, docs, and external provider connectors', () => {
+test('scanner excludes tests, fixtures, and docs', () => {
   const root = makeSourceTree({
     'server/live.ts': "fetch('/api/v1/folders');",
     'server/fixtures/example.ts': "fetch('/api/v1/not-real');",
-    'server/services/migrationProviders.ts': "fetch('/api/v1/external-provider');",
-    'server/services/migrationSources/sigma.ts': "fetch('/api/v2/auth/token', { method: 'POST' });",
     'src/component.test.ts': "fetch('/api/v1/not-real');",
     'tests/example.ts': "fetch('/api/v1/not-real');",
   });

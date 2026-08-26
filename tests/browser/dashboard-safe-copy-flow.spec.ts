@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
-import { sha256Text } from '../../src/services/semanticMigration/sourceEvidence';
+import { sha256Text } from '../../src/services/contentHash';
 import type { MigrationJob } from '../../src/services/opsConsole';
 
 const DRAFT_KEY = 'omnikit:dashboardSafeCopyDraft:v1';

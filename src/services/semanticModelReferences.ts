@@ -1,6 +1,6 @@
 import { parseDocument } from 'yaml';
 import type { OmniModelYamlResponse } from '@/services/omniApi';
-import { sha256Text } from './semanticMigration/sourceEvidence';
+import { sha256Text } from './contentHash';
 
 export interface SemanticReferenceFile {
   fileName: string;

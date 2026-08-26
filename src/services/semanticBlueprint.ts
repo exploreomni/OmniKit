@@ -7,7 +7,7 @@ import {
   type SemanticReferenceFile,
   type SemanticViewIdentityContract,
 } from './semanticModelReferences';
-import { sha256Text } from './semanticMigration/sourceEvidence';
+import { sha256Text } from './contentHash';
 import type { SemanticArtifactAction } from './semanticSolutionPlanner';
 import { authoredTopicYamlFiles } from './topicYamlGovernance';
 

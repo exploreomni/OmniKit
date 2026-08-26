@@ -4,13 +4,12 @@
   "maximumRouteChunkBytes": 700000,
   "maximumJavaScriptChunkBytes": 800000,
   "maximumTotalJavaScriptBytes": 4200000,
-  "maximumTotalJavaScriptBytesNote": "Raised from 4000000 on 2026-08-17. The build measured 4012440 bytes (0.3% over) after the Dashboard Safe Copy and BI Migration Studio work landed; the breach was a real feature-surface increase, not a regression. 4200000 restores roughly 4.5% headroom. Reducing this number requires splitting SemanticMigrationImportPanel (735kB), DeckBuilderPage (535kB) or TopicsPage (527kB) first.",
+  "maximumTotalJavaScriptBytesNote": "Re-baseline this ceiling from a clean production build before reducing it; route removal alone does not establish a safe lower limit.",
   "maximumStylesheetBytes": 150000,
   "requiredDynamicRoutes": [
     "src/pages/MigratePage.tsx",
     "src/pages/ModelMigratorPage.tsx",
     "src/pages/DeckBuilderPage.tsx",
-    "src/pages/SemanticMigrationPage.tsx",
     "src/pages/InstancesPage.tsx"
   ]
 }

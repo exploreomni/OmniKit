@@ -83,7 +83,7 @@ export class InstanceValidationCancelledError extends Error {
 
 class InstanceProbeResponseError extends Error {
   constructor() {
-    super('The Omni folders probe returned an invalid success response.');
+    super('The Omni identity probe returned an invalid success response.');
     this.name = 'InstanceProbeResponseError';
   }
 }
@@ -272,15 +272,11 @@ async function readBoundedNodeProbe(response: IncomingMessage): Promise<Uint8Arr
   );
 }
 
-function isNonNegativeInteger(value: unknown): value is number {
-  return Number.isSafeInteger(value) && Number(value) >= 0;
-}
-
 function isNonBlankString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
 
-function validateFolderProbeEnvelope(bytes: Uint8Array): void {
+function validateIdentityProbeEnvelope(bytes: Uint8Array): void {
   let value: unknown;
   try {
     const text = new TextDecoder().decode(bytes);
@@ -296,45 +292,36 @@ function validateFolderProbeEnvelope(bytes: Uint8Array): void {
     || Object.prototype.hasOwnProperty.call(value, 'errors')
     || value.ok === false
     || value.success === false
-    || !Array.isArray(value.records)
-    || !isRecord(value.pageInfo)
+    || (value.keyScope !== 'user' && value.keyScope !== 'organization')
+    || (value.orgRole !== 'MEMBER' && value.orgRole !== 'ORG_ADMIN')
+    || !isRecord(value.rolesByModel)
+    || !isRecord(value.user)
+    || !isNonBlankString(value.user.id)
+    || !isNonBlankString(value.user.membershipId)
+    || (value.rolesByModelTruncated !== undefined && typeof value.rolesByModelTruncated !== 'boolean')
   ) {
-    throw new InstanceProbeResponseError();
-  }
-  const { hasNextPage, nextCursor, pageSize, totalRecords } = value.pageInfo;
-  if (
-    typeof hasNextPage !== 'boolean'
-    || pageSize !== 1
-    || !isNonNegativeInteger(totalRecords)
-    || value.records.length > 1
-    || value.records.length > totalRecords
-    || (value.records.length === 0 && totalRecords > 0)
-    || (hasNextPage && totalRecords <= value.records.length)
-    || (!hasNextPage && totalRecords !== value.records.length)
-    || value.records.some((record) => !isRecord(record) || !isNonBlankString(record.id))
-  ) {
-    throw new InstanceProbeResponseError();
-  }
-  if (hasNextPage) {
-    if (!isNonBlankString(nextCursor) || value.records.length === 0) throw new InstanceProbeResponseError();
-  } else if (nextCursor !== null && nextCursor !== undefined) {
     throw new InstanceProbeResponseError();
   }
 }
 
-async function pinnedFolderProbe(
+async function pinnedIdentityProbe(
   url: string,
   apiKey: string,
   signal: AbortSignal,
   dependencies: InstanceHandlerDependencies,
 ): Promise<void> {
-  await (dependencies.validateProbeOutbound
-    || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url);
   const parsed = new URL(url);
   await new Promise<void>((resolve, reject) => {
+    // testInstance validates the HTTPS base URL before reaching this point.
+    // The custom lookup below validates the exact address used by the socket;
+    // a separate DNS preflight would add latency and reintroduce a rebinding gap.
     const outbound = (dependencies.pinnedRequest || httpsRequest)(parsed, {
       method: 'GET',
-      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Accept: 'application/json',
+        'Accept-Encoding': 'identity',
+      },
       agent: false,
       lookup: publicOnlyProbeLookup(dependencies.probeLookup),
       ...(isIP(parsed.hostname) ? {} : { servername: parsed.hostname }),
@@ -348,7 +335,7 @@ async function pinnedFolderProbe(
       }
       void readBoundedNodeProbe(response)
         .then((bytes) => {
-          validateFolderProbeEnvelope(bytes);
+          validateIdentityProbeEnvelope(bytes);
           resolve();
         }, reject);
     });
@@ -357,7 +344,7 @@ async function pinnedFolderProbe(
   });
 }
 
-async function injectedFolderProbe(
+async function injectedIdentityProbe(
   url: string,
   apiKey: string,
   signal: AbortSignal,
@@ -372,7 +359,7 @@ async function injectedFolderProbe(
     signal,
   });
   if (!response.ok) throw new OmniClientError(response.status, url, 'Connection probe failed.');
-  validateFolderProbeEnvelope(await readBoundedFetchProbe(response));
+  validateIdentityProbeEnvelope(await readBoundedFetchProbe(response));
 }
 
 function nodeResponseHeaders(response: IncomingMessage): Headers {
@@ -964,11 +951,11 @@ async function testInstance(
 ): Promise<void> {
   const urlError = validateBaseUrl(instance.baseUrl);
   if (urlError) throw new Error(urlError);
-  const targetUrl = `${instance.baseUrl.replace(/\/+$/, '')}/api/v1/folders?pageSize=1`;
+  const targetUrl = `${instance.baseUrl.replace(/\/+$/, '')}/api/v1/whoami`;
   await runWithInstanceValidationDeadline(
     (boundedSignal) => dependencies.probeFetch
-      ? injectedFolderProbe(targetUrl, instance.apiKey, boundedSignal, dependencies)
-      : pinnedFolderProbe(targetUrl, instance.apiKey, boundedSignal, dependencies),
+      ? injectedIdentityProbe(targetUrl, instance.apiKey, boundedSignal, dependencies)
+      : pinnedIdentityProbe(targetUrl, instance.apiKey, boundedSignal, dependencies),
     { timeoutMs: INTERACTIVE_TEST_TIMEOUT_MS, signal },
   );
 }
@@ -989,7 +976,7 @@ function instanceValidationErrorResponse(error: unknown, requestSignal?: AbortSi
   }
   if (error instanceof InstanceProbeResponseError) {
     return json({
-      error: 'Omni returned an invalid folders response, so the connection was not marked validated.',
+      error: 'Omni returned an invalid identity response, so the connection was not marked validated.',
       code: 'INSTANCE_INVALID_RESPONSE',
     }, 502);
   }

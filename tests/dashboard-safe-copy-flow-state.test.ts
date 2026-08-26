@@ -17,7 +17,7 @@ import {
   writeDashboardSafeCopyDraft,
   type DashboardSafeCopyDraft,
 } from '../src/components/dashboardMigration/dashboardSafeCopyFlowState';
-import { sha256Text } from '../src/services/semanticMigration/sourceEvidence';
+import { sha256Text } from '../src/services/contentHash';
 import type {
   InstanceModel,
   MigrationJob,

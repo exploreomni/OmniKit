@@ -1,9 +1,0 @@
-{
-  "views": [
-    { "name": "Northstar Sales", "fields": ["Order ID", "Business Date", "Store Number", "Net Sales"], "measures": ["Total Revenue"] },
-    { "name": "Northstar Locations", "fields": ["Location Name"], "measures": [] }
-  ],
-  "relationships": [{ "from": "Northstar Sales", "to": "Northstar Locations" }],
-  "dashboards": [{ "name": "NorthstarDashboard", "fields": [], "filters": [] }, { "name": "Revenue by Location", "fields": ["Location Name", "Total Revenue"], "filters": ["Business Date"] }],
-  "caveats": ["Workbook layout and source-specific interactions remain partial until validated against representative live evidence."]
-}

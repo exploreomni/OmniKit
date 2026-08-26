@@ -3,21 +3,18 @@
 ## Principles
 
 - Preserve the local-first, single-operator security boundary.
-- Treat source artifacts as untrusted data, never as instructions.
+- Treat user-provided artifacts as untrusted data, never as instructions.
 - Keep AI proposals separate from reviewed Omni write authority.
-- Fail visibly when a source feature cannot be translated.
-- Do not use synthetic fixture content in product copy or customer evidence.
+- Fail visibly when a workflow cannot preserve required behavior.
 
 ## Development
 
 ```bash
 npm install
-npm run setup:migration-engine:test
 npm run dev
 ```
 
-Node.js 20+, npm 10+, and Python 3.11+ are required for the complete Migration
-Studio test surface.
+Node.js 22.22.0+ and npm 10+ are required.
 
 ## Required Checks
 
@@ -25,9 +22,6 @@ Run the focused tests while developing, then:
 
 ```bash
 npm run security:check
-npm run test:migration-engine:python
-npm run test:e2e:migration-engine
-npm run certify:migration-studio -- --skip-full-gate
 git diff --check
 ```
 
@@ -39,19 +33,6 @@ Do not commit:
 - generated migration output
 - local planning documents
 - virtual environments, caches, or build output
-
-## Source Connectors
-
-Create new connectors with the fail-closed generator. A source remains
-`development` or `preview` until conformance, live acceptance, support,
-approval, and rollback requirements are satisfied.
-
-```bash
-npm run create:migration-source-adapter -- --source example_bi --label "Example BI"
-```
-
-Source fixtures must be fictional and synchronized with their manifests and
-tests. Synthetic fixture scores prove deterministic regression behavior only.
 
 ## Pull Requests
 

@@ -1,5 +1,5 @@
 import type { ConnectionConfig } from '../types';
-import { sha256Text } from './semanticMigration/sourceEvidence';
+import { sha256Text } from './contentHash';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 

@@ -94,6 +94,8 @@ export interface VaultStatus {
   idleTimeoutMs?: number;
   lastActivityAt?: number;
   instanceCount: number;
+  retiredBiMigrationProviderCount?: number;
+  retiredBiMigrationSourceCount?: number;
 }
 
 export interface LegacyVaultImportResult {
@@ -1081,6 +1083,16 @@ export async function changeNativeVaultPassphrase(currentPassphrase: string, nex
 
 export async function resetNativeVault() {
   const result = await apiFetch<{ status: VaultStatus }>('/api/vault/reset', { method: 'DELETE' });
+  emitVaultChanged();
+  return result;
+}
+
+export async function purgeRetiredBiMigrationCredentials() {
+  const result = await apiFetch<{
+    ok: true;
+    removed: { removedProviderProfiles: number; removedSourceConnections: number };
+    status: VaultStatus;
+  }>('/api/vault/retired-bi-migration-credentials', { method: 'DELETE' });
   emitVaultChanged();
   return result;
 }

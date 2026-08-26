@@ -7,17 +7,12 @@ initial support boundary is one operator, one local vault, and a server bound to
 localhost. Shared hosted deployment, tenant isolation, centralized access
 control, and service-level guarantees are outside this release.
 
-BI Migration Studio source connectors are Preview unless the source registry
-states otherwise. Preview migrations require human review of semantic,
-governance, permission, schedule, and dashboard-reconciliation gaps.
-
 ## Before Requesting Help
 
 1. Record the exact Git commit.
-2. Run `npm run diagnose:migration-engine`.
-3. Run the focused command that failed.
-4. Remove customer content, credentials, local file paths, and source IDs.
-5. Include only the sanitized diagnostic report and fictional reproduction.
+2. Run the focused command that failed.
+3. Remove customer content, credentials, local file paths, and source IDs.
+4. Include only the sanitized diagnostic report and fictional reproduction.
 
 ## Support Channels
 
@@ -31,7 +26,6 @@ governance, permission, schedule, and dashboard-reconciliation gaps.
 
 - recovery of a lost vault passphrase
 - public hosting of the local server
-- unsupported source-platform constructs
 - customer data, credentials, or raw export review in public channels
 - claims of semantic or visual equivalence without reconciliation evidence
 

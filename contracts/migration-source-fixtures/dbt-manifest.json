@@ -1,7 +1,0 @@
-{
-  "schemaVersion": "omnikit.synthetic-migration-fixture.v1",
-  "source": "dbt",
-  "label": "Northstar dbt synthetic fixture",
-  "synthetic": true,
-  "expectedEvidence": ["manifest", "model", "metric", "relationship"]
-}

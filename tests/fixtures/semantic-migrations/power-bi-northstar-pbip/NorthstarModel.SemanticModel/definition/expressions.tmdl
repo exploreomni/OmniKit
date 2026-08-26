@@ -1,8 +1,0 @@
-expression Warehouse =
-  let
-    Source = Snowflake.Databases("example.invalid", "FOOD_SERVICE"),
-    Analytics = Source{[Name="ANALYTICS"]}[Data]
-  in
-    Analytics
-
-annotation PBI_NavigationStepName = Navigation

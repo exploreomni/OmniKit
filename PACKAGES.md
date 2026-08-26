@@ -6,7 +6,6 @@ OmniKit is currently distributed as a source repository, not as a published pack
 
 - Clone from GitHub: `https://github.com/exploreomni/OmniKit.git`
 - Install dependencies with `npm install`.
-- Optionally install the read-only BI migration engine with `npm run setup:migration-engine` (Python 3.11+).
 - Run locally with `npm run dev`.
 - Build locally with `npm run build`.
 - Serve a local production build with `npm run start` or `npm run serve`.
@@ -22,10 +21,6 @@ The source distribution includes:
 - The npm lockfile for reproducible local installs
 
 The source distribution intentionally does not include generated build output, temporary migration files, user-supplied workbooks, API keys, local browser data, or operator-specific exports.
-
-The first-party migration engine is tracked at `packages/omnikit-migration-engine` and installed locally into ignored `data/migration-engine/`. Its isolated Python environment and installed source copy are runtime artifacts, not committed dependencies. The setup command installs exact versions from `requirements.lock`, verifies installed versions against that lock, records the lock SHA-256, frozen source provenance and content hash, contract checksums, Python package versions, and declared licenses in the ignored runtime manifest, and verifies that the embedded bridge exposes extraction capabilities only and explicitly reports no write authority. It also runs independent Looker, Power BI, Tableau, Metabase, and Sigma conformance contracts. Parser promotion is local and evidence-based: `npm run promote:migration-engine` reads only the ignored sanitized parity ledger and refuses promotion without one passing same-version observation window, a named approver, a recorded rollback drill, matching installed-runtime provenance, and passing conformance evidence.
-
-Release operators must run `npm run verify:migration-engine` after installing a clean committed engine revision. The verifier recomputes source, lock, and contract hashes; compares live read-only capabilities and conformance with the manifest; and rejects installed dependency drift. Before source promotion, `npm run accept:migration-engine -- ...` exercises the same vault-gated local API used by BI Migration Studio and writes sanitized live evidence to ignored `data/migration-engine/live-acceptance/`. API credentials remain in the encrypted vault; manual exports remain transient and are not copied into evidence. Permissions and schedules remain explicitly unsupported by the current engine IR and cannot be represented as migrated output.
 
 ## GitHub Packages
 
@@ -58,7 +53,7 @@ Build and runtime artifacts are intentionally excluded from the repository:
 
 Each operator should build artifacts locally from source.
 
-AI Content Studio requirements, screenshots, PDF references, BI Migration Studio source artifacts, migration bundles, and generated content results are treated as user-provided working data. They are held in page memory for the active session and should not be committed to the repository unless a future release explicitly adds curated fixtures. Provider credentials and API source connections belong only in the encrypted native vault.
+AI Content Studio requirements, screenshots, PDF references, and generated content results are treated as user-provided working data. They are held in page memory for the active session and should not be committed to the repository unless a future release explicitly adds curated fixtures.
 
 ## Release Assets
 
@@ -70,9 +65,6 @@ Recommended install path:
 git clone https://github.com/exploreomni/OmniKit.git
 cd OmniKit
 npm install
-npm run setup:migration-engine # installs OmniKit's tracked first-party package; requires Python 3.11+
-npm run verify:migration-engine # release gate for the installed first-party runtime
-npm run accept:migration-engine -- --help # optional credential-gated source acceptance
 npm run dev
 ```
 

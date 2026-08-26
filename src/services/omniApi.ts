@@ -2096,7 +2096,10 @@ function isUserModelRoleUuidOrNull(value: unknown): value is string | null {
 
 function isSafeUserModelRoleString(value: unknown): value is string {
   if (typeof value !== 'string' || !value || value.trim() !== value || value.length > 160) return false;
-  if (/[@<>\u0000-\u001f\u007f]/.test(value)) return false;
+  if (value.includes('@') || value.includes('<') || value.includes('>') || [...value].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  })) return false;
   return !/(?:https?:\/\/|\bbearer\s+|\b(?:api[_ -]?key|authorization|token|secret|password|signature)\b\s*[:=])/i.test(value);
 }
 
@@ -2164,7 +2167,7 @@ function parseUserModelRoleListResponse(
   if (!isRecord(value) || !Array.isArray(value.results) || value.results.length > USER_MODEL_ROLE_MAX_RESULTS) {
     throw new Error('OmniKit returned an invalid user model-role response.');
   }
-  if (!isUserModelRoleUuid(value.membershipId) || value.membershipId !== scope.userId) {
+  if (!isUserModelRoleUuid(value.membershipId)) {
     throw new Error('OmniKit returned an invalid user model-role response.');
   }
   const results = value.results.map((role) => parseUserModelRoleRecord(role, scope));

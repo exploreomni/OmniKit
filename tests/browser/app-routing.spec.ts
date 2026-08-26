@@ -999,7 +999,6 @@ test('high-risk workflows support direct navigation and browser history', async 
   const routes = [
     { path: '/dashboards/migrate', heading: 'Dashboard Migrator' },
     { path: '/models/migrate', heading: 'Model Migrator' },
-    { path: '/semantic-migrations', heading: 'BI Migration Studio' },
     { path: '/deck-builder', heading: 'Deck Builder' },
     { path: '/users?tab=groups', heading: 'User Management' },
   ];
@@ -1012,9 +1011,25 @@ test('high-risk workflows support direct navigation and browser history', async 
 
   await page.goto('/dashboards/migrate');
   await expect(page.getByRole('heading', { name: 'Dashboard Migrator', exact: true })).toBeVisible();
-  await page.goto('/semantic-migrations');
-  await expect(page.getByRole('heading', { name: 'BI Migration Studio', exact: true })).toBeVisible();
+  await page.goto('/models/migrate');
+  await expect(page.getByRole('heading', { name: 'Model Migrator', exact: true })).toBeVisible();
   await page.goBack();
   await expect(page).toHaveURL('/dashboards/migrate');
   await expect(page.getByRole('heading', { name: 'Dashboard Migrator', exact: true })).toBeVisible();
+});
+
+test('legacy BI Migration Studio bookmarks explain retirement without loading the removed API', async ({ page }) => {
+  const migrationApiRequests: string[] = [];
+  await page.route('**/api/migration-studio**', async (route) => {
+    migrationApiRequests.push(route.request().url());
+    await route.abort();
+  });
+
+  await page.goto('/semantic-migrations');
+  await closeWalkthrough(page);
+
+  await expect(page.getByRole('heading', { name: 'BI Migration Studio retired', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Open Omni-to-Omni Model Migrator', exact: true }))
+    .toHaveAttribute('href', '/models/migrate');
+  expect(migrationApiRequests).toEqual([]);
 });

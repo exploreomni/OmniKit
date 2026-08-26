@@ -1,6 +1,6 @@
 import { getModelYaml, listModels } from '@/services/omniApi';
-import { parseDestinationModelInventory } from '@/services/topicsRequestState';
-import { sha256Text } from '@/services/semanticMigration/sourceEvidence';
+import { parseVerifiedModelInventory } from '@/services/topicsRequestState';
+import { sha256Text } from '@/services/contentHash';
 import type { OmniModel } from '@/types';
 
 export interface AIContentModelSnapshot {
@@ -64,7 +64,7 @@ export async function captureAIContentModelSnapshot(
   return fingerprintModelSnapshot(
     modelId,
     yaml,
-    parseDestinationModelInventory<OmniModel>(inventory),
+    parseVerifiedModelInventory<OmniModel>(inventory, ['SHARED', 'SHARED_EXTENSION']),
   );
 }
 

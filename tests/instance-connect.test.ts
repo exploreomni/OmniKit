@@ -58,10 +58,13 @@ function instanceRequest(id: string, action: 'connect' | 'test', signal?: AbortS
   });
 }
 
-function validFolderProbeResponse(): Response {
+function validIdentityProbeResponse(): Response {
   return new Response(JSON.stringify({
-    records: [{ id: 'folder-1', name: 'Folder 1' }],
-    pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 1, totalRecords: 1 },
+    keyScope: 'user',
+    orgRole: 'MEMBER',
+    rolesByModel: {},
+    user: { id: 'user-1', membershipId: 'membership-1' },
+    rolesByModelTruncated: false,
   }), { status: 200, headers: { 'Content-Type': 'application/json' } });
 }
 
@@ -82,7 +85,7 @@ test('recent saved-instance connect reuses exact credential validation without o
   let fetchCalls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     fetchCalls += 1;
-    return validFolderProbeResponse();
+    return validIdentityProbeResponse();
   });
 
   const response = await instancesHandler(instanceRequest(saved.id, 'connect'));
@@ -106,7 +109,7 @@ test('unvalidated saved-instance connect makes exactly one cancellable live prob
       authorization: (init?.headers as Record<string, string> | undefined)?.Authorization,
       signal: init?.signal,
     });
-    return validFolderProbeResponse();
+    return validIdentityProbeResponse();
   });
 
   const response = await instancesHandler(instanceRequest(saved.id, 'connect'));
@@ -119,13 +122,13 @@ test('unvalidated saved-instance connect makes exactly one cancellable live prob
   assert.equal(body.validationSource, 'live');
   assert.ok(body.instance.lastValidatedAt);
   assert.equal(requests.length, 1);
-  assert.equal(new URL(requests[0]!.url).pathname, '/api/v1/folders');
-  assert.equal(new URL(requests[0]!.url).searchParams.get('pageSize'), '1');
+  assert.equal(new URL(requests[0]!.url).pathname, '/api/v1/whoami');
+  assert.equal(new URL(requests[0]!.url).search, '');
   assert.equal(requests[0]!.authorization, 'Bearer fixture-connect-key-one');
   assert.ok(requests[0]!.signal instanceof AbortSignal);
 });
 
-test('connection-time DNS validation blocks a private resolution after public preflight', async () => {
+test('connection probe resolves once at connection time and blocks a private address', async () => {
   const saved = upsertInstance({
     label: 'DNS change test instance',
     role: 'both',
@@ -134,18 +137,20 @@ test('connection-time DNS validation blocks a private resolution after public pr
   });
   type LookupCallback = (error: NodeJS.ErrnoException | null, addresses?: unknown) => void;
   let connectionLookups = 0;
+  let redundantPreflightLookups = 0;
   const privateLookup = ((...args: unknown[]) => {
     connectionLookups += 1;
     (args[2] as LookupCallback)(null, [{ address: '127.0.0.1', family: 4 }]);
   }) as unknown as typeof import('node:dns').lookup;
 
   const response = await instancesHandlerImplementation(instanceRequest(saved.id, 'connect'), {
-    validateProbeOutbound: async () => undefined,
+    validateProbeOutbound: async () => { redundantPreflightLookups += 1; },
     probeLookup: privateLookup,
   });
   const body = await response.json() as { code?: string };
 
   assert.equal(connectionLookups, 1);
+  assert.equal(redundantPreflightLookups, 0);
   assert.equal(response.status, 502);
   assert.equal(body.code, 'INSTANCE_VALIDATION_FAILED');
   assert.equal(getInstance(saved.id)?.lastValidatedAt, undefined);
@@ -173,13 +178,17 @@ test('connection probe rejects redirects without following them or exposing redi
   assert.equal(getInstance(saved.id)?.lastValidatedAt, undefined);
 });
 
-test('connection probe rejects empty, HTML, malformed, and arbitrary 2xx bodies', async (t) => {
+test('connection probe rejects empty, HTML, malformed, and arbitrary 2xx identity bodies', async (t) => {
   const saved = saveInstance('fixture-connect-invalid-success-key');
   const responses = [
     new Response('', { status: 200 }),
     new Response('<html>not Omni JSON</html>', { status: 200, headers: { 'Content-Type': 'text/html' } }),
     new Response('{', { status: 200, headers: { 'Content-Type': 'application/json' } }),
     new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    new Response(JSON.stringify({
+      records: [{ id: 'folder-1' }],
+      pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 1, totalRecords: 1 },
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
   ];
   let responseIndex = 0;
   t.mock.method(globalThis, 'fetch', async () => responses[responseIndex++]!);
@@ -207,7 +216,7 @@ test('saved-instance connect performs one live probe when validation is older th
   let fetchCalls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     fetchCalls += 1;
-    return validFolderProbeResponse();
+    return validIdentityProbeResponse();
   });
 
   const response = await instancesHandler(instanceRequest(saved.id, 'connect'));
@@ -228,7 +237,7 @@ test('explicit saved-instance test always performs one live probe even after rec
   let fetchCalls = 0;
   t.mock.method(globalThis, 'fetch', async () => {
     fetchCalls += 1;
-    return validFolderProbeResponse();
+    return validIdentityProbeResponse();
   });
 
   const response = await instancesHandler(instanceRequest(saved.id, 'test'));
@@ -253,7 +262,7 @@ test('rotating the saved credential invalidates recent validation and forces a l
   const authorizations: string[] = [];
   t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
     authorizations.push((init?.headers as Record<string, string> | undefined)?.Authorization || '');
-    return validFolderProbeResponse();
+    return validIdentityProbeResponse();
   });
 
   const response = await instancesHandler(instanceRequest(saved.id, 'connect'));
@@ -316,7 +325,7 @@ test('a credential rotation during a live probe cannot validate the replacement 
       baseUrl: saved.baseUrl,
       apiKey: 'fixture-connect-key-rotated-during-probe',
     });
-    return validFolderProbeResponse();
+    return validIdentityProbeResponse();
   });
 
   const response = await instancesHandler(instanceRequest(saved.id, 'connect'));

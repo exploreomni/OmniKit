@@ -21,7 +21,6 @@ const COLLAPSED_RAIL_DESTINATIONS = [
   { label: 'Model Migrator', href: '/models/migrate', destination: '/models/migrate' },
   { label: 'Model & Topic Health', href: '/models', destination: '/models' },
   { label: 'AI Semantic Studio', href: '/topics', destination: '/topics' },
-  { label: 'BI Migration Studio', href: '/semantic-migrations', destination: '/semantic-migrations' },
   { label: 'Fleet & Readiness', href: '/admin/fleet', destination: '/admin/fleet/instances' },
   { label: 'Identity & Access', href: '/admin/identity', destination: '/admin/identity/users' },
   { label: 'Content Operations', href: '/admin/content', destination: '/admin/content/health' },

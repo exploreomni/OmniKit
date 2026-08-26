@@ -29,6 +29,14 @@ const PATCH_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
 const OMNI_ID_PATTERN = /^[\w-]+$/;
 const SIMPLE_HEADERS = ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'] as const;
 const PERMISSION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
+const MODEL_ROLE_RANK: Readonly<Record<IdentityModelRoleName, number>> = {
+  NO_ACCESS: 0,
+  VIEWER: 1,
+  QUERY_TOPICS: 2,
+  QUERIER: 3,
+  MODELER: 4,
+  CONNECTION_ADMIN: 5,
+};
 const consumedIdentityPreflights = new WeakSet<object>();
 
 type RecordSource = { rowNumber: number; rowNumbers: number[] };
@@ -389,7 +397,11 @@ function simplePreview(
   if (action === 'add') {
     effects.push('Create the user if missing; otherwise fill only missing user values');
     if (groups.length > 0) effects.push(`Ensure and add ${groups.length} group membership${groups.length === 1 ? '' : 's'}`);
-    if (roleName) effects.push(`Assign ${identityModelRoleLabel(roleName)} to the resolved permission target${models.length + connections.length === 1 ? '' : 's'}`);
+    if (roleName === 'QUERY_TOPICS' && models.length === 0) {
+      effects.push(`Assign Restricted Querier to every current shared model in ${connections.length} selected connection${connections.length === 1 ? '' : 's'}; models added later are not included`);
+    } else if (roleName) {
+      effects.push(`Assign ${identityModelRoleLabel(roleName)} to the resolved permission target${models.length + connections.length === 1 ? '' : 's'}`);
+    }
   } else {
     if (groups.length > 0) effects.push(`Remove ${groups.length} matching group membership${groups.length === 1 ? '' : 's'}`);
     if (roleName) effects.push('Role removal requested; blocked until Omni publishes a supported clear contract');
@@ -577,7 +589,8 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
         issues.push({ severity: 'error', rowNumber, message: 'Connection Admin targets connections directly; leave model blank.' });
         continue;
       }
-      if (roleName && roleName !== 'CONNECTION_ADMIN' && models.length === 0) {
+      const expandsRestrictedQuerierConnection = actionValue === 'add' && roleName === 'QUERY_TOPICS' && models.length === 0;
+      if (roleName && roleName !== 'CONNECTION_ADMIN' && models.length === 0 && !expandsRestrictedQuerierConnection) {
         issues.push({ severity: 'error', rowNumber, message: `${identityModelRoleLabel(roleName)} requires at least one model name.` });
         continue;
       }
@@ -827,6 +840,68 @@ function directUserRole(role: UserModelRoleRecord): boolean {
   return role.from?.type === 'USER' || role.from?.type === 'User Role';
 }
 
+type EffectiveRoleAssessment = {
+  kind: 'exact' | 'broader' | 'custom' | 'lower' | 'unverified' | 'ambiguous';
+  message: string;
+};
+
+function assessEffectiveRole(
+  scopedRoles: UserModelRoleRecord[],
+  targetRoleName: IdentityModelRoleName,
+): EffectiveRoleAssessment {
+  const resolvedRoles = scopedRoles.filter((role) => role.resolved === true);
+  if (resolvedRoles.length === 0) {
+    return {
+      kind: 'unverified',
+      message: `Omni did not return effective-role evidence for ${identityModelRoleLabel(targetRoleName)}.`,
+    };
+  }
+  if (resolvedRoles.length !== 1) {
+    return {
+      kind: 'ambiguous',
+      message: `Omni returned ambiguous effective-role evidence for ${identityModelRoleLabel(targetRoleName)}.`,
+    };
+  }
+
+  const resolvedRole = resolvedRoles[0];
+  const normalizedBaseRole = normalizeIdentityModelRole(resolvedRole.baseRole)
+    || normalizeIdentityModelRole(resolvedRole.roleName);
+  const effectiveLabel = resolvedRole.roleName === resolvedRole.baseRole || !resolvedRole.baseRole
+    ? resolvedRole.roleName
+    : `${resolvedRole.roleName} (base ${resolvedRole.baseRole})`;
+  if (normalizedBaseRole === null) {
+    return {
+      kind: 'custom',
+      message: `Effective access resolves to ${effectiveLabel}, whose base policy cannot be verified.`,
+    };
+  }
+
+  const effectiveRank = MODEL_ROLE_RANK[normalizedBaseRole];
+  const targetRank = MODEL_ROLE_RANK[targetRoleName];
+  if (effectiveRank > targetRank) {
+    return {
+      kind: 'broader',
+      message: `Inherited or base access resolves to ${effectiveLabel}, which is more permissive than ${identityModelRoleLabel(targetRoleName)}.`,
+    };
+  }
+  if (effectiveRank < targetRank) {
+    return {
+      kind: 'lower',
+      message: `Effective access resolves to ${effectiveLabel}, below ${identityModelRoleLabel(targetRoleName)}.`,
+    };
+  }
+  if (resolvedRole.roleName === targetRoleName) {
+    return {
+      kind: 'exact',
+      message: `Effective access is exactly ${identityModelRoleLabel(targetRoleName)}.`,
+    };
+  }
+  return {
+    kind: 'custom',
+    message: `Effective access resolves to custom role ${effectiveLabel}; its base role matches ${identityModelRoleLabel(targetRoleName)}, but its policy requires review.`,
+  };
+}
+
 function roleScopeKey(email: string, connectionId: string, modelId?: string): string {
   return `${normalizedKey(email)}|${connectionId}|${modelId || 'connection'}`;
 }
@@ -866,6 +941,43 @@ function resolveRoleTargets(
 
   const connectionIds = new Set(resolvedConnections.map((connection) => connection.id));
   const targets: Array<Omit<ResolvedIdentityRoleChange, 'disposition' | 'message' | 'currentEvidence'>> = [];
+  if (record.action === 'add' && record.roleName === 'QUERY_TOPICS' && record.modelNames.length === 0) {
+    for (const connection of resolvedConnections) {
+      const connectionModels = models
+        .filter((model) => model.connectionId === connection.id)
+        .sort((left, right) => left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+      if (connectionModels.length === 0) {
+        addIssue(issues, {
+          severity: 'error',
+          rowNumber: record.rowNumber,
+          message: `Connection "${connection.name}" has no active SHARED or SHARED_EXTENSION models eligible for Restricted Querier.`,
+        });
+        continue;
+      }
+      for (const model of connectionModels) {
+        targets.push({
+          action: record.action,
+          rowNumbers: record.rowNumbers,
+          email: record.email,
+          roleName: record.roleName,
+          connectionId: connection.id,
+          connectionName: connection.name,
+          modelId: model.id,
+          modelName: model.name,
+        });
+      }
+    }
+    if (targets.length > IDENTITY_IMPORT_LIMITS.maxRoleTargetsPerRow) {
+      addIssue(issues, {
+        severity: 'error',
+        rowNumber: record.rowNumber,
+        message: `Restricted Querier expands to ${targets.length.toLocaleString()} model targets; one row can resolve to at most ${IDENTITY_IMPORT_LIMITS.maxRoleTargetsPerRow}. Split the connection scope into explicit model rows.`,
+      });
+      return [];
+    }
+    return targets;
+  }
+
   const usedConnectionIds = new Set<string>();
   for (const modelName of record.modelNames) {
     const matches = models.filter((model) => connectionIds.has(model.connectionId) && normalizedKey(model.name) === normalizedKey(modelName));
@@ -1314,7 +1426,9 @@ export async function preflightIdentityImport(
     const previous = roleIntentByScope.get(key);
     if (previous && (previous.roleName !== target.roleName || previous.action !== target.action)) {
       issues.push({ severity: 'error', rowNumber: target.rowNumbers[0], message: `Conflicting roles target ${target.email} on the same connection/model.` });
-    } else if (!previous) roleIntentByScope.set(key, target);
+    } else if (previous) {
+      previous.rowNumbers = [...new Set([...previous.rowNumbers, ...target.rowNumbers])].sort((left, right) => left - right);
+    } else roleIntentByScope.set(key, target);
   }
   const roleTargetsByConnection = new Map<string, Array<typeof unresolvedRoleTargets[number]>>();
   for (const target of roleIntentByScope.values()) {
@@ -1354,9 +1468,9 @@ export async function preflightIdentityImport(
       currentRolesByEmail.set(emailKey, []);
       return;
     }
-    const scopes = new Map<string, { connectionId: string; modelId?: string }>();
+    const scopes = new Map<string, { connectionId: string }>();
     targets.forEach((target) => {
-      scopes.set(`${target.connectionId}|${target.modelId || ''}`, { connectionId: target.connectionId, ...(target.modelId ? { modelId: target.modelId } : {}) });
+      scopes.set(target.connectionId, { connectionId: target.connectionId });
     });
     const responses = await mapWithConcurrency([...scopes.values()], 1, (targetScope) => withRateLimitRetry(
       () => listUserModelRoles(
@@ -1403,23 +1517,42 @@ export async function preflightIdentityImport(
     const sameRole = target.modelId
       ? directRoles.find((role) => role.roleName === target.roleName)
       : undefined;
-    if (sameRole) {
+    const effectiveRole = assessEffectiveRole(scopedRoles, target.roleName);
+    if (sameRole && effectiveRole.kind === 'exact') {
       noOps += 1;
-      roleChanges.push({ ...target, currentEvidence, disposition: 'noop', message: `${identityModelRoleLabel(target.roleName)} is already assigned directly.` });
+      roleChanges.push({ ...target, currentEvidence, disposition: 'noop', message: `${identityModelRoleLabel(target.roleName)} is already assigned directly and is the verified effective role.` });
       continue;
     }
-    if (target.modelId && directRoles.length > 0) {
-      roleAdds += 1;
+    if (sameRole && (effectiveRole.kind === 'broader' || effectiveRole.kind === 'custom')) {
+      noOps += 1;
+      roleChanges.push({
+        ...target,
+        currentEvidence,
+        disposition: 'noop',
+        message: `${identityModelRoleLabel(target.roleName)} is already assigned directly, but ${effectiveRole.message}`,
+      });
+      issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email}: ${effectiveRole.message}` });
+      continue;
+    }
+
+    roleAdds += 1;
+    if (sameRole) {
+      roleChanges.push({
+        ...target,
+        currentEvidence,
+        disposition: 'add',
+        message: `Re-submit ${identityModelRoleLabel(target.roleName)} because the direct assignment exists but its effective outcome is not verified.`,
+      });
+      issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email}: ${effectiveRole.message} The direct role will be re-submitted and verified.` });
+    } else if (target.modelId && directRoles.length > 0) {
       const existingNames = [...new Set(directRoles.map((role) => role.roleName))].join(', ');
       roleChanges.push({ ...target, currentEvidence, disposition: 'add', message: `Overwrite existing ${existingNames} with ${identityModelRoleLabel(target.roleName)}.` });
       issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email} has existing direct role ${existingNames} on this target; it will be overwritten with ${identityModelRoleLabel(target.roleName)}.` });
-      continue;
+    } else {
+      roleChanges.push({ ...target, currentEvidence, disposition: 'add', message: `Assign ${identityModelRoleLabel(target.roleName)}.` });
     }
-    roleAdds += 1;
-    roleChanges.push({ ...target, currentEvidence, disposition: 'add', message: `Assign ${identityModelRoleLabel(target.roleName)}.` });
-    const resolvedRole = scopedRoles.find((role) => role.resolved === true);
-    if (resolvedRole && resolvedRole.roleName !== target.roleName) {
-      issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `Inherited or base access may remain more permissive than ${identityModelRoleLabel(target.roleName)}.` });
+    if (!sameRole && effectiveRole.kind !== 'exact' && effectiveRole.kind !== 'unverified') {
+      issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email}: ${effectiveRole.message} Post-write verification must confirm the requested effective policy.` });
     }
   }
 
@@ -1690,17 +1823,48 @@ export async function executeIdentityImport(
         && role.connectionId === change.connectionId
         && (change.modelId ? role.modelId === change.modelId : true)
       ));
-      if (resolvedRoles.length === 0) throw new Error('Omni did not return effective-role evidence after the direct assignment.');
-      const effectiveNames = [...new Set(resolvedRoles.map((role) => role.roleName))];
-      const effectiveMatches = effectiveNames.every((roleName) => roleName === change.roleName);
+      if (resolvedRoles.length === 0 || (change.modelId && resolvedRoles.length !== 1)) {
+        throw new Error('Omni did not return unambiguous effective-role evidence after the direct assignment.');
+      }
+      const effectiveAccess = resolvedRoles.map((role) => {
+        const baseRole = normalizeIdentityModelRole(role.baseRole) || normalizeIdentityModelRole(role.roleName);
+        return {
+          label: role.roleName === role.baseRole ? role.roleName : `${role.roleName} (base ${role.baseRole})`,
+          roleName: role.roleName,
+          rank: baseRole === null ? null : MODEL_ROLE_RANK[baseRole],
+        };
+      });
+      const requestedRank = MODEL_ROLE_RANK[change.roleName];
+      const effectiveLabels = [...new Set(effectiveAccess.map((role) => role.label))].join(', ');
+      const exactEffectivePolicy = effectiveAccess.every((role) => (
+        role.rank === requestedRank && role.roleName === change.roleName
+      ));
+      if (!exactEffectivePolicy) {
+        const policyMismatch = effectiveAccess.some((role) => role.rank === null)
+          ? 'the effective role has an unrecognized or custom base policy'
+          : effectiveAccess.some((role) => role.rank! > requestedRank)
+            ? 'broader inherited or base access still applies'
+            : effectiveAccess.some((role) => role.rank! < requestedRank)
+              ? 'effective access remains below the requested role'
+              : 'a custom effective policy remains in force';
+        results.push({
+          status: 'failed',
+          stage: 'role',
+          field: 'role',
+          target,
+          message: `Omni accepted the direct ${identityModelRoleLabel(change.roleName)} assignment, but ${policyMismatch}: ${effectiveLabels}. The requested effective policy was not verified. Review connection and group access before another change; do not retry automatically.`,
+          rowNumbers: change.rowNumbers,
+        });
+        report('Roles', target);
+        await new Promise((resolve) => setTimeout(resolve, 300));
+        continue;
+      }
       results.push({
         status: 'succeeded',
         stage: 'role',
         field: 'role',
         target,
-        message: effectiveMatches
-          ? `Assigned ${identityModelRoleLabel(change.roleName)} and verified both direct and effective access.`
-          : `Assigned the direct ${identityModelRoleLabel(change.roleName)} role; effective access still resolves to ${effectiveNames.join(', ')} because broader access also applies.`,
+        message: `Assigned ${identityModelRoleLabel(change.roleName)} and verified both direct and effective access.`,
         rowNumbers: change.rowNumbers,
       });
     } catch (error) {
@@ -1755,7 +1919,7 @@ export async function executeIdentityImport(
 
 export const IDENTITY_IMPORT_TEMPLATE: string[][] = [
   [...SIMPLE_HEADERS],
-  ['add', 'Example Analyst', 'analyst@example.com', 'Analytics Users, Finance Users', 'Restricted Querier', 'Production Warehouse', 'Core Analytics'],
+  ['add', 'Example Analyst', 'analyst@example.com', 'Analytics Users, Finance Users', 'Restricted Querier', 'Production Warehouse', ''],
   ['add', 'Example Administrator', 'admin@example.com', '', 'Connection Admin', 'Production Warehouse', ''],
   ['remove', '', 'former.analyst@example.com', 'Legacy Users', '', '', ''],
   ['remove', 'Departed User', 'departed.user@example.com', '', '', '', ''],

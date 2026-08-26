@@ -38,8 +38,6 @@ export default defineConfig({
       OMNIKIT_NO_BROWSER: 'true',
       OMNIKIT_VAULT_PATH: join(browserTestRoot, 'vault.enc'),
       OMNIKIT_JOB_HISTORY_PATH: join(browserTestRoot, 'jobs.json'),
-      OMNIKIT_SEMANTIC_MIGRATION_AUDIT_PATH: join(browserTestRoot, 'semantic-migration-audit.jsonl'),
-      OMNIKIT_MIGRATION_ENGINE_MODE: 'off',
     },
   },
 });

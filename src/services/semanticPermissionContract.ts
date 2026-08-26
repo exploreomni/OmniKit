@@ -1,5 +1,5 @@
 import { isMap, parse, parseDocument } from 'yaml';
-import { sha256Text } from './semanticMigration/sourceEvidence';
+import { sha256Text } from './contentHash';
 
 export type SemanticPermissionMode = 'grant_only' | 'row_filter_only' | 'grant_and_row_filter';
 

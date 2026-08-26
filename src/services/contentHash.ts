@@ -1,11 +1,3 @@
-import { migrationSourceDocumentation } from './sourceDocumentation';
-import type {
-  MigrationArtifact,
-  MigrationBiSourceTool,
-  MigrationSourceEvidenceContract,
-  MigrationSourceTool,
-} from './types';
-
 const SHA256_CONSTANTS = new Uint32Array([
   0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
   0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
@@ -21,7 +13,7 @@ function rotateRight(value: number, shift: number): number {
   return (value >>> shift) | (value << (32 - shift));
 }
 
-// Browser-compatible SHA-256 keeps manual evidence fingerprints synchronous with inventory construction.
+// Browser-compatible SHA-256 keeps content fingerprints synchronous with UI state construction.
 export function sha256Text(value: string): string {
   const bytes = new TextEncoder().encode(value);
   const paddedLength = Math.ceil((bytes.length + 9) / 64) * 64;
@@ -94,78 +86,4 @@ export function sha256Text(value: string): string {
   }
 
   return Array.from(state).map((part) => part.toString(16).padStart(8, '0')).join('');
-}
-
-export function migrationArtifactSha256(artifact: MigrationArtifact): string {
-  return sha256Text(artifact.content);
-}
-
-export function migrationArtifactIsTruncated(artifact: MigrationArtifact): boolean {
-  return artifact.parseWarnings.some((warning) => /truncat/i.test(warning));
-}
-
-export function migrationArtifactFingerprintSha256(artifact: MigrationArtifact): string | undefined {
-  return migrationArtifactIsTruncated(artifact) ? undefined : migrationArtifactSha256(artifact);
-}
-
-interface ManualSourceEvidenceOptions {
-  parser?: MigrationSourceEvidenceContract['parser'];
-  selectedScopeIds?: string[];
-  collectionComplete?: boolean;
-  collectionTruncated?: boolean;
-  permissionGaps?: string[];
-  dependencyClosure?: MigrationSourceEvidenceContract['dependencyClosure'];
-  documentationIds?: string[];
-  diagnostics?: string[];
-}
-
-function officialDocumentationUrls(sourceTool: MigrationSourceTool): string[] {
-  return sourceTool === 'dbt'
-    ? []
-    : migrationSourceDocumentation(sourceTool as MigrationBiSourceTool).map((reference) => reference.url);
-}
-
-export function buildManualSourceEvidence(
-  sourceTool: MigrationSourceTool,
-  artifacts: MigrationArtifact[],
-  options: ManualSourceEvidenceOptions = {},
-): MigrationSourceEvidenceContract {
-  const truncated = options.collectionTruncated ?? artifacts.some(migrationArtifactIsTruncated);
-  const fingerprints = artifacts.map((artifact) => ({
-    name: artifact.name,
-    sha256: migrationArtifactFingerprintSha256(artifact),
-    sizeBytes: artifact.sizeBytes,
-  }));
-  const selectedScopeIds = options.selectedScopeIds || artifacts.map((artifact, index) => {
-    const sha256 = fingerprints[index]!.sha256;
-    return `manual:${encodeURIComponent(artifact.name)}${sha256 ? `:${sha256.slice(0, 16)}` : ''}`;
-  });
-
-  return {
-    schemaVersion: 'omnikit.source-evidence.v2',
-    sourceTool,
-    parser: options.parser || { name: 'OmniKit local parser', version: '2' },
-    acquisition: {
-      mode: 'manual',
-      selectedScopeIds: Array.from(new Set(selectedScopeIds.filter(Boolean))).sort(),
-    },
-    collection: {
-      observedArtifactCount: artifacts.length,
-      complete: Boolean(options.collectionComplete) && !truncated,
-      truncated,
-      permissionGaps: Array.from(new Set(options.permissionGaps || [])).sort(),
-    },
-    dependencyClosure: options.dependencyClosure || {
-      status: 'not_evaluated',
-      resolvedCount: 0,
-      missingCount: 0,
-      reviewCount: 0,
-    },
-    artifactFingerprints: fingerprints,
-    documentationIds: Array.from(new Set(options.documentationIds || officialDocumentationUrls(sourceTool))).sort(),
-    diagnostics: Array.from(new Set([
-      ...(options.diagnostics || ['Manual upload completeness and dependency closure require explicit review.']),
-      ...(truncated ? ['A complete-file SHA-256 fingerprint is unavailable for truncated source evidence.'] : []),
-    ])).sort(),
-  };
 }

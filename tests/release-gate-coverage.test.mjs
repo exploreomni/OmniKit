@@ -8,6 +8,9 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const packageJson = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
 const scripts = packageJson.scripts ?? {};
 const workflow = readFileSync(path.join(root, '.github', 'workflows', 'security.yml'), 'utf8');
+const licenseVerifier = readFileSync(path.join(root, 'scripts', 'verify-dependency-licenses.mjs'), 'utf8');
+const sbomGenerator = readFileSync(path.join(root, 'scripts', 'generate-security-sbom.mjs'), 'utf8');
+const licensePolicy = JSON.parse(readFileSync(path.join(root, 'config', 'dependency-license-policy.json'), 'utf8'));
 
 const requiredFleetAdminContracts = [
   'tests/admin-collection-contract.test.ts',
@@ -33,8 +36,6 @@ const requiredReleaseBrowserSuites = [
   'tests/browser/portfolio-overview.spec.ts',
   'tests/browser/app-routing.spec.ts',
   ...requiredNewBrowserSuites,
-  'tests/browser/bi-migration-studio.spec.ts',
-  'tests/browser/bi-migration-studio-accessibility.spec.ts',
 ];
 
 const expectedFleetAdminScripts = [
@@ -57,8 +58,6 @@ const expectedReleaseBrowserScripts = [
   'test:browser:ui-hardening',
   'test:browser:dashboard-safe-copy',
   'test:browser:model-migrator-ux',
-  'test:browser:migration-studio',
-  'test:accessibility:migration-studio',
 ];
 
 function packageScriptDependencies(command) {
@@ -134,6 +133,26 @@ test('package script references resolve and the command graph has no cycles', ()
   assert.deepEqual(missingFiles, []);
 });
 
+test('dependency license and SBOM gates are npm-only and require no migration runtime', () => {
+  assert.deepEqual(
+    packageScriptDependencies(scripts['security:supply-chain']),
+    ['security:audit', 'security:licenses', 'security:sbom'],
+  );
+  assert.deepEqual(
+    packageScriptDependencies(scripts['security:gate']),
+    ['security:audit', 'security:licenses', 'security:sbom', 'test:security', 'test:instance-connect'],
+  );
+  assert.equal(scripts['security:licenses'], 'node scripts/verify-dependency-licenses.mjs');
+  assert.equal(scripts['security:sbom'], 'node scripts/generate-security-sbom.mjs');
+  assert.doesNotMatch(licenseVerifier, /migration-engine|ecosystem:\s*['"]pypi['"]/i);
+  assert.doesNotMatch(sbomGenerator, /migration-engine|pkg:pypi/i);
+  assert.doesNotMatch(workflow, /actions\/setup-python@|migration-engine|OMNIKIT_MIGRATION_ENGINE/i);
+  assert.ok(
+    Object.keys(licensePolicy.metadataExceptions ?? {}).every((key) => key.startsWith('npm:')),
+    'license metadata exceptions must belong to the npm dependency inventory',
+  );
+});
+
 test('Fleet and Administration contract gate reaches every required focused file', () => {
   assert.deepEqual(
     packageScriptDependencies(scripts['test:fleet-admin:contracts']),
@@ -175,12 +194,6 @@ test('canonical security gate reaches every repository JavaScript and TypeScript
   const reachable = reachableScripts('security:check');
   assert.ok(reachable.has('test:fleet-admin:contracts'));
   assert.ok(reachable.has('test:browser:release'));
-  assert.ok(reachable.has('test:migration-engine:python'));
-  assert.equal(
-    scripts['test:migration-engine:python'],
-    'node scripts/run-internal-migration-engine-tests.mjs',
-    'The canonical Python gate must run the complete pytest suite without a path filter.',
-  );
 
   const files = referencedFiles(reachable);
   const releaseGuard = path.join(root, 'tests', 'release-gate-coverage.test.mjs');
@@ -192,7 +205,7 @@ test('canonical security gate reaches every repository JavaScript and TypeScript
   assert.deepEqual(discoveredTests.filter((file) => !files.has(file)), []);
 });
 
-test('PR security gate runs static checks and prepares the migration-engine manifest before its consumers run', () => {
+test('PR security gate runs static checks and the bounded security gate without migration-engine setup', () => {
   const jobStart = workflow.indexOf('  security-gate:\n');
   const nextJobStart = workflow.indexOf('\n  full-gate:\n', jobStart);
   assert.notEqual(jobStart, -1, 'security-gate job is missing');
@@ -204,24 +217,19 @@ test('PR security gate runs static checks and prepares the migration-engine mani
     /if: github\.event_name == 'pull_request' \|\| github\.event_name == 'push'/,
     'security-gate must run for both pull requests and pushes to main',
   );
+  const nodeSetup = securityGateJob.indexOf('uses: actions/setup-node@');
   const dependencyInstall = securityGateJob.indexOf('run: npm ci\n');
   const staticTypechecks = securityGateJob.indexOf('run: npm run typecheck && npm run typecheck:node\n');
-  const pythonSetup = securityGateJob.indexOf('uses: actions/setup-python@');
-  const migrationEngineSetup = securityGateJob.indexOf('run: npm run setup:migration-engine\n');
+  const releaseCoverage = securityGateJob.indexOf('run: npm run test:release-gate-coverage\n');
   const securityGateRun = securityGateJob.indexOf('run: npm run security:gate\n');
 
-  assert.ok(pythonSetup >= 0, 'security-gate must provision the pinned Python runtime');
-  assert.ok(dependencyInstall > pythonSetup, 'dependency installation must follow Python setup');
+  assert.ok(nodeSetup >= 0, 'security-gate must provision the pinned Node runtime');
+  assert.ok(dependencyInstall > nodeSetup, 'dependency installation must follow Node setup');
   assert.ok(staticTypechecks > dependencyInstall, 'PR/push security-gate must run frontend and Node typechecks');
-  assert.ok(migrationEngineSetup > pythonSetup, 'migration-engine setup must follow Python setup');
-  assert.ok(migrationEngineSetup > staticTypechecks, 'migration-engine setup must follow static typechecks');
-  assert.ok(securityGateRun > migrationEngineSetup, 'migration-engine setup must complete before security:gate');
-  assert.match(securityGateJob, /OMNIKIT_MIGRATION_ENGINE_BOOTSTRAP_PYTHON:\s*python/);
-  assert.doesNotMatch(
-    securityGateJob,
-    /run: npm run setup:migration-engine:test/,
-    'the PR gate must not install test/audit-only Python dependencies',
-  );
+  assert.ok(releaseCoverage > staticTypechecks, 'the structural guard must follow static typechecks');
+  assert.ok(securityGateRun > releaseCoverage, 'security:gate must follow the structural guard');
+  assert.doesNotMatch(securityGateJob, /actions\/setup-python@/);
+  assert.doesNotMatch(securityGateJob, /migration-engine|OMNIKIT_MIGRATION_ENGINE/);
 });
 
 test('CI invokes the structural guard and the single canonical release gate', () => {

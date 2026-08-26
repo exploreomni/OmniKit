@@ -1,5 +1,5 @@
 import { ApiError, listModels } from '../omniApi';
-import { parseDestinationModelInventory } from '../topicsRequestState';
+import { parseVerifiedModelInventory } from '../topicsRequestState';
 import type { OmniModel } from '@/types';
 
 export type AIContentModelInventoryLoader = (
@@ -152,8 +152,9 @@ export async function loadAIContentModelInventory(
     signal,
   }));
 
-  const models = parseDestinationModelInventory<OmniModel>(
+  const models = parseVerifiedModelInventory<OmniModel>(
     await loader('SHARED', forceRefresh, signal),
+    ['SHARED'],
   );
   if (models.some((model) => model.kind !== 'SHARED')) {
     throw new Error('Destination model inventory response was invalid.');

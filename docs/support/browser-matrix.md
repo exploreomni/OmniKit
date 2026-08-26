@@ -11,12 +11,9 @@
 OmniKit's initial release boundary is a local, single-operator application.
 Browser support does not imply hosted, multi-user, or mobile support.
 
-`npm run test:browser:migration-studio` is the required Chromium release gate.
-`npm run test:browser:migration-studio:all` runs the same critical journeys in
-Chromium, Firefox, and WebKit for compatibility qualification.
-`npm run test:accessibility:migration-studio` checks the critical source
-workflow against WCAG 2.0/2.1 A and AA rules and fails on serious or critical
-findings.
+`npm run test:browser:release` is the required Chromium release gate. Focused
+browser suites cover routing, Fleet and Administration workspaces, Dashboard
+Safe Copy, Model Migrator, and accessibility-sensitive critical paths.
 
 Any future support claim must add that browser to required CI, complete manual
 keyboard and visual checks, and update this matrix in the same release.

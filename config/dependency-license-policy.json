@@ -23,10 +23,6 @@
     "SSPL"
   ],
   "metadataExceptions": {
-    "npm:json-bignum@0.0.3": "MIT",
-    "pypi:annotated-types@0.7.0": "MIT",
-    "pypi:colorama@0.4.6": "BSD-3-Clause",
-    "pypi:markdown-it-py@4.2.0": "MIT",
-    "pypi:mdurl@0.1.2": "MIT"
+    "npm:json-bignum@0.0.3": "MIT"
   }
 }

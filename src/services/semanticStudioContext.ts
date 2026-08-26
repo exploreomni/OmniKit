@@ -1,6 +1,6 @@
 import { parseDocument, stringify, visit } from 'yaml';
 import type { OmniModelYamlResponse } from './omniApi';
-import { sha256Text } from './semanticMigration/sourceEvidence';
+import { sha256Text } from './contentHash';
 import {
   aiPromptSecretFindingsShared,
   redactAiPromptSecrets,

@@ -1,6 +1,0 @@
-{
-  "views": [{ "name": "NORTHSTAR_SALES", "fields": ["ORDER_ID", "BUSINESS_DATE", "STORE_NUMBER", "NET_SALES"], "measures": ["TOTAL_REVENUE"] }],
-  "relationships": [{ "from": "NORTHSTAR_SALES", "to": "NORTHSTAR_LOCATIONS" }],
-  "dashboards": [{ "name": "NorthstarDashboard", "fields": ["NET_SALES", "STORE_NUMBER"], "filters": ["BUSINESS_DATE"] }],
-  "caveats": ["DEFINE/COMPUTE expressions, repository security, schedules, and rendering require review."]
-}

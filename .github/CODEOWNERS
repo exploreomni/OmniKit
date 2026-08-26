@@ -7,6 +7,5 @@
 /scripts/ @atx-omni
 /config/ @atx-omni
 /contracts/ @atx-omni
-/packages/omnikit-migration-engine/ @atx-omni
 /SECURITY.md @atx-omni
 /THIRD_PARTY_NOTICES.md @atx-omni
