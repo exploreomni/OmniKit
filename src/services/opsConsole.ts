@@ -2,6 +2,7 @@ import { ApiError } from './omniApi';
 import type { DashboardDownloadDetails } from './dashboardDownloads';
 import { getConnectionCacheKey } from './connectionGuards';
 import { emitVaultChanged, emitVaultLocked } from './vaultEvents';
+import { normalizeConnectionDiagnosticCode } from '../../shared/instanceConnectionErrors';
 
 const defaultHeaders = {
   'Content-Type': 'application/json',
@@ -968,15 +969,17 @@ async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   if (!res.ok) {
     let message = `${path} failed (HTTP ${res.status})`;
     let detail = '';
+    let code: string | undefined;
     try {
-      const body = await res.json() as { error?: string; message?: string; detail?: string };
+      const body = await res.json() as { error?: string; message?: string; detail?: string; code?: unknown };
       message = body.error || body.message || message;
       detail = body.detail || '';
+      code = normalizeConnectionDiagnosticCode(body.code);
     } catch {
       detail = await res.text().catch(() => '');
     }
     if (res.status === 423) emitVaultLocked(message);
-    throw new ApiError(res.status, message, detail || undefined);
+    throw new ApiError(res.status, message, detail || undefined, code);
   }
   return await res.json() as T;
 }
@@ -992,15 +995,17 @@ async function apiFetchBlob(path: string, options?: RequestInit): Promise<{ blob
   if (!res.ok) {
     let message = `${path} failed (HTTP ${res.status})`;
     let detail = '';
+    let code: string | undefined;
     try {
-      const body = await res.json() as { error?: string; message?: string; detail?: string };
+      const body = await res.json() as { error?: string; message?: string; detail?: string; code?: unknown };
       message = body.error || body.message || message;
       detail = body.detail || '';
+      code = normalizeConnectionDiagnosticCode(body.code);
     } catch {
       detail = await res.text().catch(() => '');
     }
     if (res.status === 423) emitVaultLocked(message);
-    throw new ApiError(res.status, message, detail || undefined);
+    throw new ApiError(res.status, message, detail || undefined, code);
   }
   const disposition = res.headers.get('content-disposition') || '';
   const filename = disposition.match(/filename="([^"]+)"/)?.[1];

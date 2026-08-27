@@ -32,16 +32,24 @@ import {
 import {
   discardReviewedModelBranch,
   isGovernanceEditableModel,
-  publishReviewedModelBranch,
+  prepareReviewedModelHandoff,
+  ReviewedPullRequestVerificationError,
   startReviewedModelBranch,
-  validateReviewedModelBranch,
   type ReviewedModelBranch,
-  type ReviewedPublishResult,
+  type ReviewedHandoffResult,
   type ReviewedValidation,
 } from '@/services/reviewedModelWrite';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
 import { useLogOperation } from '@/hooks/useOperationLog';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { ReleaseGateEvidencePanel } from '@/components/modelGovernance/ReleaseGateEvidencePanel';
+import {
+  collectTargetedAffectedContent,
+  collectReleaseGateEvidence,
+  reconcileReleaseGateApproval,
+  type ReleaseGateApproval,
+  type ReleaseGateEvidence,
+} from '@/services/releaseGateEvidence';
 
 interface ViewCleanupPanelProps {
   connection: ConnectionConfig;
@@ -61,21 +69,23 @@ interface CleanupPreview {
     detail: string;
   }>;
   validation: ReviewedValidation;
+  releaseEvidence: ReleaseGateEvidence;
 }
 
 interface RefreshPreview {
   branch: ReviewedModelBranch;
   targetModel: OmniModel;
   status: string;
+  affectedViewNames: string[];
   validation: ReviewedValidation | null;
+  releaseEvidence: ReleaseGateEvidence | null;
 }
 
 interface GovernanceResult {
   title: string;
   message: string;
-  mode: 'merged' | 'pull_request' | 'queued' | 'discarded';
+  mode: 'manual_handoff' | 'pull_request' | 'quarantined' | 'queued' | 'discarded';
   rows?: CleanupPreview['results'];
-  postValidation?: ReviewedValidation;
   url?: string;
   removedViews?: string[];
 }
@@ -112,7 +122,7 @@ function dedupeReferences(rows: SemanticContentReference[]): SemanticContentRefe
 
 function resultFromPublish(
   title: string,
-  publish: ReviewedPublishResult,
+  publish: ReviewedHandoffResult,
   rows?: CleanupPreview['results'],
 ): GovernanceResult {
   return {
@@ -120,7 +130,6 @@ function resultFromPublish(
     message: publish.message,
     mode: publish.mode,
     rows,
-    postValidation: publish.postMergeValidation,
     url: publish.url,
   };
 }
@@ -169,6 +178,8 @@ export function ViewCleanupPanel({
   const [error, setError] = useState('');
   const [preview, setPreview] = useState<CleanupPreview | null>(null);
   const [refreshPreview, setRefreshPreview] = useState<RefreshPreview | null>(null);
+  const [cleanupApproval, setCleanupApproval] = useState<ReleaseGateApproval | null>(null);
+  const [refreshApproval, setRefreshApproval] = useState<ReleaseGateApproval | null>(null);
   const [result, setResult] = useState<GovernanceResult | null>(null);
   const [pendingOverride, setPendingOverride] = useState<StaleViewCandidate | null>(null);
   const [confirmHardRefresh, setConfirmHardRefresh] = useState(false);
@@ -187,6 +198,8 @@ export function ViewCleanupPanel({
     setSelectedViews(new Set());
     setPreview(null);
     setRefreshPreview(null);
+    setCleanupApproval(null);
+    setRefreshApproval(null);
     setResult(null);
   }, [connectionKey]);
 
@@ -224,6 +237,8 @@ export function ViewCleanupPanel({
   function resetStagedWork() {
     setPreview(null);
     setRefreshPreview(null);
+    setCleanupApproval(null);
+    setRefreshApproval(null);
     setResult(null);
   }
 
@@ -380,7 +395,11 @@ export function ViewCleanupPanel({
       }
       const results: CleanupPreview['results'] = [];
       for (const candidate of selectedCandidates) {
-        const targetFileName = candidate.fileName.split('/').pop() || `${candidate.viewName}.view`;
+        const targetLeafName = candidate.fileName.split('/').pop() || `${candidate.viewName}.view`;
+        const existingFileName = Object.keys(branchYaml.files || {}).find((name) => (
+          name === targetLeafName || name.endsWith(`/${targetLeafName}`)
+        ));
+        const targetFileName = existingFileName || targetLeafName;
         try {
           await deleteModelView(connection.baseUrl, connection.apiKey, {
             modelId: selectedTargetModel.id,
@@ -397,9 +416,6 @@ export function ViewCleanupPanel({
           });
         } catch {
           try {
-            const existingFileName = Object.keys(branchYaml.files || {}).find((name) => (
-              name === targetFileName || name.endsWith(`/${targetFileName}`)
-            ));
             const existingYaml = existingFileName ? branchYaml.files?.[existingFileName] || '' : '';
             const checksum = existingFileName ? branchYaml.checksums?.[existingFileName] : undefined;
             await updateModelYamlFiles(connection.baseUrl, connection.apiKey, {
@@ -431,13 +447,30 @@ export function ViewCleanupPanel({
           }
         }
       }
-      const validation = await validateReviewedModelBranch(connection, branch);
+      const stagedFiles = results.filter((row) => row.status === 'staged').map((row) => row.targetFileName);
+      const affectedContentEvidence = await collectTargetedAffectedContent(
+        connection,
+        selectedTargetModel.id,
+        results
+          .filter((row) => row.status === 'staged')
+          .map((row) => ({ type: 'VIEW', name: row.viewName })),
+      );
+      const releaseEvidence = await collectReleaseGateEvidence({
+        connection,
+        model: selectedTargetModel,
+        branch,
+        affectedFiles: stagedFiles,
+        ...affectedContentEvidence,
+      });
       if (!isTargetCurrent(requestKey, targetModelId)) {
         await discardReviewedModelBranch(connection, branch).catch(() => undefined);
         return;
       }
-      setPreview({ branch, targetModel: selectedTargetModel, results, validation });
-      setMessage('Cleanup branch is staged. Review every file and validation result before publishing.');
+      setPreview({ branch, targetModel: selectedTargetModel, results, validation: releaseEvidence.validation, releaseEvidence });
+      setCleanupApproval(null);
+      setMessage(releaseEvidence.status === 'blocked'
+        ? 'Cleanup branch is staged, but the release gate is blocked. Review the evidence before handoff.'
+        : 'Cleanup branch is staged. Approve the exact release evidence before handoff.');
     } catch (previewError) {
       if (branch) await discardReviewedModelBranch(connection, branch).catch(() => undefined);
       if (isTargetCurrent(requestKey, targetModelId)) setError(previewError instanceof Error ? previewError.message : 'Could not stage cleanup branch.');
@@ -447,24 +480,38 @@ export function ViewCleanupPanel({
   }
 
   async function publishCleanup() {
-    if (!preview) return;
+    if (!preview || preview.releaseEvidence.status === 'blocked') return;
     const requestKey = connectionKey;
     const targetModelId = preview.targetModel.id;
     setPublishing(true);
     setError('');
     try {
-      const validation = await validateReviewedModelBranch(connection, preview.branch);
+      const stagedRows = preview.results.filter((row) => row.status === 'staged');
+      const affectedContentEvidence = await collectTargetedAffectedContent(
+        connection,
+        preview.targetModel.id,
+        stagedRows.map((row) => ({ type: 'VIEW', name: row.viewName })),
+      );
+      const releaseEvidence = await collectReleaseGateEvidence({
+        connection,
+        model: preview.targetModel,
+        branch: preview.branch,
+        affectedFiles: stagedRows.map((row) => row.targetFileName),
+        ...affectedContentEvidence,
+      });
       if (!isTargetCurrent(requestKey, targetModelId)) return;
-      if (validation.blocking) {
-        setPreview({ ...preview, validation });
-        setError('Validation changed or still contains blockers. Resolve them before publishing.');
+      const currentApproval = reconcileReleaseGateApproval(cleanupApproval, releaseEvidence);
+      if (!currentApproval) {
+        setPreview({ ...preview, validation: releaseEvidence.validation, releaseEvidence });
+        setCleanupApproval(null);
+        setError('Release evidence changed or is blocked. Review the refreshed fingerprint and approve it again before handoff.');
         return;
       }
-      const publish = await publishReviewedModelBranch(connection, preview.branch, 'Publish OmniKit stale-view cleanup');
+      const publish = await prepareReviewedModelHandoff(connection, preview.branch, 'Review OmniKit stale-view cleanup');
       if (!isTargetCurrent(requestKey, targetModelId)) return;
       const staged = preview.results.filter((row) => row.status === 'staged').length;
       const failed = preview.results.filter((row) => row.status === 'failed').length;
-      logOperation('model_governance', `Stale view cleanup ${publish.mode === 'merged' ? 'published' : 'sent for review'} for ${preview.targetModel.name}`, {
+      logOperation('model_governance', `Stale view cleanup sent for review for ${preview.targetModel.name}`, {
         itemCount: preview.results.length,
         successCount: staged,
         failureCount: failed,
@@ -479,9 +526,24 @@ export function ViewCleanupPanel({
       });
       setResult(resultFromPublish('Cleanup result', publish, preview.results));
       setPreview(null);
+      setCleanupApproval(null);
       setMessage(publish.message);
     } catch (publishError) {
-      if (isTargetCurrent(requestKey, targetModelId)) setError(publishError instanceof Error ? publishError.message : 'Could not publish cleanup branch.');
+      if (isTargetCurrent(requestKey, targetModelId)) {
+        if (publishError instanceof ReviewedPullRequestVerificationError) {
+          setResult({
+            title: 'Cleanup handoff needs reconciliation',
+            message: `${publishError.message} No retry is allowed until the reported review is reconciled in Omni.`,
+            mode: 'quarantined',
+            rows: preview.results,
+            url: publishError.reviewUrl || preview.branch.capability.webUrl || connection.baseUrl,
+          });
+          setPreview(null);
+          setCleanupApproval(null);
+        } else {
+          setError(publishError instanceof Error ? publishError.message : 'Could not prepare the cleanup handoff.');
+        }
+      }
     } finally {
       if (isTargetCurrent(requestKey, targetModelId)) setPublishing(false);
     }
@@ -495,6 +557,7 @@ export function ViewCleanupPanel({
       await discardReviewedModelBranch(connection, preview.branch);
       setResult({ title: 'Cleanup branch discarded', message: 'No model changes were published.', mode: 'discarded', rows: preview.results });
       setPreview(null);
+      setCleanupApproval(null);
       setMessage('Cleanup branch discarded. No model changes were published.');
     } catch (discardError) {
       setError(discardError instanceof Error ? discardError.message : 'Could not discard cleanup branch.');
@@ -522,8 +585,16 @@ export function ViewCleanupPanel({
             await discardReviewedModelBranch(connection, branch).catch(() => undefined);
             return;
           }
-          setRefreshPreview({ branch, targetModel: selectedTargetModel, status: response.status || 'running', validation: null });
-          setMessage(`Hard schema refresh queued on branch ${branch.branchName}. Wait for Omni to finish, then check the branch before publishing.`);
+          setRefreshPreview({
+            branch,
+            targetModel: selectedTargetModel,
+            status: response.status || 'running',
+            affectedViewNames: [...lastScannedViews],
+            validation: null,
+            releaseEvidence: null,
+          });
+          setRefreshApproval(null);
+          setMessage(`Hard schema refresh queued on branch ${branch.branchName}. Wait for Omni to finish, then check the branch before handoff.`);
         } catch (refreshError) {
           await discardReviewedModelBranch(connection, branch).catch(() => undefined);
           throw refreshError;
@@ -560,11 +631,22 @@ export function ViewCleanupPanel({
     setLoading(true);
     setError('');
     try {
-      const validation = await validateReviewedModelBranch(connection, refreshPreview.branch);
-      setRefreshPreview({ ...refreshPreview, validation });
-      setMessage(validation.blocking
-        ? 'The refresh branch still has blockers or is still processing. Review the results and check again.'
-        : 'The refresh branch is validation-ready. Publish when the diff in Omni looks correct.');
+      const affectedContentEvidence = await collectTargetedAffectedContent(
+        connection,
+        refreshPreview.targetModel.id,
+        refreshPreview.affectedViewNames.map((viewName) => ({ type: 'VIEW', name: viewName })),
+      );
+      const releaseEvidence = await collectReleaseGateEvidence({
+        connection,
+        model: refreshPreview.targetModel,
+        branch: refreshPreview.branch,
+        ...affectedContentEvidence,
+      });
+      setRefreshPreview({ ...refreshPreview, validation: releaseEvidence.validation, releaseEvidence });
+      setRefreshApproval(null);
+      setMessage(releaseEvidence.status === 'blocked'
+        ? 'The refresh release gate still has blockers or is still processing. Review the evidence and check again.'
+        : 'The refresh branch is validation-ready. Approve the exact release evidence before handoff.');
     } catch (checkError) {
       setError(checkError instanceof Error ? checkError.message : 'Could not validate refresh branch.');
     } finally {
@@ -573,12 +655,30 @@ export function ViewCleanupPanel({
   }
 
   async function publishRefreshBranch() {
-    if (!refreshPreview?.validation || refreshPreview.validation.blocking) return;
+    if (!refreshPreview?.releaseEvidence || refreshPreview.releaseEvidence.status === 'blocked') return;
     setPublishing(true);
     setError('');
     try {
-      const publish = await publishReviewedModelBranch(connection, refreshPreview.branch, 'Publish OmniKit hard schema refresh');
-      logOperation('model_governance', `Hard schema refresh ${publish.mode === 'merged' ? 'published' : 'sent for review'} for ${refreshPreview.targetModel.name}`, {
+      const affectedContentEvidence = await collectTargetedAffectedContent(
+        connection,
+        refreshPreview.targetModel.id,
+        refreshPreview.affectedViewNames.map((viewName) => ({ type: 'VIEW', name: viewName })),
+      );
+      const releaseEvidence = await collectReleaseGateEvidence({
+        connection,
+        model: refreshPreview.targetModel,
+        branch: refreshPreview.branch,
+        ...affectedContentEvidence,
+      });
+      const currentApproval = reconcileReleaseGateApproval(refreshApproval, releaseEvidence);
+      if (!currentApproval) {
+        setRefreshPreview({ ...refreshPreview, validation: releaseEvidence.validation, releaseEvidence });
+        setRefreshApproval(null);
+        setError('Release evidence changed or is blocked. Review the refreshed fingerprint and approve it again before handoff.');
+        return;
+      }
+      const publish = await prepareReviewedModelHandoff(connection, refreshPreview.branch, 'Review OmniKit hard schema refresh');
+      logOperation('model_governance', `Hard schema refresh sent for review for ${refreshPreview.targetModel.name}`, {
         itemCount: 1,
         successCount: 1,
         details: {
@@ -591,9 +691,21 @@ export function ViewCleanupPanel({
       });
       setResult(resultFromPublish('Hard refresh result', publish));
       setRefreshPreview(null);
+      setRefreshApproval(null);
       setMessage(publish.message);
     } catch (publishError) {
-      setError(publishError instanceof Error ? publishError.message : 'Could not publish refresh branch.');
+      if (publishError instanceof ReviewedPullRequestVerificationError) {
+        setResult({
+          title: 'Refresh handoff needs reconciliation',
+          message: `${publishError.message} No retry is allowed until the reported review is reconciled in Omni.`,
+          mode: 'quarantined',
+          url: publishError.reviewUrl || refreshPreview.branch.capability.webUrl || connection.baseUrl,
+        });
+        setRefreshPreview(null);
+        setRefreshApproval(null);
+      } else {
+        setError(publishError instanceof Error ? publishError.message : 'Could not prepare the refresh handoff.');
+      }
     } finally {
       setPublishing(false);
     }
@@ -606,6 +718,7 @@ export function ViewCleanupPanel({
     try {
       await discardReviewedModelBranch(connection, refreshPreview.branch);
       setRefreshPreview(null);
+      setRefreshApproval(null);
       setResult({ title: 'Refresh branch discarded', message: 'No schema refresh changes were published.', mode: 'discarded' });
     } catch (discardError) {
       setError(discardError instanceof Error ? discardError.message : 'Could not discard refresh branch.');
@@ -788,8 +901,8 @@ export function ViewCleanupPanel({
               <h3 className="text-base font-semibold text-content-primary">Cleanup branch preview</h3>
               <p className="mt-1 text-sm text-content-secondary">{preview.branch.branchName} on {preview.targetModel.name}. Main remains untouched.</p>
             </div>
-            <div className={preview.validation.blocking ? 'rounded-chip bg-red-50 px-3 py-1 text-sm font-semibold text-red-700' : 'rounded-chip bg-green-50 px-3 py-1 text-sm font-semibold text-green-700'}>
-              {preview.validation.blocking ? 'Validation blockers' : preview.branch.capability.pullRequestRequired ? 'Ready for PR' : 'Ready to publish'}
+            <div className={preview.releaseEvidence.status === 'blocked' ? 'rounded-chip bg-red-50 px-3 py-1 text-sm font-semibold text-red-700' : 'rounded-chip bg-green-50 px-3 py-1 text-sm font-semibold text-green-700'}>
+              {preview.releaseEvidence.status === 'blocked' ? 'Release gate blocked' : preview.branch.capability.pullRequestRequired ? 'Ready for PR' : 'Ready for manual handoff'}
             </div>
           </div>
           <div className="overflow-hidden rounded-card border border-border">
@@ -807,11 +920,17 @@ export function ViewCleanupPanel({
               <div className="mt-1">{preview.validation.modelIssues.slice(0, 4).map((issue) => issue.message || issue.yaml_path || 'Validation issue').join(' · ') || preview.validation.contentError || `${preview.validation.contentIssueCount} content issue${preview.validation.contentIssueCount === 1 ? '' : 's'} found.`}</div>
             </div>
           )}
+          <ReleaseGateEvidencePanel
+            evidence={preview.releaseEvidence}
+            approval={cleanupApproval}
+            onApprovalChange={setCleanupApproval}
+            disabled={publishing}
+          />
           <div className="flex flex-wrap justify-end gap-2">
             <button type="button" onClick={discardCleanup} disabled={loading || publishing} className="btn-secondary text-sm"><XCircle size={14} />Discard branch</button>
-            <button type="button" onClick={publishCleanup} disabled={publishing || preview.validation.blocking || preview.results.every((row) => row.status !== 'staged')} className="btn-primary text-sm">
+            <button type="button" onClick={publishCleanup} disabled={publishing || preview.releaseEvidence.status === 'blocked' || preview.results.every((row) => row.status !== 'staged') || !cleanupApproval} className="btn-primary text-sm">
               {publishing ? <Loader2 size={14} className="animate-spin" /> : <Trash2 size={14} />}
-              {preview.branch.capability.pullRequestRequired ? 'Create PR handoff' : 'Publish cleanup'}
+              {preview.branch.capability.pullRequestRequired ? 'Create PR handoff' : 'Prepare manual handoff'}
             </button>
           </div>
         </section>
@@ -821,21 +940,29 @@ export function ViewCleanupPanel({
         <section className="card p-5 space-y-3" aria-label="Hard refresh branch">
           <div className="flex items-start gap-3"><RefreshCw size={18} className="mt-0.5 text-omni-700" /><div><h3 className="font-semibold text-content-primary">Hard refresh branch</h3><p className="text-sm text-content-secondary">{refreshPreview.branch.branchName} · Omni status: {refreshPreview.status}</p></div></div>
           {refreshPreview.validation && (
-            <div className={refreshPreview.validation.blocking ? 'rounded-card border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900' : 'rounded-card border border-green-200 bg-green-50 p-3 text-sm text-green-800'}>
-              {refreshPreview.validation.blocking ? 'The branch has blockers or the refresh is still processing.' : 'Model and content validation are ready.'}
+            <div className={refreshPreview.releaseEvidence?.status === 'blocked' ? 'rounded-card border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900' : 'rounded-card border border-green-200 bg-green-50 p-3 text-sm text-green-800'}>
+              {refreshPreview.releaseEvidence?.status === 'blocked' ? 'The release gate has blockers or the refresh is still processing.' : 'Model and content validation are ready.'}
             </div>
+          )}
+          {refreshPreview.releaseEvidence && (
+            <ReleaseGateEvidencePanel
+              evidence={refreshPreview.releaseEvidence}
+              approval={refreshApproval}
+              onApprovalChange={setRefreshApproval}
+              disabled={publishing}
+            />
           )}
           <div className="flex flex-wrap justify-end gap-2">
             <button type="button" onClick={discardRefreshBranch} disabled={loading || publishing} className="btn-secondary text-sm"><XCircle size={14} />Discard branch</button>
             <button type="button" onClick={checkRefreshBranch} disabled={loading || publishing} className="btn-secondary text-sm"><ShieldAlert size={14} />Check branch</button>
-            <button type="button" onClick={publishRefreshBranch} disabled={publishing || !refreshPreview.validation || refreshPreview.validation.blocking} className="btn-primary text-sm"><CheckCircle2 size={14} />{refreshPreview.branch.capability.pullRequestRequired ? 'Create PR handoff' : 'Publish refresh'}</button>
+            <button type="button" onClick={publishRefreshBranch} disabled={publishing || !refreshPreview.releaseEvidence || refreshPreview.releaseEvidence.status === 'blocked' || !refreshApproval} className="btn-primary text-sm"><CheckCircle2 size={14} />{refreshPreview.branch.capability.pullRequestRequired ? 'Create PR handoff' : 'Prepare manual handoff'}</button>
           </div>
         </section>
       )}
 
       {result && (
         <section className="card p-5" aria-live="polite">
-          <div className="flex items-start gap-3"><CheckCircle2 size={20} className={result.mode === 'discarded' ? 'text-content-secondary' : 'text-green-700'} /><div className="min-w-0"><h3 className="font-semibold text-content-primary">{result.title}</h3><p className="mt-1 text-sm text-content-secondary">{result.message}</p>{result.url && <a href={result.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-omni-700 underline">Open pull request <ExternalLink size={13} /></a>}{result.removedViews && <div className="mt-2 text-sm text-content-secondary">Removed: {result.removedViews.join(', ')}</div>}{result.postValidation && <div className="mt-2 text-sm text-content-secondary">Post-publish validation: {result.postValidation.blocking ? 'blockers found' : 'passed'}.</div>}</div></div>
+          <div className="flex items-start gap-3"><CheckCircle2 size={20} className={result.mode === 'discarded' ? 'text-content-secondary' : 'text-green-700'} /><div className="min-w-0"><h3 className="font-semibold text-content-primary">{result.title}</h3><p className="mt-1 text-sm text-content-secondary">{result.message}</p>{result.url && <a href={result.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-omni-700 underline">{result.mode === 'pull_request' ? 'Open pull request' : result.mode === 'quarantined' ? 'Open Omni to reconcile' : 'Open Omni for sign-off'} <ExternalLink size={13} /></a>}{result.removedViews && <div className="mt-2 text-sm text-content-secondary">Removed: {result.removedViews.join(', ')}</div>}</div></div>
         </section>
       )}
 

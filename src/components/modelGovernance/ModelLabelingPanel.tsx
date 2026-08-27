@@ -15,13 +15,21 @@ import {
 } from '@/services/modelGovernance';
 import { useLogOperation } from '@/hooks/useOperationLog';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
+import { ReleaseGateEvidencePanel } from '@/components/modelGovernance/ReleaseGateEvidencePanel';
+import {
+  collectReleaseGateEvidence,
+  reconcileReleaseGateApproval,
+  type ReleaseGateAffectedContentScope,
+  type ReleaseGateApproval,
+  type ReleaseGateEvidence,
+} from '@/services/releaseGateEvidence';
 import {
   discardReviewedModelBranch,
   inspectModelWriteCapability,
   isGovernanceEditableModel,
-  publishReviewedModelBranch,
+  prepareReviewedModelHandoff,
+  ReviewedPullRequestVerificationError,
   startReviewedModelBranch,
-  validateReviewedModelBranch,
   type ModelWriteCapability,
   type ReviewedModelBranch,
   type ReviewedValidation,
@@ -41,14 +49,14 @@ interface LabelPreview {
   patches: LabelPatch[];
   changedFiles: Array<{ fileName: string; yaml: string }>;
   validation: ReviewedValidation;
+  releaseEvidence: ReleaseGateEvidence;
   warnings: string[];
 }
 
 interface LabelResult {
-  mode: 'merged' | 'pull_request' | 'discarded';
+  mode: 'manual_handoff' | 'pull_request' | 'quarantined' | 'discarded';
   message: string;
   patches: LabelPatch[];
-  postValidation?: ReviewedValidation;
   url?: string;
 }
 
@@ -63,6 +71,17 @@ function labelModel(model: OmniModel): string {
 function patchName(patch: LabelPatch): string {
   if (patch.kind === 'field') return `${patch.viewName}.${patch.fieldName}`;
   return patch.name;
+}
+
+function labelAffectedContentScope(patches: LabelPatch[]): ReleaseGateAffectedContentScope {
+  return {
+    state: 'metadata_only',
+    basis: 'metadata_only_label_change',
+    targets: patches.map((patch) => ({
+      type: patch.kind === 'topic' ? 'TOPIC' : patch.kind === 'view' ? 'VIEW' : 'FIELD_GROUP',
+      name: patch.kind === 'field' ? `${patch.viewName}.${patch.fieldName}` : patch.name,
+    })),
+  };
 }
 
 export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelProps) {
@@ -96,6 +115,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
   const [error, setError] = useState('');
   const [preview, setPreview] = useState<LabelPreview | null>(null);
   const [result, setResult] = useState<LabelResult | null>(null);
+  const [releaseApproval, setReleaseApproval] = useState<ReleaseGateApproval | null>(null);
   const [capability, setCapability] = useState<ModelWriteCapability | null>(null);
 
   const selectedModel = models.find((model) => model.id === selectedModelId) || null;
@@ -153,6 +173,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
     setDraftValues({});
     setSelectedKeys(new Set());
     setPreview(null);
+    setReleaseApproval(null);
     setResult(null);
     setSelectedViewName('');
   }
@@ -165,6 +186,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
     setError('');
     setMessage('');
     setPreview(null);
+    setReleaseApproval(null);
     setResult(null);
     try {
       const nextCapability = await inspectModelWriteCapability(connection, selectedModel);
@@ -325,7 +347,13 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
         })),
         commitMessage: 'OmniKit model label updates',
       });
-      const validation = await validateReviewedModelBranch(connection, branch);
+      const releaseEvidence = await collectReleaseGateEvidence({
+        connection,
+        model: selectedModel,
+        branch,
+        affectedFiles: patchResult.changedFiles.map((file) => file.fileName),
+        affectedContentScope: labelAffectedContentScope(patchResult.deltas),
+      });
       if (activeConnectionRef.current !== requestKey || activeModelRef.current !== modelId) {
         await discardReviewedModelBranch(connection, branch).catch(() => undefined);
         return;
@@ -335,10 +363,14 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
         targetModel: selectedModel,
         patches: patchResult.deltas,
         changedFiles: patchResult.changedFiles,
-        validation,
+        validation: releaseEvidence.validation,
+        releaseEvidence,
         warnings: patchResult.warnings,
       });
-      setMessage('Labeling branch is ready for review. Publish only after the diff and validation look right.');
+      setReleaseApproval(null);
+      setMessage(releaseEvidence.status === 'blocked'
+        ? 'Labeling branch is staged, but the release gate is blocked. Review the evidence before handoff.'
+        : 'Labeling branch is ready for review. Approve the exact release evidence before handoff.');
     } catch (err) {
       if (branch) await discardReviewedModelBranch(connection, branch).catch(() => undefined);
       if (activeConnectionRef.current === requestKey && activeModelRef.current === modelId) setError(err instanceof Error ? err.message : 'Could not preview labeling changes on a branch.');
@@ -348,25 +380,33 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
   }
 
   async function publishPreview() {
-    if (!preview) return;
+    if (!preview || preview.releaseEvidence.status === 'blocked') return;
     const requestKey = connectionKey;
     const modelId = preview.targetModel.id;
     setPublishing(true);
     setError('');
     try {
-      const validation = await validateReviewedModelBranch(connection, preview.branch);
+      const releaseEvidence = await collectReleaseGateEvidence({
+        connection,
+        model: preview.targetModel,
+        branch: preview.branch,
+        affectedFiles: preview.changedFiles.map((file) => file.fileName),
+        affectedContentScope: labelAffectedContentScope(preview.patches),
+      });
       if (activeConnectionRef.current !== requestKey || activeModelRef.current !== modelId) return;
-      if (validation.blocking) {
-        setPreview({ ...preview, validation });
-        setError('Validation changed or still contains blockers. Resolve them before publishing.');
+      const currentApproval = reconcileReleaseGateApproval(releaseApproval, releaseEvidence);
+      if (!currentApproval) {
+        setPreview({ ...preview, validation: releaseEvidence.validation, releaseEvidence });
+        setReleaseApproval(null);
+        setError('Release evidence changed or is blocked. Review the refreshed fingerprint and approve it again before handoff.');
         return;
       }
-      const publish = await publishReviewedModelBranch(connection, preview.branch, 'Publish OmniKit model labels');
+      const publish = await prepareReviewedModelHandoff(connection, preview.branch, 'Review OmniKit model labels');
       if (activeConnectionRef.current !== requestKey || activeModelRef.current !== modelId) return;
       const topicCount = preview.patches.filter((patch) => patch.kind === 'topic').length;
       const viewCount = preview.patches.filter((patch) => patch.kind === 'view').length;
       const fieldCount = preview.patches.filter((patch) => patch.kind === 'field').length;
-      logOperation('model_governance', `Model labeling ${publish.mode === 'merged' ? 'published' : 'sent for review'} for ${preview.targetModel.name}`, {
+      logOperation('model_governance', `Model labeling sent for review for ${preview.targetModel.name}`, {
         itemCount: preview.patches.length,
         successCount: preview.patches.length,
         details: {
@@ -384,13 +424,26 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
         mode: publish.mode,
         message: publish.message,
         patches: preview.patches,
-        postValidation: publish.postMergeValidation,
         url: publish.url,
       });
       setPreview(null);
+      setReleaseApproval(null);
       setMessage(publish.message);
     } catch (err) {
-      if (activeConnectionRef.current === requestKey && activeModelRef.current === modelId) setError(err instanceof Error ? err.message : 'Could not publish labeling branch.');
+      if (activeConnectionRef.current === requestKey && activeModelRef.current === modelId) {
+        if (err instanceof ReviewedPullRequestVerificationError) {
+          setResult({
+            mode: 'quarantined',
+            message: `${err.message} No retry is allowed until the reported review is reconciled in Omni.`,
+            patches: preview.patches,
+            url: err.reviewUrl || preview.branch.capability.webUrl || connection.baseUrl,
+          });
+          setPreview(null);
+          setReleaseApproval(null);
+        } else {
+          setError(err instanceof Error ? err.message : 'Could not prepare the labeling handoff.');
+        }
+      }
     } finally {
       if (activeConnectionRef.current === requestKey && activeModelRef.current === modelId) setPublishing(false);
     }
@@ -404,6 +457,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
       await discardReviewedModelBranch(connection, preview.branch);
       setResult({ mode: 'discarded', message: 'No model changes were published.', patches: preview.patches });
       setPreview(null);
+      setReleaseApproval(null);
       setMessage('Labeling branch discarded. No model changes were published.');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not discard labeling branch.');
@@ -412,7 +466,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
     }
   }
 
-  const branchHasErrors = Boolean(preview?.validation.blocking);
+  const branchHasErrors = Boolean(preview?.releaseEvidence.status === 'blocked');
 
   return (
     <div className="space-y-4" role="tabpanel" id="model-tabpanel-labeling" aria-labelledby="model-tab-labeling">
@@ -421,7 +475,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
           <div className="min-w-0 flex-1">
             <h2 className="text-lg font-semibold text-content-primary">Model labeling</h2>
             <p className="mt-1 text-sm text-content-secondary">
-              Bulk-set topic and view labels, or assign field group labels, then validate the YAML on a branch before publishing.
+              Bulk-set topic and view labels, or assign field group labels, then validate the YAML on a branch before human handoff.
             </p>
           </div>
           <div className="grid min-w-[240px] gap-2">
@@ -572,7 +626,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
               <p className="mt-1 text-sm text-content-secondary">Branch {preview.branch.branchName} changes {preview.changedFiles.length} YAML file{preview.changedFiles.length === 1 ? '' : 's'} on {preview.targetModel.name}.</p>
             </div>
             <div className={branchHasErrors ? 'rounded-chip bg-red-50 px-3 py-1 text-sm font-semibold text-red-700' : 'rounded-chip bg-green-50 px-3 py-1 text-sm font-semibold text-green-700'}>
-              {branchHasErrors ? 'Validation blockers' : preview.branch.capability.pullRequestRequired ? 'Ready for PR' : 'Validation ready'}
+              {branchHasErrors ? 'Release gate blocked' : preview.branch.capability.pullRequestRequired ? 'Ready for PR' : 'Validation ready'}
             </div>
           </div>
           <div className="grid gap-2">
@@ -596,14 +650,20 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
               <div className="mt-1">{preview.validation.modelIssues.slice(0, 3).map((issue) => issue.message || issue.yaml_path || 'Validation issue').join(' · ') || preview.validation.contentError || `${preview.validation.contentIssueCount} content issue${preview.validation.contentIssueCount === 1 ? '' : 's'} found.`}</div>
             </div>
           )}
+          <ReleaseGateEvidencePanel
+            evidence={preview.releaseEvidence}
+            approval={releaseApproval}
+            onApprovalChange={setReleaseApproval}
+            disabled={publishing}
+          />
           <div className="flex flex-wrap justify-end gap-2">
             <button type="button" onClick={discardPreview} disabled={loading || publishing} className="btn-secondary text-sm">
               <XCircle size={14} />
               Discard branch
             </button>
-            <button type="button" onClick={publishPreview} disabled={publishing || branchHasErrors} className="btn-primary text-sm">
+            <button type="button" onClick={publishPreview} disabled={publishing || branchHasErrors || !releaseApproval} className="btn-primary text-sm">
               {publishing ? <Loader2 size={14} className="animate-spin" /> : <CheckCircle2 size={14} />}
-              {preview.branch.capability.pullRequestRequired ? 'Create PR handoff' : 'Publish labels'}
+              {preview.branch.capability.pullRequestRequired ? 'Create PR handoff' : 'Prepare manual handoff'}
             </button>
           </div>
         </div>
@@ -617,8 +677,7 @@ export function ModelLabelingPanel({ connection, models }: ModelLabelingPanelPro
               <h3 className="font-semibold text-content-primary">Model labeling result</h3>
               <p className="mt-1 text-sm text-content-secondary">{result.message}</p>
               <p className="mt-1 text-xs text-content-secondary">{result.patches.length} reviewed label change{result.patches.length === 1 ? '' : 's'}.</p>
-              {result.url && <a href={result.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-omni-700 underline">Open pull request <ExternalLink size={13} /></a>}
-              {result.postValidation && <p className="mt-2 text-sm text-content-secondary">Post-publish validation: {result.postValidation.blocking ? 'blockers found' : 'passed'}.</p>}
+              {result.url && <a href={result.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-omni-700 underline">{result.mode === 'pull_request' ? 'Open pull request' : result.mode === 'quarantined' ? 'Open Omni to reconcile' : 'Open Omni for sign-off'} <ExternalLink size={13} /></a>}
             </div>
           </div>
         </div>

@@ -152,6 +152,49 @@ test('available zero remains zero while partial and unavailable evidence stay di
   assert.equal(parsed.capabilities[2].evidenceState, 'unavailable');
 });
 
+test('frontend contract accepts only the sanitized current-caller projection and reconciles truncation', () => {
+  const capabilities = ordinaryCapabilities('fleet').map((entry) => {
+    const row = entry as Record<string, unknown>;
+    if (row.id !== 'fleet.current_token_introspection') return entry;
+    return capability({
+      id: 'fleet.current_token_introspection',
+      label: 'Current caller permissions',
+      evidenceState: 'partial',
+      readinessState: 'unknown',
+      reason: { code: 'partial_coverage', message: 'The documented model-permission projection was truncated.' },
+      source: { kind: 'omni_api', scope: 'resource', method: 'GET', path: '/api/v1/whoami' },
+      coverage: { included: 200, total: null, complete: false, unit: 'model_permission_sets' },
+      exclusions: ['model_permission_sets_outside_response_limit'],
+      data: {
+        keyScope: 'organization',
+        orgRole: 'ORG_ADMIN',
+        returnedModelCount: 200,
+        returnedPermissionCount: 417,
+        rolesByModelTruncated: true,
+      },
+    });
+  });
+  const parsed = parseAdminReadinessReport(report(capabilities));
+  assert.deepEqual(parsed.capabilities[3].data, {
+    keyScope: 'organization',
+    orgRole: 'ORG_ADMIN',
+    returnedModelCount: 200,
+    returnedPermissionCount: 417,
+    rolesByModelTruncated: true,
+  });
+
+  const malformed = structuredClone(report(capabilities)) as { capabilities: Array<Record<string, unknown>> };
+  const caller = malformed.capabilities[3];
+  caller.data = {
+    ...(caller.data as Record<string, unknown>),
+    privateMembershipId: 'must-not-cross-the-contract',
+  };
+  assert.throws(
+    () => parseAdminReadinessReport(malformed),
+    /data contains an unknown field/,
+  );
+});
+
 test('authentication, permission, resource-missing, and unexpected-redirect reasons do not collapse', () => {
   const reasons = [
     { id: 'auth', evidenceState: 'unauthorized', code: 'authentication_required' },

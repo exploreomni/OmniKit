@@ -17,6 +17,7 @@ import {
   unlockVault,
   upsertInstance,
 } from '../server/services/nativeVault';
+import { instanceConnectionDiagnosticFromError } from '../src/services/instanceConnectionDiagnostics';
 
 let tempDir = '';
 
@@ -151,8 +152,8 @@ test('connection probe resolves once at connection time and blocks a private add
 
   assert.equal(connectionLookups, 1);
   assert.equal(redundantPreflightLookups, 0);
-  assert.equal(response.status, 502);
-  assert.equal(body.code, 'INSTANCE_VALIDATION_FAILED');
+  assert.equal(response.status, 400);
+  assert.equal(body.code, 'INSTANCE_NETWORK_TARGET_BLOCKED');
   assert.equal(getInstance(saved.id)?.lastValidatedAt, undefined);
 });
 
@@ -172,10 +173,79 @@ test('connection probe rejects redirects without following them or exposing redi
   const body = await response.json() as { code?: string };
 
   assert.equal(fetchCalls, 1);
-  assert.equal(response.status, 400);
-  assert.equal(body.code, 'INSTANCE_VALIDATION_FAILED');
+  assert.equal(response.status, 502);
+  assert.equal(body.code, 'INSTANCE_REDIRECT_BLOCKED');
   assert.doesNotMatch(JSON.stringify(body), /private-redirect|raw-secret/i);
   assert.equal(getInstance(saved.id)?.lastValidatedAt, undefined);
+});
+
+test('connection probe classifies safe transport failures without exposing raw socket details', async (t) => {
+  const saved = saveInstance('fixture-connect-transport-key');
+  const failures = [
+    ['ENOTFOUND', 'INSTANCE_DNS_RESOLUTION_FAILED'],
+    ['ECONNREFUSED', 'INSTANCE_CONNECTION_REFUSED'],
+    ['ENETUNREACH', 'INSTANCE_NETWORK_UNREACHABLE'],
+    ['ECONNRESET', 'INSTANCE_CONNECTION_INTERRUPTED'],
+    ['CERT_HAS_EXPIRED', 'INSTANCE_TLS_VALIDATION_FAILED'],
+    ['UND_ERR_CONNECT_TIMEOUT', 'INSTANCE_NETWORK_TIMEOUT'],
+  ] as const;
+  let failureIndex = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    const [systemCode] = failures[failureIndex++]!;
+    throw Object.assign(new Error(`raw socket detail fixture-secret-${systemCode}`), { code: systemCode });
+  });
+
+  for (const [, expectedCode] of failures) {
+    const response = await instancesHandler(instanceRequest(saved.id, 'connect'));
+    const body = await response.json() as { error?: string; code?: string };
+    assert.equal(response.status, 502);
+    assert.equal(body.code, expectedCode);
+    assert.doesNotMatch(JSON.stringify(body), /raw socket detail|fixture-secret/i);
+  }
+  assert.equal(failureIndex, failures.length);
+  assert.equal(getInstance(saved.id)?.lastValidatedAt, undefined);
+});
+
+test('connection probe separates credential, permission, endpoint, rate-limit, and other HTTP failures', async (t) => {
+  const saved = saveInstance('fixture-connect-http-key');
+  const failures = [
+    [401, 401, 'INSTANCE_CREDENTIAL_REJECTED'],
+    [403, 403, 'INSTANCE_CALLER_FORBIDDEN'],
+    [404, 502, 'INSTANCE_IDENTITY_ENDPOINT_UNAVAILABLE'],
+    [405, 502, 'INSTANCE_IDENTITY_ENDPOINT_UNAVAILABLE'],
+    [418, 502, 'INSTANCE_VALIDATION_HTTP_FAILED'],
+    [429, 429, 'INSTANCE_RATE_LIMITED'],
+  ] as const;
+  let failureIndex = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    const [upstreamStatus] = failures[failureIndex++]!;
+    return new Response(JSON.stringify({ error: 'raw upstream fixture-secret' }), { status: upstreamStatus });
+  });
+
+  for (const [, expectedStatus, expectedCode] of failures) {
+    const response = await instancesHandler(instanceRequest(saved.id, 'connect'));
+    const body = await response.json() as { error?: string; code?: string };
+    assert.equal(response.status, expectedStatus);
+    assert.equal(body.code, expectedCode);
+    assert.doesNotMatch(JSON.stringify(body), /raw upstream|fixture-secret/i);
+  }
+  assert.equal(failureIndex, failures.length);
+  assert.equal(getInstance(saved.id)?.lastValidatedAt, undefined);
+});
+
+test('frontend connection diagnostics preserve safe server codes and reject malformed codes', () => {
+  const dnsFailure = instanceConnectionDiagnosticFromError(Object.assign(
+    new Error('OmniKit could not resolve the saved Omni hostname.'),
+    { code: 'INSTANCE_DNS_RESOLUTION_FAILED' },
+  ));
+  assert.equal(dnsFailure.code, 'INSTANCE_DNS_RESOLUTION_FAILED');
+  assert.match(dnsFailure.guidance || '', /DNS|VPN/i);
+
+  const malformed = instanceConnectionDiagnosticFromError(Object.assign(
+    new Error('Connection failed.'),
+    { code: '<script>unsafe</script>' },
+  ));
+  assert.equal(malformed.code, 'INSTANCE_CLIENT_CONNECTION_FAILED');
 });
 
 test('connection probe rejects empty, HTML, malformed, and arbitrary 2xx identity bodies', async (t) => {

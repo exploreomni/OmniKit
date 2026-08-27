@@ -13,7 +13,9 @@ import {
 } from '@/services/opsConsole';
 import { onVaultChanged, onVaultLocked } from '@/services/vaultEvents';
 import { hasActiveSavedVaultConnection } from '@/services/connectionGuards';
+import { instanceConnectionDiagnosticFromError } from '@/services/instanceConnectionDiagnostics';
 import { toast } from '@/services/toast';
+import { INSTANCE_CONNECTION_ERROR_CODES } from '../../shared/instanceConnectionErrors';
 
 export type VaultSessionState = 'unknown' | 'no-vault' | 'locked' | 'unlocked';
 
@@ -156,6 +158,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
     updateConnection({
       status: 'untested',
       errorMessage: lockedMessage || 'Vault locked — unlock to resume.',
+      errorCode: undefined,
     });
   }, [connection.connectionMode, connection.status, lockedMessage, updateConnection, vaultStatus]);
 
@@ -182,6 +185,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
         ...(validationInvalidated ? {
           status: 'untested' as const,
           errorMessage: 'This saved instance changed. Reconnect before continuing.',
+          errorCode: INSTANCE_CONNECTION_ERROR_CODES.credentialChanged,
         } : {}),
       });
     }
@@ -240,6 +244,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
       apiKey: vaultApiKeyReference(targetInstance.id),
       status: 'testing' as const,
       errorMessage: '',
+      errorCode: undefined,
       connectionMode: 'vault' as const,
       instanceId: targetInstance.id,
       instanceLabel: targetInstance.label,
@@ -270,7 +275,7 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
       ) {
         throw new Error('OmniKit received a mismatched saved-instance connection. Reconnect from the vault and try again.');
       }
-      updateConnection({ ...result.connection, errorMessage: '' });
+      updateConnection({ ...result.connection, errorMessage: '', errorCode: undefined });
       setVaultStatus((current) => current ? { ...current, unlocked: true, lastActivityAt: Date.now() } : current);
       catalogSequenceRef.current += 1;
       let replaced = false;
@@ -292,9 +297,14 @@ export function VaultSessionProvider({ children }: { children: ReactNode }) {
       return result.instance;
     } catch (error) {
       if (!isCurrentIntent()) throw staleIntentError();
-      const errorMessage = error instanceof Error ? error.message : 'Could not connect to this saved instance.';
+      const diagnostic = instanceConnectionDiagnosticFromError(error);
       if (!preservesDifferentActiveInstance) {
-        updateConnection({ ...pendingConnection, status: 'error', errorMessage });
+        updateConnection({
+          ...pendingConnection,
+          status: 'error',
+          errorMessage: diagnostic.message,
+          errorCode: diagnostic.code,
+        });
       }
       throw error;
     } finally {

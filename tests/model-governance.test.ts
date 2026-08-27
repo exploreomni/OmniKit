@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
+import { readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Readable, Writable } from 'node:stream';
 import test from 'node:test';
@@ -18,12 +19,19 @@ import {
   createReviewedModelPullRequestHandoff,
   discardReviewedModelBranch,
   normalizeModelGitCapability,
-  publishReviewedModelBranch,
+  prepareReviewedModelHandoff,
   ReviewedPullRequestVerificationError,
   validateReviewedModelBranch,
   type ReviewedModelBranch,
 } from '../src/services/reviewedModelWrite';
-import { deleteModelYamlFile } from '../src/services/omniApi';
+import {
+  approveReleaseGate,
+  collectTargetedAffectedContent,
+  collectReleaseGateEvidence,
+  reconcileReleaseGateApproval,
+  type ReleaseGateEvidenceApi,
+} from '../src/services/releaseGateEvidence';
+import { ApiError, deleteModelYamlFile } from '../src/services/omniApi';
 import { apiMiddleware } from '../server/apiMiddleware';
 import { OmniClient, normalizeOmniAiJobResult } from '../server/services/omniClient';
 
@@ -59,14 +67,14 @@ const browserConnection = {
   errorMessage: '',
 };
 
-function reviewedBranch(pullRequestRequired = false): ReviewedModelBranch {
+function reviewedBranch(pullRequestRequired = false, gitConfigured = pullRequestRequired): ReviewedModelBranch {
   return {
     modelId: 'model-a',
     branchId: 'branch-a',
     branchName: 'governance-review',
     capability: {
       editable: true,
-      gitConfigured: pullRequestRequired,
+      gitConfigured,
       gitConfigurationKnown: true,
       gitFollower: false,
       pullRequestRequired,
@@ -377,28 +385,47 @@ test('reviewed model validation counts query and dashboard-filter issues', () =>
   }), 3);
 });
 
-test('reviewed model publish merges then validates main', async (t) => {
-  const endpoints: string[] = [];
-  t.mock.method(globalThis, 'fetch', async (_url: string | URL | Request, init?: RequestInit) => {
-    const body = JSON.parse(String(init?.body || '{}')) as { endpoint?: string };
-    endpoints.push(body.endpoint || '');
-    if (body.endpoint?.endsWith('/validate')) return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
-    if (body.endpoint?.endsWith('/content-validator')) return new Response(JSON.stringify({ content: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+test('reviewed model handoff leaves an unprotected validated branch for manual Omni sign-off without an API mutation', async (t) => {
+  let fetchCalls = 0;
+  t.mock.method(globalThis, 'fetch', async () => {
+    fetchCalls += 1;
     return new Response(JSON.stringify({ success: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   });
 
-  const result = await publishReviewedModelBranch(browserConnection, reviewedBranch(false), 'Publish labels');
+  const result = await prepareReviewedModelHandoff(browserConnection, reviewedBranch(false), 'Review labels');
 
-  assert.equal(result.mode, 'merged');
-  assert.equal(result.postMergeValidation?.blocking, false);
-  assert.deepEqual(endpoints, [
-    '/v1/models/model-a/branch/governance-review/merge',
-    '/v1/models/model-a/validate',
-    '/v1/models/model-a/content-validator',
-  ]);
+  assert.equal(result.mode, 'manual_handoff');
+  assert.match(result.message, /did not merge or publish/i);
+  assert.equal(result.url, browserConnection.baseUrl);
+  assert.equal(fetchCalls, 0);
 });
 
-test('reviewed model publish creates a PR handoff for protected models', async (t) => {
+test('reviewed governance UI paths do not import or call an automatic branch merge helper', () => {
+  const paths = [
+    '../src/components/modelGovernance/ModelLabelingPanel.tsx',
+    '../src/components/modelGovernance/ViewCleanupPanel.tsx',
+    '../src/components/semanticStudio/ReviewedTopicDeletePanel.tsx',
+    '../src/services/reviewedModelWrite.ts',
+  ];
+  for (const path of paths) {
+    const source = readFileSync(new URL(path, import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /mergeModelBranch|publishReviewedModelBranch|\/branch\/[^\s'"`]+\/merge/);
+  }
+});
+
+test('governed release UI callers provide explicit scoped impact evidence', () => {
+  const labeling = readFileSync(new URL('../src/components/modelGovernance/ModelLabelingPanel.tsx', import.meta.url), 'utf8');
+  const cleanup = readFileSync(new URL('../src/components/modelGovernance/ViewCleanupPanel.tsx', import.meta.url), 'utf8');
+  const topicDelete = readFileSync(new URL('../src/components/semanticStudio/ReviewedTopicDeletePanel.tsx', import.meta.url), 'utf8');
+  const evidencePanel = readFileSync(new URL('../src/components/modelGovernance/ReleaseGateEvidencePanel.tsx', import.meta.url), 'utf8');
+
+  assert.match(labeling, /basis:\s*'metadata_only_label_change'/);
+  assert.ok((cleanup.match(/collectTargetedAffectedContent\(/g) || []).length >= 4);
+  assert.ok((topicDelete.match(/collectTargetedAffectedContent\(/g) || []).length >= 2);
+  assert.doesNotMatch(evidencePanel, /No affected content items were returned/);
+});
+
+test('reviewed model handoff creates a PR for protected models', async (t) => {
   let requestBody: Record<string, unknown> = {};
   t.mock.method(globalThis, 'fetch', async (_url: string | URL | Request, init?: RequestInit) => {
     requestBody = JSON.parse(String(init?.body || '{}')) as Record<string, unknown>;
@@ -410,7 +437,7 @@ test('reviewed model publish creates a PR handoff for protected models', async (
     }), { status: 200, headers: { 'Content-Type': 'application/json' } });
   });
 
-  const result = await publishReviewedModelBranch(browserConnection, reviewedBranch(true), 'Publish labels');
+  const result = await prepareReviewedModelHandoff(browserConnection, reviewedBranch(true), 'Review labels');
 
   assert.equal(result.mode, 'pull_request');
   assert.equal(result.url, 'https://github.example/pr/12');
@@ -419,6 +446,434 @@ test('reviewed model publish creates a PR handoff for protected models', async (
   assert.equal(result.didSync, false);
   assert.equal(requestBody.endpoint, '/v1/models/model-a/git/commit');
   assert.equal((requestBody.body as Record<string, unknown>).require_branch_exists, false);
+});
+
+function releaseEvidenceApi(input: {
+  branchYaml?: string;
+  branchChecksum?: string;
+  requirePullRequest?: 'always' | 'never';
+  extraBranchFile?: boolean;
+  gitNotConfigured?: boolean;
+  callerHasModelAccess?: boolean;
+  modelValidationResponse?: unknown;
+  mainContentValidationResponse?: unknown;
+  branchContentValidationResponse?: unknown;
+  dbtConfigResponse?: unknown;
+  dbtEnvironmentsResponse?: unknown;
+} = {}): ReleaseGateEvidenceApi {
+  const branchYaml = input.branchYaml || 'label: Reviewed orders';
+  const branchChecksum = input.branchChecksum || 'branch-checksum-1';
+  const requirePullRequest = input.requirePullRequest || 'never';
+  return {
+    getModelYaml: async (_baseUrl, _apiKey, _modelId, options) => options?.branchId
+      ? {
+          files: {
+            'orders.view': branchYaml,
+            ...(input.extraBranchFile ? { 'unreviewed.view': 'label: Unreviewed' } : {}),
+          },
+          checksums: {
+            'orders.view': branchChecksum,
+            ...(input.extraBranchFile ? { 'unreviewed.view': 'unreviewed-checksum' } : {}),
+          },
+        }
+      : { files: { 'orders.view': 'label: Orders' }, checksums: { 'orders.view': 'main-checksum-1' } },
+    getModelGitConfiguration: async () => {
+      if (input.gitNotConfigured) throw new ApiError(404, 'Git configuration not found');
+      return { requirePullRequest };
+    },
+    validateModel: async () => (
+      input.modelValidationResponse === undefined ? [] : input.modelValidationResponse
+    ) as Awaited<ReturnType<ReleaseGateEvidenceApi['validateModel']>>,
+    validateModelContent: async (_baseUrl, _apiKey, _modelId, options) => {
+      const branchId = typeof options === 'string' ? options : options?.branchId;
+      return (
+        branchId
+          ? input.branchContentValidationResponse ?? { content: [] }
+          : input.mainContentValidationResponse ?? { content: [] }
+      ) as Awaited<ReturnType<ReleaseGateEvidenceApi['validateModelContent']>>;
+    },
+    getCurrentCaller: async () => ({
+      keyScope: 'user',
+      orgRole: 'MEMBER',
+      user: { id: 'caller-user', membershipId: 'caller-membership' },
+      rolesByModel: input.callerHasModelAccess === false
+        ? {}
+        : { 'model-a': { permissions: ['EDIT_MODEL'] } },
+      rolesByModelTruncated: false,
+    }),
+    getConnectionDbt: async () => input.dbtConfigResponse === undefined
+      ? {
+          supportsDbt: true,
+          autogenRelationships: true,
+          branch: 'main',
+          dbtVersion: 'Auto',
+          enableSemanticLayer: false,
+          enableVirtualSchemas: true,
+          projectRootPath: 'dbt_project',
+          sshUrl: 'git@example.invalid:example/dbt.git',
+        }
+      : input.dbtConfigResponse,
+    getConnectionDbtEnvironments: async () => input.dbtEnvironmentsResponse === undefined
+      ? [{
+          id: 'environment-a',
+          name: 'Production',
+          isDefaultEnvironment: true,
+          ownerId: 'owner-a',
+          variables: [{ name: 'PRIVATE_TOKEN', value: 'fixture-secret-value', isSecret: true }],
+        }]
+      : input.dbtEnvironmentsResponse,
+  };
+}
+
+const releaseAffectedContent = [{
+  documentId: 'example-document-a',
+  identifier: 'example-document',
+  name: 'Example document',
+  type: 'Workbook',
+  queryNames: ['Example query'],
+}];
+
+const releaseAffectedContentScope = {
+  state: 'verified' as const,
+  basis: 'targeted_content_validator' as const,
+  targets: [{ type: 'VIEW' as const, name: 'orders' }],
+};
+
+test('release-gate approval is invalidated by checksum, fingerprint, or Git handoff state drift', async () => {
+  const model = {
+    id: 'model-a',
+    name: 'Example shared model',
+    kind: 'SHARED',
+    connectionId: 'connection-a',
+    connectionName: 'Example warehouse',
+  };
+  const initial = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi());
+  const approval = approveReleaseGate(initial);
+
+  assert.equal(initial.status, 'ready_for_manual_handoff');
+  assert.deepEqual(initial.checks.map((check) => check.id), [
+    'connection',
+    'caller',
+    'dbt',
+    'dbt_environments',
+    'git',
+    'branch',
+    'checksums',
+    'model_validation',
+    'content_validation',
+    'affected_content',
+    'diff',
+    'handoff',
+  ]);
+  assert.ok(approval);
+  assert.equal(reconcileReleaseGateApproval(approval, initial), approval);
+  const unchangedRefresh = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi());
+  assert.equal(unchangedRefresh.fingerprint, initial.fingerprint);
+  assert.equal(reconcileReleaseGateApproval(approval, unchangedRefresh), approval);
+
+  const callerWithoutModelAccess = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi({ callerHasModelAccess: false }));
+  assert.equal(callerWithoutModelAccess.status, 'blocked');
+  assert.match(callerWithoutModelAccess.blockers.join(' '), /did not return effective permissions for this model/i);
+
+  const noGitConfiguration = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi({ gitNotConfigured: true }));
+  assert.equal(noGitConfiguration.status, 'ready_for_manual_handoff');
+  assert.equal(noGitConfiguration.git?.configured, false);
+
+  const checksumDrift = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi({ branchYaml: 'label: Changed after approval', branchChecksum: 'branch-checksum-2' }));
+  assert.notEqual(checksumDrift.fingerprint, initial.fingerprint);
+  assert.equal(reconcileReleaseGateApproval(approval, checksumDrift), null);
+
+  const unreviewedBranchDrift = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi({ extraBranchFile: true }));
+  assert.equal(unreviewedBranchDrift.status, 'blocked');
+  assert.match(unreviewedBranchDrift.blockers.join(' '), /outside the reviewed scope: unreviewed\.view/i);
+  assert.equal(reconcileReleaseGateApproval(approval, unreviewedBranchDrift), null);
+
+  const protectedState = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi({ requirePullRequest: 'always' }));
+  assert.equal(protectedState.status, 'ready_for_pull_request');
+  assert.equal(reconcileReleaseGateApproval(approval, protectedState), null);
+});
+
+test('release gate fails closed on malformed successful validation responses', async () => {
+  const model = {
+    id: 'model-a',
+    name: 'Example shared model',
+    kind: 'SHARED',
+    connectionId: 'connection-a',
+    connectionName: 'Example warehouse',
+  };
+  const input = {
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  };
+
+  const malformedModelValidation = await collectReleaseGateEvidence(
+    input,
+    releaseEvidenceApi({ modelValidationResponse: { success: true } }),
+  );
+  assert.equal(malformedModelValidation.status, 'blocked');
+  assert.equal(malformedModelValidation.validation.blocking, true);
+  assert.equal(malformedModelValidation.checks.find((check) => check.id === 'model_validation')?.status, 'blocked');
+  assert.equal(malformedModelValidation.checks.find((check) => check.id === 'content_validation')?.status, 'ready');
+  assert.match(malformedModelValidation.blockers.join(' '), /expected issue-array contract/i);
+
+  const malformedContentValidation = await collectReleaseGateEvidence(
+    input,
+    releaseEvidenceApi({ branchContentValidationResponse: { ok: true } }),
+  );
+  assert.equal(malformedContentValidation.status, 'blocked');
+  assert.equal(malformedContentValidation.validation.blocking, true);
+  assert.equal(malformedContentValidation.checks.find((check) => check.id === 'model_validation')?.status, 'ready');
+  assert.equal(malformedContentValidation.checks.find((check) => check.id === 'content_validation')?.status, 'blocked');
+  assert.match(malformedContentValidation.blockers.join(' '), /expected content-array contract/i);
+
+  const contentErrorEnvelope = await collectReleaseGateEvidence(
+    input,
+    releaseEvidenceApi({
+      branchContentValidationResponse: { content: [], error: { message: 'Upstream failure' } },
+    }),
+  );
+  assert.equal(contentErrorEnvelope.status, 'blocked');
+  assert.equal(contentErrorEnvelope.checks.find((check) => check.id === 'content_validation')?.status, 'blocked');
+  assert.match(contentErrorEnvelope.blockers.join(' '), /error envelope/i);
+});
+
+test('release gate requires scoped affected-content evidence independently of validator cleanliness', async () => {
+  const model = {
+    id: 'model-a',
+    name: 'Example shared model',
+    kind: 'SHARED',
+    connectionId: 'connection-a',
+    connectionName: 'Example warehouse',
+  };
+  const withoutInventory = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+  }, releaseEvidenceApi());
+
+  assert.equal(withoutInventory.status, 'blocked');
+  assert.equal(withoutInventory.checks.find((check) => check.id === 'content_validation')?.status, 'ready');
+  assert.equal(withoutInventory.checks.find((check) => check.id === 'affected_content')?.status, 'unavailable');
+  assert.deepEqual(withoutInventory.affectedContent, []);
+  assert.match(withoutInventory.blockers.join(' '), /independent affected-content inventory or impact-scope evidence/i);
+
+  const explicitZeroInventory = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: [],
+  }, releaseEvidenceApi());
+  assert.equal(explicitZeroInventory.status, 'blocked');
+  assert.equal(explicitZeroInventory.checks.find((check) => check.id === 'affected_content')?.status, 'unavailable');
+  assert.match(
+    explicitZeroInventory.checks.find((check) => check.id === 'affected_content')?.detail || '',
+    /valid independent scope and basis/i,
+  );
+
+  const scopedZeroInventory = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: [],
+    affectedContentScope: releaseAffectedContentScope,
+  }, releaseEvidenceApi());
+  assert.equal(scopedZeroInventory.status, 'ready_for_manual_handoff');
+  assert.equal(scopedZeroInventory.checks.find((check) => check.id === 'affected_content')?.status, 'ready');
+  assert.match(
+    scopedZeroInventory.checks.find((check) => check.id === 'affected_content')?.detail || '',
+    /zero matching content items across 1 exact semantic target/i,
+  );
+  assert.match(
+    scopedZeroInventory.checks.find((check) => check.id === 'affected_content')?.detail || '',
+    /not a model-wide zero-impact claim/i,
+  );
+
+  const metadataOnlyScope = await collectReleaseGateEvidence({
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContentScope: {
+      state: 'metadata_only',
+      basis: 'metadata_only_label_change',
+      targets: [{ type: 'FIELD_GROUP', name: 'orders.order_id' }],
+    },
+  }, releaseEvidenceApi());
+  assert.equal(metadataOnlyScope.status, 'ready_for_manual_handoff');
+  assert.deepEqual(metadataOnlyScope.affectedContent, []);
+  assert.match(
+    metadataOnlyScope.checks.find((check) => check.id === 'affected_content')?.detail || '',
+    /consumer content was not inventoried, and no zero-impact claim is made/i,
+  );
+});
+
+test('targeted affected-content collection is exact, bounded, and fail closed', async () => {
+  const calls: Array<{ find?: string; findType?: string; includePersonalFolders?: boolean }> = [];
+  const verified = await collectTargetedAffectedContent(
+    browserConnection,
+    'model-a',
+    [{ type: 'TOPIC', name: 'Example topic' }],
+    {
+      validateModelContent: async (_baseUrl, _apiKey, _modelId, options) => {
+        if (typeof options === 'object') calls.push(options);
+        return {
+          content: [{
+            document_id: 'document-a',
+            identifier: 'example-document',
+            name: 'Example document',
+            type: 'Workbook',
+            dashboard_filter_issues: [],
+            queries_and_issues: [],
+          }],
+        };
+      },
+    },
+  );
+  assert.deepEqual(calls, [{ find: 'Example topic', findType: 'TOPIC', includePersonalFolders: true }]);
+  assert.equal(verified.affectedContentScope.state, 'verified');
+  assert.equal(verified.affectedContent?.length, 1);
+
+  let oversizedCalls = 0;
+  const oversized = await collectTargetedAffectedContent(
+    browserConnection,
+    'model-a',
+    Array.from({ length: 26 }, (_, index) => ({ type: 'VIEW', name: `view_${index}` })),
+    {
+      validateModelContent: async () => {
+        oversizedCalls += 1;
+        return { content: [] };
+      },
+    },
+  );
+  assert.equal(oversizedCalls, 0);
+  assert.equal(oversized.affectedContentScope.state, 'unavailable');
+  assert.match(oversized.affectedContentScope.reason || '', /bounded 25-lookup limit/i);
+
+  const malformed = await collectTargetedAffectedContent(
+    browserConnection,
+    'model-a',
+    [{ type: 'VIEW', name: 'orders' }],
+    { validateModelContent: async () => ({ content: [], error: { message: 'Upstream failure' } }) },
+  );
+  assert.equal(malformed.affectedContentScope.state, 'unavailable');
+  assert.match(malformed.affectedContentScope.reason || '', /did not match the expected contract/i);
+});
+
+test('release gate verifies dbt environments with aggregate-only evidence', async () => {
+  const model = {
+    id: 'model-a',
+    name: 'Example shared model',
+    kind: 'SHARED',
+    connectionId: 'connection-a',
+    connectionName: 'Example warehouse',
+  };
+  const input = {
+    connection: browserConnection,
+    model,
+    branch: reviewedBranch(false, true),
+    affectedFiles: ['orders.view'],
+    affectedContent: releaseAffectedContent,
+    affectedContentScope: releaseAffectedContentScope,
+  };
+  const verified = await collectReleaseGateEvidence(input, releaseEvidenceApi());
+  assert.deepEqual(verified.dbtEnvironments, {
+    state: 'verified',
+    environmentCount: 1,
+    defaultEnvironmentCount: 1,
+  });
+  assert.equal(verified.checks.find((check) => check.id === 'dbt_environments')?.status, 'ready');
+  const serialized = JSON.stringify(verified);
+  assert.doesNotMatch(serialized, /fixture-secret-value|PRIVATE_TOKEN|owner-a|environment-a/);
+
+  const malformed = await collectReleaseGateEvidence(
+    input,
+    releaseEvidenceApi({ dbtEnvironmentsResponse: { environments: [] } }),
+  );
+  assert.equal(malformed.status, 'blocked');
+  assert.equal(malformed.dbtEnvironments, null);
+  assert.match(malformed.blockers.join(' '), /environment inventory was unavailable or did not match/i);
+
+  const duplicateDefaults = await collectReleaseGateEvidence(
+    input,
+    releaseEvidenceApi({
+      dbtEnvironmentsResponse: [
+        { id: 'environment-a', name: 'Production', isDefaultEnvironment: true },
+        { id: 'environment-b', name: 'Development', isDefaultEnvironment: true },
+      ],
+    }),
+  );
+  assert.equal(duplicateDefaults.status, 'blocked');
+  assert.match(duplicateDefaults.blockers.join(' '), /2 defaults; exactly one default is required/i);
+
+  const notConfigured = await collectReleaseGateEvidence(
+    input,
+    releaseEvidenceApi({
+      dbtConfigResponse: { message: 'dbt not configured for this connection', supportsDbt: true },
+      dbtEnvironmentsResponse: { error: 'not applicable' },
+    }),
+  );
+  assert.equal(notConfigured.status, 'ready_for_manual_handoff');
+  assert.deepEqual(notConfigured.dbtEnvironments, { state: 'not_applicable' });
+  assert.match(
+    notConfigured.checks.find((check) => check.id === 'dbt_environments')?.detail || '',
+    /not applicable because dbt is not configured/i,
+  );
 });
 
 test('PR-only reviewed handoff refuses an unprotected model without merging', async (t) => {

@@ -28,6 +28,7 @@ const protectedToolNames: Record<string, string> = {
   '/admin/content/schedules': 'Schedules',
   '/embeds': 'Embed URLs',
   '/admin/developer/embeds': 'Embed URLs',
+  '/admin/developer/api-contract': 'API Contract Radar',
 };
 
 const assuranceItems = [

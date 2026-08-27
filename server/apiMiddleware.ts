@@ -2,11 +2,13 @@ import type { IncomingHttpHeaders, IncomingMessage, ServerResponse } from 'node:
 import { Readable } from 'node:stream';
 
 import adminReadiness from './handlers/admin-readiness';
+import aiGovernance from './handlers/ai-governance';
 import bulkCopyDocuments from './handlers/bulk-copy-documents';
 import bulkDeleteDocuments from './handlers/bulk-delete-documents';
 import bulkMoveDocuments from './handlers/bulk-move-documents';
 import deckRecipes from './handlers/deck-recipes';
 import dashboardDownloads from './handlers/dashboard-downloads';
+import deliveryOwnership from './handlers/delivery-ownership';
 import enrichDocuments from './handlers/enrich-documents';
 import generateEmbedUrl from './handlers/generate-embed-url';
 import inspectExport from './handlers/inspect-export';
@@ -25,6 +27,7 @@ import migrationJobs from './handlers/migration-jobs';
 import modelMigrator from './handlers/model-migrator';
 import omniProxy from './handlers/omni-proxy';
 import omniApiCapabilities from './handlers/omni-api-capabilities';
+import omniApiContractRadar from './handlers/omni-api-contract-radar';
 import portfolioOverview from './handlers/portfolio-overview';
 import testConnection from './handlers/test-connection';
 import vault from './handlers/vault';
@@ -38,11 +41,13 @@ const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-
 
 const routes: Record<string, Handler> = {
   'admin-readiness': adminReadiness,
+  'ai-governance': aiGovernance,
   'bulk-copy-documents': bulkCopyDocuments,
   'bulk-delete-documents': bulkDeleteDocuments,
   'bulk-move-documents': bulkMoveDocuments,
   'deck-recipes': deckRecipes,
   'dashboard-downloads': dashboardDownloads,
+  'delivery-ownership': deliveryOwnership,
   'enrich-documents': enrichDocuments,
   'generate-embed-url': generateEmbedUrl,
   'inspect-export': inspectExport,
@@ -61,6 +66,7 @@ const routes: Record<string, Handler> = {
   'model-migrator': modelMigrator,
   'omni-proxy': omniProxy,
   'omni-api-capabilities': omniApiCapabilities,
+  'omni-api-contract-radar': omniApiContractRadar,
   'portfolio-overview': portfolioOverview,
   'test-connection': testConnection,
   vault,

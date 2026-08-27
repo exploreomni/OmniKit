@@ -5,6 +5,7 @@ export interface ConnectionConfig {
   apiKey: string;
   status: ConnectionStatus;
   errorMessage: string;
+  errorCode?: string;
   connectionMode?: 'manual' | 'vault';
   instanceId?: string;
   instanceLabel?: string;

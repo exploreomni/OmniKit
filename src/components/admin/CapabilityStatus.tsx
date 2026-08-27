@@ -113,6 +113,19 @@ function capabilityData(capability: AdminReadinessCapability) {
       </div>
     );
   }
+  if (capability.id === 'fleet.current_token_introspection' && 'keyScope' in data) {
+    return (
+      <div className="mt-2 grid grid-cols-2 gap-2 text-xs text-content-secondary sm:grid-cols-4">
+        <span>Key scope: {data.keyScope === 'organization' ? 'Organization' : 'User'}</span>
+        <span>Organization role: {data.orgRole === 'ORG_ADMIN' ? 'Organization admin' : 'Member'}</span>
+        <span>Model permission sets: {data.returnedModelCount}</span>
+        <span>
+          Permissions returned: {data.returnedPermissionCount}
+          {data.rolesByModelTruncated ? ' · Partial' : ''}
+        </span>
+      </div>
+    );
+  }
   if (capability.id === 'identity.scim_groups' && 'total' in data) {
     return <div className="mt-2 text-xs text-content-secondary">Group records returned: {data.total}</div>;
   }

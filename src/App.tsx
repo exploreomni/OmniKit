@@ -28,6 +28,9 @@ const DashboardOperationsPage = lazy(() => import('@/pages/DashboardOperationsPa
 const ContentHealthPage = lazy(() => import('@/pages/ContentHealthPage').then((module) => ({ default: module.ContentHealthPage })));
 const AIContentStudioPage = lazy(() => import('@/pages/AIContentStudioPage').then((module) => ({ default: module.AIContentStudioPage })));
 const InstancesPage = lazy(() => import('@/pages/InstancesPage').then((module) => ({ default: module.InstancesPage })));
+const AIGovernancePage = lazy(() => import('@/pages/AIGovernancePage').then((module) => ({ default: module.AIGovernancePage })));
+const RoleEnablementPage = lazy(() => import('@/pages/RoleEnablementPage').then((module) => ({ default: module.RoleEnablementPage })));
+const ApiContractRadarPage = lazy(() => import('@/pages/ApiContractRadarPage').then((module) => ({ default: module.ApiContractRadarPage })));
 const AdminWorkspaceLayout = lazy(() => (
   import('@/components/layout/AdminWorkspaceLayout').then((module) => ({ default: module.AdminWorkspaceLayout }))
 ));
@@ -132,6 +135,7 @@ function AppLayout() {
               <Route path="fleet" element={<AdminWorkspaceLayout workspaceId="fleet" />}>
                 <Route index element={<QueryPreservingRedirect to="/admin/fleet/instances" />} />
                 <Route path="instances" element={<InstancesPage />} />
+                <Route path="ai-governance" element={<AIGovernancePage />} />
                 <Route
                   path="connections"
                   element={<RequireConnection><ConnectionsPage /></RequireConnection>}
@@ -169,6 +173,11 @@ function AppLayout() {
                   path="embeds"
                   element={<RequireConnection><EmbedsPage /></RequireConnection>}
                 />
+                <Route
+                  path="api-contract"
+                  element={<RequireConnection><ApiContractRadarPage /></RequireConnection>}
+                />
+                <Route path="enablement" element={<RoleEnablementPage />} />
               </Route>
             </Route>
             <Route path="/instances" element={<QueryPreservingRedirect to="/admin/fleet/instances" />} />

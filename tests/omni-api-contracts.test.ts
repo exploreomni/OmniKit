@@ -96,6 +96,10 @@ test('registry operations and ids are unique and unverified contracts explain th
 });
 
 test('mixed GET and mutation paths are operation-specific and readiness reads stay read-only', () => {
+  const documentedReadOnlyPostQueries = new Set([
+    'POST /api/v1/ai/credit-usage/users',
+    'POST /api/v1/ai/credit-usage/entity-groups',
+  ]);
   for (const contract of OMNI_API_CONTRACTS) {
     assert.equal(
       contract.methods.includes('GET') && contract.methods.some((method) => method !== 'GET'),
@@ -106,7 +110,9 @@ test('mixed GET and mutation paths are operation-specific and readiness reads st
       assert.equal(contract.probeMode, 'read_only', `${contract.id} GET must be read-only`);
     }
     if (contract.probeMode === 'read_only') {
-      assert.ok(contract.methods.every((method) => method === 'GET'), `${contract.id} non-GET cannot be a read-only probe`);
+      assert.ok(contract.methods.every((method) => (
+        method === 'GET' || documentedReadOnlyPostQueries.has(`${method} ${contract.path}`)
+      )), `${contract.id} non-GET cannot be a read-only operation without an explicit contract exception`);
     }
   }
 
@@ -118,6 +124,55 @@ test('mixed GET and mutation paths are operation-specific and readiness reads st
   assert.equal(findOmniApiContract('GET', '/api/v1/users/user-1/model-roles')?.probeMode, 'read_only');
   assert.equal(findOmniApiContract('POST', '/api/scim/v2/users')?.probeMode, 'controlled_write');
   assert.equal(findOmniApiContract('GET', '/api/scim/v2/users')?.probeMode, 'read_only');
+  assert.equal(findOmniApiContract('POST', '/api/v1/ai/credit-usage/users')?.probeMode, 'read_only');
+  assert.equal(findOmniApiContract('POST', '/api/v1/ai/credit-usage/entity-groups')?.probeMode, 'read_only');
+});
+
+test('current registry corrections preserve read-versus-write semantics', () => {
+  assert.equal(findOmniApiContract('GET', '/api/v1/models/model-1/content-validator')?.probeMode, 'read_only');
+  assert.equal(findOmniApiContract('POST', '/api/v1/models/model-1/content-validator')?.id, 'content-validator-find-replace');
+  assert.equal(findOmniApiContract('POST', '/api/v1/models/model-1/content-validator')?.probeMode, 'manual_only');
+
+  for (const [method, endpoint] of [
+    ['POST', '/api/v1/models/model-1/migrate'],
+    ['DELETE', '/api/v1/models/model-1/view/orders'],
+    ['GET', '/api/v1/query/wait'],
+    ['GET', '/api/v1/ai/credit-controls'],
+    ['GET', '/api/v1/schedules/schedule-1/recipients'],
+    ['GET', '/api/v1/connections/connection-1/dbt/environments'],
+  ] as const) {
+    assert.equal(findOmniApiContract(method, endpoint)?.status, 'documented_current', `${method} ${endpoint}`);
+  }
+
+  const dbtWrite = findOmniApiContract('POST', '/api/v1/models/model-1/branch/reviewed/dbt');
+  assert.equal(dbtWrite?.probeMode, 'manual_only');
+  assert.match(dbtWrite?.notes || '', /confirmation/i);
+
+  for (const [method, endpoint] of [
+    ['GET', '/api/v1/ai/eval/prompt-sets'],
+    ['GET', '/api/v1/ai/eval/prompt-sets/prompt-set-1'],
+    ['GET', '/api/v1/ai/eval/runs'],
+    ['GET', '/api/v1/ai/eval/runs/run-1'],
+  ] as const) {
+    const contract = findOmniApiContract(method, endpoint);
+    assert.equal(contract?.status, 'documented_current', `${method} ${endpoint}`);
+    assert.equal(contract?.probeMode, 'read_only', `${method} ${endpoint}`);
+  }
+
+  for (const [method, endpoint] of [
+    ['POST', '/api/v1/ai/eval/prompt-sets'],
+    ['PATCH', '/api/v1/ai/eval/prompt-sets/prompt-set-1'],
+    ['DELETE', '/api/v1/ai/eval/prompt-sets/prompt-set-1'],
+    ['POST', '/api/v1/ai/eval/prompt-sets/prompt-set-1/unarchive'],
+    ['POST', '/api/v1/ai/eval/runs'],
+    ['POST', '/api/v1/ai/eval/runs/run-1/cancel'],
+    ['POST', '/api/v1/ai/eval/runs/run-1/unarchive'],
+    ['DELETE', '/api/v1/ai/eval/runs/run-1'],
+  ] as const) {
+    const contract = findOmniApiContract(method, endpoint);
+    assert.equal(contract?.status, 'documented_current', `${method} ${endpoint}`);
+    assert.equal(contract?.probeMode, 'manual_only', `${method} ${endpoint}`);
+  }
 });
 
 test('method-specific documentation links retain documented operation status', () => {

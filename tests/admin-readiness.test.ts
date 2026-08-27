@@ -66,7 +66,7 @@ function scimPage(resources: unknown[], totalResults = resources.length, startIn
   };
 }
 
-test('fleet readiness returns lower-bound folder evidence and aggregate-only token counts using GET', async () => {
+test('fleet readiness returns aggregate-only folder, token, and current-caller evidence using GET', async () => {
   const calls: Array<{ url: URL; method: string }> = [];
   const report = await getAdminReadinessReport({ instance, workspace: 'fleet' }, {
     assertSafeUrl: async () => undefined,
@@ -87,13 +87,38 @@ test('fleet readiness returns lower-bound folder evidence and aggregate-only tok
           { id: 'token-id-2', name: 'Operator PAT', type: 'personal', enabled: false },
         ], 3, 'next-token-cursor'));
       }
+      if (url.pathname === '/api/v1/whoami') {
+        return response({
+          keyScope: 'organization',
+          orgRole: 'ORG_ADMIN',
+          user: {
+            id: 'private-caller-user-id',
+            membershipId: 'private-caller-membership-id',
+          },
+          rolesByModel: {
+            'private-finance-model-id': {
+              roleName: 'Private Finance Modeler',
+              baseRole: 'MODELER',
+              connectionId: 'private-warehouse-connection-id',
+              permissions: ['QUERY_TOPICS', 'VIEW_SQL'],
+            },
+            'private-sales-model-id': {
+              roleName: 'Private Sales Querier',
+              baseRole: 'QUERIER',
+              connectionId: 'private-sales-connection-id',
+              permissions: ['QUERY_TOPICS'],
+            },
+          },
+          rolesByModelTruncated: false,
+        });
+      }
       return response(cursorPage([
         { id: 'token-id-3', name: 'MCP OAuth grant', type: 'mcp', enabled: true },
       ], 3));
     }) as typeof fetch,
   });
 
-  assert.ok(calls.length >= 3);
+  assert.ok(calls.length >= 4);
   assert.ok(calls.every((call) => call.method === 'GET'));
   const folder = report.capabilities.find((entry) => entry.id === 'fleet.folder_read');
   assert.deepEqual(folder?.data, { readable: true, visibleFoldersLowerBound: 1 });
@@ -110,7 +135,22 @@ test('fleet readiness returns lower-bound folder evidence and aggregate-only tok
   });
   assert.equal(tokens?.evidenceState, 'available');
   assert.equal(report.capabilities.find((entry) => entry.id === 'fleet.organization_api_key_confirmation')?.source.kind, 'operator_confirmation');
-  assert.equal(report.capabilities.find((entry) => entry.id === 'fleet.current_token_introspection')?.evidenceState, 'unsupported');
+  const currentCaller = report.capabilities.find((entry) => entry.id === 'fleet.current_token_introspection');
+  assert.equal(currentCaller?.evidenceState, 'available');
+  assert.equal(currentCaller?.source.path, '/api/v1/whoami');
+  assert.deepEqual(currentCaller?.data, {
+    keyScope: 'organization',
+    orgRole: 'ORG_ADMIN',
+    returnedModelCount: 2,
+    returnedPermissionCount: 3,
+    rolesByModelTruncated: false,
+  });
+  assert.deepEqual(currentCaller?.coverage, {
+    included: 2,
+    total: 2,
+    complete: true,
+    unit: 'model_permission_sets',
+  });
 
   const serialized = JSON.stringify(report);
   for (const prohibited of [
@@ -123,9 +163,46 @@ test('fleet readiness returns lower-bound folder evidence and aggregate-only tok
     'Production credential',
     'Operator PAT',
     'MCP OAuth grant',
+    'private-caller-user-id',
+    'private-caller-membership-id',
+    'private-finance-model-id',
+    'Private Finance Modeler',
+    'private-warehouse-connection-id',
+    'private-sales-model-id',
+    'Private Sales Querier',
+    'private-sales-connection-id',
+    'QUERY_TOPICS',
+    'VIEW_SQL',
   ]) {
     assert.equal(serialized.includes(prohibited), false, prohibited);
   }
+});
+
+test('fleet current-caller evidence fails closed on malformed private permission rows', async () => {
+  const privateMarker = 'private-caller-contract-marker';
+  const report = await getAdminReadinessReport({ instance, workspace: 'fleet' }, {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname === '/api/v1/folders') return response(cursorPage([], 0));
+      if (url.pathname === '/api/v1/api-keys') return response(cursorPage([], 0));
+      return response({
+        keyScope: 'user',
+        orgRole: 'MEMBER',
+        user: { id: privateMarker, membershipId: 'membership-private' },
+        rolesByModel: {
+          'model-private': { permissions: [privateMarker, 42] },
+        },
+        rolesByModelTruncated: false,
+      });
+    }) as typeof fetch,
+  });
+
+  const currentCaller = report.capabilities.find((entry) => entry.id === 'fleet.current_token_introspection');
+  assert.equal(currentCaller?.evidenceState, 'failed');
+  assert.equal(currentCaller?.reason.code, 'invalid_response_shape');
+  assert.equal(currentCaller?.data, undefined);
+  assert.equal(JSON.stringify(report).includes(privateMarker), false);
 });
 
 test('identity readiness completes SCIM pagination, strips attribute values, and returns sanitized exact role provenance', async () => {

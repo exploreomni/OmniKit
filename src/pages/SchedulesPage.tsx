@@ -13,6 +13,7 @@ import {
   PlayCircle,
   Plus,
   Send,
+  ShieldCheck,
   Trash2,
   Webhook,
   X,
@@ -25,6 +26,7 @@ import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { Blobby } from '@/components/ui/Blobby';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
+import { DeliveryOwnershipPanel } from '@/components/admin/DeliveryOwnershipPanel';
 import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { selectedBadgeClass, selectedRowClass, unselectedRowClass } from '@/components/ui/selectionStyles';
 import { friendlyApiError } from '@/utils/apiErrors';
@@ -50,6 +52,7 @@ const SCHEDULE_TABLE_COLUMNS = {
 };
 
 const ACTION_GUIDE = [
+  { label: 'Evidence', description: 'Review owner, recipients, and offboarding exposure.', icon: ShieldCheck },
   { label: 'Edit', description: 'Change schedule settings.', icon: Edit3 },
   { label: 'Send now', description: 'Trigger one delivery.', icon: Send },
   { label: 'Pause / resume', description: 'Stop or restart future runs.', icon: PauseCircle },
@@ -655,6 +658,7 @@ export function SchedulesPage() {
   const [formSchedule, setFormSchedule] = useState<OmniSchedule | null>(null);
   const [formOpen, setFormOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<OmniSchedule | null>(null);
+  const [ownershipTarget, setOwnershipTarget] = useState<OmniSchedule | null>(null);
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
   const requestGenerationRef = useRef(0);
   const paginationEvidenceRef = useRef<{ pageSize: number; totalRecords: number } | null>(null);
@@ -718,6 +722,7 @@ export function SchedulesPage() {
     setFormSchedule(null);
     setFormOpen(false);
     setDeleteTarget(null);
+    setOwnershipTarget(null);
     setActionLoadingId(null);
     setError('');
     setLoading(false);
@@ -987,6 +992,13 @@ export function SchedulesPage() {
                           ) : (
                             <>
                               <ScheduleActionButton
+                                label="Evidence"
+                                description="Review owner, recipients, and offboarding exposure."
+                                onClick={() => setOwnershipTarget(schedule)}
+                              >
+                                <ShieldCheck size={13} />
+                              </ScheduleActionButton>
+                              <ScheduleActionButton
                                 label="Edit"
                                 description="Change schedule settings."
                                 onClick={() => {
@@ -1065,6 +1077,15 @@ export function SchedulesPage() {
         onConfirm={() => deleteTarget && runScheduleAction(deleteTarget, 'delete')}
         onCancel={() => setDeleteTarget(null)}
       />
+
+      {ownershipTarget && (
+        <DeliveryOwnershipPanel
+          instanceId={connection.instanceId}
+          scheduleId={ownershipTarget.id}
+          scheduleName={ownershipTarget.name}
+          onClose={() => setOwnershipTarget(null)}
+        />
+      )}
     </div>
   );
 }

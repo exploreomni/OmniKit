@@ -29,6 +29,7 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 const RATE_LIMIT_REQUEST_BUDGET = 55;
 const MAX_CURSOR_PAGES = 1_000;
 const MAX_SCIM_PAGES = 1_000;
+const SCIM_USER_PAGE_MAX_BYTES = 2 * 1024 * 1024;
 const DOCUMENT_INVENTORY_MAX_PAGE_BYTES = 2 * 1024 * 1024;
 const DOCUMENT_INVENTORY_MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 const DOCUMENT_INVENTORY_DEADLINE_BASE_MS = 30_000;
@@ -36,6 +37,7 @@ const DOCUMENT_INVENTORY_DEADLINE_PER_PAGE_MS = 1_500;
 const DOCUMENT_INVENTORY_INITIAL_DEADLINE_MS = 120_000;
 const DOCUMENT_INVENTORY_RETRY_RESERVE_PAGES = 3;
 const ERROR_RESPONSE_MAX_BYTES = 64 * 1024;
+const AI_EVAL_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
 
 export interface OmniRequestPolicy {
   requestTimeoutMs?: number;
@@ -2015,6 +2017,26 @@ export class OmniClient {
       .sort((a, b) => (a.email || a.userName).localeCompare(b.email || b.userName));
   }
 
+  async getIdentityUserPage(count: number, startIndex: number, signal?: AbortSignal): Promise<unknown> {
+    if (
+      !Number.isSafeInteger(count)
+      || count < 1
+      || count > 100
+      || !Number.isSafeInteger(startIndex)
+      || startIndex < 1
+    ) {
+      throw new OmniPaginationError();
+    }
+    const response = await this.request('GET', '/api/scim/v2/users', {
+      query: { count, startIndex },
+      signal,
+    });
+    return (await readBoundedJsonResponse(response, SCIM_USER_PAGE_MAX_BYTES, {
+      signal,
+      timeoutMs: this.requestTimeoutMs,
+    })).data;
+  }
+
   async listUserGroups(): Promise<OmniUserGroupRecord[]> {
     const groups: OmniUserGroupRecord[] = [];
     let startIndex = 1;
@@ -2803,6 +2825,52 @@ export class OmniClient {
 
   async getAiJobResult(jobId: string, signal?: AbortSignal): Promise<unknown> {
     const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/result`, { signal });
+    return response.json().catch(() => ({}));
+  }
+
+  async getAiCreditControls(signal?: AbortSignal): Promise<unknown> {
+    const response = await this.request('GET', '/api/v1/ai/credit-controls', { signal });
+    return response.json().catch(() => ({}));
+  }
+
+  async listAiEvalPromptSets(signal?: AbortSignal): Promise<unknown> {
+    const response = await this.request('GET', '/api/v1/ai/eval/prompt-sets', { signal });
+    return (await readBoundedJsonResponse(response, AI_EVAL_RESPONSE_MAX_BYTES, {
+      signal,
+      timeoutMs: this.requestTimeoutMs,
+    })).data;
+  }
+
+  async listAiEvalRuns(promptSetId: string, signal?: AbortSignal): Promise<unknown> {
+    const normalizedPromptSetId = promptSetId.trim();
+    if (!normalizedPromptSetId) throw new Error('An eval prompt-set id is required.');
+    const response = await this.request('GET', '/api/v1/ai/eval/runs', {
+      query: { prompt_set_id: normalizedPromptSetId },
+      signal,
+    });
+    return (await readBoundedJsonResponse(response, AI_EVAL_RESPONSE_MAX_BYTES, {
+      signal,
+      timeoutMs: this.requestTimeoutMs,
+    })).data;
+  }
+
+  async getAiEvalRun(runId: string, signal?: AbortSignal): Promise<unknown> {
+    const normalizedRunId = runId.trim();
+    if (!normalizedRunId) throw new Error('An eval run id is required.');
+    const response = await this.request('GET', `/api/v1/ai/eval/runs/${encodeURIComponent(normalizedRunId)}`, { signal });
+    return (await readBoundedJsonResponse(response, AI_EVAL_RESPONSE_MAX_BYTES, {
+      signal,
+      timeoutMs: this.requestTimeoutMs,
+    })).data;
+  }
+
+  async getSchedule(scheduleId: string, signal?: AbortSignal): Promise<unknown> {
+    const response = await this.request('GET', `/api/v1/schedules/${encodeURIComponent(scheduleId)}`, { signal });
+    return response.json().catch(() => ({}));
+  }
+
+  async listScheduleRecipients(scheduleId: string, signal?: AbortSignal): Promise<unknown> {
+    const response = await this.request('GET', `/api/v1/schedules/${encodeURIComponent(scheduleId)}/recipients`, { signal });
     return response.json().catch(() => ({}));
   }
 

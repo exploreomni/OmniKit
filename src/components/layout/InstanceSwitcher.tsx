@@ -2,9 +2,15 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router';
 import { ChevronDown, Clock, KeyRound, Loader2, Lock, Server, ShieldCheck, UnlockKeyhole } from 'lucide-react';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
+import { ConnectionFailureDetails } from '@/components/ui/ConnectionFailureDetails';
 import { useConnection } from '@/hooks/useConnection';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { hasActiveSavedVaultConnection, hasSavedVaultConnection } from '@/services/connectionGuards';
+import {
+  instanceConnectionDiagnosticFromError,
+  instanceConnectionDiagnosticFromState,
+  type InstanceConnectionDiagnostic,
+} from '@/services/instanceConnectionDiagnostics';
 
 const PRIMARY_ACTION_CLASS = 'flex min-h-9 w-full items-center justify-center gap-2 rounded-[6px] bg-brand-wine px-3 py-2 text-xs font-semibold text-white transition-colors hover:bg-brand-ink focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine disabled:cursor-not-allowed disabled:opacity-50';
 const SECONDARY_ACTION_CLASS = 'flex min-h-9 w-full items-center justify-center gap-2 rounded-[6px] border border-border-strong bg-surface-primary px-3 py-2 text-xs font-semibold text-omni-900 transition-colors hover:border-brand-wine hover:bg-surface-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine';
@@ -66,7 +72,7 @@ export function InstanceSwitcher() {
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState(false);
   const [connectingInstanceId, setConnectingInstanceId] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState<InstanceConnectionDiagnostic | null>(null);
   const [passphrase, setPassphrase] = useState('');
   const [now, setNow] = useState(Date.now());
 
@@ -114,6 +120,11 @@ export function InstanceSwitcher() {
   const canUnlockVault = Boolean(passphrase.trim()) && Boolean(vaultStatus?.exists) && !busy;
   const hasSavedConnection = hasSavedVaultConnection(connection);
   const hasActiveConnection = hasActiveSavedVaultConnection(connection);
+  const displayedError = error || (
+    connection.status === 'error' && connection.errorMessage
+      ? instanceConnectionDiagnosticFromState(connection.errorMessage, connection.errorCode)
+      : null
+  );
   const currentInstanceLabel = activeInstance?.label || connection.instanceLabel || (hasSavedConnection ? 'Saved instance' : 'Instance vault');
   const statusLabel = hasActiveConnection
     ? 'Connected'
@@ -150,7 +161,7 @@ export function InstanceSwitcher() {
     connectUiSequenceRef.current = sequence;
     setBusy(true);
     setConnectingInstanceId(instanceId);
-    setError('');
+    setError(null);
     try {
       await connectInstance(instanceId);
       if (connectUiSequenceRef.current !== sequence) return;
@@ -158,7 +169,7 @@ export function InstanceSwitcher() {
     } catch (err) {
       if (connectUiSequenceRef.current !== sequence) return;
       if (err instanceof DOMException && err.name === 'AbortError') return;
-      setError(err instanceof Error ? err.message : 'Could not connect to this saved instance.');
+      setError(instanceConnectionDiagnosticFromError(err));
     } finally {
       if (connectUiSequenceRef.current === sequence) {
         setConnectingInstanceId('');
@@ -169,11 +180,11 @@ export function InstanceSwitcher() {
 
   async function handleExtend() {
     setBusy(true);
-    setError('');
+    setError(null);
     try {
       await touch();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not extend the vault session.');
+      setError({ message: err instanceof Error ? err.message : 'Could not extend the vault session.' });
       setOpen(true);
     } finally {
       setBusy(false);
@@ -183,14 +194,14 @@ export function InstanceSwitcher() {
   async function handleUnlock() {
     if (!canUnlockVault) return;
     setBusy(true);
-    setError('');
+    setError(null);
     try {
       const result = await unlock(passphrase);
       setPassphrase('');
       if (result.activeInstance || result.resumedInstance) closeAndRestoreFocus();
       else setOpen(true);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not unlock the vault.');
+      setError({ message: err instanceof Error ? err.message : 'Could not unlock the vault.' });
     } finally {
       setBusy(false);
     }
@@ -212,7 +223,7 @@ export function InstanceSwitcher() {
         ref={triggerRef}
         type="button"
         onClick={() => {
-          if (!open) setError('');
+          if (!open) setError(null);
           setOpen((value) => !value);
         }}
         className="group flex min-h-12 w-full items-center gap-2.5 rounded-[6px] px-2 py-2 text-left text-[12px] font-semibold text-omni-900 transition-colors hover:bg-surface-secondary focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-wine"
@@ -286,10 +297,12 @@ export function InstanceSwitcher() {
               {lockedMessage}
             </div>
           )}
-          {error && (
-            <div className="border-l-2 border-red-500 bg-red-50 px-2.5 py-2 text-[11px] text-red-800" role="alert">
-              {error}
-            </div>
+          {displayedError && (
+            <ConnectionFailureDetails
+              message={displayedError.message}
+              code={displayedError.code}
+              compact
+            />
           )}
 
           {status === 'no-vault' ? (

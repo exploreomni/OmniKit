@@ -1,4 +1,20 @@
 import { assertSafeOutboundUrl, validateBaseUrl, jsonHeaders } from '../security';
+import {
+  buildIdentityAccessEvidence,
+  IdentityAccessEvidenceError,
+  listIdentityAccessUsers,
+  type IdentityAccessContentRole,
+  type IdentityAccessEvidenceInput,
+  type IdentityAccessEvidenceReader,
+  type IdentityAccessEvidenceReport,
+  type IdentityAccessModelRole,
+} from '../services/identityAccessEvidence';
+import { OmniClient } from '../services/omniClient';
+import {
+  getInstance,
+  VAULT_SESSION_ABORT_SIGNAL,
+  type SavedInstance,
+} from '../services/nativeVault';
 
 export const USER_MODEL_ROLE_NAMES = [
   "VIEWER",
@@ -40,12 +56,18 @@ export interface ManageUsersDependencies {
   assertSafeUrl?: (url: string) => Promise<void>;
   timeoutMs?: number;
   verificationDelaysMs?: readonly number[];
+  buildAccessEvidence?: (
+    input: IdentityAccessEvidenceInput,
+    signal: AbortSignal,
+    instance: SavedInstance,
+  ) => Promise<IdentityAccessEvidenceReport>;
+  getSavedInstance?: typeof getInstance;
 }
 
 interface RequestBody {
   base_url: string;
   api_key: string;
-  action: "list" | "list_attributes" | "find" | "create" | "update" | "delete" | "list_model_roles" | "assign_model_role";
+  action: "list" | "list_attributes" | "find" | "create" | "update" | "delete" | "list_model_roles" | "assign_model_role" | "debug_access";
   count?: number;
   start_index?: number;
   email?: string;
@@ -54,6 +76,12 @@ interface RequestBody {
   role_name?: UserModelRoleName;
   model_id?: string;
   connection_id?: string;
+  instance_id?: unknown;
+  principal_type?: unknown;
+  principal_identifier?: unknown;
+  folder_id?: unknown;
+  document_id?: unknown;
+  expected_access?: unknown;
 }
 
 interface UserModelRoleScope {
@@ -126,6 +154,103 @@ function isSafeRoleSourceType(value: unknown): value is string {
     && /^[A-Za-z][A-Za-z _-]{0,79}$/.test(value);
 }
 
+function stringInput(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+function savedInstanceId(value: unknown): string {
+  const instanceId = stringInput(value).trim();
+  if (!instanceId || instanceId.length > 500 || [...instanceId].some((character) => {
+    const code = character.charCodeAt(0);
+    return code <= 31 || code === 127;
+  })) {
+    throw new IdentityAccessEvidenceError('INVALID_INPUT', 'A valid saved instance ID is required.', 400);
+  }
+  return instanceId;
+}
+
+function identityAccessInput(body: RequestBody, instance: SavedInstance): IdentityAccessEvidenceInput {
+  if (body.expected_access !== undefined && !isRecord(body.expected_access)) {
+    throw new IdentityAccessEvidenceError('INVALID_INPUT', 'Expected access must be an object.', 400);
+  }
+  const expected = isRecord(body.expected_access) ? body.expected_access : undefined;
+  return {
+    instanceId: instance.id,
+    instanceLabel: instance.label,
+    principalType: body.principal_type as IdentityAccessEvidenceInput['principalType'],
+    principalIdentifier: stringInput(body.principal_identifier),
+    ...(body.connection_id !== undefined ? { connectionId: stringInput(body.connection_id) } : {}),
+    ...(body.model_id !== undefined ? { modelId: stringInput(body.model_id) } : {}),
+    ...(body.folder_id !== undefined ? { folderId: stringInput(body.folder_id) } : {}),
+    ...(body.document_id !== undefined ? { documentId: stringInput(body.document_id) } : {}),
+    ...(expected ? {
+      expectedAccess: {
+        ...(Object.prototype.hasOwnProperty.call(expected, 'active') ? { active: expected.active as boolean } : {}),
+        ...(Object.prototype.hasOwnProperty.call(expected, 'modelRole') ? { modelRole: expected.modelRole as IdentityAccessModelRole } : {}),
+        ...(Object.prototype.hasOwnProperty.call(expected, 'contentRole') ? { contentRole: expected.contentRole as IdentityAccessContentRole } : {}),
+      },
+    } : {}),
+  };
+}
+
+function accessEvidenceReader(
+  client: OmniClient,
+  listIdentityUsers: IdentityAccessEvidenceReader['listIdentityUsers'],
+): IdentityAccessEvidenceReader {
+  return {
+    listIdentityUsers,
+    listUserGroups: () => client.listUserGroups(),
+    getUserGroup: (groupId) => client.getUserGroup(groupId),
+    listUserModelRoles: (userId, options) => client.listUserModelRoles(userId, options),
+    listUserGroupModelRoles: (groupId, options) => client.listUserGroupModelRoles(groupId, options),
+    listDocumentAccessInventory: (documentId, options, signal) => client.listDocumentAccessInventory(documentId, options, signal),
+  };
+}
+
+async function collectIdentityAccessEvidence(
+  req: Request,
+  instance: SavedInstance,
+  input: IdentityAccessEvidenceInput,
+  dependencies: ManageUsersDependencies,
+): Promise<IdentityAccessEvidenceReport> {
+  const vaultSignal = instance[VAULT_SESSION_ABORT_SIGNAL];
+  const evidenceSignal = vaultSignal ? AbortSignal.any([req.signal, vaultSignal]) : req.signal;
+  if (dependencies.buildAccessEvidence) return dependencies.buildAccessEvidence(input, evidenceSignal, instance);
+  const cleanUrl = instance.baseUrl.replace(/\/+$/, '');
+  const client = new OmniClient(
+    instance,
+    {
+      ...(dependencies.fetchImpl ? { fetchImpl: dependencies.fetchImpl } : {}),
+      maxReadRetries: 0,
+      requestTimeoutMs: dependencies.timeoutMs ?? MODEL_ROLE_TIMEOUT_MS,
+    },
+  );
+  const authHeaders = {
+    Authorization: `Bearer ${instance.apiKey}`,
+    'Content-Type': 'application/json',
+  };
+  const listStrictIdentityUsers: IdentityAccessEvidenceReader['listIdentityUsers'] = (signal) => (
+    listIdentityAccessUsers(async (count, startIndex) => {
+      const url = new URL(`${cleanUrl}/api/scim/v2/users`);
+      url.searchParams.set('count', String(count));
+      url.searchParams.set('startIndex', String(startIndex));
+      const response = await fetchModelRoleUpstream(
+        req,
+        url.toString(),
+        { method: 'GET', headers: authHeaders },
+        dependencies,
+        evidenceSignal,
+      );
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new Error('The SCIM user collection could not be read.');
+      }
+      return readBoundedJson(response);
+    }, signal)
+  );
+  return buildIdentityAccessEvidence(input, accessEvidenceReader(client, listStrictIdentityUsers), evidenceSignal);
+}
+
 function modelRoleScope(body: RequestBody): UserModelRoleScope {
   if (!isOmniId(body.user_id)) {
     throw new ModelRoleRequestError("user_id must be a valid Omni identifier for model-role actions.");
@@ -184,6 +309,7 @@ async function fetchModelRoleUpstream(
   url: string,
   init: RequestInit,
   dependencies: ManageUsersDependencies,
+  operationSignal: AbortSignal = req.signal,
 ): Promise<Response> {
   const assertSafeUrl = dependencies.assertSafeUrl
     || ((value: string) => assertSafeOutboundUrl(value, { label: "base_url" }));
@@ -195,9 +321,9 @@ async function fetchModelRoleUpstream(
 
   const controller = new AbortController();
   let timedOut = false;
-  const forwardAbort = () => controller.abort(req.signal.reason);
-  if (req.signal.aborted) controller.abort(req.signal.reason);
-  else req.signal.addEventListener("abort", forwardAbort, { once: true });
+  const forwardAbort = () => controller.abort(operationSignal.reason);
+  if (operationSignal.aborted) controller.abort(operationSignal.reason);
+  else operationSignal.addEventListener("abort", forwardAbort, { once: true });
   const timeout = setTimeout(() => {
     timedOut = true;
     controller.abort(new DOMException("The model-role request timed out.", "TimeoutError"));
@@ -211,11 +337,11 @@ async function fetchModelRoleUpstream(
     });
   } catch (error) {
     if (timedOut) throw new ModelRoleTransportError(504, "MODEL_ROLE_REQUEST_TIMEOUT");
-    if (req.signal.aborted) throw new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED");
+    if (operationSignal.aborted) throw new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED");
     throw error;
   } finally {
     clearTimeout(timeout);
-    req.signal.removeEventListener("abort", forwardAbort);
+    operationSignal.removeEventListener("abort", forwardAbort);
   }
 }
 
@@ -437,6 +563,18 @@ export default async function handler(
     const body: RequestBody = await req.json();
     const { base_url, api_key, action } = body;
 
+    if (action === 'debug_access') {
+      const instanceId = savedInstanceId(body.instance_id);
+      const instance = (dependencies.getSavedInstance || getInstance)(instanceId);
+      if (!instance) return json({ error: 'Saved Omni instance not found.', code: 'SAVED_INSTANCE_NOT_FOUND' }, 404);
+      return json(await collectIdentityAccessEvidence(
+        req,
+        instance,
+        identityAccessInput(body, instance),
+        dependencies,
+      ));
+    }
+
     const urlError = validateBaseUrl(base_url);
     if (urlError) {
       return new Response(JSON.stringify({ error: urlError }), { status: 400, headers: jsonHeaders });
@@ -621,6 +759,12 @@ export default async function handler(
       headers: jsonHeaders,
     });
   } catch (error) {
+    if (error instanceof IdentityAccessEvidenceError) {
+      return json({ error: error.message, code: error.code }, error.status);
+    }
+    if ((error as { statusCode?: unknown }).statusCode === 423) {
+      return json({ error: 'Unlock the native vault before collecting identity access evidence.', code: 'VAULT_LOCKED' }, 423);
+    }
     if (error instanceof ModelRoleRequestError) return json({ error: error.message }, 400);
     if (error instanceof ModelRoleResponseError) {
       const message = error.code === "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED"

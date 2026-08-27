@@ -7,7 +7,6 @@ import {
   deleteModelYamlFile,
   getModelYaml,
   getModelGitConfiguration,
-  mergeModelBranch,
   updateModelYamlFile,
   validateModel,
   validateModelContent,
@@ -46,14 +45,13 @@ export interface ReviewedValidationOptions {
   baselineContentResult?: Record<string, unknown> | null;
 }
 
-export interface ReviewedPublishResult {
-  mode: 'merged' | 'pull_request';
+export interface ReviewedHandoffResult {
+  mode: 'manual_handoff' | 'pull_request';
   message: string;
   url?: string;
   commitRef?: string;
   inSync?: boolean;
   didSync?: boolean;
-  postMergeValidation?: ReviewedValidation;
   raw: Record<string, unknown>;
 }
 
@@ -147,7 +145,7 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function reviewedPullRequestResult(raw: Record<string, unknown>): ReviewedPublishResult {
+function reviewedPullRequestResult(raw: Record<string, unknown>): ReviewedHandoffResult {
   const documentedUrl = firstString(raw.pr_url);
   const url = (() => {
     if (!documentedUrl) return undefined;
@@ -610,11 +608,11 @@ export async function stageGovernedTopicMutation(
   };
 }
 
-export async function publishReviewedModelBranch(
+export async function prepareReviewedModelHandoff(
   connection: ConnectionConfig,
   branch: ReviewedModelBranch,
   commitMessage: string,
-): Promise<ReviewedPublishResult> {
+): Promise<ReviewedHandoffResult> {
   if (branch.capability.pullRequestRequired) {
     const raw = await createOrUpdateModelBranchPullRequest(connection.baseUrl, connection.apiKey, {
       modelId: branch.modelId,
@@ -625,24 +623,16 @@ export async function publishReviewedModelBranch(
     });
     return reviewedPullRequestResult(raw);
   }
-
-  const raw = await mergeModelBranch(connection.baseUrl, connection.apiKey, {
-    modelId: branch.modelId,
-    branchName: branch.branchName,
-    publishDrafts: true,
-    deleteBranch: true,
-  });
-  const postMergeValidation = await validateReviewedModelBranch(connection, {
-    ...branch,
-    branchId: '',
-  });
   return {
-    mode: 'merged',
-    message: postMergeValidation.blocking
-      ? 'The branch merged, but post-publish validation found blockers that need review.'
-      : 'The branch merged and post-publish model/content validation completed.',
-    postMergeValidation,
-    raw,
+    mode: 'manual_handoff',
+    message: 'The validated development branch remains unchanged for final sign-off in Omni. OmniKit did not merge or publish it.',
+    url: branch.capability.webUrl || connection.baseUrl,
+    raw: {
+      handoff: 'manual',
+      model_id: branch.modelId,
+      branch_id: branch.branchId,
+      branch_name: branch.branchName,
+    },
   };
 }
 
@@ -650,7 +640,7 @@ export async function createReviewedModelPullRequestHandoff(
   connection: ConnectionConfig,
   branch: ReviewedModelBranch,
   commitMessage: string,
-): Promise<ReviewedPublishResult> {
+): Promise<ReviewedHandoffResult> {
   if (!branch.capability.pullRequestRequired) {
     throw new Error('This handoff helper is PR-only. No merge was attempted; complete sign-off in Omni.');
   }

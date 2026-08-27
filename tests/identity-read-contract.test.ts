@@ -4,6 +4,12 @@ import { test, type TestContext } from 'node:test';
 import manageGroupsHandler from '../server/handlers/manage-groups';
 import manageUsersHandler from '../server/handlers/manage-users';
 import {
+  buildIdentityAccessEvidence,
+  listIdentityAccessUsers,
+  type IdentityAccessEvidenceReader,
+} from '../server/services/identityAccessEvidence';
+import type { SavedInstance } from '../server/services/nativeVault';
+import {
   assignUserModelRole,
   cloneScimUserAttributes,
   findUserByEmail,
@@ -17,6 +23,11 @@ import {
   SCIM_USER_ATTRIBUTE_LIMITS,
   type ScimListResponse,
 } from '../src/services/omniApi';
+import {
+  fetchIdentityAccessEvidence,
+  parseIdentityAccessEvidenceReport,
+  serializeIdentityAccessEvidence,
+} from '../src/services/identityAccessEvidence';
 
 const BASE_URL = 'https://tenant.example.invalid';
 const API_KEY = 'vault-reference-only';
@@ -1052,6 +1063,283 @@ test('user model-role browser helpers preserve scope, cancellation, and validate
   assert.equal(requests[1].body.role_name, 'MODELER');
   assert.equal(requests[0].signal, controller.signal);
   assert.equal(requests[1].signal, controller.signal);
+});
+
+function accessEvidenceReader(
+  overrides: Partial<IdentityAccessEvidenceReader> = {},
+): IdentityAccessEvidenceReader {
+  return {
+    listIdentityUsers: async () => [],
+    listUserGroups: async () => [],
+    getUserGroup: async (groupId) => ({ id: groupId, displayName: groupId, members: [] }),
+    listUserModelRoles: async () => [],
+    listUserGroupModelRoles: async () => [],
+    listDocumentAccessInventory: async () => ({
+      principals: [],
+      pagination: { complete: true, pages: 1, pageSize: 100, returnedRecords: 0, reportedTotalRecords: 0 },
+    }),
+    ...overrides,
+  };
+}
+
+const ACCESS_EVIDENCE_INSTANCE: SavedInstance = {
+  id: 'instance-1',
+  label: 'Vault-selected tenant',
+  role: 'both',
+  baseUrl: 'https://vault-selected.example.invalid',
+  apiKey: 'vault-selected-private-key',
+  metricFilter: {
+    connectionDatabaseContains: [],
+    connectionDatabaseExact: [],
+    embedExternalIdContains: [],
+    embedExternalIdExact: [],
+  },
+  postMigrationActions: [],
+  createdAt: '2026-08-26T12:00:00.000Z',
+  updatedAt: '2026-08-26T12:00:00.000Z',
+};
+
+test('access evidence SCIM reader preserves an omitted lifecycle state as unknown', async () => {
+  const users = await listIdentityAccessUsers(async (count, startIndex) => ({
+    Resources: [{ id: 'user-unknown', userName: 'unknown@example.invalid' }],
+    totalResults: 1,
+    itemsPerPage: 1,
+    startIndex,
+    requestedCount: count,
+  }));
+
+  assert.equal(users.length, 1);
+  assert.equal(Object.prototype.hasOwnProperty.call(users[0], 'active'), false);
+
+  const report = await buildIdentityAccessEvidence({
+    instanceId: 'instance-1',
+    instanceLabel: 'Selected tenant',
+    principalType: 'user',
+    principalIdentifier: 'unknown@example.invalid',
+    expectedAccess: { active: true },
+  }, accessEvidenceReader({ listIdentityUsers: async () => users }));
+
+  assert.equal(report.lifecycle.state, 'unknown');
+  assert.equal(Object.prototype.hasOwnProperty.call(report.principal, 'active'), false);
+  assert.equal(report.findings.find((finding) => finding.label === 'Standard-user lifecycle state was not returned')?.classification, 'unverified');
+  assert.equal(report.findings.find((finding) => finding.label === 'Expected lifecycle cannot be compared')?.classification, 'unverified');
+});
+
+test('access evidence correlates inactive-user offboarding exposure without promoting it to runtime proof', async () => {
+  const report = await buildIdentityAccessEvidence({
+    instanceId: 'instance-1',
+    instanceLabel: 'Selected tenant',
+    principalType: 'user',
+    principalIdentifier: 'analyst@example.invalid',
+    connectionId: 'connection-1',
+    modelId: 'model-1',
+    folderId: 'Shared/Finance',
+    documentId: 'document-1',
+    expectedAccess: { active: false, modelRole: 'QUERIER', contentRole: 'MANAGER' },
+  }, accessEvidenceReader({
+    listIdentityUsers: async () => [{
+      id: 'user-1',
+      displayName: 'Finance Analyst',
+      userName: 'analyst@example.invalid',
+      email: 'analyst@example.invalid',
+      active: false,
+      lastLogin: '2026-08-20T12:00:00.000Z',
+    }],
+    listUserGroups: async () => [{
+      id: 'group-1',
+      displayName: 'Finance',
+      members: [{ value: 'user-1', display: 'Finance Analyst' }],
+    }],
+    listUserModelRoles: async () => [{
+      roleName: 'QUERIER',
+      connectionId: 'connection-1',
+      modelId: 'model-1',
+      resolved: true,
+      from: { type: 'User Role', name: 'Direct querier' },
+    }],
+    listUserGroupModelRoles: async () => [{
+      roleName: 'QUERY_TOPICS',
+      connectionId: 'connection-1',
+      modelId: 'model-1',
+      resolved: true,
+      from: { type: 'Group Role', name: 'Finance' },
+    }],
+    listDocumentAccessInventory: async () => ({
+      principals: [{
+        id: 'user-1',
+        name: 'Finance Analyst',
+        email: 'analyst@example.invalid',
+        type: 'user',
+        role: 'MANAGER',
+        accessBoost: false,
+        accessSource: 'direct',
+        isOwner: true,
+        folderInfo: { id: 'folder-1', name: 'Finance', path: 'Shared/Finance' },
+      }, {
+        id: 'group-1',
+        name: 'Finance',
+        type: 'userGroup',
+        role: 'VIEWER',
+        accessBoost: false,
+        accessSource: 'folder',
+        isOwner: false,
+        folderInfo: { id: 'folder-1', name: 'Finance', path: 'Shared/Finance' },
+      }],
+      pagination: { complete: true, pages: 1, pageSize: 100, returnedRecords: 2, reportedTotalRecords: 2 },
+    }),
+  }));
+
+  assert.equal(report.lifecycle.state, 'inactive');
+  assert.deepEqual(report.lifecycle.offboardingExposure, [
+    '2 observed model-role assignments',
+    '2 selected-document access entries',
+    'selected-document ownership',
+  ]);
+  assert.equal(report.coverage.find((entry) => entry.source === 'model_roles')?.state, 'complete');
+  assert.equal(report.coverage.find((entry) => entry.source === 'document_access')?.state, 'complete');
+  assert.equal(report.findings.find((finding) => finding.label === 'Inactive-user offboarding exposure')?.classification, 'inferred');
+  assert.equal(report.findings.find((finding) => finding.label === 'Model-role expectation represented')?.classification, 'inferred');
+  assert.ok(report.exclusions.some((value) => /not proof of row-level/i.test(value)));
+
+  const parsed = parseIdentityAccessEvidenceReport(report);
+  assert.equal(parsed.principal.id, 'user-1');
+  const exported = serializeIdentityAccessEvidence({
+    ...parsed,
+    exclusions: [...parsed.exclusions, 'Authorization: Bearer private-token-marker'],
+  });
+  assert.doesNotMatch(exported, /analyst@example\.invalid/i);
+  assert.doesNotMatch(exported, /private-token-marker/i);
+  assert.match(exported, /\[redacted-email\]/);
+  assert.match(exported, /Authorization: \[redacted\]/);
+});
+
+test('access evidence does not turn failed group detail into a no-access conclusion', async () => {
+  const report = await buildIdentityAccessEvidence({
+    instanceId: 'instance-1',
+    instanceLabel: 'Selected tenant',
+    principalType: 'user',
+    principalIdentifier: 'user-1',
+    documentId: 'document-1',
+    expectedAccess: { contentRole: 'VIEWER' },
+  }, accessEvidenceReader({
+    listIdentityUsers: async () => [{ id: 'user-1', userName: 'analyst@example.invalid', active: true }],
+    listUserGroups: async () => [{ id: 'group-unknown', displayName: 'Unknown members' }],
+    getUserGroup: async () => { throw new Error('detail unavailable'); },
+    listDocumentAccessInventory: async () => ({
+      principals: [{
+        id: 'group-unknown',
+        name: 'Unknown members',
+        type: 'userGroup',
+        role: 'VIEWER',
+        accessBoost: false,
+        accessSource: 'direct',
+        isOwner: false,
+      }],
+      pagination: { complete: true, pages: 1, pageSize: 100, returnedRecords: 1, reportedTotalRecords: 1 },
+    }),
+  }));
+
+  assert.equal(report.coverage.find((entry) => entry.source === 'group_membership')?.state, 'unavailable');
+  assert.equal(report.coverage.find((entry) => entry.source === 'document_access')?.state, 'partial');
+  const expectation = report.findings.find((finding) => finding.label === 'Content-role expectation not proven');
+  assert.equal(expectation?.classification, 'unverified');
+  assert.match(expectation?.message || '', /complete group membership evidence/i);
+});
+
+test('access evidence handler exposes only the read-only debug action contract', async () => {
+  let capturedInput: Record<string, unknown> | undefined;
+  let capturedInstance: SavedInstance | undefined;
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'debug_access',
+    instance_id: 'instance-1',
+    instance_label: 'Client-claimed tenant label',
+    principal_type: 'user',
+    principal_identifier: 'analyst@example.invalid',
+    expected_access: { active: false },
+  }), {
+    getSavedInstance: (instanceId) => instanceId === ACCESS_EVIDENCE_INSTANCE.id ? ACCESS_EVIDENCE_INSTANCE : undefined,
+    buildAccessEvidence: async (input, _signal, instance) => {
+      capturedInput = input as unknown as Record<string, unknown>;
+      capturedInstance = instance;
+      return buildIdentityAccessEvidence(input, accessEvidenceReader({
+        listIdentityUsers: async () => [{ id: 'user-1', userName: 'analyst@example.invalid', active: false }],
+      }));
+    },
+  });
+
+  assert.equal(response.status, 200);
+  assert.equal(capturedInput?.instanceId, ACCESS_EVIDENCE_INSTANCE.id);
+  assert.equal(capturedInput?.instanceLabel, ACCESS_EVIDENCE_INSTANCE.label);
+  assert.equal(capturedInstance?.baseUrl, ACCESS_EVIDENCE_INSTANCE.baseUrl);
+  assert.equal(capturedInstance?.apiKey, ACCESS_EVIDENCE_INSTANCE.apiKey);
+  assert.notEqual(capturedInstance?.baseUrl, 'https://example.omniapp.co');
+  assert.notEqual(capturedInstance?.apiKey, 'private-api-key-marker');
+  assert.equal(capturedInput?.principalIdentifier, 'analyst@example.invalid');
+  assert.deepEqual(capturedInput?.expectedAccess, { active: false });
+  const payload = await response.json();
+  assert.equal(payload.schemaVersion, 'omnikit.identity-access-evidence.v1');
+  assert.deepEqual(payload.instance, { id: ACCESS_EVIDENCE_INSTANCE.id, label: ACCESS_EVIDENCE_INSTANCE.label });
+  assert.equal(JSON.stringify(payload).includes('Client-claimed tenant label'), false);
+  assert.equal(JSON.stringify(payload).includes('private-api-key-marker'), false);
+
+  const malformed = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'debug_access',
+    instance_id: 'instance-1',
+    instance_label: 'Client-claimed tenant label',
+    principal_type: 'user',
+    principal_identifier: 'analyst@example.invalid',
+    expected_access: 'active',
+  }), {
+    getSavedInstance: () => ACCESS_EVIDENCE_INSTANCE,
+    buildAccessEvidence: async () => { throw new Error('must not run'); },
+  });
+  assert.equal(malformed.status, 400);
+  assert.deepEqual(await malformed.json(), { error: 'Expected access must be an object.', code: 'INVALID_INPUT' });
+
+  const missing = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'debug_access',
+    instance_id: 'missing-instance',
+    principal_type: 'user',
+    principal_identifier: 'analyst@example.invalid',
+  }), { getSavedInstance: () => undefined });
+  assert.equal(missing.status, 404);
+  assert.deepEqual(await missing.json(), { error: 'Saved Omni instance not found.', code: 'SAVED_INSTANCE_NOT_FOUND' });
+});
+
+test('access evidence browser request sends only the saved instance reference and scoped operator inputs', async (t) => {
+  const report = await buildIdentityAccessEvidence({
+    instanceId: ACCESS_EVIDENCE_INSTANCE.id,
+    instanceLabel: ACCESS_EVIDENCE_INSTANCE.label,
+    principalType: 'user',
+    principalIdentifier: 'analyst@example.invalid',
+  }, accessEvidenceReader({
+    listIdentityUsers: async () => [{ id: 'user-1', userName: 'analyst@example.invalid', active: true }],
+  }));
+  let requestBody: Record<string, unknown> | undefined;
+  t.mock.method(globalThis, 'fetch', async (input: string | URL | Request, init?: RequestInit) => {
+    assert.equal(String(input), '/api/manage-users');
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return json(report);
+  });
+
+  const result = await fetchIdentityAccessEvidence({
+    instanceId: ACCESS_EVIDENCE_INSTANCE.id,
+    principalType: 'user',
+    principalIdentifier: 'analyst@example.invalid',
+    modelId: 'model-1',
+  });
+
+  assert.equal(result.instance.label, ACCESS_EVIDENCE_INSTANCE.label);
+  assert.deepEqual(requestBody, {
+    action: 'debug_access',
+    instance_id: ACCESS_EVIDENCE_INSTANCE.id,
+    principal_type: 'user',
+    principal_identifier: 'analyst@example.invalid',
+    model_id: 'model-1',
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(requestBody, 'base_url'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(requestBody, 'api_key'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(requestBody, 'instance_label'), false);
 });
 
 // Compile-time guard: aggregated list reads retain their documented response type.

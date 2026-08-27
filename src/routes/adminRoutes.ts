@@ -36,6 +36,7 @@ export const ADMIN_WORKSPACES = [
     navigation: [
       { id: 'instances', label: 'Instances', path: '/admin/fleet/instances' },
       { id: 'connections', label: 'Connections', path: '/admin/fleet/connections' },
+      { id: 'ai-governance', label: 'AI Governance', path: '/admin/fleet/ai-governance' },
     ],
   },
   {
@@ -69,6 +70,8 @@ export const ADMIN_WORKSPACES = [
     defaultPath: '/admin/developer/embeds',
     navigation: [
       { id: 'embeds', label: 'Embed URLs', path: '/admin/developer/embeds' },
+      { id: 'api-contract', label: 'API Contract', path: '/admin/developer/api-contract' },
+      { id: 'enablement', label: 'Role Enablement', path: '/admin/developer/enablement' },
     ],
   },
 ] as const satisfies readonly AdminWorkspaceDefinition[];

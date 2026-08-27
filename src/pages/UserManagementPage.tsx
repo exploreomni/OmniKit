@@ -7,6 +7,7 @@ import { GroupsPage } from '@/pages/GroupsPage';
 import { UserHealthPage } from '@/pages/UserHealthPage';
 import { BulkIdentityImportPage } from '@/pages/BulkIdentityImportPage';
 import { AdminReadinessPanel } from '@/components/admin/CapabilityStatus';
+import { IdentityAccessDebugger } from '@/components/admin/IdentityAccessDebugger';
 import { useConnection } from '@/hooks/useConnection';
 
 type UserManagementTab = 'users' | 'groups' | 'import' | 'health';
@@ -102,7 +103,12 @@ export function UserManagementPage() {
       {activeTab === 'users' && <UsersPage embedded />}
       {activeTab === 'groups' && <GroupsPage embedded />}
       {activeTab === 'import' && <BulkIdentityImportPage />}
-      {activeTab === 'health' && <UserHealthPage />}
+      {activeTab === 'health' && (
+        <div className="space-y-5">
+          <IdentityAccessDebugger connection={connection} />
+          <UserHealthPage />
+        </div>
+      )}
     </div>
   );
 }

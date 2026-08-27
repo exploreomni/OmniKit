@@ -3285,7 +3285,10 @@ test('same-instance reconnect failure remains unverified and does not start AI m
     await route.fulfill({
       status: 504,
       contentType: 'application/json',
-      body: JSON.stringify({ error: 'Omni did not respond within 8 seconds.' }),
+      body: JSON.stringify({
+        error: 'Omni did not respond within 8 seconds.',
+        code: 'INSTANCE_VALIDATION_TIMEOUT',
+      }),
     });
   });
   await page.route('**/api/list-models', async (route) => {
@@ -3317,7 +3320,8 @@ test('same-instance reconnect failure remains unverified and does not start AI m
     .getByRole('button', { name: /Unverified retry instance/ })
     .click();
 
-  await expect(sidebar.getByRole('alert')).toHaveText('Omni did not respond within 8 seconds.');
+  await expect(sidebar.getByRole('alert')).toContainText('Omni did not respond within 8 seconds.');
+  await expect(sidebar.getByRole('alert')).toContainText('Code INSTANCE_VALIDATION_TIMEOUT');
   await expect(page.getByText('Choose an instance to unlock AI Content Studio')).toBeVisible();
   await expect.poll(() => page.evaluate(() => {
     const raw = window.sessionStorage.getItem('omnikit:activeConnection:v1');

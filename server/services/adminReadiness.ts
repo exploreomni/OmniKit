@@ -170,6 +170,7 @@ const DOCS = {
   apiExplorer: 'https://docs.omni.co/api/api-explorer',
   apiTokens: 'https://docs.omni.co/api/api-tokens/list-api-tokens',
   authentication: 'https://docs.omni.co/api/authentication',
+  whoami: 'https://docs.omni.co/api/who-am-i/get-current-identity-and-permissions',
   folders: 'https://docs.omni.co/api/folders/list-folders',
   schedules: 'https://docs.omni.co/api/schedules/list-schedules',
   users: 'https://docs.omni.co/api/users/list-users',
@@ -917,26 +918,111 @@ function organizationApiKeyConfirmationCapability(
     source: { kind: 'operator_confirmation', scope: 'saved_setting' },
     checkedAt,
     coverage: coverage(confirmed === true ? 1 : 0, 1, confirmed === true, 'operator_confirmations'),
-    exclusions: ['not_verified_by_current_token_introspection'],
+    exclusions: ['operator_attestation_separate_from_live_whoami_scope'],
     documentation: documentation('API authentication', DOCS.authentication),
     data: { confirmed: confirmed === true },
   });
 }
 
-function currentTokenIntrospectionCapability(checkedAt: string): AdminReadinessCapability {
-  return capability({
-    id: 'fleet.current_token_introspection',
-    label: 'Current token introspection',
-    evidenceState: 'unsupported',
-    readinessState: 'unknown',
-    reason: reason('no_documented_read_api', 'The documented Omni API does not expose a current-token introspection response that OmniKit can safely use here.'),
-    source: { kind: 'official_documentation', scope: 'manual_action' },
-    checkedAt,
-    coverage: coverage(0, 1, false, 'token_introspection_checks'),
-    exclusions: ['credential_type_not_inferred_from_other_endpoint_access'],
-    documentation: documentation('API authentication', DOCS.authentication),
-    actions: [{ kind: 'documentation', label: 'Review API authentication', url: DOCS.authentication }],
-  });
+interface CurrentCallerSummary {
+  keyScope: 'user' | 'organization';
+  orgRole: 'MEMBER' | 'ORG_ADMIN';
+  returnedModelCount: number;
+  returnedPermissionCount: number;
+  rolesByModelTruncated: boolean;
+}
+
+function parseCurrentCallerSummary(raw: unknown): CurrentCallerSummary {
+  if (
+    !isRecord(raw)
+    || Object.prototype.hasOwnProperty.call(raw, 'error')
+    || Object.prototype.hasOwnProperty.call(raw, 'errors')
+    || raw.ok === false
+    || raw.success === false
+    || (raw.keyScope !== 'user' && raw.keyScope !== 'organization')
+    || (raw.orgRole !== 'MEMBER' && raw.orgRole !== 'ORG_ADMIN')
+    || !isRecord(raw.user)
+    || !stringValue(raw.user.id)
+    || !stringValue(raw.user.membershipId)
+    || !isRecord(raw.rolesByModel)
+    || Object.keys(raw.rolesByModel).length > MAX_DIRECT_RECORDS
+    || (raw.rolesByModelTruncated !== undefined && typeof raw.rolesByModelTruncated !== 'boolean')
+  ) {
+    throw new AdminReadException('invalid_response_shape');
+  }
+
+  let returnedPermissionCount = 0;
+  for (const [modelId, role] of Object.entries(raw.rolesByModel)) {
+    if (!stringValue(modelId) || !isRecord(role) || !Array.isArray(role.permissions)) {
+      throw new AdminReadException('invalid_response_shape');
+    }
+    if (role.permissions.length > MAX_DIRECT_RECORDS) {
+      throw new AdminReadException('invalid_response_shape');
+    }
+    for (const permission of role.permissions) {
+      if (!stringValue(permission, 200)) throw new AdminReadException('invalid_response_shape');
+    }
+    returnedPermissionCount += role.permissions.length;
+    if (!Number.isSafeInteger(returnedPermissionCount) || returnedPermissionCount > MAX_DIRECT_RECORDS * MAX_DIRECT_RECORDS) {
+      throw new AdminReadException('invalid_response_shape');
+    }
+  }
+
+  return {
+    keyScope: raw.keyScope,
+    orgRole: raw.orgRole,
+    returnedModelCount: Object.keys(raw.rolesByModel).length,
+    returnedPermissionCount,
+    rolesByModelTruncated: raw.rolesByModelTruncated === true,
+  };
+}
+
+async function currentTokenIntrospectionCapability(
+  context: RequestContext,
+  checkedAt: string,
+): Promise<AdminReadinessCapability> {
+  const capabilitySource = source('/api/v1/whoami', 'resource');
+  try {
+    const summary = parseCurrentCallerSummary(await readJson(context, '/api/v1/whoami'));
+    const complete = !summary.rolesByModelTruncated;
+    return capability({
+      id: 'fleet.current_token_introspection',
+      label: 'Current caller permissions',
+      evidenceState: complete ? 'available' : 'partial',
+      readinessState: complete ? 'ready' : 'unknown',
+      reason: complete
+        ? reason('ok', 'Omni returned the documented current-caller scope and a complete model-permission projection.')
+        : reason('partial_coverage', 'Omni returned the documented current-caller scope, but its model-permission projection was truncated.'),
+      source: capabilitySource,
+      checkedAt,
+      coverage: coverage(
+        summary.returnedModelCount,
+        complete ? summary.returnedModelCount : null,
+        complete,
+        'model_permission_sets',
+      ),
+      exclusions: [
+        'caller_user_id',
+        'caller_membership_id',
+        'model_ids',
+        'role_names',
+        'permission_values',
+        ...(complete ? [] : ['model_permission_sets_outside_response_limit']),
+      ],
+      documentation: documentation('Get current identity and permissions', DOCS.whoami),
+      data: { ...summary },
+    });
+  } catch (error) {
+    return failedCapability({
+      id: 'fleet.current_token_introspection',
+      label: 'Current caller permissions',
+      source: capabilitySource,
+      checkedAt,
+      docsLabel: 'Get current identity and permissions',
+      docsUrl: DOCS.whoami,
+      error,
+    });
+  }
 }
 
 interface UserAggregate {
@@ -1433,11 +1519,13 @@ async function buildReport(
     const live = await runBounded([
       () => folderReadCapability(context, checkedAt),
       () => apiTokenCapability(context, checkedAt),
+      () => currentTokenIntrospectionCapability(context, checkedAt),
     ]);
     capabilities = [
-      ...live,
+      live[0],
+      live[1],
       organizationApiKeyConfirmationCapability(input.instance.organizationApiKeyConfirmed, checkedAt),
-      currentTokenIntrospectionCapability(checkedAt),
+      live[2],
     ];
   } else if (input.workspace === 'identity') {
     if (input.accessPosture) {

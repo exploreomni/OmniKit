@@ -88,10 +88,19 @@ export interface AdminScheduleStatusCounts {
   unknown: number;
 }
 
+export interface AdminCurrentCallerEvidence {
+  keyScope: 'user' | 'organization';
+  orgRole: 'MEMBER' | 'ORG_ADMIN';
+  returnedModelCount: number;
+  returnedPermissionCount: number;
+  rolesByModelTruncated: boolean;
+}
+
 export type AdminReadinessData =
   | { readable: boolean; visibleFoldersLowerBound: number }
   | { total: number; organization: number; personal: number; mcp: number; other: number; enabled: number; disabled: number }
   | { confirmed: boolean }
+  | AdminCurrentCallerEvidence
   | { total: number; active: number; inactive: number; statusUnknown: number }
   | { total: number }
   | Array<{ name: string; label?: string; type?: string; multiple: boolean; system: boolean; hasDefault: boolean; hasDescription: boolean }>
@@ -371,6 +380,26 @@ function parseData(id: AdminReadinessCapabilityId, value: unknown): AdminReadine
     exactKeys(row, ['confirmed'], 'data');
     return { confirmed: booleanValue(row.confirmed, 'data.confirmed') };
   }
+  if (id === 'fleet.current_token_introspection') {
+    const row = record(value, 'data');
+    const keys = [
+      'keyScope',
+      'orgRole',
+      'returnedModelCount',
+      'returnedPermissionCount',
+      'rolesByModelTruncated',
+    ] as const;
+    exactKeys(row, keys, 'data');
+    if (row.keyScope !== 'user' && row.keyScope !== 'organization') fail('data.keyScope');
+    if (row.orgRole !== 'MEMBER' && row.orgRole !== 'ORG_ADMIN') fail('data.orgRole');
+    return {
+      keyScope: row.keyScope,
+      orgRole: row.orgRole,
+      returnedModelCount: nonNegativeInteger(row.returnedModelCount, 'data.returnedModelCount'),
+      returnedPermissionCount: nonNegativeInteger(row.returnedPermissionCount, 'data.returnedPermissionCount'),
+      rolesByModelTruncated: booleanValue(row.rolesByModelTruncated, 'data.rolesByModelTruncated'),
+    };
+  }
   if (id === 'identity.scim_users' || id === 'developer.embed_users') {
     const keys = ['total', 'active', 'inactive', 'statusUnknown'] as const;
     const row = record(value, 'data');
@@ -449,6 +478,17 @@ function validateDataCoverage(
       || tokens.organization + tokens.personal + tokens.mcp + tokens.other !== tokens.total
       || tokens.enabled + tokens.disabled !== tokens.total
     ) fail('API token aggregate partitions');
+    return;
+  }
+
+  if (id === 'fleet.current_token_introspection') {
+    const caller = data as AdminCurrentCallerEvidence;
+    if (
+      caller.returnedModelCount !== coverage.included
+      || coverage.complete === caller.rolesByModelTruncated
+      || (coverage.complete && coverage.total !== caller.returnedModelCount)
+      || (!coverage.complete && coverage.total !== null)
+    ) fail('current caller aggregate coverage');
     return;
   }
 

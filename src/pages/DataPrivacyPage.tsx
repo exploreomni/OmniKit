@@ -7,6 +7,7 @@ import { toast } from '@/services/toast';
 import { Blobby } from '@/components/ui/Blobby';
 import { useWalkthrough } from '@/hooks/useWalkthrough';
 import { WALKTHROUGH_STORAGE_KEY } from '@/services/walkthrough';
+import { OMNIKIT_BUILD_INFO } from '@/services/buildInfo';
 import {
   clearMigrationJobs,
   getVaultStatus,
@@ -220,6 +221,21 @@ export function DataPrivacyPage() {
         icon={<Blobby mood="governance" size={58} className="animate-float" style={{ animationDuration: '3.6s' }} />}
         actions={<StatusChip status="success" label={`${totalRecords} records stored locally`} />}
       />
+
+      <div className="card border-omni-100 bg-white p-5">
+        <div className="flex items-start gap-3">
+          <HardDrive size={17} className="mt-0.5 text-omni-700" aria-hidden="true" />
+          <div>
+            <h2 className="text-base font-semibold text-content-primary">OmniKit build identity</h2>
+            <p className="mt-1 text-[13px] leading-relaxed text-content-secondary">
+              Include this non-secret identifier with tester screenshots so the running code can be matched to a repository revision.
+            </p>
+            <div className="mt-2 font-mono text-[11px] text-content-tertiary">
+              {OMNIKIT_BUILD_INFO.label}
+            </div>
+          </div>
+        </div>
+      </div>
 
       <div className="card p-5 border-omni-100 bg-white">
         <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">

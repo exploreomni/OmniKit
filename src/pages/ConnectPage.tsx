@@ -27,8 +27,13 @@ import { useConnection } from '@/hooks/useConnection';
 import { useVaultSession } from '@/hooks/useVaultSession';
 import { OmniKitLogo } from '@/components/brand/OmniKitLogo';
 import { ConnectionAnimation } from '@/components/ui/ConnectionAnimation';
+import { ConnectionFailureDetails } from '@/components/ui/ConnectionFailureDetails';
 import { PassphraseInput } from '@/components/ui/PassphraseInput';
 import { countWorkspaceSnapshotSemanticModels } from '@/services/workspaceSnapshot';
+import {
+  instanceConnectionDiagnosticFromError,
+  type InstanceConnectionDiagnostic,
+} from '@/services/instanceConnectionDiagnostics';
 import {
   saveSavedInstance,
   type InstanceRole,
@@ -276,7 +281,7 @@ export function ConnectPage() {
   const [vaultPassphraseConfirm, setVaultPassphraseConfirm] = useState('');
   const [vaultBusy, setVaultBusy] = useState(false);
   const [vaultMessage, setVaultMessage] = useState('');
-  const [vaultError, setVaultError] = useState('');
+  const [vaultError, setVaultError] = useState<InstanceConnectionDiagnostic | null>(null);
   const [newVaultInstance, setNewVaultInstance] = useState<NewVaultInstanceForm>(EMPTY_VAULT_INSTANCE_FORM);
   const [showAddVaultInstance, setShowAddVaultInstance] = useState(false);
 
@@ -297,7 +302,7 @@ export function ConnectPage() {
 
   async function handleVaultUnlock() {
     setVaultBusy(true);
-    setVaultError('');
+    setVaultError(null);
     setVaultMessage('');
     try {
       const beforeUnlockStatus = await refreshStatus().catch(() => vaultStatus);
@@ -317,7 +322,7 @@ export function ConnectPage() {
       }
       setShowAddVaultInstance(instances.length === 0);
     } catch (err) {
-      setVaultError(err instanceof Error ? err.message : 'Could not unlock the vault.');
+      setVaultError({ message: err instanceof Error ? err.message : 'Could not unlock the vault.' });
     } finally {
       setVaultBusy(false);
     }
@@ -326,14 +331,14 @@ export function ConnectPage() {
   async function handleUseSavedInstance(instanceId = selectedInstance?.id || '') {
     if (!instanceId) return;
     setVaultBusy(true);
-    setVaultError('');
+    setVaultError(null);
     setVaultMessage('');
     try {
       const instance = await connectInstance(instanceId);
       await refreshInstances();
       setVaultMessage(`Connected to ${instance.label}.`);
     } catch (err) {
-      setVaultError(err instanceof Error ? err.message : 'Could not connect to the saved instance.');
+      setVaultError(instanceConnectionDiagnosticFromError(err, 'Could not connect to the saved instance.'));
     } finally {
       setVaultBusy(false);
     }
@@ -341,7 +346,7 @@ export function ConnectPage() {
 
   async function handleSaveAndUseVaultInstance() {
     setVaultBusy(true);
-    setVaultError('');
+    setVaultError(null);
     setVaultMessage('');
     try {
       const saved = await saveSavedInstance({
@@ -365,7 +370,7 @@ export function ConnectPage() {
       await refreshInstances();
       setVaultMessage(`Saved and connected to ${instance.label}.`);
     } catch (err) {
-      setVaultError(err instanceof Error ? err.message : 'Could not save and test this instance.');
+      setVaultError(instanceConnectionDiagnosticFromError(err, 'Could not save and test this instance.'));
     } finally {
       setVaultBusy(false);
     }
@@ -550,6 +555,15 @@ export function ConnectPage() {
                     <span className="block">{heroCopy.titleBottom}</span>
                   </h1>
                   <p className="mt-4 max-w-2xl text-sm leading-6 text-white/80">{heroCopy.body}</p>
+                  {connection.status === 'error' && connection.errorMessage && (
+                    <div className="mt-4 max-w-2xl">
+                      <ConnectionFailureDetails
+                        message={connection.errorMessage}
+                        code={connection.errorCode}
+                        tone="inverse"
+                      />
+                    </div>
+                  )}
                 </div>
                 <img
                   key={currentBlobby.src}
@@ -692,7 +706,11 @@ export function ConnectPage() {
                     </span>
                   </div>
 
-                  {vaultError && <div className="mt-4 rounded-[7px] border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700" role="alert">{vaultError}</div>}
+                  {vaultError && (
+                    <div className="mt-4">
+                      <ConnectionFailureDetails message={vaultError.message} code={vaultError.code} />
+                    </div>
+                  )}
                   {vaultMessage && <div className="mt-4 rounded-[7px] border border-green-200 bg-green-50 px-3 py-2 text-xs text-green-700" role="status">{vaultMessage}</div>}
 
 	                {!vaultUnlocked ? (

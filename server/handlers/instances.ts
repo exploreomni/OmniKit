@@ -44,6 +44,11 @@ import {
   readThroughCache,
   readThroughCacheResult,
 } from '../services/readThroughCache';
+import {
+  INSTANCE_CONNECTION_DIAGNOSTICS,
+  INSTANCE_CONNECTION_ERROR_CODES,
+  type InstanceConnectionErrorCode,
+} from '../../shared/instanceConnectionErrors';
 
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 const INTERACTIVE_TEST_TIMEOUT_MS = 8_000;
@@ -85,6 +90,13 @@ class InstanceProbeResponseError extends Error {
   constructor() {
     super('The Omni identity probe returned an invalid success response.');
     this.name = 'InstanceProbeResponseError';
+  }
+}
+
+class InstanceUrlValidationError extends Error {
+  constructor() {
+    super('The saved Omni instance URL is invalid or no longer permitted.');
+    this.name = 'InstanceUrlValidationError';
   }
 }
 
@@ -950,7 +962,7 @@ async function testInstance(
   dependencies: InstanceHandlerDependencies = {},
 ): Promise<void> {
   const urlError = validateBaseUrl(instance.baseUrl);
-  if (urlError) throw new Error(urlError);
+  if (urlError) throw new InstanceUrlValidationError();
   const targetUrl = `${instance.baseUrl.replace(/\/+$/, '')}/api/v1/whoami`;
   await runWithInstanceValidationDeadline(
     (boundedSignal) => dependencies.probeFetch
@@ -960,50 +972,86 @@ async function testInstance(
   );
 }
 
+function nestedSystemErrorCode(error: unknown, depth = 0): string {
+  if (!error || typeof error !== 'object' || depth > 3) return '';
+  const candidate = error as { code?: unknown; cause?: unknown };
+  if (typeof candidate.code === 'string' && candidate.code.trim()) {
+    return candidate.code.trim().toUpperCase();
+  }
+  return nestedSystemErrorCode(candidate.cause, depth + 1);
+}
+
+function isTlsSystemError(code: string): boolean {
+  return code.startsWith('ERR_TLS_')
+    || code.startsWith('CERT_')
+    || code === 'DEPTH_ZERO_SELF_SIGNED_CERT'
+    || code === 'SELF_SIGNED_CERT_IN_CHAIN'
+    || code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE';
+}
+
+function transportFailureCode(error: unknown): InstanceConnectionErrorCode {
+  if (error instanceof InstanceUrlValidationError) return INSTANCE_CONNECTION_ERROR_CODES.urlInvalid;
+  const code = nestedSystemErrorCode(error);
+  if (code === 'ERR_INVALID_URL') return INSTANCE_CONNECTION_ERROR_CODES.urlInvalid;
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return INSTANCE_CONNECTION_ERROR_CODES.dnsResolutionFailed;
+  if (code === 'EACCES') return INSTANCE_CONNECTION_ERROR_CODES.networkTargetBlocked;
+  if (code === 'ECONNREFUSED') return INSTANCE_CONNECTION_ERROR_CODES.connectionRefused;
+  if (code === 'ENETUNREACH' || code === 'EHOSTUNREACH') return INSTANCE_CONNECTION_ERROR_CODES.networkUnreachable;
+  if (code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return INSTANCE_CONNECTION_ERROR_CODES.networkTimeout;
+  if (code === 'ECONNRESET' || code === 'ECONNABORTED' || code === 'EPIPE') {
+    return INSTANCE_CONNECTION_ERROR_CODES.connectionInterrupted;
+  }
+  if (isTlsSystemError(code)) return INSTANCE_CONNECTION_ERROR_CODES.tlsValidationFailed;
+  return INSTANCE_CONNECTION_ERROR_CODES.transportFailed;
+}
+
+function diagnosticResponse(code: InstanceConnectionErrorCode, status: number): Response {
+  return json({
+    error: INSTANCE_CONNECTION_DIAGNOSTICS[code].message,
+    code,
+  }, status);
+}
+
+function upstreamFailureCode(status: number): InstanceConnectionErrorCode {
+  if (status >= 300 && status < 400) return INSTANCE_CONNECTION_ERROR_CODES.redirectBlocked;
+  if (status === 401) return INSTANCE_CONNECTION_ERROR_CODES.credentialRejected;
+  if (status === 403) return INSTANCE_CONNECTION_ERROR_CODES.callerForbidden;
+  if (status === 404 || status === 405) return INSTANCE_CONNECTION_ERROR_CODES.identityEndpointUnavailable;
+  if (status === 429) return INSTANCE_CONNECTION_ERROR_CODES.rateLimited;
+  if (status >= 500) return INSTANCE_CONNECTION_ERROR_CODES.upstreamUnavailable;
+  return INSTANCE_CONNECTION_ERROR_CODES.validationHttpFailed;
+}
+
+function upstreamFailureStatus(code: InstanceConnectionErrorCode): number {
+  if (code === INSTANCE_CONNECTION_ERROR_CODES.credentialRejected) return 401;
+  if (code === INSTANCE_CONNECTION_ERROR_CODES.callerForbidden) return 403;
+  if (code === INSTANCE_CONNECTION_ERROR_CODES.rateLimited) return 429;
+  return 502;
+}
+
 function instanceValidationErrorResponse(error: unknown, requestSignal?: AbortSignal): Response {
   if (requestSignal?.aborted || error instanceof InstanceValidationCancelledError) {
-    return json({
-      error: 'The Omni connection check was cancelled.',
-      code: 'INSTANCE_VALIDATION_CANCELLED',
-    }, 499);
+    return diagnosticResponse(INSTANCE_CONNECTION_ERROR_CODES.cancelled, 499);
   }
   if (error instanceof InstanceValidationDeadlineError
     || (error instanceof DOMException && error.name === 'AbortError')) {
-    return json({
-      error: 'Omni did not respond within 8 seconds. Check the instance network path and try again.',
-      code: 'INSTANCE_VALIDATION_TIMEOUT',
-    }, 504);
+    return diagnosticResponse(INSTANCE_CONNECTION_ERROR_CODES.timeout, 504);
   }
   if (error instanceof InstanceProbeResponseError) {
-    return json({
-      error: 'Omni returned an invalid identity response, so the connection was not marked validated.',
-      code: 'INSTANCE_INVALID_RESPONSE',
-    }, 502);
+    return diagnosticResponse(INSTANCE_CONNECTION_ERROR_CODES.invalidResponse, 502);
   }
   if (error instanceof OmniClientError) {
-    if (error.status === 401 || error.status === 403) {
-      return json({
-        error: 'The saved Omni credential was rejected. Test the instance or replace its API key.',
-        code: 'INSTANCE_CREDENTIAL_REJECTED',
-      }, error.status);
-    }
-    if (error.status === 429) {
-      return json({
-        error: 'Omni is rate limiting connection checks. Wait briefly, then try again.',
-        code: 'INSTANCE_RATE_LIMITED',
-      }, 429);
-    }
-    return json({
-      error: error.status >= 500
-        ? 'Omni is temporarily unavailable. Try the connection again.'
-        : 'The Omni connection could not be verified. Check the saved instance URL and credential.',
-      code: error.status >= 500 ? 'INSTANCE_UPSTREAM_UNAVAILABLE' : 'INSTANCE_VALIDATION_FAILED',
-    }, error.status >= 500 ? 502 : 400);
+    const code = upstreamFailureCode(error.status);
+    return diagnosticResponse(code, upstreamFailureStatus(code));
   }
-  return json({
-    error: 'The Omni connection could not be verified. Check network access and try again.',
-    code: 'INSTANCE_VALIDATION_FAILED',
-  }, 502);
+  const code = transportFailureCode(error);
+  return diagnosticResponse(
+    code,
+    code === INSTANCE_CONNECTION_ERROR_CODES.urlInvalid
+      || code === INSTANCE_CONNECTION_ERROR_CODES.networkTargetBlocked
+      ? 400
+      : 502,
+  );
 }
 
 export default async function handler(
