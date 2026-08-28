@@ -1,4 +1,5 @@
 import {
+  ApiError,
   assignUserModelRole,
   createGroup,
   createUser,
@@ -29,6 +30,7 @@ const PATCH_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
 const OMNI_ID_PATTERN = /^[\w-]+$/;
 const SIMPLE_HEADERS = ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'] as const;
 const PERMISSION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
+const IDENTITY_IMPORT_CONNECTION_TIMEOUT_MS = 15_000;
 const MODEL_ROLE_RANK: Readonly<Record<IdentityModelRoleName, number>> = {
   NO_ACCESS: 0,
   VIEWER: 1,
@@ -73,6 +75,7 @@ export type IdentityImportIssue = {
   severity: 'error' | 'warning';
   message: string;
   rowNumber?: number;
+  rowNumbers?: number[];
 };
 
 export type IdentityImportSummary = {
@@ -206,6 +209,38 @@ function normalizedKey(value: string) {
   return value.trim().normalize('NFC').toLowerCase();
 }
 
+function identityImportMembershipGroupCount(plan: IdentityImportPlan) {
+  return new Set(
+    plan.records
+      .filter((record): record is Extract<IdentityImportRecord, { type: 'membership' }> => record.type === 'membership')
+      .map((record) => normalizedKey(record.groupName)),
+  ).size;
+}
+
+export function identityImportPreflightProgressTotal(plan: IdentityImportPlan) {
+  const roleUsers = new Set(
+    plan.records
+      .filter((record): record is Extract<IdentityImportRecord, { type: 'role' }> => record.type === 'role')
+      .map((record) => normalizedKey(record.email)),
+  ).size;
+  return 1 + identityImportMembershipGroupCount(plan) + roleUsers;
+}
+
+function identityImportApplyProgressTotal(preflight: IdentityImportPreflight) {
+  const groupRecords = preflight.plan.records.filter((record) => record.type === 'group').length;
+  const userUpserts = preflight.plan.records.filter((record) => record.type === 'user' && record.action === 'upsert').length;
+  const userDeletes = preflight.plan.records.filter((record) => record.type === 'user' && record.action === 'delete').length;
+  return groupRecords
+    + userUpserts
+    + identityImportMembershipGroupCount(preflight.plan)
+    + preflight.roleChanges.length
+    + userDeletes;
+}
+
+export function identityImportExecutionProgressTotal(preflight: IdentityImportPreflight) {
+  return identityImportPreflightProgressTotal(preflight.plan) + identityImportApplyProgressTotal(preflight);
+}
+
 function looksLikeEmail(value: string) {
   if (value.length > IDENTITY_IMPORT_LIMITS.maxEmailLength || value.trim() !== value) return false;
   const parts = value.split('@');
@@ -266,6 +301,7 @@ function deduplicateRecords(records: IdentityImportRecord[], issues: IdentityImp
   const deduplicated: IdentityImportRecord[] = [];
   const seenUsers = new Map<string, Extract<IdentityImportRecord, { type: 'user' }>>();
   const seenGroups = new Map<string, Extract<IdentityImportRecord, { type: 'group' }>>();
+  const duplicateGroupIssues = new Map<string, IdentityImportIssue>();
   const seenMemberships = new Map<string, Extract<IdentityImportRecord, { type: 'membership' }>>();
   const seenRoles = new Map<string, Extract<IdentityImportRecord, { type: 'role' }>>();
 
@@ -323,7 +359,18 @@ function deduplicateRecords(records: IdentityImportRecord[], issues: IdentityImp
         deduplicated.push(record);
       } else {
         mergeRowNumbers(previous, record);
-        issues.push({ severity: 'warning', rowNumber: record.rowNumber, message: `Duplicate group add for ${record.groupName} was merged.` });
+        const duplicateIssue = duplicateGroupIssues.get(key) || {
+          severity: 'warning' as const,
+          rowNumber: previous.rowNumber,
+          rowNumbers: [...previous.rowNumbers],
+          message: '',
+        };
+        duplicateIssue.rowNumbers = [...previous.rowNumbers];
+        duplicateIssue.message = `${previous.rowNumbers.length} rows referencing group ${previous.groupName} were merged into one group operation.`;
+        if (!duplicateGroupIssues.has(key)) {
+          duplicateGroupIssues.set(key, duplicateIssue);
+          issues.push(duplicateIssue);
+        }
       }
       continue;
     }
@@ -586,8 +633,12 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
         continue;
       }
       if (roleName === 'CONNECTION_ADMIN' && models.length > 0) {
-        issues.push({ severity: 'error', rowNumber, message: 'Connection Admin targets connections directly; leave model blank.' });
-        continue;
+        issues.push({
+          severity: 'warning',
+          rowNumber,
+          message: `Connection Admin is connection-scoped; ${models.length} model value${models.length === 1 ? ' was' : 's were'} ignored and the named connection${connections.length === 1 ? ' remains' : 's remain'} the target.`,
+        });
+        models = [];
       }
       const expandsRestrictedQuerierConnection = actionValue === 'add' && roleName === 'QUERY_TOPICS' && models.length === 0;
       if (roleName && roleName !== 'CONNECTION_ADMIN' && models.length === 0 && !expandsRestrictedQuerierConnection) {
@@ -812,7 +863,59 @@ function parseModels(payload: unknown, expectedKind: NamedModel['kind']): NamedM
   return models;
 }
 
-async function mapWithConcurrency<T, R>(values: T[], concurrency: number, mapper: (value: T) => Promise<R>, options?: { delayMs?: number }): Promise<R[]> {
+function waitForIdentityImport(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException('The request was cancelled.', 'AbortError'));
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timeout);
+      reject(new DOMException('The request was cancelled.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function readIdentityImportConnections(
+  baseUrl: string,
+  apiKey: string,
+  parentSignal?: AbortSignal,
+): Promise<unknown> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const forwardAbort = () => controller.abort(parentSignal?.reason);
+  if (parentSignal?.aborted) controller.abort(parentSignal.reason);
+  else parentSignal?.addEventListener('abort', forwardAbort, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort(new DOMException('The connection inventory timed out.', 'TimeoutError'));
+  }, IDENTITY_IMPORT_CONNECTION_TIMEOUT_MS);
+  try {
+    return await listConnections(baseUrl, apiKey, { forceRefresh: true, signal: controller.signal });
+  } catch (error) {
+    if (timedOut) {
+      throw new ApiError(
+        504,
+        'The Omni connection inventory timed out. Check the selected instance and validate again.',
+        undefined,
+        'IDENTITY_IMPORT_CONNECTIONS_TIMEOUT',
+      );
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    parentSignal?.removeEventListener('abort', forwardAbort);
+  }
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T) => Promise<R>,
+  options?: { delayMs?: number; signal?: AbortSignal },
+): Promise<R[]> {
   const results = new Array<R>(values.length);
   const delayMs = options?.delayMs || 0;
   let nextIndex = 0;
@@ -822,7 +925,7 @@ async function mapWithConcurrency<T, R>(values: T[], concurrency: number, mapper
       nextIndex += 1;
       results[index] = await mapper(values[index]);
       if (delayMs > 0 && nextIndex < values.length) {
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await waitForIdentityImport(delayMs, options?.signal);
       }
     }
   }
@@ -1212,27 +1315,40 @@ export async function preflightIdentityImport(
   onProgress?: (progress: IdentityImportProgress) => void,
 ): Promise<IdentityImportPreflight> {
   const roleRecords = plan.records.filter((record): record is Extract<IdentityImportRecord, { type: 'role' }> => record.type === 'role');
+  const hasModelScopedRoleRecords = roleRecords.some((record) => record.roleName !== 'CONNECTION_ADMIN');
   const referencedAttributes = new Set(plan.records.flatMap((record) => record.type === 'user' ? Object.keys(record.attributes) : []));
   const userCount = plan.records.filter((record) => record.type === 'user').length;
-  const roleUserCount = new Set(roleRecords.map((r) => normalizedKey(r.email))).size;
-  const totalSteps = 1 + (referencedAttributes.size > 0 ? 1 : 0) + (roleRecords.length > 0 ? 1 : 0) + roleUserCount;
+  const membershipGroups = new Map<string, string>();
+  plan.records.forEach((record) => {
+    if (record.type === 'membership' && !membershipGroups.has(normalizedKey(record.groupName))) {
+      membershipGroups.set(normalizedKey(record.groupName), record.groupName);
+    }
+  });
+  const roleUsers = new Map<string, string>();
+  roleRecords.forEach((record) => {
+    if (!roleUsers.has(normalizedKey(record.email))) roleUsers.set(normalizedKey(record.email), record.email);
+  });
+  const totalSteps = identityImportPreflightProgressTotal(plan);
   let completedSteps = 0;
-  const reportProgress = (stage: string, message: string) => {
-    completedSteps += 1;
+  const emitProgress = (stage: string, message: string) => {
     onProgress?.({ completed: completedSteps, total: totalSteps, stage, message });
   };
-  onProgress?.({ completed: 0, total: totalSteps, stage: 'Inventory', message: `Fetching ${userCount} users and groups from Omni...` });
+  const reportProgress = (stage: string, message: string) => {
+    completedSteps += 1;
+    emitProgress(stage, message);
+  };
+  emitProgress('Inventory', `Fetching ${userCount} users and the related identity inventory from Omni...`);
   const [userResponse, groupResponse, attributeResult, connectionResult, sharedModelResult, extensionModelResult] = await Promise.all([
     listAllUsers(baseUrl, apiKey, { pageSize: 100, maxPages: 200, signal: scope.signal }),
     listAllGroups(baseUrl, apiKey, { pageSize: 100, maxPages: 200, signal: scope.signal }),
     referencedAttributes.size > 0
       ? listUserAttributes(baseUrl, apiKey, { signal: scope.signal }).then((payload) => ({ payload, error: null })).catch((error: unknown) => ({ payload: null, error }))
       : Promise.resolve({ payload: null, error: null }),
-    roleRecords.length > 0 ? listConnections(baseUrl, apiKey, { forceRefresh: true, signal: scope.signal }) : Promise.resolve(null),
-    roleRecords.length > 0
+    roleRecords.length > 0 ? readIdentityImportConnections(baseUrl, apiKey, scope.signal) : Promise.resolve(null),
+    hasModelScopedRoleRecords
       ? listModels(baseUrl, apiKey, { modelKind: PERMISSION_MODEL_KINDS[0], allPages: true, pageSize: 100, forceRefresh: true, signal: scope.signal })
       : Promise.resolve(null),
-    roleRecords.length > 0
+    hasModelScopedRoleRecords
       ? listModels(baseUrl, apiKey, { modelKind: PERMISSION_MODEL_KINDS[1], allPages: true, pageSize: 100, forceRefresh: true, signal: scope.signal })
       : Promise.resolve(null),
   ]);
@@ -1256,25 +1372,33 @@ export async function preflightIdentityImport(
     const key = normalizedKey(group.displayName);
     groupsByName.set(key, [...(groupsByName.get(key) || []), group]);
   });
+  const preflightAssertActive = () => {
+    if (scope.signal?.aborted || (scope.isActive && !scope.isActive())) throw new Error('cancelled');
+  };
 
-  const referencedExistingGroups = [...new Set(
-    plan.records
-      .filter((record): record is Extract<IdentityImportRecord, { type: 'membership' }> => record.type === 'membership')
-      .flatMap((record) => (groupsByName.get(normalizedKey(record.groupName)) || []).map((group) => group.id)),
-  )];
-  if (referencedExistingGroups.length > 0) {
-    reportProgress('Groups', `Checking ${referencedExistingGroups.length} group memberships...`);
-    await new Promise((resolve) => setTimeout(resolve, 300));
-  }
-  const detailedGroups = await mapWithConcurrency(referencedExistingGroups, 1, async (groupId) => {
-    if (!isOmniId(groupId)) throw new Error('Omni returned an invalid group identifier for a referenced membership.');
-    const detail = await withRateLimitRetry(
-      () => getGroup(baseUrl, apiKey, groupId, { signal: scope.signal }),
-      () => { if (scope.isActive && !scope.isActive()) throw new Error('cancelled'); },
-    );
-    const listed = listedGroups.find((group) => group.id === groupId);
-    return parseDetailedGroup(detail, { id: groupId, ...(listed ? { name: listed.displayName } : {}) });
-  });
+  const detailedGroups = (await mapWithConcurrency(
+    [...membershipGroups.entries()],
+    1,
+    async ([groupKey, groupName]) => {
+      emitProgress('Groups', `Checking membership evidence for ${groupName}...`);
+      const referencedGroupIds = [...new Set(
+        (groupsByName.get(groupKey) || []).map((group) => group.id),
+      )];
+      const details = await mapWithConcurrency(referencedGroupIds, 1, async (groupId) => {
+        if (!isOmniId(groupId)) throw new Error('Omni returned an invalid group identifier for a referenced membership.');
+        const detail = await withRateLimitRetry(
+          () => getGroup(baseUrl, apiKey, groupId, { signal: scope.signal }),
+          preflightAssertActive,
+          { signal: scope.signal },
+        );
+        const listed = listedGroups.find((group) => group.id === groupId);
+        return parseDetailedGroup(detail, { id: groupId, ...(listed ? { name: listed.displayName } : {}) });
+      }, { signal: scope.signal });
+      reportProgress('Groups', `Checked membership evidence for ${groupName}.`);
+      return details;
+    },
+    { signal: scope.signal },
+  )).flat();
   if (scope.isActive && !scope.isActive()) throw new Error('The selected Omni instance changed during preflight. Validate the import again.');
   const detailById = new Map(detailedGroups.map((group) => [group.id, group]));
   const groups = listedGroups.map((group) => detailById.get(group.id) || group);
@@ -1285,7 +1409,7 @@ export async function preflightIdentityImport(
   });
 
   const connections = roleRecords.length > 0 ? parseConnections(connectionResult) : [];
-  const models = roleRecords.length > 0 ? [...parseModels(sharedModelResult, 'SHARED'), ...parseModels(extensionModelResult, 'SHARED_EXTENSION')] : [];
+  const models = hasModelScopedRoleRecords ? [...parseModels(sharedModelResult, 'SHARED'), ...parseModels(extensionModelResult, 'SHARED_EXTENSION')] : [];
   if (new Set(models.map((model) => model.id)).size !== models.length) {
     throw new Error('Omni returned duplicate model identities across the permission inventories.');
   }
@@ -1450,41 +1574,49 @@ export async function preflightIdentityImport(
     roleTargetsByUser.set(key, [...(roleTargetsByUser.get(key) || []), target]);
   }
   const currentRolesByEmail = new Map<string, UserModelRoleRecord[]>();
-  const preflightAssertActive = () => { if (scope.isActive && !scope.isActive()) throw new Error('cancelled'); };
-  if (roleTargetsByUser.size > 0) {
-    reportProgress('Roles', `Checking current roles for ${roleTargetsByUser.size} users...`);
-    await new Promise((resolve) => setTimeout(resolve, 500));
+  if (roleUsers.size > 0) {
+    emitProgress('Roles', `Checking current roles for ${roleUsers.size} users...`);
   }
   let roleUsersChecked = 0;
-  await mapWithConcurrency([...roleTargetsByUser.entries()], 1, async ([emailKey, targets]) => {
-    const userMatches = usersByEmail.get(emailKey) || [];
-    if (userMatches.length === 0) {
-      if (!plannedUsers.has(emailKey)) issues.push({ severity: 'error', rowNumber: targets[0].rowNumbers[0], message: `${targets[0].email} is not in Omni and has no user add row.` });
-      currentRolesByEmail.set(emailKey, []);
-      return;
+  await mapWithConcurrency([...roleUsers.entries()], 1, async ([emailKey, email]) => {
+    emitProgress('Roles', `Checking current roles for ${email}...`);
+    const targets = roleTargetsByUser.get(emailKey) || [];
+    try {
+      if (targets.length === 0) {
+        currentRolesByEmail.set(emailKey, []);
+        return;
+      }
+      const userMatches = usersByEmail.get(emailKey) || [];
+      if (userMatches.length === 0) {
+        if (!plannedUsers.has(emailKey)) issues.push({ severity: 'error', rowNumber: targets[0].rowNumbers[0], message: `${targets[0].email} is not in Omni and has no user add row.` });
+        currentRolesByEmail.set(emailKey, []);
+        return;
+      }
+      if (userMatches.length !== 1) return;
+      if (!isOmniId(userMatches[0].id)) {
+        currentRolesByEmail.set(emailKey, []);
+        return;
+      }
+      const scopes = new Map<string, { connectionId: string }>();
+      targets.forEach((target) => {
+        scopes.set(target.connectionId, { connectionId: target.connectionId });
+      });
+      const responses = await mapWithConcurrency([...scopes.values()], 1, (targetScope) => withRateLimitRetry(
+        () => listUserModelRoles(
+          baseUrl,
+          apiKey,
+          userMatches[0].id,
+          { ...targetScope, signal: scope.signal },
+        ),
+        preflightAssertActive,
+        { signal: scope.signal },
+      ), { delayMs: 350, signal: scope.signal });
+      currentRolesByEmail.set(emailKey, responses.flatMap((response) => response.results));
+    } finally {
+      roleUsersChecked += 1;
+      reportProgress('Roles', `Checked role evidence for ${roleUsersChecked}/${roleUsers.size} users.`);
     }
-    if (userMatches.length !== 1) return;
-    if (!isOmniId(userMatches[0].id)) {
-      currentRolesByEmail.set(emailKey, []);
-      return;
-    }
-    const scopes = new Map<string, { connectionId: string }>();
-    targets.forEach((target) => {
-      scopes.set(target.connectionId, { connectionId: target.connectionId });
-    });
-    const responses = await mapWithConcurrency([...scopes.values()], 1, (targetScope) => withRateLimitRetry(
-      () => listUserModelRoles(
-        baseUrl,
-        apiKey,
-        userMatches[0].id,
-        { ...targetScope, signal: scope.signal },
-      ),
-      preflightAssertActive,
-    ), { delayMs: 350 });
-    currentRolesByEmail.set(emailKey, responses.flatMap((response) => response.results));
-    roleUsersChecked += 1;
-    onProgress?.({ completed: completedSteps + roleUsersChecked, total: totalSteps, stage: 'Roles', message: `Checked ${roleUsersChecked}/${roleTargetsByUser.size} users...` });
-  }, { delayMs: 350 });
+  }, { delayMs: 350, signal: scope.signal });
   if (scope.isActive && !scope.isActive()) throw new Error('The selected Omni instance changed during preflight. Validate the import again.');
 
   const roleChanges: ResolvedIdentityRoleChange[] = [];
@@ -1580,8 +1712,12 @@ export function buildGroupMembershipPatch(additions: ScimMember[], removals: str
   return { schemas: [PATCH_SCHEMA], Operations: operations };
 }
 
-async function withRateLimitRetry<T>(operation: () => Promise<T>, assertActive: () => void, options?: { maxAttempts?: number }): Promise<T> {
-  const maxAttempts = options?.maxAttempts || 8;
+async function withRateLimitRetry<T>(
+  operation: () => Promise<T>,
+  assertActive: () => void,
+  options?: { maxAttempts?: number; signal?: AbortSignal },
+): Promise<T> {
+  const maxAttempts = options?.maxAttempts || 3;
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     assertActive();
@@ -1589,10 +1725,9 @@ async function withRateLimitRetry<T>(operation: () => Promise<T>, assertActive: 
       return await operation();
     } catch (error) {
       lastError = error;
-      const message = error instanceof Error ? error.message : String(error);
-      if (!/\b429\b|rate.?limit/i.test(message) || attempt === maxAttempts - 1) throw error;
-      const baseDelay = attempt < 2 ? 2000 : 5000;
-      await new Promise((resolve) => setTimeout(resolve, baseDelay * (2 ** Math.min(attempt, 3))));
+      if (!(error instanceof ApiError) || error.status !== 429 || attempt === maxAttempts - 1) throw error;
+      await waitForIdentityImport(Math.min(1_000 * (2 ** attempt), 4_000), options?.signal);
+      assertActive();
     }
   }
   throw lastError;
@@ -1622,7 +1757,25 @@ export async function executeIdentityImport(
   };
   assertActive();
   if (preflight.issues.some((issue) => issue.severity === 'error')) throw new Error('Resolve preflight errors before running the import.');
-  const fresh = await preflightIdentityImport(baseUrl, apiKey, preflight.plan, scope);
+  const revalidationTotal = identityImportPreflightProgressTotal(preflight.plan);
+  const applyTotal = identityImportApplyProgressTotal(preflight);
+  const total = revalidationTotal + applyTotal;
+  let completed = 0;
+  onProgress?.({
+    completed,
+    total,
+    stage: 'Revalidating',
+    message: `Refreshing identity evidence for ${scope.label} before the first change...`,
+  });
+  const fresh = await preflightIdentityImport(baseUrl, apiKey, preflight.plan, scope, (progress) => {
+    completed = progress.completed;
+    onProgress?.({
+      completed,
+      total,
+      stage: 'Revalidating',
+      message: `${progress.stage}: ${progress.message}`,
+    });
+  });
   assertActive();
   if (fresh.issues.some((issue) => issue.severity === 'error')) throw new Error('The live identity inventory changed. Review a fresh preflight before continuing.');
   if (fresh.executionFingerprint !== preflight.executionFingerprint) {
@@ -1638,16 +1791,24 @@ export async function executeIdentityImport(
   const groupsToEnsure = fresh.plan.records.filter((record): record is Extract<IdentityImportRecord, { type: 'group' }> => record.type === 'group');
   const memberships = fresh.plan.records.filter((record): record is Extract<IdentityImportRecord, { type: 'membership' }> => record.type === 'membership');
   const userDeletes = fresh.plan.records.filter((record): record is UserDeleteRecord => record.type === 'user' && record.action === 'delete');
-  const membershipGroups = new Set(memberships.map((record) => normalizedKey(record.groupName)));
-  const total = groupsToEnsure.length + userUpserts.length + membershipGroups.size + fresh.roleChanges.length + userDeletes.length;
-  let completed = 0;
+  completed = revalidationTotal;
+  onProgress?.({
+    completed,
+    total,
+    stage: 'Applying',
+    message: applyTotal === 0 ? 'No changes are required.' : `Current evidence confirmed. Processing ${applyTotal} apply step${applyTotal === 1 ? '' : 's'}...`,
+  });
+  function begin(stage: string, message: string) {
+    onProgress?.({ completed, total, stage: `Applying ${stage.toLowerCase()}`, message });
+  }
   function report(stage: string, message: string) {
     completed += 1;
-    onProgress?.({ completed, total, stage, message });
+    onProgress?.({ completed, total, stage: `Applying ${stage.toLowerCase()}`, message });
   }
 
   for (const record of groupsToEnsure) {
     assertActive();
+    begin('Groups', `Ensuring group ${record.groupName}...`);
     const key = normalizedKey(record.groupName);
     const existing = groupsByName.get(key);
     if (existing) {
@@ -1656,9 +1817,13 @@ export async function executeIdentityImport(
       continue;
     }
     try {
-      const response = await withRateLimitRetry(() => createGroup(baseUrl, apiKey, { displayName: record.groupName, members: [] }, { signal: scope.signal }), assertActive);
+      const response = await createGroup(baseUrl, apiKey, { displayName: record.groupName, members: [] }, { signal: scope.signal });
       if (!isOmniId(response.id)) throw new Error('Omni did not return a valid group ID.');
-      const verified = parseDetailedGroup(await getGroup(baseUrl, apiKey, response.id, { signal: scope.signal }), { id: response.id, name: record.groupName });
+      const verified = parseDetailedGroup(await withRateLimitRetry(
+        () => getGroup(baseUrl, apiKey, response.id, { signal: scope.signal }),
+        assertActive,
+        { signal: scope.signal },
+      ), { id: response.id, name: record.groupName });
       assertActive();
       groupsByName.set(key, verified);
       results.push({ status: 'succeeded', stage: 'group', field: 'group', target: record.groupName, message: `Created group ${record.groupName}.`, rowNumbers: record.rowNumbers });
@@ -1671,6 +1836,7 @@ export async function executeIdentityImport(
 
   for (const record of userUpserts) {
     assertActive();
+    begin('Users', `Applying user changes for ${record.email}...`);
     const key = normalizedKey(record.email);
     const existing = usersByEmail.get(key);
     try {
@@ -1681,21 +1847,29 @@ export async function executeIdentityImport(
           if (fieldResults.length > 0) results.push(...fieldResults);
           else results.push({ status: 'skipped', stage: 'user', field: 'user', target: record.email, message: `${record.email} already exists.`, rowNumbers: record.rowNumbers });
         } else {
-          await withRateLimitRetry(() => updateUser(baseUrl, apiKey, existing.id, mutation.patch, { signal: scope.signal }), assertActive);
-          const verified = await withRateLimitRetry(() => readExactUser(baseUrl, apiKey, record.email, existing.id, scope.signal), assertActive);
+          await updateUser(baseUrl, apiKey, existing.id, mutation.patch, { signal: scope.signal });
+          const verified = await withRateLimitRetry(
+            () => readExactUser(baseUrl, apiKey, record.email, existing.id, scope.signal),
+            assertActive,
+            { signal: scope.signal },
+          );
           assertActive();
           if (!appliedUserPatchMatches(mutation.patch, verified)) throw new Error('OmniKit could not verify the requested user completion.');
           usersByEmail.set(key, verified);
           results.push(...completedExistingUserFieldResults(record, existing));
         }
       } else {
-        const response = await withRateLimitRetry(() => createUser(baseUrl, apiKey, {
+        const response = await createUser(baseUrl, apiKey, {
           userName: record.email,
           displayName: record.displayName,
           ...(Object.keys(record.attributes).length > 0 ? { [USER_ATTRIBUTE_URN]: record.attributes } : {}),
-        }, { signal: scope.signal }), assertActive);
+        }, { signal: scope.signal });
         if (!isOmniId(response.id)) throw new Error('Omni did not return a valid user ID.');
-        const verified = await withRateLimitRetry(() => readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal), assertActive);
+        const verified = await withRateLimitRetry(
+          () => readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal),
+          assertActive,
+          { signal: scope.signal },
+        );
         assertActive();
         if (!requestedUserValuesMatch(record, verified)) throw new Error('OmniKit could not verify the requested new-user values.');
         usersByEmail.set(key, verified);
@@ -1735,6 +1909,7 @@ export async function executeIdentityImport(
   });
   for (const [groupKey, groupRecords] of membershipsByGroup) {
     assertActive();
+    begin('Memberships', `Applying membership changes for ${groupRecords[0].groupName}...`);
     let group = groupsByName.get(groupKey);
     if (!group || failedGroups.has(groupKey)) {
       groupRecords.forEach((record) => results.push({ status: record.action === 'remove' ? 'skipped' : 'failed', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`, message: `Group ${record.groupName} is unavailable.`, rowNumbers: record.rowNumbers }));
@@ -1744,7 +1919,11 @@ export async function executeIdentityImport(
     let pendingOnFailure = groupRecords;
     try {
       if (fresh.inventory.groups.some((candidate) => candidate.id === group?.id)) {
-        group = parseDetailedGroup(await withRateLimitRetry(() => getGroup(baseUrl, apiKey, group!.id, { signal: scope.signal }), assertActive), { id: group.id, name: group.displayName });
+        group = parseDetailedGroup(await withRateLimitRetry(
+          () => getGroup(baseUrl, apiKey, group!.id, { signal: scope.signal }),
+          assertActive,
+          { signal: scope.signal },
+        ), { id: group.id, name: group.displayName });
       }
       const existingMemberIds = new Set((group.members || []).map((member) => member.value));
       const additions: ScimMember[] = [];
@@ -1776,8 +1955,12 @@ export async function executeIdentityImport(
       const patch = buildGroupMembershipPatch(additions, removals);
       if (patch) {
         assertActive();
-        await withRateLimitRetry(() => patchGroup(baseUrl, apiKey, group!.id, patch, { signal: scope.signal }), assertActive);
-        const verified = parseDetailedGroup(await withRateLimitRetry(() => getGroup(baseUrl, apiKey, group!.id, { signal: scope.signal }), assertActive), { id: group!.id, name: group!.displayName });
+        await patchGroup(baseUrl, apiKey, group!.id, patch, { signal: scope.signal });
+        const verified = parseDetailedGroup(await withRateLimitRetry(
+          () => getGroup(baseUrl, apiKey, group!.id, { signal: scope.signal }),
+          assertActive,
+          { signal: scope.signal },
+        ), { id: group!.id, name: group!.displayName });
         assertActive();
         const verifiedIds = new Set(verified.members!.map((member) => member.value));
         if (additions.some((member) => !verifiedIds.has(member.value)) || removals.some((id) => verifiedIds.has(id))) throw new Error('OmniKit could not verify the group membership update.');
@@ -1795,12 +1978,12 @@ export async function executeIdentityImport(
       pendingOnFailure.forEach((record) => results.push({ status: 'failed', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`, message: `Membership outcome is unverified. Refresh and validate before retrying: ${error instanceof Error ? error.message : String(error)}`, rowNumbers: record.rowNumbers }));
     }
     report('Memberships', groupRecords[0].groupName);
-    await new Promise((resolve) => setTimeout(resolve, 300));
   }
 
   for (const change of fresh.roleChanges) {
     assertActive();
     const target = `${change.email} → ${change.connectionName}${change.modelName ? ` / ${change.modelName}` : ''}`;
+    begin('Roles', `Applying role change for ${target}...`);
     if (change.disposition !== 'add') {
       results.push({ status: change.disposition === 'unsupported' ? 'failed' : 'skipped', stage: 'role', field: 'role', target, message: change.message, rowNumbers: change.rowNumbers });
       report('Roles', target);
@@ -1813,11 +1996,11 @@ export async function executeIdentityImport(
       continue;
     }
     try {
-      const assignment = await withRateLimitRetry(() => assignUserModelRole(baseUrl, apiKey, user.id, {
+      const assignment = await assignUserModelRole(baseUrl, apiKey, user.id, {
         roleName: change.roleName,
         connectionId: change.connectionId,
         ...(change.modelId ? { modelId: change.modelId } : {}),
-      }, { signal: scope.signal }), assertActive);
+      }, { signal: scope.signal });
       const resolvedRoles = assignment.results.filter((role) => (
         role.resolved === true
         && role.connectionId === change.connectionId
@@ -1856,7 +2039,6 @@ export async function executeIdentityImport(
           rowNumbers: change.rowNumbers,
         });
         report('Roles', target);
-        await new Promise((resolve) => setTimeout(resolve, 300));
         continue;
       }
       results.push({
@@ -1871,11 +2053,11 @@ export async function executeIdentityImport(
       results.push({ status: 'failed', stage: 'role', field: 'role', target, message: `Role assignment outcome is unverified. Refresh and validate before retrying: ${error instanceof Error ? error.message : String(error)}`, rowNumbers: change.rowNumbers });
     }
     report('Roles', target);
-    await new Promise((resolve) => setTimeout(resolve, 300));
   }
 
   for (const record of userDeletes) {
     assertActive();
+    begin('Deprovisioning', `Revoking organization membership for ${record.email}...`);
     const key = normalizedKey(record.email);
     const user = usersByEmail.get(key);
     if (!user) {
@@ -1890,7 +2072,11 @@ export async function executeIdentityImport(
     }
     try {
       await deleteUser(baseUrl, apiKey, user.id, { signal: scope.signal });
-      const verification = await findUserByEmail(baseUrl, apiKey, record.email, { signal: scope.signal });
+      const verification = await withRateLimitRetry(
+        () => findUserByEmail(baseUrl, apiKey, record.email, { signal: scope.signal }),
+        assertActive,
+        { signal: scope.signal },
+      );
       if ((verification.Resources || []).length !== 0 || verification.totalResults !== 0) {
         throw new Error('Omni still returns this user after the deprovisioning request.');
       }
@@ -1899,7 +2085,11 @@ export async function executeIdentityImport(
     } catch (error) {
       let reconciled = false;
       try {
-        const verification = await findUserByEmail(baseUrl, apiKey, record.email, { signal: scope.signal });
+        const verification = await withRateLimitRetry(
+          () => findUserByEmail(baseUrl, apiKey, record.email, { signal: scope.signal }),
+          assertActive,
+          { signal: scope.signal },
+        );
         reconciled = (verification.Resources || []).length === 0 && verification.totalResults === 0;
       } catch {
         reconciled = false;

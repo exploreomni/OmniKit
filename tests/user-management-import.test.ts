@@ -6,6 +6,7 @@ import manageUsers from '../server/handlers/manage-users';
 import {
   buildGroupMembershipPatch,
   executeIdentityImport,
+  identityImportPreflightProgressTotal,
   parseIdentityImportCsv,
   preflightIdentityImport,
 } from '../src/services/userManagement/bulkIdentityImport';
@@ -178,6 +179,60 @@ test('simple identity CSV accepts a blank model for Restricted Querier adds', ()
   assert.equal(role.roleName, 'QUERY_TOPICS');
   assert.deepEqual(role.connectionNames, ['Warehouse A', 'Warehouse B']);
   assert.deepEqual(role.modelNames, []);
+});
+
+test('simple identity CSV ignores model values for connection-scoped Connection Admin assignments', () => {
+  const plan = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'add,Casey Doe,casey@example.com,,Connection Admin,"Warehouse A, Warehouse B","Core A, Core B"',
+  ].join('\n'));
+
+  assert.equal(plan.issues.filter((issue) => issue.severity === 'error').length, 0);
+  const warning = plan.issues.find((issue) => issue.severity === 'warning' && issue.rowNumber === 2);
+  assert.ok(warning);
+  assert.match(warning.message, /2 model values were ignored/i);
+  assert.match(warning.message, /named connections remain the target/i);
+
+  const role = plan.records.find((record) => record.type === 'role');
+  assert.ok(role && role.type === 'role');
+  assert.equal(role.roleName, 'CONNECTION_ADMIN');
+  assert.deepEqual(role.connectionNames, ['Warehouse A', 'Warehouse B']);
+  assert.deepEqual(role.modelNames, []);
+
+  assert.equal(plan.previewRows.length, 1);
+  assert.deepEqual(plan.previewRows[0].connections, ['Warehouse A', 'Warehouse B']);
+  assert.deepEqual(plan.previewRows[0].models, []);
+});
+
+test('Connection Admin-only preflight resolves supplied models to connection scope without model inventory reads', async (t) => {
+  const baseUrl = 'https://connection-admin-scope.example.omniapp.co';
+  const requests = installIdentityImportApiMock(t, {
+    baseUrl,
+    connections: [{ id: 'connection-a', name: 'Warehouse A', deletedAt: null }],
+    models: [],
+  });
+  const plan = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'add,Casey Doe,casey@example.com,,Connection Admin,Warehouse A,Core Analytics',
+  ].join('\n'));
+
+  const preflight = await preflightIdentityImport(baseUrl, 'connection-admin-scope-key', plan, {
+    key: 'connection-admin-scope',
+    label: 'Connection Admin scope',
+  });
+
+  assert.equal(preflight.issues.filter((issue) => issue.severity === 'error').length, 0);
+  assert.equal(preflight.changes.roleAdds, 1);
+  assert.deepEqual(preflight.roleChanges.map((change) => ({
+    connectionId: change.connectionId,
+    modelId: change.modelId,
+    roleName: change.roleName,
+  })), [{
+    connectionId: 'connection-a',
+    modelId: undefined,
+    roleName: 'CONNECTION_ADMIN',
+  }]);
+  assert.equal(requests.filter((request) => request.url === '/api/list-models').length, 0);
 });
 
 test('preflight expands a blank Restricted Querier model to every current permission model on selected connections', async (t) => {
@@ -384,7 +439,14 @@ test('execution overwrites an existing direct No Access role with Restricted Que
   assert.equal(preflight.roleChanges[0].disposition, 'add');
   assert.match(preflight.roleChanges[0].message, /Overwrite existing NO_ACCESS with Restricted Querier/i);
 
-  const results = await executeIdentityImport(baseUrl, 'blank-model-no-access-key', preflight, undefined, scope);
+  const progress: Array<{ completed: number; total: number; stage: string; message: string }> = [];
+  const results = await executeIdentityImport(
+    baseUrl,
+    'blank-model-no-access-key',
+    preflight,
+    (next) => progress.push(next),
+    scope,
+  );
 
   const roleResult = results.find((result) => result.stage === 'role');
   assert.ok(roleResult);
@@ -394,6 +456,15 @@ test('execution overwrites an existing direct No Access role with Restricted Que
   assert.equal(assignmentRequests.length, 1);
   assert.equal(assignmentRequests[0].body.role_name, 'QUERY_TOPICS');
   assert.equal(assignmentRequests[0].body.model_id, 'model-shared-a');
+  assert.equal(progress[0]?.completed, 0);
+  assert.ok((progress[0]?.total || 0) > 1);
+  assert.equal(new Set(progress.map((entry) => entry.total)).size, 1);
+  assert.ok(progress.some((entry) => entry.stage === 'Revalidating'));
+  assert.ok(progress.some((entry) => entry.stage === 'Applying roles' && /Applying role change/i.test(entry.message)));
+  progress.slice(1).forEach((entry, index) => {
+    assert.ok(entry.completed >= progress[index].completed, 'progress must never move backward');
+  });
+  assert.equal(progress.at(-1)?.completed, progress.at(-1)?.total);
 });
 
 test('execution does not report a same-base custom role as exact Restricted Querier verification', async (t) => {
@@ -518,6 +589,49 @@ test('conflicting operations block an identity import while exact duplicates are
   assert.equal(plan.records.length, 1);
   assert.match(plan.issues.find((issue) => issue.severity === 'warning')?.message || '', /Duplicate membership add/);
   assert.match(plan.issues.find((issue) => issue.severity === 'error')?.message || '', /Conflicting membership actions/);
+});
+
+test('duplicate group setup is summarized once per group with all source rows', () => {
+  const plan = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'add,User One,one@example.com,Operations,,,',
+    'add,User Two,two@example.com,operations,,,',
+    'add,User Three,three@example.com,Operations,,,',
+    'add,User Four,four@example.com,Product,,,',
+    'add,User Five,five@example.com,Product,,,',
+  ].join('\n'));
+
+  const groupRecords = plan.records.filter((record) => record.type === 'group');
+  assert.equal(groupRecords.length, 2);
+  assert.equal(plan.summary.groupsEnsured, 2);
+  assert.deepEqual(groupRecords.map((record) => ({
+    groupName: record.groupName,
+    rowNumbers: record.rowNumbers,
+  })), [
+    { groupName: 'Operations', rowNumbers: [2, 3, 4] },
+    { groupName: 'Product', rowNumbers: [5, 6] },
+  ]);
+
+  const groupWarnings = plan.issues.filter((issue) => /merged into one group operation/i.test(issue.message));
+  assert.equal(groupWarnings.length, 2);
+  assert.deepEqual(groupWarnings.map((issue) => ({
+    rowNumber: issue.rowNumber,
+    rowNumbers: issue.rowNumbers,
+    message: issue.message,
+  })), [
+    {
+      rowNumber: 2,
+      rowNumbers: [2, 3, 4],
+      message: '3 rows referencing group Operations were merged into one group operation.',
+    },
+    {
+      rowNumber: 5,
+      rowNumbers: [5, 6],
+      message: '2 rows referencing group Product were merged into one group operation.',
+    },
+  ]);
+  assert.equal(plan.records.filter((record) => record.type === 'membership').length, 5);
+  assert.equal(identityImportPreflightProgressTotal(plan), 3);
 });
 
 test('group membership patches batch additions and targeted removals without replacing unrelated members', () => {

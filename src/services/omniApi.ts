@@ -2244,6 +2244,7 @@ export async function assignUserModelRole(
   }
   if (input.roleName === 'CONNECTION_ADMIN') {
     if (!scope.connectionId) throw new Error('connectionId is required for CONNECTION_ADMIN.');
+    if (scope.modelId) throw new Error('modelId is not permitted for CONNECTION_ADMIN.');
   } else if (!scope.modelId) {
     throw new Error('modelId is required for non-admin model roles.');
   }

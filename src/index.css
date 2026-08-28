@@ -1722,6 +1722,53 @@
     font-weight: 700;
   }
 
+  .identity-import-progress {
+    position: relative;
+    height: 10px;
+    overflow: hidden;
+    border: 1px solid rgba(95, 69, 80, 0.12);
+    border-radius: 999px;
+    background: #EEEAF0;
+  }
+
+  .identity-import-progress::after {
+    content: '';
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: 34%;
+    border-radius: inherit;
+    opacity: 0;
+    transform: translateX(-120%);
+    background: linear-gradient(90deg, transparent, rgba(158, 72, 112, 0.64), transparent);
+  }
+
+  .identity-import-progress-active.identity-import-progress-indeterminate::after {
+    opacity: 1;
+    animation: identityImportProgressIndeterminate 1.25s ease-in-out infinite;
+  }
+
+  .identity-import-progress-fill {
+    position: relative;
+    height: 100%;
+    min-width: 0;
+    overflow: hidden;
+    border-radius: inherit;
+    background: linear-gradient(90deg, #4D122C 0%, #9E4870 58%, #FF5FA2 100%);
+    box-shadow: 0 0 12px rgba(158, 72, 112, 0.2);
+    transition: width 320ms ease-out;
+  }
+
+  .identity-import-progress-fill > span {
+    position: absolute;
+    inset: 0;
+    transform: translateX(-110%);
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.72), transparent);
+  }
+
+  .identity-import-progress-fill-active > span {
+    animation: identityImportProgressSweep 1.45s ease-in-out infinite;
+  }
+
   .workflow-status-pill {
     display: inline-flex;
     align-items: center;
@@ -2322,6 +2369,16 @@
   100% { transform: translate3d(380px, 0, 0); opacity: 0; }
 }
 
+@keyframes identityImportProgressSweep {
+  0% { transform: translateX(-110%); }
+  65%, 100% { transform: translateX(110%); }
+}
+
+@keyframes identityImportProgressIndeterminate {
+  0% { transform: translateX(-120%); }
+  68%, 100% { transform: translateX(395%); }
+}
+
 @keyframes dustPuff {
   0%, 100% { transform: translate3d(0, 0, 0) scaleX(0.72); opacity: 0.28; }
   44% { transform: translate3d(-10px, -2px, 0) scaleX(1.1); opacity: 0.55; }
@@ -2456,6 +2513,8 @@
   .workflow-status-scan-beam,
   .workflow-status-route-file-motion,
   .workflow-status-moving-box-motion,
+  .identity-import-progress-active.identity-import-progress-indeterminate::after,
+  .identity-import-progress-fill-active > span,
   .workflow-status-label-stamp-motion,
   .workflow-status-detective,
   .workflow-status-search-motion,
@@ -2466,6 +2525,12 @@
   .dashboard-migration-launch-succeeded .dashboard-migration-launch-celebration span,
   .dashboard-migration-launch-succeeded .dashboard-migration-launch-rocket {
     animation: none !important;
+  }
+
+  .identity-import-progress-active.identity-import-progress-indeterminate::after {
+    width: 100%;
+    opacity: 0.42;
+    transform: none;
   }
 }
 

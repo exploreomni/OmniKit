@@ -18,6 +18,7 @@ interface WorkflowStatusSceneProps {
   detail?: string;
   statusLabel?: string;
   progressLabel?: string;
+  active?: boolean;
   compact?: boolean;
   className?: string;
 }
@@ -41,7 +42,7 @@ function DashboardTile({ className = '', style }: { className?: string; style?: 
   );
 }
 
-function SceneArt({ variant, reduced }: { variant: WorkflowStatusVariant; reduced: boolean }) {
+function SceneArt({ variant, reduced, active }: { variant: WorkflowStatusVariant; reduced: boolean; active: boolean }) {
   if (variant === 'health-scan') {
     return (
       <>
@@ -83,7 +84,7 @@ function SceneArt({ variant, reduced }: { variant: WorkflowStatusVariant; reduce
         {[0, 1, 2].map((index) => (
           <DashboardTile
             key={index}
-            className={reduced ? 'workflow-status-moving-box' : 'workflow-status-moving-box workflow-status-moving-box-motion'}
+            className={!active || reduced ? 'workflow-status-moving-box' : 'workflow-status-moving-box workflow-status-moving-box-motion'}
             style={{ animationDelay: `${index * 780}ms` }}
           />
         ))}
@@ -145,6 +146,7 @@ export function WorkflowStatusScene({
   detail,
   statusLabel,
   progressLabel,
+  active = true,
   compact = false,
   className = '',
 }: WorkflowStatusSceneProps) {
@@ -157,12 +159,12 @@ export function WorkflowStatusScene({
       aria-atomic="true"
     >
       <div className={`workflow-status-scene workflow-status-scene-${variant}`}>
-        <SceneArt variant={variant} reduced={reduced} />
+        <SceneArt variant={variant} reduced={reduced} active={active} />
       </div>
       <div className="workflow-status-copy">
         {statusLabel && (
           <div className="workflow-status-pill">
-            <span className={reduced ? '' : 'workflow-status-live-dot'} />
+            <span className={!active || reduced ? '' : 'workflow-status-live-dot'} />
             {statusLabel}
           </div>
         )}

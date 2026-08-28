@@ -2657,11 +2657,13 @@ test('omni-proxy screens outbound targets and refuses to follow credentialed red
   // and that it pins redirect handling like every other outbound call.
   let outboundCalls = 0;
   let observedRedirect: RequestRedirect | undefined;
+  let observedSignal: AbortSignal | null | undefined;
   let nextStatus = 200;
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
     outboundCalls += 1;
     observedRedirect = init?.redirect;
+    observedSignal = init?.signal;
     if (nextStatus >= 300 && nextStatus < 400) {
       return new Response(null, { status: nextStatus, headers: { Location: 'https://10.0.0.9/api/v1/folders' } });
     }
@@ -2692,6 +2694,7 @@ test('omni-proxy screens outbound targets and refuses to follow credentialed red
     assert.equal(allowed.status, 200);
     assert.equal(outboundCalls, 1);
     assert.equal(observedRedirect, 'manual', 'omni-proxy must pin redirect handling');
+    assert.ok(observedSignal instanceof AbortSignal, 'omni-proxy must forward request cancellation upstream');
 
     // A redirect is reported rather than followed, and rather than surfacing as
     // an uninterpretable empty 3xx body.

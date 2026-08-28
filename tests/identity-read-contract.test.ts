@@ -44,10 +44,12 @@ test('available list membership evidence avoids a redundant detail read and surv
 function identityHandlerRequest(
   route: 'manage-users' | 'manage-groups',
   body: Record<string, unknown>,
+  signal?: AbortSignal,
 ) {
   return new Request(`http://localhost/api/${route}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
+    signal,
     body: JSON.stringify({
       base_url: 'https://example.omniapp.co',
       api_key: 'private-api-key-marker',
@@ -702,6 +704,93 @@ test('identity handlers encode opaque path IDs and never forward upstream error 
   assert.equal(responseIndex, 4);
 });
 
+test('standard identity handlers bound upstream requests and return sanitized timeout evidence', async () => {
+  const cases = [
+    {
+      route: 'manage-users' as const,
+      code: 'USER_REQUEST_TIMEOUT',
+      invoke: manageUsersHandler,
+    },
+    {
+      route: 'manage-groups' as const,
+      code: 'GROUP_REQUEST_TIMEOUT',
+      invoke: manageGroupsHandler,
+    },
+  ];
+
+  for (const current of cases) {
+    let forwardedSignal: AbortSignal | null | undefined;
+    const response = await current.invoke(
+      identityHandlerRequest(current.route, { action: 'list' }),
+      {
+        timeoutMs: 5,
+        fetchImpl: async (_input, init) => {
+          forwardedSignal = init?.signal;
+          return await new Promise<Response>((_resolve, reject) => {
+            forwardedSignal?.addEventListener('abort', () => {
+              reject(new DOMException('private upstream timeout detail', 'AbortError'));
+            }, { once: true });
+          });
+        },
+      },
+    );
+
+    assert.equal(response.status, 504);
+    assert.equal(forwardedSignal?.aborted, true);
+    assert.deepEqual(await response.json(), {
+      error: `The Omni ${current.route === 'manage-users' ? 'user' : 'group'} request timed out.`,
+      code: current.code,
+    });
+  }
+});
+
+test('standard identity handlers propagate cancellation without exposing upstream details', async () => {
+  const cases = [
+    {
+      route: 'manage-users' as const,
+      code: 'USER_REQUEST_CANCELLED',
+      invoke: manageUsersHandler,
+    },
+    {
+      route: 'manage-groups' as const,
+      code: 'GROUP_REQUEST_CANCELLED',
+      invoke: manageGroupsHandler,
+    },
+  ];
+
+  for (const current of cases) {
+    const controller = new AbortController();
+    let markStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    const pendingResponse = current.invoke(
+      identityHandlerRequest(current.route, { action: 'list' }, controller.signal),
+      {
+        timeoutMs: 1_000,
+        fetchImpl: async (_input, init) => {
+          const signal = init?.signal;
+          markStarted?.();
+          return await new Promise<Response>((_resolve, reject) => {
+            signal?.addEventListener('abort', () => {
+              reject(new DOMException('private upstream cancellation detail', 'AbortError'));
+            }, { once: true });
+          });
+        },
+      },
+    );
+    await started;
+    controller.abort();
+    const response = await pendingResponse;
+
+    assert.equal(response.status, 499);
+    assert.deepEqual(await response.json(), {
+      error: `The Omni ${current.route === 'manage-users' ? 'user' : 'group'} request was cancelled.`,
+      code: current.code,
+    });
+  }
+});
+
 const ROLE_USER_ID = '11111111-1111-4111-8111-111111111111';
 const ROLE_MODEL_ID = '22222222-2222-4222-8222-222222222222';
 const ROLE_CONNECTION_ID = '33333333-3333-4333-8333-333333333333';
@@ -758,6 +847,39 @@ test('user model-role handler performs a strictly scoped and sanitized list read
     }],
   });
   assert.equal(JSON.stringify(payload).includes(PRIVATE_MARKER), false);
+});
+
+test('user model-role handler keeps its deadline active through a stalled response body', async () => {
+  let forwardedSignal: AbortSignal | null | undefined;
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'list_model_roles',
+    user_id: ROLE_USER_ID,
+    model_id: ROLE_MODEL_ID,
+    connection_id: ROLE_CONNECTION_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    timeoutMs: 5,
+    fetchImpl: async (_input, init) => {
+      forwardedSignal = init?.signal;
+      return new Response(new ReadableStream({
+        start(controller) {
+          forwardedSignal?.addEventListener('abort', () => {
+            controller.error(new DOMException('private stalled response detail', 'AbortError'));
+          }, { once: true });
+        },
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+  });
+
+  assert.equal(response.status, 504);
+  assert.equal(forwardedSignal?.aborted, true);
+  assert.deepEqual(await response.json(), {
+    error: 'The Omni user model-role request timed out.',
+    code: 'MODEL_ROLE_REQUEST_TIMEOUT',
+  });
 });
 
 test('user model-role handler never reflects malformed upstream field values in diagnostics', async () => {
@@ -874,6 +996,7 @@ test('user model-role handler validates assignment scope and verifies CONNECTION
     { action: 'list_model_roles', user_id: 'not/a/valid-id', model_id: ROLE_MODEL_ID },
     { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'QUERIER', connection_id: ROLE_CONNECTION_ID },
     { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'CONNECTION_ADMIN', model_id: ROLE_MODEL_ID },
+    { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'CONNECTION_ADMIN', model_id: ROLE_MODEL_ID, connection_id: ROLE_CONNECTION_ID },
     { action: 'assign_model_role', user_id: ROLE_USER_ID, role_name: 'ADMIN', model_id: ROLE_MODEL_ID },
   ]) {
     const rejected = await manageUsersHandler(identityHandlerRequest('manage-users', body), dependencies);
@@ -1051,6 +1174,14 @@ test('user model-role browser helpers preserve scope, cancellation, and validate
     modelId: ROLE_MODEL_ID,
     connectionId: ROLE_CONNECTION_ID,
   }, { signal: controller.signal });
+  await assert.rejects(
+    assignUserModelRole(BASE_URL, API_KEY, ROLE_USER_ID, {
+      roleName: 'CONNECTION_ADMIN',
+      modelId: ROLE_MODEL_ID,
+      connectionId: ROLE_CONNECTION_ID,
+    }, { signal: controller.signal }),
+    /modelId is not permitted for CONNECTION_ADMIN/i,
+  );
 
   assert.equal(listed.results[0]?.roleName, 'QUERIER');
   assert.equal(listed.membershipId, ROLE_MEMBERSHIP_ID);

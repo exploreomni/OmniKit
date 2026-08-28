@@ -93,6 +93,7 @@ export default async function handler(req: Request): Promise<Response> {
       // Every other outbound call in the codebase pins this. A redirecting host
       // must not be able to steer a credentialed request somewhere else.
       redirect: 'manual',
+      signal: req.signal,
     };
 
     if (body !== undefined && (method === "POST" || method === "PUT" || method === "PATCH")) {

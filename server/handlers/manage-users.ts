@@ -94,6 +94,7 @@ const USER_MODEL_ROLE_NAME_SET = new Set<string>(USER_MODEL_ROLE_NAMES);
 const OMNI_ID_PATTERN = /^[\w-]+$/;
 const MAX_MODEL_ROLE_RECORDS = 1_000;
 const MAX_MODEL_ROLE_RESPONSE_BYTES = 512 * 1024;
+const USER_REQUEST_TIMEOUT_MS = 15_000;
 const MODEL_ROLE_TIMEOUT_MS = 15_000;
 const MODEL_ROLE_VERIFICATION_DELAYS_MS = [0, 250, 750] as const;
 const RETRYABLE_MODEL_ROLE_VERIFICATION_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
@@ -119,6 +120,16 @@ class ModelRoleTransportError extends Error {
   }
 }
 
+class UserTransportError extends Error {
+  constructor(
+    readonly status: 499 | 504,
+    readonly code: "USER_REQUEST_CANCELLED" | "USER_REQUEST_TIMEOUT",
+  ) {
+    super(code);
+    this.name = "UserTransportError";
+  }
+}
+
 class ModelRoleUpstreamHttpError extends Error {
   constructor(readonly status: number) {
     super(`HTTP ${status}`);
@@ -132,6 +143,60 @@ function json(data: unknown, status = 200): Response {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+async function performUserRequest(
+  req: Request,
+  url: string,
+  init: RequestInit,
+  dependencies: ManageUsersDependencies,
+): Promise<Response> {
+  if (req.signal.aborted) {
+    throw new UserTransportError(499, "USER_REQUEST_CANCELLED");
+  }
+
+  const controller = new AbortController();
+  let timedOut = false;
+  let rejectBoundary: (reason: UserTransportError) => void = () => undefined;
+  const boundary = new Promise<never>((_resolve, reject) => {
+    rejectBoundary = reject;
+  });
+  const cancel = () => {
+    controller.abort(req.signal.reason);
+    rejectBoundary(new UserTransportError(499, "USER_REQUEST_CANCELLED"));
+  };
+  req.signal.addEventListener("abort", cancel, { once: true });
+  const timeout = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+    rejectBoundary(new UserTransportError(504, "USER_REQUEST_TIMEOUT"));
+  }, dependencies.timeoutMs ?? USER_REQUEST_TIMEOUT_MS);
+
+  const operation = (async () => {
+    const response = await (dependencies.fetchImpl || fetch)(url, {
+      ...init,
+      redirect: "manual",
+      signal: controller.signal,
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
+      return json({ error: `Omni user request failed with HTTP ${response.status}.` }, response.status);
+    }
+    if (response.status === 204) return json({ success: true });
+    return json(await response.json());
+  })();
+
+  try {
+    return await Promise.race([operation, boundary]);
+  } catch (error) {
+    if (error instanceof UserTransportError) throw error;
+    if (timedOut) throw new UserTransportError(504, "USER_REQUEST_TIMEOUT");
+    if (req.signal.aborted) throw new UserTransportError(499, "USER_REQUEST_CANCELLED");
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+    req.signal.removeEventListener("abort", cancel);
+  }
 }
 
 function isOmniId(value: unknown): value is string {
@@ -234,18 +299,20 @@ async function collectIdentityAccessEvidence(
       const url = new URL(`${cleanUrl}/api/scim/v2/users`);
       url.searchParams.set('count', String(count));
       url.searchParams.set('startIndex', String(startIndex));
-      const response = await fetchModelRoleUpstream(
+      return withModelRoleUpstreamResponse(
         req,
         url.toString(),
         { method: 'GET', headers: authHeaders },
         dependencies,
+        async (response) => {
+          if (!response.ok) {
+            await response.body?.cancel().catch(() => undefined);
+            throw new Error('The SCIM user collection could not be read.');
+          }
+          return readBoundedJson(response);
+        },
         evidenceSignal,
       );
-      if (!response.ok) {
-        await response.body?.cancel().catch(() => undefined);
-        throw new Error('The SCIM user collection could not be read.');
-      }
-      return readBoundedJson(response);
     }, signal)
   );
   return buildIdentityAccessEvidence(input, accessEvidenceReader(client, listStrictIdentityUsers), evidenceSignal);
@@ -279,6 +346,9 @@ function assignmentRole(body: RequestBody, scope: UserModelRoleScope): UserModel
     if (!scope.connectionId) {
       throw new ModelRoleRequestError("connection_id is required for CONNECTION_ADMIN.");
     }
+    if (scope.modelId) {
+      throw new ModelRoleRequestError("model_id is not permitted for CONNECTION_ADMIN.");
+    }
   } else if (!scope.modelId) {
     throw new ModelRoleRequestError("model_id is required for non-admin model roles.");
   }
@@ -304,13 +374,14 @@ function modelRoleUrl(cleanUrl: string, scope: UserModelRoleScope, includeScope 
   return url.toString();
 }
 
-async function fetchModelRoleUpstream(
+async function withModelRoleUpstreamResponse<T>(
   req: Request,
   url: string,
   init: RequestInit,
   dependencies: ManageUsersDependencies,
+  consume: (response: Response) => Promise<T>,
   operationSignal: AbortSignal = req.signal,
-): Promise<Response> {
+): Promise<T> {
   const assertSafeUrl = dependencies.assertSafeUrl
     || ((value: string) => assertSafeOutboundUrl(value, { label: "base_url" }));
   try {
@@ -318,24 +389,43 @@ async function fetchModelRoleUpstream(
   } catch {
     throw new ModelRoleTransportError(400, "MODEL_ROLE_OUTBOUND_REJECTED");
   }
+  if (operationSignal.aborted) {
+    throw new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED");
+  }
 
   const controller = new AbortController();
   let timedOut = false;
-  const forwardAbort = () => controller.abort(operationSignal.reason);
-  if (operationSignal.aborted) controller.abort(operationSignal.reason);
-  else operationSignal.addEventListener("abort", forwardAbort, { once: true });
+  let upstreamResponse: Response | undefined;
+  let rejectBoundary: (reason: ModelRoleTransportError) => void = () => undefined;
+  const boundary = new Promise<never>((_resolve, reject) => {
+    rejectBoundary = reject;
+  });
+  const forwardAbort = () => {
+    controller.abort(operationSignal.reason);
+    void upstreamResponse?.body?.cancel().catch(() => undefined);
+    rejectBoundary(new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED"));
+  };
+  operationSignal.addEventListener("abort", forwardAbort, { once: true });
   const timeout = setTimeout(() => {
     timedOut = true;
     controller.abort(new DOMException("The model-role request timed out.", "TimeoutError"));
+    void upstreamResponse?.body?.cancel().catch(() => undefined);
+    rejectBoundary(new ModelRoleTransportError(504, "MODEL_ROLE_REQUEST_TIMEOUT"));
   }, dependencies.timeoutMs ?? MODEL_ROLE_TIMEOUT_MS);
 
-  try {
-    return await (dependencies.fetchImpl || fetch)(url, {
+  const operation = (async () => {
+    upstreamResponse = await (dependencies.fetchImpl || fetch)(url, {
       ...init,
       redirect: "manual",
       signal: controller.signal,
     });
+    return consume(upstreamResponse);
+  })();
+
+  try {
+    return await Promise.race([operation, boundary]);
   } catch (error) {
+    if (error instanceof ModelRoleTransportError) throw error;
     if (timedOut) throw new ModelRoleTransportError(504, "MODEL_ROLE_REQUEST_TIMEOUT");
     if (operationSignal.aborted) throw new ModelRoleTransportError(499, "MODEL_ROLE_REQUEST_CANCELLED");
     throw error;
@@ -464,17 +554,19 @@ async function readModelRoles(
   scope: UserModelRoleScope,
   dependencies: ManageUsersDependencies,
 ): Promise<UserModelRoleListResponse> {
-  const response = await fetchModelRoleUpstream(
+  const payload = await withModelRoleUpstreamResponse(
     req,
     modelRoleUrl(cleanUrl, scope),
     { method: "GET", headers: authHeaders },
     dependencies,
+    async (response) => {
+      if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new ModelRoleUpstreamHttpError(response.status);
+      }
+      return readBoundedJson(response);
+    },
   );
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
-    throw new ModelRoleUpstreamHttpError(response.status);
-  }
-  const payload = await readBoundedJson(response);
   if (!isRecord(payload) || !Array.isArray(payload.results) || payload.results.length > MAX_MODEL_ROLE_RECORDS) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
@@ -594,26 +686,24 @@ export default async function handler(
       "Content-Type": "application/json",
     };
 
-    let response: Response;
+    let upstreamUrl = scimBase;
+    let upstreamInit: RequestInit;
 
     switch (action) {
       case "list": {
         const count = body.count || 100;
         const startIndex = body.start_index || 1;
-        response = await fetch(
-          `${scimBase}?count=${count}&startIndex=${startIndex}`,
-          { method: "GET", headers: authHeaders, redirect: "manual", signal: req.signal }
-        );
+        upstreamUrl = `${scimBase}?count=${count}&startIndex=${startIndex}`;
+        upstreamInit = { method: "GET", headers: authHeaders };
         break;
       }
 
       case "list_attributes": {
-        response = await fetch(`${cleanUrl}/api/v1/user-attributes`, {
+        upstreamUrl = `${cleanUrl}/api/v1/user-attributes`;
+        upstreamInit = {
           method: "GET",
           headers: authHeaders,
-          redirect: "manual",
-          signal: req.signal,
-        });
+        };
         break;
       }
 
@@ -624,10 +714,8 @@ export default async function handler(
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(
-          `${scimBase}?filter=${encodeURIComponent(`userName eq "${body.email}"`)}`,
-          { method: "GET", headers: authHeaders, redirect: "manual", signal: req.signal }
-        );
+        upstreamUrl = `${scimBase}?filter=${encodeURIComponent(`userName eq "${body.email}"`)}`;
+        upstreamInit = { method: "GET", headers: authHeaders };
         break;
       }
 
@@ -638,13 +726,11 @@ export default async function handler(
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(scimBase, {
+        upstreamInit = {
           method: "POST",
           headers: authHeaders,
           body: JSON.stringify(body.user_data),
-          redirect: "manual",
-          signal: req.signal,
-        });
+        };
         break;
       }
 
@@ -655,13 +741,12 @@ export default async function handler(
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(`${scimBase}/${encodeURIComponent(body.user_id)}`, {
+        upstreamUrl = `${scimBase}/${encodeURIComponent(body.user_id)}`;
+        upstreamInit = {
           method: "PUT",
           headers: authHeaders,
           body: JSON.stringify(body.user_data),
-          redirect: "manual",
-          signal: req.signal,
-        });
+        };
         break;
       }
 
@@ -672,19 +757,11 @@ export default async function handler(
             { status: 400, headers: jsonHeaders }
           );
         }
-        response = await fetch(`${scimBase}/${encodeURIComponent(body.user_id)}`, {
+        upstreamUrl = `${scimBase}/${encodeURIComponent(body.user_id)}`;
+        upstreamInit = {
           method: "DELETE",
           headers: authHeaders,
-          redirect: "manual",
-          signal: req.signal,
-        });
-
-        if (response.status === 204) {
-          return new Response(
-            JSON.stringify({ success: true }),
-            { headers: jsonHeaders }
-          );
-        }
+        };
         break;
       }
 
@@ -696,7 +773,7 @@ export default async function handler(
       case "assign_model_role": {
         const scope = modelRoleScope(body);
         const roleName = assignmentRole(body, scope);
-        const response = await fetchModelRoleUpstream(
+        const assignmentPayload = await withModelRoleUpstreamResponse(
           req,
           modelRoleUrl(cleanUrl, scope, false),
           {
@@ -709,13 +786,16 @@ export default async function handler(
             }),
           },
           dependencies,
+          async (response) => {
+            if (!response.ok) {
+              await response.body?.cancel().catch(() => undefined);
+              throw new ModelRoleUpstreamHttpError(response.status);
+            }
+            return readBoundedJson(response);
+          },
         );
-        if (!response.ok) {
-          await response.body?.cancel().catch(() => undefined);
-          throw new ModelRoleUpstreamHttpError(response.status);
-        }
         const assignment = parseModelRoleAssignmentProof(
-          await readBoundedJson(response),
+          assignmentPayload,
           scope,
           roleName,
         );
@@ -744,20 +824,7 @@ export default async function handler(
         );
     }
 
-    if (!response.ok) {
-      return new Response(
-        JSON.stringify({ error: `Omni user request failed with HTTP ${response.status}.` }),
-        { status: response.status, headers: jsonHeaders }
-      );
-    }
-    if (response.status === 204) {
-      return new Response(JSON.stringify({ success: true }), { headers: jsonHeaders });
-    }
-    const data = await response.json();
-    return new Response(JSON.stringify(data), {
-      status: 200,
-      headers: jsonHeaders,
-    });
+    return await performUserRequest(req, upstreamUrl, upstreamInit, dependencies);
   } catch (error) {
     if (error instanceof IdentityAccessEvidenceError) {
       return json({ error: error.message, code: error.code }, error.status);
@@ -782,6 +849,12 @@ export default async function handler(
     }
     if (error instanceof ModelRoleUpstreamHttpError) {
       return json({ error: `Omni user model-role request failed with HTTP ${error.status}.` }, error.status);
+    }
+    if (error instanceof UserTransportError) {
+      const message = error.code === "USER_REQUEST_TIMEOUT"
+        ? "The Omni user request timed out."
+        : "The Omni user request was cancelled.";
+      return json({ error: message, code: error.code }, error.status);
     }
     return new Response(JSON.stringify({ error: "The Omni user request could not be completed." }), {
       status: 500,

@@ -21,11 +21,13 @@ import {
   executeIdentityImport,
   IdentityImportExecutionStoppedError,
   IDENTITY_IMPORT_TEMPLATE,
+  identityImportExecutionProgressTotal,
   parseIdentityImportCsv,
   preflightIdentityImport,
   type IdentityImportPlan,
   type IdentityImportPreflight,
   type IdentityImportProgress,
+  type IdentityImportIssue,
   type IdentityImportResult,
 } from '@/services/userManagement/bulkIdentityImport';
 
@@ -67,6 +69,31 @@ function identityKey(value: string) {
   return value.trim().normalize('NFC').toLowerCase();
 }
 
+function issueRowLabel(issue: IdentityImportIssue): string {
+  const rows = [...new Set(
+    issue.rowNumbers?.length
+      ? issue.rowNumbers
+      : issue.rowNumber
+        ? [issue.rowNumber]
+        : [],
+  )].filter((row) => Number.isSafeInteger(row) && row > 0).sort((left, right) => left - right);
+  if (rows.length === 0) return '';
+  const ranges: string[] = [];
+  let start = rows[0];
+  let end = rows[0];
+  for (const row of rows.slice(1)) {
+    if (row === end + 1) {
+      end = row;
+      continue;
+    }
+    ranges.push(start === end ? String(start) : `${start}–${end}`);
+    start = row;
+    end = row;
+  }
+  ranges.push(start === end ? String(start) : `${start}–${end}`);
+  return `${rows.length === 1 ? 'Row' : 'Rows'} ${ranges.join(', ')}`;
+}
+
 function identityResultRows(
   scope: IdentityImportPreflight['scope'],
   results: IdentityImportResult[],
@@ -90,6 +117,7 @@ export function BulkIdentityImportPage() {
   const { connection } = useConnection();
   const { connectionKey, isActiveConnectionRequest } = useConnectionRequestGuard(connection);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const resultsSectionRef = useRef<HTMLElement>(null);
   const mountedRef = useRef(true);
   const fileReadRequestRef = useRef(0);
   const validationAbortRef = useRef<AbortController | null>(null);
@@ -276,7 +304,12 @@ export function BulkIdentityImportPage() {
     setRunning(true);
     setError('');
     setResults([]);
-    setProgress({ completed: 0, total: 1, stage: 'Starting', message: `Preparing changes for ${preflight.scope.label}` });
+    setProgress({
+      completed: 0,
+      total: identityImportExecutionProgressTotal(preflight),
+      stage: 'Revalidating',
+      message: `Refreshing identity evidence for ${preflight.scope.label} before the first change...`,
+    });
     try {
       const nextResults = await executeIdentityImport(
         connection.baseUrl,
@@ -342,11 +375,48 @@ export function BulkIdentityImportPage() {
     && !previewConsumed
     && !executionLockRef.current
   );
-  const completed = results.length > 0 && !running;
   const successfulResults = results.filter((result) => result.status === 'succeeded').length;
-  const failedResults = results.filter((result) => result.status === 'failed').length;
+  const failedResultEntries = useMemo(
+    () => results.filter((result) => result.status === 'failed'),
+    [results],
+  );
+  const displayedResults = useMemo(() => {
+    const rank: Record<IdentityImportResult['status'], number> = { failed: 0, skipped: 1, succeeded: 2 };
+    return [...results].sort((left, right) => rank[left.status] - rank[right.status]);
+  }, [results]);
+  const failedResults = failedResultEntries.length;
   const skippedResults = results.length - successfulResults - failedResults;
   const executionIncomplete = previewConsumed && Boolean(error);
+  const executionFinished = previewConsumed && !running && !validating && Boolean(progress);
+  const terminalNeedsReview = failedResults > 0 || executionIncomplete;
+  const firstFailure = failedResultEntries[0];
+  const progressPercent = progress
+    ? progress.completed >= progress.total
+      ? 100
+      : Math.min(99, Math.max(progress.completed > 0 ? 1 : 0, Math.floor((progress.completed / Math.max(1, progress.total)) * 100)))
+    : 0;
+  const revalidatingExecution = running && progress?.stage === 'Revalidating';
+  const terminalSummary = executionIncomplete
+    ? results.length > 0
+      ? `Execution stopped after recording ${results.length} result entr${results.length === 1 ? 'y' : 'ies'}. ${error}`
+      : `Execution stopped before a result journal was returned. ${error}`
+    : failedResults > 0
+      ? `${failedResults} result${failedResults === 1 ? '' : 's'} need review. ${successfulResults} succeeded and ${skippedResults} skipped.`
+      : `Import finished with ${successfulResults} succeeded and ${skippedResults} skipped.`;
+  const workflowDetail = progress
+    ? running || validating
+      ? `${progress.stage}: ${progress.message}`
+      : terminalSummary
+    : validating
+      ? 'Connecting to Omni...'
+      : 'Preparing the import.';
+  const workflowProgressLabel = progress
+    ? running || validating
+      ? `${progress.completed}/${progress.total} steps complete · ${progressPercent}%`
+      : executionIncomplete
+        ? `${progress.completed}/${progress.total} steps processed before stopping`
+        : `Finished · ${successfulResults} succeeded · ${failedResults} failed · ${skippedResults} skipped`
+    : undefined;
 
   const deprovisionTargets = useMemo(() => {
     if (!preflight) return [];
@@ -368,8 +438,9 @@ export function BulkIdentityImportPage() {
   const issuesByRow = useMemo(() => {
     const next = new Map<number, typeof issues>();
     issues.forEach((issue) => {
-      if (!issue.rowNumber) return;
-      next.set(issue.rowNumber, [...(next.get(issue.rowNumber) || []), issue]);
+      const firstRow = issue.rowNumber || issue.rowNumbers?.[0];
+      if (!firstRow) return;
+      next.set(firstRow, [...(next.get(firstRow) || []), issue]);
     });
     return next;
   }, [issues]);
@@ -472,7 +543,7 @@ export function BulkIdentityImportPage() {
               Separate multiple group, connection, or model names with commas. Escape a literal comma as <code className="font-mono text-content-primary">{'\\,'}</code> and a literal backslash as <code className="font-mono text-content-primary">{'\\\\'}</code>. CSV quoting still applies around cells containing commas.
             </p>
             <p className="mt-1">
-              Roles are Viewer, Restricted Querier, Querier, Modeler, Connection Admin (or Admin), and No Access. Restricted Querier is sent to Omni as QUERY_TOPICS. Admin maps only to Connection Admin; Bulk Import never grants Organization Admin. Omni does not publish a role-clear operation, so remove rows that name a role are blocked rather than converted to No Access. A remove row with groups revokes only those memberships; a remove row with blank group and role revokes the user&apos;s Omni organization membership. Full deprovisioning requires the current display_name and an exact identity match. Supported legacy files remain accepted.
+              Roles are Viewer, Restricted Querier, Querier, Modeler, Connection Admin (or Admin), and No Access. Restricted Querier is sent to Omni as QUERY_TOPICS. Admin maps only to Connection Admin; Bulk Import never grants Organization Admin. Connection Admin is connection-scoped, so any supplied model values are ignored with a non-blocking warning and the named connections remain the targets. Omni does not publish a role-clear operation, so remove rows that name a role are blocked rather than converted to No Access. A remove row with groups revokes only those memberships; a remove row with blank group and role revokes the user&apos;s Omni organization membership. Full deprovisioning requires the current display_name and an exact identity match. Supported legacy files remain accepted.
             </p>
             <p className="mt-1">
               For an add row with Restricted Querier, leave model blank to assign the role to every current active shared model in each named connection. The preview expands and lists every model before execution. Models created later are not included automatically. Other model roles still require explicit model names.
@@ -711,7 +782,7 @@ export function BulkIdentityImportPage() {
                     ? <XCircle size={15} className="mt-0.5 shrink-0 text-red-600" />
                     : <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-600" />}
                   <span className={issue.severity === 'error' ? 'text-red-700' : 'text-amber-800'}>
-                    {issue.rowNumber ? `Row ${issue.rowNumber}: ` : ''}{issue.message}
+                    {issueRowLabel(issue) ? `${issueRowLabel(issue)}: ` : ''}{issue.message}
                   </span>
                 </div>
               ))}
@@ -771,39 +842,95 @@ export function BulkIdentityImportPage() {
         <section className="card bg-surface-secondary space-y-3">
           <WorkflowStatusScene
             variant="bulk-upload"
-            title={validating ? 'Validating identity inventory' : running ? 'Applying identity changes' : failedResults > 0 || executionIncomplete ? 'Identity import needs review' : 'Identity import complete'}
-            detail={progress ? `${progress.stage}: ${progress.message}` : validating ? 'Connecting to Omni...' : 'Preparing the import.'}
-            statusLabel={validating ? 'Checking' : running ? 'Running' : failedResults > 0 || executionIncomplete ? 'Needs review' : 'Complete'}
-            progressLabel={progress ? `${progress.completed}/${progress.total} checks complete` : undefined}
+            title={validating ? 'Validating identity inventory' : revalidatingExecution ? 'Revalidating approved changes' : running ? 'Applying identity changes' : terminalNeedsReview ? 'Identity import finished with review items' : 'Identity import complete'}
+            detail={workflowDetail}
+            statusLabel={validating || revalidatingExecution ? 'Checking' : running ? 'Running' : terminalNeedsReview ? 'Needs review' : 'Complete'}
+            progressLabel={workflowProgressLabel}
+            active={running || validating}
             compact
           />
           {progress && (
-            <div className="h-2 overflow-hidden rounded-full bg-gray-200">
+            <div
+              className={`identity-import-progress ${running || validating ? 'identity-import-progress-active' : ''} ${progress.completed === 0 ? 'identity-import-progress-indeterminate' : ''}`}
+              role="progressbar"
+              aria-label={`${progress.stage} progress`}
+              aria-valuemin={0}
+              aria-valuemax={progress.total}
+              aria-valuenow={progress.completed}
+              aria-valuetext={`${progress.completed} of ${progress.total} steps complete`}
+            >
               <div
-                className="h-full rounded-full bg-omni-700 transition-all duration-300"
-                style={{ width: `${Math.min(100, (progress.completed / Math.max(1, progress.total)) * 100)}%` }}
-              />
+                className={`identity-import-progress-fill ${running || validating ? 'identity-import-progress-fill-active' : ''}`}
+                style={{ width: `${progressPercent}%` }}
+              >
+                <span aria-hidden />
+              </div>
+            </div>
+          )}
+          {executionFinished && (
+            <div className={`rounded-lg border px-4 py-3 ${terminalNeedsReview ? 'border-amber-200 bg-amber-50' : 'border-green-200 bg-green-50'}`}>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                <div className="flex min-w-0 items-start gap-3">
+                  {terminalNeedsReview
+                    ? <AlertTriangle size={18} className="mt-0.5 shrink-0 text-amber-700" />
+                    : <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-green-700" />}
+                  <div className="min-w-0">
+                    <div className={`text-sm font-semibold ${terminalNeedsReview ? 'text-amber-900' : 'text-green-900'}`}>
+                      {executionIncomplete ? 'Execution stopped' : failedResults > 0 ? `${failedResults} result${failedResults === 1 ? '' : 's'} need review` : 'Import finished successfully'}
+                    </div>
+                    <p className={`mt-1 text-xs leading-5 ${terminalNeedsReview ? 'text-amber-800' : 'text-green-800'}`}>
+                      {terminalSummary}
+                    </p>
+                    {firstFailure && (
+                      <div className="mt-2 rounded-md border border-amber-200 bg-white/80 px-3 py-2 text-xs text-amber-900">
+                        <span className="font-semibold">First failure:</span>{' '}
+                        <span className="break-all">{firstFailure.target}</span>
+                        <span className="block mt-1 text-amber-800">{firstFailure.message}</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  aria-controls="identity-import-results"
+                  onClick={() => {
+                    const section = resultsSectionRef.current;
+                    if (!section) return;
+                    section.scrollIntoView({ block: 'start' });
+                    section.focus({ preventScroll: true });
+                  }}
+                  className="btn-secondary shrink-0 text-sm"
+                >
+                  {failedResults > 0 ? 'Review failures' : 'View results'}
+                </button>
+              </div>
             </div>
           )}
         </section>
       )}
 
-      {completed && (
-        <section className="card p-0 overflow-hidden">
+      {executionFinished && (
+        <section
+          id="identity-import-results"
+          ref={resultsSectionRef}
+          tabIndex={-1}
+          aria-labelledby="identity-import-results-heading"
+          className="card p-0 overflow-hidden scroll-mt-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-omni-500"
+        >
           <div className="px-5 py-4 border-b border-border flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-3">
               {failedResults > 0 || executionIncomplete
                 ? <AlertTriangle size={20} className="text-amber-600" />
                 : <CheckCircle2 size={20} className="text-green-700" />}
               <div>
-                <div className="text-sm font-semibold text-content-primary">Import results · {preflight?.scope.label || selectedInstanceLabel}</div>
+                <div id="identity-import-results-heading" className="text-sm font-semibold text-content-primary">Import results · {preflight?.scope.label || selectedInstanceLabel}</div>
                 <p className="mt-0.5 text-xs text-content-secondary">
                   {successfulResults} succeeded · {failedResults} failed · {skippedResults} skipped{executionIncomplete ? ' · execution stopped; review before retrying' : ''}
                 </p>
               </div>
             </div>
             <div className="flex gap-2">
-              <button type="button" onClick={exportResults} className="btn-secondary text-sm">
+              <button type="button" onClick={exportResults} disabled={results.length === 0} className="btn-secondary text-sm disabled:opacity-40">
                 <Download size={14} />
                 Export results
               </button>
@@ -822,7 +949,12 @@ export function BulkIdentityImportPage() {
             </div>
           </div>
           <div className="max-h-96 divide-y divide-border overflow-y-auto">
-            {results.map((result, index) => (
+            {results.length === 0 && (
+              <div className="px-5 py-4 text-xs leading-5 text-content-secondary">
+                {error || 'No result entries were produced because no changes were required.'}
+              </div>
+            )}
+            {displayedResults.map((result, index) => (
               <div key={`${result.stage}-${result.field}-${result.target}-${index}`} className="px-5 py-3 flex items-start gap-3 text-xs">
                 {result.status === 'succeeded'
                   ? <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-green-700" />
