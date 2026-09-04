@@ -41,7 +41,7 @@
     "test:governance-controls": "node --test tests/release-governance-controls.test.mjs",
     "test:instance-dashboard": "tsx --test tests/instance-dashboard.test.ts",
     "test:user-health": "tsx --test tests/user-health.test.ts",
-    "test:user-management": "tsx --test tests/user-management-import.test.ts",
+    "test:user-management": "tsx --test tests/user-management-import.test.ts tests/user-export.test.ts",
     "test:workspace-snapshot": "tsx --test tests/workspace-snapshot.test.ts",
     "test:portfolio-overview": "tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 tests/portfolio-overview.test.ts",
     "test:admin-collection-contract": "tsx --test tests/admin-collection-contract.test.ts",
