@@ -75,6 +75,39 @@ export interface SemanticBlueprintPlanBindings {
   actionOverrides: Record<string, SemanticArtifactAction>;
 }
 
+export function semanticBlueprintModelYamlInventoryIssues(
+  modelYaml: OmniModelYamlResponse | null | undefined,
+  authoredModelYaml?: OmniModelYamlResponse | null,
+): string[] {
+  if (!modelYaml || typeof modelYaml !== 'object' || Array.isArray(modelYaml)) {
+    return ['Omni returned an invalid resolved model response.'];
+  }
+  if (!modelYaml.files || typeof modelYaml.files !== 'object' || Array.isArray(modelYaml.files)) {
+    return ['Omni did not return a resolved model file inventory.'];
+  }
+  if (Object.values(modelYaml.files).some((value) => typeof value !== 'string')) {
+    return ['Omni returned a resolved model file inventory with unsupported values.'];
+  }
+  if (
+    modelYaml.viewNames !== undefined
+    && (typeof modelYaml.viewNames !== 'object' || Array.isArray(modelYaml.viewNames))
+  ) {
+    return ['Omni returned an invalid resolved view-name index.'];
+  }
+
+  const authoredViewNames = new Set(
+    semanticBlueprintViewOptions(authoredModelYaml).map((option) => option.viewName.toLowerCase()),
+  );
+  const resolvedViewNames = new Set(
+    semanticBlueprintViewOptions(modelYaml).map((option) => option.viewName.toLowerCase()),
+  );
+  const missingAuthoredViews = [...authoredViewNames]
+    .filter((viewName) => !resolvedViewNames.has(viewName));
+  return missingAuthoredViews.length > 0
+    ? [`Omni's resolved view inventory omitted ${missingAuthoredViews.length} authored view${missingAuthoredViews.length === 1 ? '' : 's'}.`]
+    : [];
+}
+
 const ACTION_PRESERVING_BLUEPRINT_PATCH_KEYS = new Set<keyof SemanticBlueprintDraft>([
   'relationshipGuidance',
   'securityGuidance',
@@ -620,6 +653,7 @@ export function semanticBlueprintMutationFingerprint(input: SemanticBlueprintMut
 export function semanticBlueprintPlanBindings(
   draft: SemanticBlueprintDraft,
   viewOptions: readonly SemanticBlueprintViewOption[],
+  options: { authoredFileNames?: readonly string[] } = {},
 ): SemanticBlueprintPlanBindings {
   const blueprint = normalizeSemanticBlueprintDraft(draft);
   const approvedNames = new Set(
@@ -627,10 +661,19 @@ export function semanticBlueprintPlanBindings(
       .filter(Boolean)
       .map((viewName) => viewName.toLowerCase()),
   );
-  const requestedArtifactFileNames = unique(viewOptions
+  const authoredFileNames = options.authoredFileNames
+    ? new Set(options.authoredFileNames.map((fileName) => fileName.toLowerCase()))
+    : null;
+  const authoredViewOptions = authoredFileNames
+    ? viewOptions.filter((option) => (
+        Boolean(option.fileName)
+        && authoredFileNames.has((option.fileName || '').toLowerCase())
+      ))
+    : viewOptions;
+  const requestedArtifactFileNames = unique(authoredViewOptions
     .filter((option) => approvedNames.has(option.viewName.toLowerCase()))
     .map((option) => option.fileName || ''), 40);
-  const excludedArtifactFileNames = unique(viewOptions
+  const excludedArtifactFileNames = unique(authoredViewOptions
     .filter((option) => !approvedNames.has(option.viewName.toLowerCase()))
     .map((option) => option.fileName || ''), Math.max(1, viewOptions.length));
   const actionOverrides = Object.fromEntries(requestedArtifactFileNames.map((fileName) => [

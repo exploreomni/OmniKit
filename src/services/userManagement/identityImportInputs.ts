@@ -14,6 +14,8 @@ export const IDENTITY_IMPORT_LIMITS = {
 
 export type IdentityModelRoleName = UserModelRoleName;
 
+export const IDENTITY_NO_ASSIGNMENT_LABEL = 'No assignment';
+
 const ROLE_ALIASES: Readonly<Record<string, IdentityModelRoleName>> = {
   viewer: 'VIEWER',
   restricted_querier: 'QUERY_TOPICS',
@@ -28,6 +30,10 @@ const ROLE_ALIASES: Readonly<Record<string, IdentityModelRoleName>> = {
 export function normalizeIdentityModelRole(value: string): IdentityModelRoleName | null {
   const key = value.trim().toLowerCase().replace(/[\s-]+/g, '_');
   return ROLE_ALIASES[key] ?? null;
+}
+
+export function isIdentityNoAssignment(value: string): boolean {
+  return value.trim().toLowerCase().replace(/[\s_-]+/g, '_') === 'no_assignment';
 }
 
 export function identityModelRoleLabel(roleName: IdentityModelRoleName): string {
@@ -45,6 +51,24 @@ export type EscapedIdentityList = {
   values: string[];
   duplicateCount: number;
 };
+
+const CSV_FORMULA_PREFIX_PATTERN = /^[\t\r\n ]*[=+\-@]/;
+
+/**
+ * Reserves one leading apostrophe as a reversible, spreadsheet-safe marker.
+ * A real leading apostrophe is doubled so OmniKit exports round-trip exactly.
+ */
+export function escapeIdentityCsvValue(value: string): string {
+  return value.startsWith("'") || CSV_FORMULA_PREFIX_PATTERN.test(value)
+    ? `'${value}`
+    : value;
+}
+
+export function unescapeIdentityCsvValue(value: string): string {
+  if (value.startsWith("''")) return value.slice(1);
+  if (value.startsWith("'") && CSV_FORMULA_PREFIX_PATTERN.test(value.slice(1))) return value.slice(1);
+  return value;
+}
 
 /**
  * Parses a comma-delimited value inside one CSV cell. A literal comma is
@@ -90,7 +114,7 @@ export function parseEscapedIdentityList(
   const seen = new Set<string>();
   let duplicateCount = 0;
   for (const rawValue of rawValues) {
-    const nextValue = rawValue.trim();
+    const nextValue = unescapeIdentityCsvValue(rawValue.trim());
     if (!nextValue) throw new Error(`${options.label} contains an empty value.`);
     if (nextValue.length > options.maxValueLength) {
       throw new Error(`${options.label} values cannot exceed ${options.maxValueLength} characters.`);
@@ -113,7 +137,7 @@ export function parseEscapedIdentityList(
 }
 
 export function escapeIdentityListValue(value: string): string {
-  return value.replace(/\\/g, '\\\\').replace(/,/g, '\\,');
+  return escapeIdentityCsvValue(value).replace(/\\/g, '\\\\').replace(/,/g, '\\,');
 }
 
 export function joinIdentityList(values: string[]): string {

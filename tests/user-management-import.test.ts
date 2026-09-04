@@ -167,6 +167,32 @@ test('simple identity CSV supports BOM, CRLF, escaped comma lists, and role alia
   assert.deepEqual(role.modelNames, ['Core A', 'Core B']);
 });
 
+test('simple identity CSV treats No assignment as a non-destructive export marker', () => {
+  const plan = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'add,Casey Doe,casey@example.com,Analytics Users,No assignment,,',
+  ].join('\n'));
+
+  assert.equal(plan.issues.filter((issue) => issue.severity === 'error').length, 0);
+  assert.equal(plan.records.filter((record) => record.type === 'role').length, 0);
+  assert.equal(plan.records.filter((record) => record.type === 'user').length, 1);
+  assert.equal(plan.records.filter((record) => record.type === 'membership').length, 1);
+  assert.equal(plan.previewRows[0].role, 'No assignment');
+  assert.equal(plan.previewRows[0].destructive, false);
+  assert.ok(plan.issues.some((issue) => issue.severity === 'warning' && /no model-role change/i.test(issue.message)));
+});
+
+test('simple identity CSV blocks destructive or scoped use of No assignment', () => {
+  const plan = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'remove,Casey Doe,casey@example.com,,No assignment,,',
+    'add,Casey Doe,casey@example.com,,No assignment,Warehouse A,',
+  ].join('\n'));
+
+  assert.equal(plan.issues.filter((issue) => issue.severity === 'error').length, 2);
+  assert.equal(plan.records.length, 0);
+});
+
 test('simple identity CSV accepts a blank model for Restricted Querier adds', () => {
   const plan = parseIdentityImportCsv([
     'action,display_name,email,group,role,connection,model',

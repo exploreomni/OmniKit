@@ -147,6 +147,7 @@ import {
   semanticBlueprintExistingRelationshipContracts,
   semanticBlueprintFingerprint,
   semanticBlueprintIssues,
+  semanticBlueprintModelYamlInventoryIssues,
   semanticBlueprintMutationFingerprint,
   semanticBlueprintPackageIssues,
   semanticBlueprintPlanBindings,
@@ -5014,6 +5015,8 @@ export function TopicsPage() {
   const [targetFileSearch, setTargetFileSearch] = useState('');
   const [modelFileOptions, setModelFileOptions] = useState<string[]>([]);
   const [selectedModelYaml, setSelectedModelYaml] = useState<OmniModelYamlResponse | null>(null);
+  const [selectedModelViewYaml, setSelectedModelViewYaml] = useState<OmniModelYamlResponse | null>(null);
+  const [modelViewInventoryError, setModelViewInventoryError] = useState('');
   const [loadingModelFiles, setLoadingModelFiles] = useState(false);
   const [inventoryRequestPhase, setInventoryRequestPhase] = useState<TopicsInventoryRequestPhase>('idle');
 	  const [selectedWorkstreams, setSelectedWorkstreams] = useState<WorkstreamId[]>(defaultWorkstreamsForPath('topic'));
@@ -5142,6 +5145,23 @@ export function TopicsPage() {
     return `${connectionKey}\u0000${modelId}\u0000${path || 'unselected'}`;
   }
 
+  async function loadVerifiedModelViewYaml(
+    modelId: string,
+    authoredYaml: OmniModelYamlResponse,
+    options: { branchId?: string; fresh?: boolean } = {},
+  ) {
+    const resolvedYaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId, {
+      branchId: options.branchId,
+      fullyResolved: true,
+      fresh: options.fresh,
+    });
+    const inventoryIssues = semanticBlueprintModelYamlInventoryIssues(resolvedYaml, authoredYaml);
+    if (inventoryIssues.length > 0) {
+      throw new Error(inventoryIssues.join(' '));
+    }
+    return resolvedYaml;
+  }
+
   async function loadModelFileOptions(
     modelId: string,
     path: StudioPathSelection,
@@ -5155,9 +5175,14 @@ export function TopicsPage() {
       && inventoryRequestCoordinator.isCurrent(token)
     );
     try {
-      const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId, { fresh: options?.fresh });
+      const yaml = await getModelYaml(connection.baseUrl, connection.apiKey, modelId, {
+        fullyResolved: false,
+        fresh: options?.fresh,
+      });
       if (!isCurrentModelFileRequest()) return false;
       setSelectedModelYaml(yaml);
+      setSelectedModelViewYaml(pathIncludesTopic(path) ? null : yaml);
+      setModelViewInventoryError('');
       const fileNames = Object.keys(yaml?.files || {});
       const supported = fileNames.filter((fileName) => {
         if (path === 'permissions') {
@@ -5167,11 +5192,31 @@ export function TopicsPage() {
       });
       const pinnedTargets = path === 'permissions' ? ['model'] : ['model', 'relationships'];
       setModelFileOptions(uniqueStrings([...pinnedTargets, ...supported], 120));
+
+      if (pathIncludesTopic(path)) {
+        try {
+          const resolvedYaml = await loadVerifiedModelViewYaml(modelId, yaml, {
+            fresh: options?.fresh,
+          });
+          if (!isCurrentModelFileRequest()) return false;
+          setSelectedModelViewYaml(resolvedYaml);
+        } catch (resolvedError) {
+          if (!isCurrentModelFileRequest()) return false;
+          setSelectedModelViewYaml(null);
+          setModelViewInventoryError(
+            resolvedError instanceof Error
+              ? resolvedError.message
+              : 'The resolved model view inventory request failed.',
+          );
+        }
+      }
       inventoryRequestCoordinator.settle(token, 'modelFiles', 'succeeded');
       return true;
     } catch (err) {
       if (!isCurrentModelFileRequest()) return false;
       setSelectedModelYaml(null);
+      setSelectedModelViewYaml(null);
+      setModelViewInventoryError('');
       setModelFileOptions([]);
       setError(err instanceof Error ? err.message : 'Failed to load model files for this model');
       inventoryRequestCoordinator.settle(token, 'modelFiles', 'failed');
@@ -5304,6 +5349,8 @@ export function TopicsPage() {
     setTopicDetails({});
     setModelFileOptions([]);
     setSelectedModelYaml(null);
+    setSelectedModelViewYaml(null);
+    setModelViewInventoryError('');
     setSemanticBlueprintApproval(null);
     setSemanticBlueprintApprovalNotice('');
     setModelWriteCapability(null);
@@ -5583,6 +5630,8 @@ export function TopicsPage() {
     setAiPickedTopic('');
     setModelFileOptions([]);
     setSelectedModelYaml(null);
+    setSelectedModelViewYaml(null);
+    setModelViewInventoryError('');
 
     await Promise.all([
       pathIncludesTopic(path) ? loadTopicsForModel(modelId, token) : Promise.resolve(true),
@@ -5610,6 +5659,8 @@ export function TopicsPage() {
     setTargetFileSearch('');
     setModelFileOptions([]);
     setSelectedModelYaml(null);
+    setSelectedModelViewYaml(null);
+    setModelViewInventoryError('');
     setSemanticBlueprintDraft(EMPTY_SEMANTIC_BLUEPRINT_DRAFT);
     setSemanticBlueprintApproval(null);
     setSemanticBlueprintApprovalNotice('');
@@ -5642,6 +5693,8 @@ export function TopicsPage() {
       setTopics([]);
       setTopicDetails({});
       setSelectedModelYaml(null);
+      setSelectedModelViewYaml(null);
+      setModelViewInventoryError('');
       resetAiConversation();
       return;
     }
@@ -5662,6 +5715,8 @@ export function TopicsPage() {
     setTargetBaseViewName('');
     setTargetFileSearch('');
     setModelFileOptions([]);
+    setSelectedModelViewYaml(null);
+    setModelViewInventoryError('');
     if (pathUsesTargetSemanticFile(path)) {
       setSelectedTopicName('');
       setTopics([]);
@@ -5700,11 +5755,16 @@ export function TopicsPage() {
       nextDraft = normalizeSemanticBlueprintDraft({ ...nextDraft, reviewedAndApproved: false });
       setSemanticBlueprintApproval(null);
       setSemanticBlueprintApprovalNotice(`Complete the exact access setup before approving these build instructions: ${permissionApprovalIssues.join(' ')}`);
-    } else if (nextDraft.reviewedAndApproved && selectedModelId && selectedModelYaml) {
+    } else if (
+      nextDraft.reviewedAndApproved
+      && selectedModelId
+      && selectedModelYaml
+      && selectedModelViewYaml
+    ) {
       setSemanticBlueprintApproval(createSemanticBlueprintApproval({
         draft: nextDraft,
         modelId: selectedModelId,
-        modelYaml: selectedModelYaml,
+        modelYaml: selectedModelViewYaml,
         mutationBoundary: semanticBlueprintMutationBoundaryForDraft(nextDraft),
       }));
       setSemanticBlueprintApprovalNotice('');
@@ -5746,7 +5806,8 @@ export function TopicsPage() {
   ): SemanticBlueprintMutationBoundary {
     const bindings = semanticBlueprintPlanBindings(
       draft,
-      semanticBlueprintViewOptions(selectedModelYaml),
+      semanticBlueprintViewOptions(selectedModelViewYaml),
+      { authoredFileNames: Object.keys(selectedModelYaml?.files || {}) },
     );
     return {
       targetTopicFileName: solutionPlan?.topicFileName || '',
@@ -5812,6 +5873,7 @@ export function TopicsPage() {
     mainYaml: OmniModelYamlResponse,
     branchYaml: OmniModelYamlResponse,
     reviewedFiles: readonly { fileName: string }[],
+    modelViewYaml: OmniModelYamlResponse = branchYaml,
   ) {
     if (!selectedPathIncludesTopic || !requiresReviewedSourceScope) return [];
     const reviewedTargetTopicFileName = reviewedFiles.find((file) => (
@@ -5826,7 +5888,7 @@ export function TopicsPage() {
     });
     return uniqueStrings([
       ...missingFiles.map((fileName) => `Omni did not return the reviewed file ${fileName} after the branch write.`),
-      ...semanticModelReferenceIssues(actualFiles, branchYaml),
+      ...semanticModelReferenceIssues(actualFiles, modelViewYaml),
       ...actualFiles
         .filter((file) => !file.fileName.endsWith('.topic'))
         .flatMap((file) => authoredSemanticYamlCommentIssues(
@@ -5836,7 +5898,7 @@ export function TopicsPage() {
         )),
       ...semanticBlueprintPackageIssues({
         draft: normalizedSemanticBlueprint,
-        viewOptions: semanticBlueprintViewOptions(mainYaml),
+        viewOptions: semanticBlueprintViewOptions(modelViewYaml),
         files: actualFiles,
         baselineRelationshipsYaml: mainYaml.files?.relationships || '',
         approvedStagedViewFileNames: approvedBlueprintStagedViewFiles(solutionPlan),
@@ -6158,7 +6220,7 @@ export function TopicsPage() {
 	    if (requiresReviewedSourceScope) {
 	      const blueprintBlockers = semanticBlueprintIssues({
 	        draft: semanticBlueprintDraft,
-	        viewOptions: semanticBlueprintViewOptions(selectedModelYaml),
+	        viewOptions: semanticBlueprintViewOptions(selectedModelViewYaml),
 	        relationshipIntent: solutionRelationshipIntent,
 	      });
 	      if (blueprintBlockers.length > 0) {
@@ -6223,7 +6285,12 @@ export function TopicsPage() {
           })
 	        : null;
 	      assertSemanticOperationCurrent(operationToken);
+	      const modelViewYaml = requiresReviewedSourceScope && modelYaml
+	        ? await loadVerifiedModelViewYaml(selectedModel.id, modelYaml, { fresh: true })
+	        : modelYaml;
+	      assertSemanticOperationCurrent(operationToken);
 	      let authoredAnalysisYaml = modelYaml;
+	      let modelViewAnalysisYaml = modelViewYaml;
 	      if (reviewedBranchSessionForAnalysis) {
 	        const freshReviewedBranchYaml = await getModelYaml(
 	          connection.baseUrl,
@@ -6245,6 +6312,13 @@ export function TopicsPage() {
 	          throw new Error(`The reviewed branch changed before analysis: ${reviewedBranchChanges.join(', ')}. Start a new reviewed run or reconcile the branch before analyzing again.`);
 	        }
 	        authoredAnalysisYaml = freshReviewedBranchYaml;
+	        modelViewAnalysisYaml = requiresReviewedSourceScope
+	          ? await loadVerifiedModelViewYaml(selectedModel.id, freshReviewedBranchYaml, {
+	              branchId: reviewedBranchSessionForAnalysis.session.branchId,
+	              fresh: true,
+	            })
+	          : freshReviewedBranchYaml;
+	        assertSemanticOperationCurrent(operationToken);
 	      }
 	      const reviewedAnalysisTopicFile = pathIncludesTopic(workflowPath) && reviewedAnalysisTopicName && authoredAnalysisYaml
 	        ? findAuthoredTopicYamlFile(authoredAnalysisYaml, reviewedAnalysisTopicName)
@@ -6257,8 +6331,9 @@ export function TopicsPage() {
 	          })
 	        : 'Topic Builder context: not selected. Keep topic YAML out of the deployable output.';
       if (requiresReviewedSourceScope) {
-        const approvalIssues = currentSemanticBlueprintApprovalIssues(modelYaml);
+        const approvalIssues = currentSemanticBlueprintApprovalIssues(modelViewYaml);
         if (approvalIssues.length > 0) {
+          setSelectedModelViewYaml(modelViewYaml);
           invalidateSemanticBlueprintApproval(modelYaml);
           throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again.`);
         }
@@ -6266,9 +6341,9 @@ export function TopicsPage() {
 	      const modelSourceContext = pathUsesTargetSemanticFile(workflowPath)
 	        ? buildModelSourceContext(authoredAnalysisYaml, reviewedAnalysisTargetView || selectedTopicBaseView || undefined, workflowPath, { includeTargetYaml: false })
 	        : requiresReviewedSourceScope
-	          ? buildTopicBuilderModelDiscoveryContext(authoredAnalysisYaml, reviewedSolutionViewNames)
+	          ? buildTopicBuilderModelDiscoveryContext(modelViewAnalysisYaml, reviewedSolutionViewNames)
 	          : reviewedBranchSessionForAnalysis
-	            ? buildTopicBuilderModelDiscoveryContext(authoredAnalysisYaml, reviewedSolutionViewNames)
+	            ? buildTopicBuilderModelDiscoveryContext(modelViewAnalysisYaml, reviewedSolutionViewNames)
 	          : 'Model / View Builder context: not selected. Keep model, relationships, and view-file changes out of the deployable output unless they are explicitly required.';
 
       const reviewChunks = DEEP_REVIEW_CHUNKS.filter((chunk) => REVIEW_CHUNK_IDS.includes(chunk.id));
@@ -6387,7 +6462,7 @@ export function TopicsPage() {
     if (requiresReviewedSourceScope) {
       const blueprintBlockers = semanticBlueprintIssues({
         draft: semanticBlueprintDraft,
-        viewOptions: semanticBlueprintViewOptions(selectedModelYaml),
+        viewOptions: semanticBlueprintViewOptions(selectedModelViewYaml),
         relationshipIntent: solutionRelationshipIntent,
       });
       if (blueprintBlockers.length > 0) {
@@ -6490,13 +6565,19 @@ export function TopicsPage() {
       if (!modelYaml) {
         throw new Error('OmniKit could not load the current model YAML baseline. No changes were generated; return to Decide and try again.');
       }
+      const modelViewYaml = requiresReviewedSourceScope
+        ? await loadVerifiedModelViewYaml(selectedModel.id, modelYaml, { fresh: true })
+        : modelYaml;
+      assertSemanticOperationCurrent(operationToken);
       if (requiresReviewedSourceScope) {
-        const approvalIssues = currentSemanticBlueprintApprovalIssues(modelYaml);
+        const approvalIssues = currentSemanticBlueprintApprovalIssues(modelViewYaml);
         if (approvalIssues.length > 0) {
+          setSelectedModelViewYaml(modelViewYaml);
           invalidateSemanticBlueprintApproval(modelYaml);
           throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again.`);
         }
       }
+      let modelViewGenerationYaml = modelViewYaml;
       if (reviewedBranchSessionForRegeneration) {
         const freshReviewedBranchYaml = await getModelYaml(
           connection.baseUrl,
@@ -6518,6 +6599,13 @@ export function TopicsPage() {
           throw new Error(`The reviewed branch changed before regeneration: ${reviewedBranchChanges.join(', ')}. Start a new reviewed run or reconcile the branch before generating another package.`);
         }
         reviewedBranchYamlForRegeneration = freshReviewedBranchYaml;
+        modelViewGenerationYaml = requiresReviewedSourceScope
+          ? await loadVerifiedModelViewYaml(selectedModel.id, freshReviewedBranchYaml, {
+              branchId: reviewedBranchSessionForRegeneration.session.branchId,
+              fresh: true,
+            })
+          : freshReviewedBranchYaml;
+        assertSemanticOperationCurrent(operationToken);
       }
       const authoredGenerationYaml = reviewedBranchYamlForRegeneration || modelYaml;
       setDeployReviewedMainYaml(modelYaml);
@@ -6564,7 +6652,7 @@ export function TopicsPage() {
             semanticBlueprintFingerprint: semanticBlueprintFingerprint(normalizedSemanticBlueprint),
             semanticBlueprintSourceFingerprint: semanticBlueprintSourceFingerprint(
               normalizedSemanticBlueprint,
-              modelYaml,
+              modelViewYaml,
               solutionPlan?.topicFileName || '',
             ),
             semanticBlueprintMutationFingerprint: currentSemanticBlueprintMutationFingerprint,
@@ -6585,7 +6673,7 @@ export function TopicsPage() {
             && validateSemanticStudioRepairOutput([file]).length === 0
             && (!requiresReviewedSourceScope || semanticBlueprintPackageIssues({
               draft: normalizedSemanticBlueprint,
-              viewOptions: semanticBlueprintViewOptions(modelYaml),
+              viewOptions: semanticBlueprintViewOptions(modelViewGenerationYaml),
               relationshipIntent: solutionRelationshipIntent,
               permissionIntent: solutionPermissionIntent,
               files: [file],
@@ -6641,12 +6729,12 @@ export function TopicsPage() {
             : 'Topic YAML is outside this artifact request. Return only the explicitly requested model, relationship, or view file.';
 	          const artifactModelContext = artifactItem.kind === 'topic'
 	            ? buildTopicBuilderModelDiscoveryContext(
-	                authoredGenerationYaml,
+	                modelViewGenerationYaml,
 	                topicOperationForRun === 'create_new' ? reviewedSolutionViewNames : [],
 	                acceptedFiles,
 	              )
 	            : artifactItem.fileName === 'relationships' && requiresReviewedSourceScope
-	              ? buildRelationshipBuilderModelContext(authoredGenerationYaml, reviewedSolutionViewNames)
+	              ? buildRelationshipBuilderModelContext(modelViewGenerationYaml, reviewedSolutionViewNames)
 	            : buildModelSourceContext(authoredGenerationYaml, artifactItem.fileName, artifactPath, {
 	                includeTargetYaml: true,
 	                maxYamlChars: 18_000,
@@ -6701,11 +6789,11 @@ export function TopicsPage() {
           let artifactLintIssues = parsedFiles.length === 1
             ? [
                 ...parsedFiles.flatMap((file) => validateDeployYamlFile(file)),
-                ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], authoredGenerationYaml),
+                ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], modelViewGenerationYaml),
                 ...(requiresReviewedSourceScope
                   ? semanticBlueprintPackageIssues({
                       draft: normalizedSemanticBlueprint,
-                      viewOptions: semanticBlueprintViewOptions(modelYaml),
+                      viewOptions: semanticBlueprintViewOptions(modelViewGenerationYaml),
                       relationshipIntent: solutionRelationshipIntent,
                       permissionIntent: solutionPermissionIntent,
                       files: [...acceptedFiles, ...parsedFiles],
@@ -6787,11 +6875,11 @@ export function TopicsPage() {
             artifactLintIssues = parsedFiles.length === 1
               ? [
                   ...parsedFiles.flatMap((file) => validateDeployYamlFile(file)),
-                  ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], authoredGenerationYaml),
+                  ...semanticModelReferenceIssues([...acceptedFiles, ...parsedFiles], modelViewGenerationYaml),
                   ...(requiresReviewedSourceScope
                     ? semanticBlueprintPackageIssues({
                         draft: normalizedSemanticBlueprint,
-                        viewOptions: semanticBlueprintViewOptions(modelYaml),
+                        viewOptions: semanticBlueprintViewOptions(modelViewGenerationYaml),
                         relationshipIntent: solutionRelationshipIntent,
                         permissionIntent: solutionPermissionIntent,
                         files: [...acceptedFiles, ...parsedFiles],
@@ -6881,11 +6969,11 @@ export function TopicsPage() {
             if (existingIndex >= 0) generatedFiles[existingIndex] = nextFile;
             else generatedFiles.unshift(nextFile);
           });
-          const permissionReferenceIssues = semanticModelReferenceIssues(generatedFiles, authoredGenerationYaml);
+          const permissionReferenceIssues = semanticModelReferenceIssues(generatedFiles, modelViewGenerationYaml);
           const permissionSourceScopeIssues = requiresReviewedSourceScope
             ? semanticBlueprintPackageIssues({
                 draft: normalizedSemanticBlueprint,
-                viewOptions: semanticBlueprintViewOptions(modelYaml),
+                viewOptions: semanticBlueprintViewOptions(modelViewGenerationYaml),
                 relationshipIntent: solutionRelationshipIntent,
                 permissionIntent: solutionPermissionIntent,
                 files: generatedFiles,
@@ -6909,7 +6997,7 @@ export function TopicsPage() {
         if (requiresReviewedSourceScope) {
           const sourceScopeIssues = semanticBlueprintPackageIssues({
             draft: normalizedSemanticBlueprint,
-            viewOptions: semanticBlueprintViewOptions(modelYaml),
+            viewOptions: semanticBlueprintViewOptions(modelViewGenerationYaml),
             relationshipIntent: solutionRelationshipIntent,
             permissionIntent: solutionPermissionIntent,
             files: generatedFiles,
@@ -7056,7 +7144,7 @@ export function TopicsPage() {
 	      const baseModelSourceContext = pathUsesTargetSemanticFile(workflowPath)
 	        ? buildModelSourceContext(authoredGenerationYaml, reviewedGenerationTargetView || selectedTopicBaseView || undefined, workflowPath, { includeTargetYaml: true, maxYamlChars: 18_000 })
 	        : !topicName
-	          ? buildTopicBuilderModelDiscoveryContext(authoredGenerationYaml, reviewedSolutionViewNames)
+	          ? buildTopicBuilderModelDiscoveryContext(modelViewGenerationYaml, reviewedSolutionViewNames)
           : 'Model / View Builder context: not selected. Keep model, relationships, and view-file changes out of the deployable output unless they are explicitly required.';
       const modelSourceContext = promptSemanticContext
         ? `${baseModelSourceContext}\n\n${semanticStudioContextPromptBlock(promptSemanticContext)}`
@@ -7518,12 +7606,12 @@ export function TopicsPage() {
 
   const selectedModel = models.find((model) => model.id === selectedModelId);
   const blueprintViewOptions = useMemo(
-    () => semanticBlueprintViewOptions(selectedModelYaml),
-    [selectedModelYaml],
+    () => semanticBlueprintViewOptions(selectedModelViewYaml),
+    [selectedModelViewYaml],
   );
   const blueprintRelationshipContracts = useMemo(
-    () => semanticBlueprintExistingRelationshipContracts(selectedModelYaml),
-    [selectedModelYaml],
+    () => semanticBlueprintExistingRelationshipContracts(selectedModelViewYaml),
+    [selectedModelViewYaml],
   );
   const normalizedSemanticBlueprint = useMemo(
     () => normalizeSemanticBlueprintDraft(semanticBlueprintDraft),
@@ -7546,8 +7634,10 @@ export function TopicsPage() {
     [normalizedSemanticBlueprint],
   );
   const blueprintPlanBindings = useMemo(
-    () => semanticBlueprintPlanBindings(normalizedSemanticBlueprint, blueprintViewOptions),
-    [blueprintViewOptions, normalizedSemanticBlueprint],
+    () => semanticBlueprintPlanBindings(normalizedSemanticBlueprint, blueprintViewOptions, {
+      authoredFileNames: Object.keys(selectedModelYaml?.files || {}),
+    }),
+    [blueprintViewOptions, normalizedSemanticBlueprint, selectedModelYaml],
   );
   const solutionPlan = useMemo(() => {
     if (!selectedModel || !selectedModelYaml?.files) return null;
@@ -8472,6 +8562,12 @@ export function TopicsPage() {
           fresh: true,
         }),
       );
+      const mainModelViewYaml = selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? await runSemanticOperationStep(
+            operationToken,
+            () => loadVerifiedModelViewYaml(selectedModel.id, mainYaml, { fresh: true }),
+          )
+        : mainYaml;
       setDeployMainYaml(mainYaml);
       if (!deployReviewedMainYaml) {
         throw new Error('The reviewed main-model baseline is unavailable. Return to Review Changes and regenerate before writing.');
@@ -8479,12 +8575,22 @@ export function TopicsPage() {
       const mainBaselineChanges = semanticStudioYamlSnapshotChanges(deployReviewedMainYaml, mainYaml);
       if (mainBaselineChanges.length > 0) {
         if (requiresReviewedSourceScope) {
+          setSelectedModelViewYaml(mainModelViewYaml);
           invalidateSemanticBlueprintApproval(mainYaml, 'The model changed after package review. The previous build-instruction approval was cleared; reload the latest context and approve it again.');
         }
         throw new Error(`The main model changed after package review: ${mainBaselineChanges.join(', ')}. Reload and regenerate before writing.`);
       }
       const authoredPreWriteYaml = reviewedBranchSessionAtWriteStart?.branchYaml || mainYaml;
-      const semanticReferenceIssues = semanticModelReferenceIssues(filesToSave, authoredPreWriteYaml);
+      const preWriteModelViewYaml = reviewedBranchSessionAtWriteStart && selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? await runSemanticOperationStep(
+            operationToken,
+            () => loadVerifiedModelViewYaml(selectedModel.id, authoredPreWriteYaml, {
+              branchId: reviewedBranchSessionAtWriteStart.session.branchId,
+              fresh: true,
+            }),
+          )
+        : mainModelViewYaml;
+      const semanticReferenceIssues = semanticModelReferenceIssues(filesToSave, preWriteModelViewYaml);
       if (semanticReferenceIssues.length > 0) {
         throw new Error(`Resolve semantic references before creating a dev branch:\n${semanticReferenceIssues.map((issue) => `- ${issue}`).join('\n')}`);
       }
@@ -8513,8 +8619,9 @@ export function TopicsPage() {
         }
       }
       if (selectedPathIncludesTopic && requiresReviewedSourceScope) {
-        const approvalIssues = currentSemanticBlueprintApprovalIssues(mainYaml);
+        const approvalIssues = currentSemanticBlueprintApprovalIssues(mainModelViewYaml);
         if (approvalIssues.length > 0) {
+          setSelectedModelViewYaml(mainModelViewYaml);
           invalidateSemanticBlueprintApproval(mainYaml);
           throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again.`);
         }
@@ -8527,7 +8634,7 @@ export function TopicsPage() {
         const reviewedTargetTopicFileName = reviewedTargetTopicFileNames[0];
         const blueprintIssues = semanticBlueprintPackageIssues({
           draft: normalizedSemanticBlueprint,
-          viewOptions: semanticBlueprintViewOptions(mainYaml),
+          viewOptions: semanticBlueprintViewOptions(preWriteModelViewYaml),
           files: filesToSave,
           baselineRelationshipsYaml: mainYaml.files?.relationships || '',
           approvedStagedViewFileNames: approvedBlueprintStagedViewFiles(solutionPlan),
@@ -8723,7 +8830,7 @@ export function TopicsPage() {
         const preservedLintIssues = filesToSave.flatMap((file) => validateDeployYamlFile(file, {
           sourceTopicYaml: authoredTopicSourceYaml || undefined,
         }));
-        preservedLintIssues.push(...semanticModelReferenceIssues(filesToSave, branchYamlBefore));
+        preservedLintIssues.push(...semanticModelReferenceIssues(filesToSave, preWriteModelViewYaml));
         if (preservedLintIssues.length > 0) {
           throw new Error(`Fix generated YAML before saving to dev:\n${preservedLintIssues.map((issue) => `- ${issue}`).join('\n')}`);
         }
@@ -8820,10 +8927,20 @@ export function TopicsPage() {
           fresh: true,
         }),
       );
+      const branchModelViewYamlAfter = selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? await runSemanticOperationStep(
+            operationToken,
+            () => loadVerifiedModelViewYaml(selectedModel.id, branchYamlAfter, {
+              branchId,
+              fresh: true,
+            }),
+          )
+        : branchYamlAfter;
       const postWriteBlueprintIssues = semanticBlueprintBranchPackageIssues(
         mainYaml,
         branchYamlAfter,
         filesToSave,
+        branchModelViewYamlAfter,
       );
       if (postWriteBlueprintIssues.length > 0) {
         throw new Error(`The actual branch returned by Omni no longer matches the approved semantic blueprint:\n${postWriteBlueprintIssues.map((issue) => `- ${issue}`).join('\n')}\nThe branch was not approved for handoff.`);
@@ -9106,9 +9223,20 @@ export function TopicsPage() {
         }),
       ]);
       assertSemanticOperationCurrent(operationToken);
+      const [freshMainModelViewYaml, freshBranchModelViewYaml] = selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? await Promise.all([
+            loadVerifiedModelViewYaml(selectedModel.id, freshMainYaml, { fresh: true }),
+            loadVerifiedModelViewYaml(selectedModel.id, freshBranchYaml, {
+              branchId: deployBranchId,
+              fresh: true,
+            }),
+          ])
+        : [freshMainYaml, freshBranchYaml];
+      assertSemanticOperationCurrent(operationToken);
       if (selectedPathIncludesTopic && requiresReviewedSourceScope) {
-        const approvalIssues = currentSemanticBlueprintApprovalIssues(freshMainYaml);
+        const approvalIssues = currentSemanticBlueprintApprovalIssues(freshMainModelViewYaml);
         if (approvalIssues.length > 0) {
+          setSelectedModelViewYaml(freshMainModelViewYaml);
           invalidateSemanticBlueprintApproval(freshMainYaml);
           throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again before asking Blobby to repair it.`);
         }
@@ -9225,7 +9353,7 @@ export function TopicsPage() {
           ? (() => {
               const scope = semanticBlueprintPromptScope(
                 normalizedSemanticBlueprint,
-                semanticBlueprintViewOptions(freshMainYaml),
+                semanticBlueprintViewOptions(freshBranchModelViewYaml),
               );
               return {
                 allowedReadOnlyFileNames: scope.readOnlyFileNames,
@@ -9283,7 +9411,7 @@ export function TopicsPage() {
           ? freshBranchYaml.files?.[file.fileName] || freshMainYaml.files?.[file.fileName]
           : undefined,
       }));
-      lintIssues.push(...semanticModelReferenceIssues(nextFiles, freshBranchYaml));
+      lintIssues.push(...semanticModelReferenceIssues(nextFiles, freshBranchModelViewYaml));
       if (selectedPathIncludesTopic && requiresReviewedSourceScope) {
         const repairTargetTopicFileNames = repairReviewedTargetFiles.filter((fileName) => (
           /\.topic$/i.test(fileName.trim())
@@ -9293,7 +9421,7 @@ export function TopicsPage() {
         }
         lintIssues.push(...semanticBlueprintPackageIssues({
           draft: normalizedSemanticBlueprint,
-          viewOptions: semanticBlueprintViewOptions(freshBranchYaml),
+          viewOptions: semanticBlueprintViewOptions(freshBranchModelViewYaml),
           files: nextFiles,
           baselineRelationshipsYaml: freshMainYaml.files?.relationships || '',
           approvedStagedViewFileNames: approvedBlueprintStagedViewFiles(solutionPlan),
@@ -9430,6 +9558,12 @@ export function TopicsPage() {
           }),
         ]),
       );
+      const currentMainModelViewYaml = selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? await runSemanticOperationStep(
+            operationToken,
+            () => loadVerifiedModelViewYaml(selectedModel.id, currentMainYaml, { fresh: true }),
+          )
+        : currentMainYaml;
       if (!deployMainYaml) {
         setDeployReviewAcknowledged(false);
         throw new Error('The reviewed main-model YAML baseline is unavailable. Reload and review the package before handoff.');
@@ -9438,14 +9572,16 @@ export function TopicsPage() {
       if (reviewedMainChanges.length > 0) {
         setDeployReviewAcknowledged(false);
         if (requiresReviewedSourceScope) {
+          setSelectedModelViewYaml(currentMainModelViewYaml);
           invalidateSemanticBlueprintApproval(currentMainYaml, 'The model changed after review. The previous build-instruction approval was cleared; reload the latest context and approve it again.');
         }
         throw new Error(`The main model changed after review. Reload the package before handoff: ${reviewedMainChanges.join(', ')}.`);
       }
       if (selectedPathIncludesTopic && requiresReviewedSourceScope) {
-        const approvalIssues = currentSemanticBlueprintApprovalIssues(currentMainYaml);
+        const approvalIssues = currentSemanticBlueprintApprovalIssues(currentMainModelViewYaml);
         if (approvalIssues.length > 0) {
           setDeployReviewAcknowledged(false);
+          setSelectedModelViewYaml(currentMainModelViewYaml);
           invalidateSemanticBlueprintApproval(currentMainYaml);
           throw new Error(`The approved build context changed:\n${approvalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define, review the current model context, and approve the build instructions again before handoff.`);
         }
@@ -9509,7 +9645,7 @@ export function TopicsPage() {
           operation,
           modelId: selectedModel.id,
           modelName: selectedModel.name,
-          semanticBlueprintApproval: currentSemanticBlueprintContextApproval(currentMainYaml),
+          semanticBlueprintApproval: currentSemanticBlueprintContextApproval(currentMainModelViewYaml),
           branchId: deployBranchId,
           branchName: deployBranchName,
           topicName,
@@ -9593,6 +9729,18 @@ export function TopicsPage() {
           }),
         ]),
       );
+      const [handoffMainModelViewYaml, handoffBranchModelViewYaml] = selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? await runSemanticOperationStep(
+            operationToken,
+            () => Promise.all([
+              loadVerifiedModelViewYaml(selectedModel.id, handoffMainYaml, { fresh: true }),
+              loadVerifiedModelViewYaml(selectedModel.id, handoffBranchYaml, {
+                branchId: deployBranchId,
+                fresh: true,
+              }),
+            ]),
+          )
+        : [handoffMainYaml, handoffBranchYaml];
       const handoffMainChanges = semanticStudioYamlSnapshotChanges(currentMainYaml, handoffMainYaml);
       const handoffBranchChanges = semanticStudioYamlSnapshotChanges(currentBranchYaml, handoffBranchYaml);
       const handoffContentSignatures = contentValidationIssueSignatures(handoffMainContentValidation).sort();
@@ -9600,15 +9748,27 @@ export function TopicsPage() {
       if (handoffMainChanges.length > 0 || handoffBranchChanges.length > 0 || handoffContentChanged) {
         setDeployReviewAcknowledged(false);
         if (handoffMainChanges.length > 0 && requiresReviewedSourceScope) {
+          setSelectedModelViewYaml(handoffMainModelViewYaml);
           invalidateSemanticBlueprintApproval(handoffMainYaml, 'The model changed during final validation. The previous build-instruction approval was cleared; reload the latest context and approve it again.');
         }
         throw new Error(`The model changed during final validation. Reload and re-review before handoff.${handoffMainChanges.length > 0 ? ` Main: ${handoffMainChanges.join(', ')}.` : ''}${handoffBranchChanges.length > 0 ? ` Branch: ${handoffBranchChanges.join(', ')}.` : ''}${handoffContentChanged ? ' Main content-validation evidence changed.' : ''}`);
+      }
+
+      const handoffApprovalIssues = selectedPathIncludesTopic && requiresReviewedSourceScope
+        ? currentSemanticBlueprintApprovalIssues(handoffMainModelViewYaml)
+        : [];
+      if (handoffApprovalIssues.length > 0) {
+        setDeployReviewAcknowledged(false);
+        setSelectedModelViewYaml(handoffMainModelViewYaml);
+        invalidateSemanticBlueprintApproval(handoffMainYaml);
+        throw new Error(`The effective model view context changed during final validation:\n${handoffApprovalIssues.map((issue) => `- ${issue}`).join('\n')}\nReturn to Choose & Define and approve the current data boundary again.`);
       }
 
       const handoffBlueprintIssues = semanticBlueprintBranchPackageIssues(
         handoffMainYaml,
         handoffBranchYaml,
         deployFiles,
+        handoffBranchModelViewYaml,
       );
       if (handoffBlueprintIssues.length > 0) {
         setDeployReviewAcknowledged(false);
@@ -9646,23 +9806,40 @@ export function TopicsPage() {
 	            }),
 	          ]),
 	        );
+	        const [postHandoffMainModelViewYaml, postHandoffBranchModelViewYaml] = selectedPathIncludesTopic && requiresReviewedSourceScope
+	          ? await runSemanticOperationStep(
+	              operationToken,
+	              () => Promise.all([
+	                loadVerifiedModelViewYaml(selectedModel.id, postHandoffMainYaml, { fresh: true }),
+	                loadVerifiedModelViewYaml(selectedModel.id, postHandoffBranchYaml, {
+	                  branchId: deployBranchId,
+	                  fresh: true,
+	                }),
+	              ]),
+	            )
+	          : [postHandoffMainYaml, postHandoffBranchYaml];
 	        const postHandoffMainChanges = semanticStudioYamlSnapshotChanges(handoffMainYaml, postHandoffMainYaml);
 	        const postHandoffBranchChanges = semanticStudioYamlSnapshotChanges(handoffBranchYaml, postHandoffBranchYaml);
+	        const postHandoffApprovalIssues = selectedPathIncludesTopic && requiresReviewedSourceScope
+	          ? currentSemanticBlueprintApprovalIssues(postHandoffMainModelViewYaml)
+	          : [];
 	        const postHandoffBlueprintIssues = semanticBlueprintBranchPackageIssues(
 	          postHandoffMainYaml,
 	          postHandoffBranchYaml,
 	          deployFiles,
+	          postHandoffBranchModelViewYaml,
 	        );
-	          if (postHandoffMainChanges.length > 0 || postHandoffBranchChanges.length > 0 || postHandoffBlueprintIssues.length > 0) {
+	          if (postHandoffMainChanges.length > 0 || postHandoffBranchChanges.length > 0 || postHandoffApprovalIssues.length > 0 || postHandoffBlueprintIssues.length > 0) {
 	          setDeployReviewAcknowledged(false);
-	          if (postHandoffMainChanges.length > 0 && requiresReviewedSourceScope) {
+	          if ((postHandoffMainChanges.length > 0 || postHandoffApprovalIssues.length > 0) && requiresReviewedSourceScope) {
+	            setSelectedModelViewYaml(postHandoffMainModelViewYaml);
 	            invalidateSemanticBlueprintApproval(
 	              postHandoffMainYaml,
 	              'The main model changed during pull-request handoff. The previous build-instruction approval was cleared; reload the latest context and approve it again.',
 	              { preserveDeployHandoff: true },
 	            );
 	          }
-	          throw new Error(`The pull request was created, but its reviewed state changed during handoff. Do not merge it until OmniKit reloads and revalidates the package.${postHandoffMainChanges.length > 0 ? ` Main: ${postHandoffMainChanges.join(', ')}.` : ''}${postHandoffBranchChanges.length > 0 ? ` Branch: ${postHandoffBranchChanges.join(', ')}.` : ''}${postHandoffBlueprintIssues.length > 0 ? ` Blueprint blockers: ${postHandoffBlueprintIssues.join(' ')}` : ''}`);
+	          throw new Error(`The pull request was created, but its reviewed state changed during handoff. Do not merge it until OmniKit reloads and revalidates the package.${postHandoffMainChanges.length > 0 ? ` Main: ${postHandoffMainChanges.join(', ')}.` : ''}${postHandoffBranchChanges.length > 0 ? ` Branch: ${postHandoffBranchChanges.join(', ')}.` : ''}${postHandoffApprovalIssues.length > 0 ? ` Effective view context: ${postHandoffApprovalIssues.join(' ')}` : ''}${postHandoffBlueprintIssues.length > 0 ? ` Blueprint blockers: ${postHandoffBlueprintIssues.join(' ')}` : ''}`);
 	        }
 	        setDeployHandoffStatus('ready');
 	        setDeployHandoffMessage(`${result.message}${result.commitRef ? ` Commit evidence: ${result.commitRef}.` : ''}`);
@@ -10178,9 +10355,10 @@ export function TopicsPage() {
 	                }}
 		                blueprintDraft={semanticBlueprintDraft}
 		                blueprintViewOptions={blueprintViewOptions}
-		                blueprintRelationshipContracts={blueprintRelationshipContracts}
+	                blueprintRelationshipContracts={blueprintRelationshipContracts}
 	                blueprintIssues={scopeSemanticBlueprintIssues}
 	                approvalNotice={semanticBlueprintApprovalNotice}
+	                blueprintViewInventoryError={modelViewInventoryError}
 	                onBlueprintDraftChange={handleSemanticBlueprintDraftChange}
 	                requestedArtifactFileNames={requestedArtifactFileNames}
 	                onRequestedArtifactFileNamesChange={(fileNames) => {
@@ -10222,6 +10400,14 @@ export function TopicsPage() {
 	                onAdvancedOpenChange={setSolutionAdvancedOpen}
 	                onRefreshModel={() => {
 	                  if (!selectedModelId || deployOperationActive) return;
+	                  if (semanticBlueprintApproval || semanticBlueprintDraft.reviewedAndApproved) {
+	                    setSemanticBlueprintApproval(null);
+	                    setSemanticBlueprintDraft((previous) => normalizeSemanticBlueprintDraft({
+	                      ...previous,
+	                      reviewedAndApproved: false,
+	                    }));
+	                    setSemanticBlueprintApprovalNotice('The effective model view inventory was reloaded. Review and approve the current data boundary again.');
+	                  }
 	                  inventoryRequestCoordinator.clear();
 	                  void loadSelectedModelInventory(selectedModelId, selectedStudioPath, { fresh: true });
 	                }}

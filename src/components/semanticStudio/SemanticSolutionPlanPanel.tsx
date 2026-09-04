@@ -36,6 +36,7 @@ export interface SemanticSolutionPlanPanelProps {
   blueprintRelationshipContracts: SemanticBlueprintRelationshipContract[];
   blueprintIssues: string[];
   approvalNotice?: string;
+  blueprintViewInventoryError?: string;
   onBlueprintDraftChange: (patch: Partial<SemanticBlueprintDraft>) => void;
   requestedArtifactFileNames: string[];
   onRequestedArtifactFileNamesChange: (fileNames: string[]) => void;
@@ -204,6 +205,7 @@ export function SemanticSolutionPlanPanel({
   blueprintRelationshipContracts,
   blueprintIssues,
   approvalNotice,
+  blueprintViewInventoryError,
   onBlueprintDraftChange,
   requestedArtifactFileNames,
   onRequestedArtifactFileNamesChange,
@@ -347,6 +349,7 @@ export function SemanticSolutionPlanPanel({
           relationshipIntent={relationshipIntent}
           permissionIntent={permissionIntent}
           approvalNotice={approvalNotice}
+          viewInventoryError={blueprintViewInventoryError}
           relationshipIntentSetup={(
             <fieldset disabled={busy}>
               <legend className="mb-2 text-xs font-semibold text-content-primary">How the data connects</legend>

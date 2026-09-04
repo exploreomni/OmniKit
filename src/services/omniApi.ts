@@ -33,6 +33,7 @@ interface SafeFetchPolicy {
   deduplicate?: boolean;
   deduplicationScope?: string;
   retry?: boolean;
+  requestSpacingMs?: number;
 }
 
 interface MetadataCacheLoadContext {
@@ -44,13 +45,15 @@ export class ApiError extends Error {
   status: number;
   detail?: string;
   code?: string;
+  retryAfterMs?: number;
 
-  constructor(status: number, message: string, detail?: string, code?: string) {
+  constructor(status: number, message: string, detail?: string, code?: string, retryAfterMs?: number) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.detail = detail;
     this.code = code;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 
@@ -143,13 +146,17 @@ async function acquireRequestSlot(signal?: AbortSignal): Promise<void> {
   });
 }
 
-async function runQueued<T>(task: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+async function runQueued<T>(
+  task: () => Promise<T>,
+  signal?: AbortSignal,
+  requestSpacingMs = REQUEST_SPACING_MS,
+): Promise<T> {
   await acquireRequestSlot(signal);
   try {
     if (signal?.aborted) throw requestAbortError();
     const now = Date.now();
     const waitMs = Math.max(0, nextRequestAt - now);
-    nextRequestAt = Math.max(now, nextRequestAt) + REQUEST_SPACING_MS;
+    nextRequestAt = Math.max(now, nextRequestAt) + requestSpacingMs;
     if (waitMs > 0) await sleep(waitMs, signal);
     if (signal?.aborted) throw requestAbortError();
     return await task();
@@ -309,6 +316,7 @@ async function handleResponse(res: Response, context: string): Promise<Response>
   let serverMessage = '';
   let detail = '';
   let code = '';
+  let retryAfterMs: number | undefined;
   try {
     const body = await res.json() as unknown;
     const record = body && typeof body === 'object' && !Array.isArray(body)
@@ -328,6 +336,12 @@ async function handleResponse(res: Response, context: string): Promise<Response>
     code = typeof candidateCode === 'string' && /^[A-Z][A-Z0-9_]{0,79}$/.test(candidateCode)
       ? candidateCode
       : '';
+    const candidateRetryAfterMs = record?.retryAfterMs;
+    retryAfterMs = Number.isSafeInteger(candidateRetryAfterMs)
+      && Number(candidateRetryAfterMs) > 0
+      && Number(candidateRetryAfterMs) <= 60_000
+      ? Number(candidateRetryAfterMs)
+      : undefined;
   } catch {
     try {
       detail = await res.text();
@@ -346,6 +360,7 @@ async function handleResponse(res: Response, context: string): Promise<Response>
     friendlyMessage,
     redactSensitiveText(detail) || undefined,
     code || undefined,
+    retryAfterMs,
   );
 }
 
@@ -362,14 +377,14 @@ async function safeFetch(
     let promise: Promise<Response>;
     if (policy.deduplicate === false) {
       // Credential-bearing one-time requests must never enter a retained request-key map.
-      promise = runQueued(fetchOnce, options.signal || undefined);
+      promise = runQueued(fetchOnce, options.signal || undefined, policy.requestSpacingMs);
     } else {
       const baseRequestKey = requestKey(url, options);
       const key = policy.deduplicationScope
         ? `${baseRequestKey}|scope:${policy.deduplicationScope}`
         : baseRequestKey;
       const existing = inFlightRequests.get(key);
-      promise = existing || runQueued(fetchOnce, options.signal || undefined)
+      promise = existing || runQueued(fetchOnce, options.signal || undefined, policy.requestSpacingMs)
         .finally(() => inFlightRequests.delete(key));
       if (!existing) inFlightRequests.set(key, promise);
     }
@@ -2070,6 +2085,7 @@ export interface UserModelRoleListOptions {
   modelId?: string;
   connectionId?: string;
   signal?: AbortSignal;
+  requestSpacingMs?: number;
 }
 
 export interface AssignUserModelRoleInput {
@@ -2103,7 +2119,7 @@ function isSafeUserModelRoleString(value: unknown): value is string {
   return !/(?:https?:\/\/|\bbearer\s+|\b(?:api[_ -]?key|authorization|token|secret|password|signature)\b\s*[:=])/i.test(value);
 }
 
-function validateUserModelRoleScope(
+function validateUserModelRoleReadScope(
   userId: string,
   input: { modelId?: string; connectionId?: string },
 ): { userId: string; modelId?: string; connectionId?: string } {
@@ -2113,9 +2129,6 @@ function validateUserModelRoleScope(
   }
   if (input.connectionId !== undefined && !isUserModelRoleUuid(input.connectionId)) {
     throw new Error('connectionId must be a valid identifier when provided.');
-  }
-  if (!input.modelId && !input.connectionId) {
-    throw new Error('modelId or connectionId is required for a scoped model-role read.');
   }
   return {
     userId,
@@ -2205,10 +2218,16 @@ export async function listUserModelRoles(
   baseUrl: string,
   apiKey: string,
   userId: string,
-  options: UserModelRoleListOptions,
+  options: UserModelRoleListOptions = {},
 ): Promise<UserModelRoleListResponse> {
-  const { signal, ...requestedScope } = options;
-  const scope = validateUserModelRoleScope(userId, requestedScope);
+  const { signal, requestSpacingMs, ...requestedScope } = options;
+  if (
+    requestSpacingMs !== undefined
+    && (!Number.isSafeInteger(requestSpacingMs) || requestSpacingMs < 100 || requestSpacingMs > 60_000)
+  ) {
+    throw new Error('requestSpacingMs must be an integer between 100 and 60000.');
+  }
+  const scope = validateUserModelRoleReadScope(userId, requestedScope);
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
     {
@@ -2225,7 +2244,7 @@ export async function listUserModelRoles(
       }),
     },
     'List user model roles',
-    { deduplicate: false, retry: false },
+    { deduplicate: false, retry: false, requestSpacingMs },
   );
   const payload: unknown = await res.json();
   return parseUserModelRoleListResponse(payload, scope);
@@ -2238,7 +2257,7 @@ export async function assignUserModelRole(
   input: AssignUserModelRoleInput,
   options: { signal?: AbortSignal } = {},
 ): Promise<UserModelRoleAssignmentResponse> {
-  const scope = validateUserModelRoleScope(userId, input);
+  const scope = validateUserModelRoleReadScope(userId, input);
   if (!isUserModelRoleName(input.roleName)) {
     throw new Error('roleName must be one of the supported built-in model roles.');
   }

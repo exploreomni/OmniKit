@@ -30,6 +30,7 @@ interface SemanticBlueprintPanelProps {
   relationshipIntent: SemanticRelationshipIntent;
   permissionIntent: SemanticPermissionIntent;
   approvalNotice?: string;
+  viewInventoryError?: string;
   relationshipIntentSetup?: ReactNode;
   accessIntentSetup?: ReactNode;
   accessSetup?: ReactNode;
@@ -98,6 +99,7 @@ export function SemanticBlueprintPanel({
   relationshipIntent,
   permissionIntent,
   approvalNotice,
+  viewInventoryError,
   relationshipIntentSetup,
   accessIntentSetup,
   accessSetup,
@@ -304,9 +306,11 @@ export function SemanticBlueprintPanel({
                     ? 'Choose the main data source...'
                     : busy
                       ? 'Loading model views...'
+                      : viewInventoryError
+                        ? 'Effective model views could not be verified'
                       : viewOptions.length > 0
                         ? 'No views match the schema focus'
-                        : 'No views found — refresh the model schema in Omni'
+                        : 'No effective model views were returned by Omni'
                 }
                 ariaLabel="Main data source"
                 allowFreeText={false}
@@ -317,13 +321,17 @@ export function SemanticBlueprintPanel({
             </div>
             {!busy && viewOptions.length === 0 && onRefreshModel && (
               <div className="mt-2 flex items-center gap-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-800">
-                <span>No view files found in this model. Refresh the schema in Omni, then reload here.</span>
+                <span>
+                  {viewInventoryError
+                    ? `OmniKit could not verify this model's effective view inventory. ${viewInventoryError}`
+                    : 'Omni returned no effective model views. If this model should expose database views, refresh its schema in Omni and reload the inventory here.'}
+                </span>
                 <button
                   type="button"
                   onClick={onRefreshModel}
                   className="shrink-0 rounded border border-amber-300 bg-white px-2 py-0.5 font-semibold text-amber-900 hover:bg-amber-100"
                 >
-                  Reload
+                  Reload views
                 </button>
               </div>
             )}

@@ -11,6 +11,7 @@ import {
   semanticBlueprintExistingRelationshipContracts,
   semanticBlueprintFingerprint,
   semanticBlueprintIssues,
+  semanticBlueprintModelYamlInventoryIssues,
   semanticBlueprintMutationFingerprint,
   semanticBlueprintPackageIssues,
   semanticBlueprintPlanBindings,
@@ -231,6 +232,64 @@ test('discovers schema and conservative fact/dimension hints from authored view 
       fieldReference: 'subway__dim_locations.opened_at',
       dataType: 'timestamp',
     }],
+  );
+});
+
+test('accepts inherited views from a verified resolved inventory without treating them as authored mutations', () => {
+  const authoredYaml = {
+    files: {
+      model: 'extends: base_model\n',
+      'local/local_orders.view': 'schema: local\ntable_name: orders\n',
+    },
+    viewNames: {
+      'local/local_orders.view': 'local__orders',
+    },
+  };
+  const resolvedYaml = {
+    files: {
+      ...authoredYaml.files,
+      'shared/customers.view': 'schema: shared\ntable_name: customers\ndimensions:\n  created_at:\n    type: timestamp\n',
+    },
+    viewNames: {
+      ...authoredYaml.viewNames,
+      'shared/customers.view': 'shared__customers',
+    },
+  };
+
+  assert.deepEqual(semanticBlueprintModelYamlInventoryIssues(resolvedYaml, authoredYaml), []);
+  const resolvedOptions = semanticBlueprintViewOptions(resolvedYaml);
+  assert.deepEqual(resolvedOptions.map((option) => option.viewName), [
+    'local__orders',
+    'shared__customers',
+  ]);
+
+  const bindings = semanticBlueprintPlanBindings(approvedDraft({
+    primaryViewName: 'shared__customers',
+    supportingViewNames: ['local__orders'],
+    relationshipDecisions: { local__orders: 'needs_review' },
+    relationshipContracts: {},
+    primaryDateField: 'shared__customers.created_at',
+  }), resolvedOptions, {
+    authoredFileNames: Object.keys(authoredYaml.files),
+  });
+  assert.deepEqual(bindings.requestedArtifactFileNames, ['local/local_orders.view']);
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(bindings.actionOverrides, 'view:shared/customers.view'),
+    false,
+  );
+});
+
+test('rejects malformed or internally inconsistent resolved view inventories', () => {
+  assert.match(
+    semanticBlueprintModelYamlInventoryIssues({}, { files: {} }).join(' '),
+    /did not return a resolved model file inventory/i,
+  );
+  assert.match(
+    semanticBlueprintModelYamlInventoryIssues(
+      { files: { model: 'name: example\n' }, viewNames: {} },
+      modelYaml,
+    ).join(' '),
+    /omitted 3 authored views/i,
   );
 });
 

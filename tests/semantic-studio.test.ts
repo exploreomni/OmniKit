@@ -1033,8 +1033,8 @@ test('reviewed blueprint and action edits retain the validated branch for an exa
 	  assert.match(analysisHandler, /findAuthoredTopicYamlFile\(authoredAnalysisYaml, reviewedAnalysisTopicName\)/);
 	  assert.match(analysisHandler, /buildTopicSourceContext\(reviewedAnalysisTopicName,[\s\S]*?currentTopicYaml: reviewedAnalysisTopicFile\?\.yaml \|\| ''[\s\S]*?includeCurrentYaml: Boolean\(reviewedAnalysisTopicFile \|\| topicName\)/);
 	  assert.match(analysisHandler, /buildModelSourceContext\(authoredAnalysisYaml/);
-	  assert.match(analysisHandler, /buildTopicBuilderModelDiscoveryContext\(authoredAnalysisYaml/);
-	  assert.match(analysisHandler, /: reviewedBranchSessionForAnalysis\s*\? buildTopicBuilderModelDiscoveryContext\(authoredAnalysisYaml/);
+		  assert.match(analysisHandler, /buildTopicBuilderModelDiscoveryContext\(modelViewAnalysisYaml/);
+		  assert.match(analysisHandler, /: reviewedBranchSessionForAnalysis\s*\? buildTopicBuilderModelDiscoveryContext\(modelViewAnalysisYaml/);
 	  assert.match(analysisHandler, /runAiPrompt\([\s\S]*?topicName:[\s\S]*?reviewedAnalysisTopicName[\s\S]*?branchId: reviewedBranchSessionForAnalysis\?\.session\.branchId/);
   assert.ok(
     generationHandler.indexOf('const reviewedBranchSessionForRegeneration = reviewedDeployBranchSessionForCurrentScope()')
@@ -1048,7 +1048,7 @@ test('reviewed blueprint and action edits retain the validated branch for an exa
   assert.match(generationHandler, /semanticStudioYamlSnapshotChanges\([\s\S]*?reviewedBranchSessionForRegeneration\.branchYaml,[\s\S]*?freshReviewedBranchYaml/);
   assert.match(generationHandler, /const authoredGenerationYaml = reviewedBranchYamlForRegeneration \|\| modelYaml/);
   assert.match(generationHandler, /const currentArtifactYaml = authoredGenerationYaml\.files\?\.\[artifactItem\.fileName\]/);
-  assert.match(generationHandler, /buildRelationshipBuilderModelContext\(authoredGenerationYaml/);
+	  assert.match(generationHandler, /buildRelationshipBuilderModelContext\(modelViewGenerationYaml/);
   assert.match(generationHandler, /viewFieldPreservationLintIssues\([\s\S]*?authoredArtifactYaml/);
 	  const genericGenerationStart = generationHandler.indexOf('const reviewedRegenerationTopicName');
 	  const genericGeneration = generationHandler.slice(genericGenerationStart);
@@ -1061,7 +1061,7 @@ test('reviewed blueprint and action edits retain the validated branch for an exa
 	  assert.match(genericGeneration, /buildDeepReviewChunkPrompt\([\s\S]*?topicName: genericPackageTopicName/);
 	  assert.match(genericGeneration, /runAiPrompt\([\s\S]*?topicName:[\s\S]*?genericPackageTopicName[\s\S]*?branchId: reviewedBranchSessionForRegeneration\?\.session\.branchId/);
 	  assert.match(genericGeneration, /buildModelSourceContext\(authoredGenerationYaml/);
-	  assert.match(genericGeneration, /buildTopicBuilderModelDiscoveryContext\(authoredGenerationYaml/);
+		  assert.match(genericGeneration, /buildTopicBuilderModelDiscoveryContext\(modelViewGenerationYaml/);
 	  assert.match(genericGeneration, /reconcileSemanticStudioRegeneratedPackage\([\s\S]*?branchFiles: reviewedBranchYamlForRegeneration\.files \|\| \{\}[\s\S]*?files: generatedFiles/);
 	  assert.match(genericGeneration, /branchId: reviewedBranchSessionForRegeneration\?\.session\.branchId[\s\S]*?branchYaml: reviewedBranchYamlForRegeneration/);
 	  assert.match(genericGeneration, /setDeploySemanticContext\(generatedContext\);\s*setDeployFiles\(generatedFiles\);\s*setDeployPreWriteAcknowledged\(false\)/);
@@ -1192,7 +1192,7 @@ test('AI Semantic Studio plans and stages one governed end-to-end topic solution
   assert.match(blueprint, /Existing model relationship/);
   assert.match(blueprint, /existingRelationshipContracts/);
   assert.match(panel, /blueprintRelationshipContracts/);
-  assert.match(page, /semanticBlueprintExistingRelationshipContracts\(selectedModelYaml\)/);
+  assert.match(page, /semanticBlueprintExistingRelationshipContracts\(selectedModelViewYaml\)/);
   assert.match(blueprint, /excluded automatically/);
   assert.doesNotMatch(blueprint, /Explicit exclusions \(optional\)/);
   assert.match(blueprint, /I approve these build instructions/);
@@ -1210,7 +1210,7 @@ test('AI Semantic Studio plans and stages one governed end-to-end topic solution
   assert.match(page, /resumableAcceptedSemanticSolutionFiles/);
   assert.match(page, /semanticSolutionGeneratedFileFingerprint/);
   assert.match(page, /validateDeployYamlFile\(file\)/);
-  assert.match(page, /semanticModelReferenceIssues\(\[\.\.\.acceptedFiles, \.\.\.parsedFiles\], authoredGenerationYaml\)/);
+  assert.match(page, /semanticModelReferenceIssues\(\[\.\.\.acceptedFiles, \.\.\.parsedFiles\], modelViewGenerationYaml\)/);
   assert.match(page, /semanticBlueprintPackageIssues/);
   assert.match(page, /semanticBlueprintApprovalIssues/);
   assert.match(page, /targetTopicFileName: solutionPlan\?\.topicFileName/);
@@ -1296,6 +1296,25 @@ test('AI Semantic Studio plans and stages one governed end-to-end topic solution
   assert.match(page, /restored authored topic settings[\s\S]+approve it before saving/);
   assert.match(page, /createReviewedModelPullRequestHandoff/);
   assert.doesNotMatch(page, /publishReviewedModelBranch/);
+});
+
+test('AI Semantic Studio separates effective view discovery from authored model writes', () => {
+  const page = source('src/pages/TopicsPage.tsx');
+  const blueprint = source('src/components/semanticStudio/SemanticBlueprintPanel.tsx');
+
+  assert.match(page, /const \[selectedModelYaml, setSelectedModelYaml\]/);
+  assert.match(page, /const \[selectedModelViewYaml, setSelectedModelViewYaml\]/);
+  assert.match(page, /fullyResolved: false,[\s\S]+loadVerifiedModelViewYaml/);
+  assert.match(page, /loadVerifiedModelViewYaml[\s\S]+fullyResolved: true/);
+  assert.match(page, /setSelectedModelViewYaml\(resolvedYaml\)/);
+  assert.doesNotMatch(page, /setSelectedModelYaml\(resolvedYaml\)/);
+  assert.match(page, /modelYaml: selectedModelViewYaml/);
+  assert.match(page, /semanticBlueprintPlanBindings\(normalizedSemanticBlueprint, blueprintViewOptions, \{[\s\S]+authoredFileNames: Object\.keys\(selectedModelYaml\?\.files \|\| \{\}\)/);
+  assert.match(page, /modelYamlFiles: selectedModelYaml\.files/);
+  assert.match(page, /blueprintViewInventoryError=\{modelViewInventoryError\}/);
+  assert.match(page, /effective model view inventory was reloaded[\s\S]+approve the current data boundary again/i);
+  assert.match(blueprint, /effective view inventory/i);
+  assert.match(blueprint, /Reload views/);
 });
 
 test('AI Semantic Studio keeps large model scope usable and applies one Review gate', () => {

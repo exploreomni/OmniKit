@@ -96,6 +96,7 @@ const MAX_MODEL_ROLE_RECORDS = 1_000;
 const MAX_MODEL_ROLE_RESPONSE_BYTES = 512 * 1024;
 const USER_REQUEST_TIMEOUT_MS = 15_000;
 const MODEL_ROLE_TIMEOUT_MS = 15_000;
+const MAX_MODEL_ROLE_RETRY_AFTER_MS = 60_000;
 const MODEL_ROLE_VERIFICATION_DELAYS_MS = [0, 250, 750] as const;
 const RETRYABLE_MODEL_ROLE_VERIFICATION_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
@@ -131,10 +132,26 @@ class UserTransportError extends Error {
 }
 
 class ModelRoleUpstreamHttpError extends Error {
-  constructor(readonly status: number) {
+  constructor(
+    readonly status: number,
+    readonly retryAfterMs?: number,
+  ) {
     super(`HTTP ${status}`);
     this.name = "ModelRoleUpstreamHttpError";
   }
+}
+
+function modelRoleRetryAfterMs(response: Response): number | undefined {
+  const raw = response.headers.get('retry-after')?.trim();
+  if (!raw) return undefined;
+  let milliseconds: number;
+  if (/^\d+(?:\.\d+)?$/.test(raw)) {
+    milliseconds = Math.ceil(Number(raw) * 1_000);
+  } else {
+    milliseconds = Date.parse(raw) - Date.now();
+  }
+  if (!Number.isFinite(milliseconds) || milliseconds <= 0) return undefined;
+  return Math.min(milliseconds, MAX_MODEL_ROLE_RETRY_AFTER_MS);
 }
 
 function json(data: unknown, status = 200): Response {
@@ -318,7 +335,7 @@ async function collectIdentityAccessEvidence(
   return buildIdentityAccessEvidence(input, accessEvidenceReader(client, listStrictIdentityUsers), evidenceSignal);
 }
 
-function modelRoleScope(body: RequestBody): UserModelRoleScope {
+function modelRoleReadScope(body: RequestBody): UserModelRoleScope {
   if (!isOmniId(body.user_id)) {
     throw new ModelRoleRequestError("user_id must be a valid Omni identifier for model-role actions.");
   }
@@ -327,9 +344,6 @@ function modelRoleScope(body: RequestBody): UserModelRoleScope {
   }
   if (body.connection_id !== undefined && !isOmniId(body.connection_id)) {
     throw new ModelRoleRequestError("connection_id must be a valid Omni identifier when provided.");
-  }
-  if (!body.model_id && !body.connection_id) {
-    throw new ModelRoleRequestError("model_id or connection_id is required for a scoped model-role read.");
   }
   return {
     userId: body.user_id,
@@ -561,8 +575,9 @@ async function readModelRoles(
     dependencies,
     async (response) => {
       if (!response.ok) {
+        const retryAfterMs = modelRoleRetryAfterMs(response);
         await response.body?.cancel().catch(() => undefined);
-        throw new ModelRoleUpstreamHttpError(response.status);
+        throw new ModelRoleUpstreamHttpError(response.status, retryAfterMs);
       }
       return readBoundedJson(response);
     },
@@ -766,12 +781,12 @@ export default async function handler(
       }
 
       case "list_model_roles": {
-        const scope = modelRoleScope(body);
+        const scope = modelRoleReadScope(body);
         return json(await readModelRoles(req, cleanUrl, authHeaders, scope, dependencies));
       }
 
       case "assign_model_role": {
-        const scope = modelRoleScope(body);
+        const scope = modelRoleReadScope(body);
         const roleName = assignmentRole(body, scope);
         const assignmentPayload = await withModelRoleUpstreamResponse(
           req,
@@ -788,8 +803,9 @@ export default async function handler(
           dependencies,
           async (response) => {
             if (!response.ok) {
+              const retryAfterMs = modelRoleRetryAfterMs(response);
               await response.body?.cancel().catch(() => undefined);
-              throw new ModelRoleUpstreamHttpError(response.status);
+              throw new ModelRoleUpstreamHttpError(response.status, retryAfterMs);
             }
             return readBoundedJson(response);
           },
@@ -848,7 +864,10 @@ export default async function handler(
       return json({ error: message, code: error.code }, error.status);
     }
     if (error instanceof ModelRoleUpstreamHttpError) {
-      return json({ error: `Omni user model-role request failed with HTTP ${error.status}.` }, error.status);
+      return json({
+        error: `Omni user model-role request failed with HTTP ${error.status}.`,
+        ...(error.retryAfterMs === undefined ? {} : { retryAfterMs: error.retryAfterMs }),
+      }, error.status);
     }
     if (error instanceof UserTransportError) {
       const message = error.code === "USER_REQUEST_TIMEOUT"

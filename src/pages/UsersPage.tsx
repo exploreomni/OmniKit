@@ -18,7 +18,11 @@ import { WorkflowStatusScene } from '@/components/ui/WorkflowStatusScene';
 import { friendlyApiError } from '@/utils/apiErrors';
 import { csvRowsToText, type CsvCellValue } from '@/utils/csvExport';
 import { getConnectionCacheKey } from '@/services/connectionGuards';
-import { joinIdentityList } from '@/services/userManagement/identityImportInputs';
+import {
+  prepareIdentityUserExport,
+  type IdentityExportProgress,
+  type IdentityExportRoleRequestLimit,
+} from '@/services/userManagement/userExport';
 import { AccessPostureEvidence } from '@/components/admin/CapabilityStatus';
 import { fetchAdminReadiness, type AdminAccessPosture } from '@/services/adminReadiness';
 import type { OmniUser, OmniUserAttributeValue, OmniUserAttributes } from '@/types';
@@ -371,6 +375,17 @@ function downloadCsv(fileName: string, rows: CsvCellValue[][]) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+function formatExportRemainingTime(remainingMs?: number): string {
+  if (remainingMs === undefined) return 'Estimating time remaining';
+  if (remainingMs <= 0) return 'Finishing export';
+  const minutes = Math.ceil(remainingMs / 60_000);
+  if (minutes <= 1) return 'About 1 minute remaining';
+  if (minutes < 60) return `About ${minutes} minutes remaining`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `About ${hours}h${remainingMinutes > 0 ? ` ${remainingMinutes}m` : ''} remaining`;
+}
+
 function mapScimUser(user: Record<string, unknown>): OmniUser {
   const rawAttributes = user[USER_ATTRIBUTE_URN];
   const active = typeof user.active === 'boolean' ? user.active : undefined;
@@ -390,6 +405,8 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const { connection } = useConnection();
   const connectionKey = getConnectionCacheKey(connection);
   const activeConnectionKeyRef = useRef(connectionKey);
+  const exportAbortRef = useRef<AbortController | null>(null);
+  const exportLockRef = useRef(false);
   const [users, setUsers] = useState<OmniUser[]>([]);
   const [hasLoadedUsers, setHasLoadedUsers] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -406,12 +423,19 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
   const [accessPostureErrors, setAccessPostureErrors] = useState<Record<string, string>>({});
   const [loadingAccessPostureId, setLoadingAccessPostureId] = useState('');
   const [exportNotice, setExportNotice] = useState('');
+  const [exportingUsers, setExportingUsers] = useState(false);
+  const [userExportProgress, setUserExportProgress] = useState<IdentityExportProgress | null>(null);
+  const [roleExportRateByConnection, setRoleExportRateByConnection] = useState<Record<string, IdentityExportRoleRequestLimit>>({});
   const [multiCreateRows, setMultiCreateRows] = useState<MultiCreateUserRow[]>([]);
   const [multiCreateProgress, setMultiCreateProgress] = useState<MultiCreateProgress>(null);
   const [creatingMany, setCreatingMany] = useState(false);
   const pageSize = 50;
+  const roleExportRequestsPerMinute = roleExportRateByConnection[connectionKey] || 60;
 
   useLayoutEffect(() => {
+    exportAbortRef.current?.abort();
+    exportAbortRef.current = null;
+    exportLockRef.current = false;
     activeConnectionKeyRef.current = connectionKey;
     setUsers([]);
     setHasLoadedUsers(false);
@@ -426,9 +450,14 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     setAccessPostureErrors({});
     setLoadingAccessPostureId('');
     setExportNotice('');
+    setExportingUsers(false);
+    setUserExportProgress(null);
     setMultiCreateRows([]);
     setMultiCreateProgress(null);
     setCreatingMany(false);
+    return () => {
+      exportAbortRef.current?.abort();
+    };
   }, [connectionKey]);
 
   const fetchUsers = useCallback(async () => {
@@ -514,29 +543,75 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     }
   }
 
-  function handleDownloadCurrentUsers() {
+  async function handleDownloadCurrentUsers() {
     if (!hasLoadedUsers || userLoadTruncated || users.length !== totalResults) {
       setError(`User export is blocked because the collection is incomplete: ${users.length} of ${totalResults || 'an unknown total'} records are loaded.`);
       return;
     }
-    downloadCsv('omnikit-current-users.csv', [
-      ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'],
-      ...users.map((user) => [
-        'add',
-        user.displayName || '',
-        user.userName,
-        joinIdentityList((user.groups || []).map((group) => group.display).filter(Boolean)),
-        '',
-        '',
-        '',
-      ]),
-    ]);
-    showExportNotice(`User export started (${users.length} loaded users).`);
+    if (exportLockRef.current) return;
+
+    const requestKey = connectionKey;
+    const controller = new AbortController();
+    exportAbortRef.current?.abort();
+    exportAbortRef.current = controller;
+    exportLockRef.current = true;
+    setExportingUsers(true);
+    setUserExportProgress(null);
+    setError('');
+    setExportNotice('');
+
+    let host = '';
+    try {
+      host = new URL(connection.baseUrl).hostname;
+    } catch {
+      host = '';
+    }
+    const instanceLabel = connection.instanceLabel?.trim() || host || 'the selected Omni instance';
+    try {
+      const result = await prepareIdentityUserExport(
+        connection.baseUrl,
+        connection.apiKey,
+        {
+          key: requestKey,
+          label: instanceLabel,
+          signal: controller.signal,
+          isActive: () => activeConnectionKeyRef.current === requestKey,
+          roleRequestsPerMinute: roleExportRequestsPerMinute,
+        },
+        (progress) => {
+          if (activeConnectionKeyRef.current === requestKey && !controller.signal.aborted) {
+            setUserExportProgress(progress);
+          }
+        },
+      );
+      if (activeConnectionKeyRef.current !== requestKey || controller.signal.aborted) return;
+      downloadCsv('omnikit-current-users.csv', result.rows);
+      showExportNotice(
+        `User export started with ${result.userCount} users and ${result.directRoleCount} direct role assignment${result.directRoleCount === 1 ? '' : 's'}.${result.unknownAssignmentSourceUserCount > 0 ? ` ${result.unknownAssignmentSourceUserCount} user${result.unknownAssignmentSourceUserCount === 1 ? ' has' : 's have'} role evidence from an unrecognized assignment source; verified direct assignments were exported and unrecognized assignments were omitted.` : ''}${result.noAssignmentUserCount > 0 ? ` ${result.noAssignmentUserCount} of those user${result.noAssignmentUserCount === 1 ? 's was' : 's were'} tagged “No assignment” because no verified direct assignment was available; those markers will not change access when imported.` : ''}`,
+      );
+    } catch (nextError) {
+      if (activeConnectionKeyRef.current !== requestKey) return;
+      if (nextError instanceof DOMException && nextError.name === 'AbortError') {
+        setExportNotice('User export cancelled. No file was downloaded.');
+      } else {
+        setError(friendlyApiError(nextError, 'User export could not be prepared'));
+      }
+    } finally {
+      if (exportAbortRef.current === controller) {
+        controller.abort();
+        exportAbortRef.current = null;
+        exportLockRef.current = false;
+        if (activeConnectionKeyRef.current === requestKey) {
+          setExportingUsers(false);
+          setUserExportProgress(null);
+        }
+      }
+    }
   }
 
   function showExportNotice(message: string) {
     setExportNotice(message);
-    window.setTimeout(() => setExportNotice(''), 4000);
+    window.setTimeout(() => setExportNotice(''), 8000);
   }
 
   function addMultiCreateRow() {
@@ -661,15 +736,32 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     && !userLoadTruncated
     && users.length === totalResults;
   const headerActions = (
-    <div className="flex flex-wrap gap-2">
+    <div className="flex flex-wrap items-center gap-2">
+      <label className="flex items-center gap-2 text-xs text-content-secondary">
+        <span>Export pace</span>
+        <select
+          aria-label="Complete user export API pace"
+          value={roleExportRequestsPerMinute}
+          disabled={exportingUsers}
+          onChange={(event) => {
+            const nextRate: IdentityExportRoleRequestLimit = event.target.value === '500' ? 500 : 60;
+            setRoleExportRateByConnection((current) => ({ ...current, [connectionKey]: nextRate }));
+          }}
+          title="Use the accelerated pace only when Omni Support has approved the 500 requests-per-minute limit for this instance."
+          className="input-field w-auto py-2 text-xs disabled:opacity-50"
+        >
+          <option value={60}>Standard (60/min)</option>
+          <option value={500}>Approved accelerated (500/min)</option>
+        </select>
+      </label>
       <button
         onClick={handleDownloadCurrentUsers}
-        disabled={users.length === 0 || !userCollectionComplete}
+        disabled={users.length === 0 || !userCollectionComplete || exportingUsers}
         title={!userCollectionComplete && users.length > 0 ? 'Export requires complete user collection coverage.' : undefined}
         className="btn-secondary text-sm disabled:opacity-40"
       >
-        <Download size={14} />
-        Export Users
+        {exportingUsers ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+        {exportingUsers ? 'Preparing Export' : 'Export Users'}
       </button>
       <button onClick={() => { setEditingUser(null); setShowForm(true); }} className="btn-primary text-sm">
         <Plus size={14} />
@@ -707,6 +799,41 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
         <div className="bg-green-50 border border-green-200 text-green-700 text-sm px-4 py-3 rounded-card">
           {exportNotice} If you are using the in-app preview, the file may appear in the host browser downloads instead of inside the preview pane.
         </div>
+      )}
+
+      {exportingUsers && userExportProgress && (
+        <section className="card space-y-3" aria-live="polite" aria-label="User export progress">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 items-start gap-3">
+              <Loader2 size={18} className="mt-0.5 shrink-0 animate-spin text-omni-700" />
+              <div className="min-w-0">
+                <div className="text-sm font-semibold text-content-primary">Preparing complete user export</div>
+                <p className="mt-0.5 text-xs text-content-secondary">{userExportProgress.message}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => exportAbortRef.current?.abort()}
+              className="btn-secondary shrink-0 text-xs"
+            >
+              Cancel
+            </button>
+          </div>
+          <div className="h-2 w-full overflow-hidden rounded-full bg-gray-200">
+            <div
+              className="h-full rounded-full bg-omni-700 transition-all duration-300"
+              style={{ width: `${Math.min(100, (userExportProgress.completed / Math.max(userExportProgress.total, 1)) * 100)}%` }}
+            />
+          </div>
+          <div className="flex items-center justify-between gap-3 text-[11px] text-content-secondary">
+            <span>Step {userExportProgress.phase} of {userExportProgress.phaseTotal} · {userExportProgress.stage}</span>
+            <span>
+              {userExportProgress.stage === 'User access'
+                ? `${userExportProgress.stageCompleted.toLocaleString()}/${userExportProgress.stageTotal.toLocaleString()} users · ${formatExportRemainingTime(userExportProgress.estimatedRemainingMs)}`
+                : `${userExportProgress.stageCompleted}/${userExportProgress.stageTotal} complete`}
+            </span>
+          </div>
+        </section>
       )}
 
       <div className="grid md:grid-cols-3 gap-3">

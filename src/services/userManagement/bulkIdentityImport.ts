@@ -19,9 +19,12 @@ import {
 import { parseCsvTable } from '../../utils/csvImport';
 import {
   IDENTITY_IMPORT_LIMITS,
+  IDENTITY_NO_ASSIGNMENT_LABEL,
   identityModelRoleLabel,
+  isIdentityNoAssignment,
   normalizeIdentityModelRole,
   parseEscapedIdentityList,
+  unescapeIdentityCsvValue,
   type IdentityModelRoleName,
 } from './identityImportInputs';
 
@@ -300,6 +303,7 @@ function mergeRowNumbers(target: RecordSource, next: RecordSource) {
 function deduplicateRecords(records: IdentityImportRecord[], issues: IdentityImportIssue[]) {
   const deduplicated: IdentityImportRecord[] = [];
   const seenUsers = new Map<string, Extract<IdentityImportRecord, { type: 'user' }>>();
+  const duplicateUserIssues = new Map<string, IdentityImportIssue>();
   const seenGroups = new Map<string, Extract<IdentityImportRecord, { type: 'group' }>>();
   const duplicateGroupIssues = new Map<string, IdentityImportIssue>();
   const seenMemberships = new Map<string, Extract<IdentityImportRecord, { type: 'membership' }>>();
@@ -323,11 +327,21 @@ function deduplicateRecords(records: IdentityImportRecord[], issues: IdentityImp
         continue;
       }
       mergeRowNumbers(previous, record);
-      if (record.action === 'delete' || previous.action === 'delete') {
-        issues.push({ severity: 'warning', rowNumber: record.rowNumber, message: `Duplicate delete row for ${record.email} was merged.` });
-        continue;
+      const duplicateIssue = duplicateUserIssues.get(key) || {
+        severity: 'warning' as const,
+        rowNumber: previous.rowNumber,
+        rowNumbers: [...previous.rowNumbers],
+        message: '',
+      };
+      duplicateIssue.rowNumbers = [...previous.rowNumbers];
+      duplicateIssue.message = record.action === 'delete' || previous.action === 'delete'
+        ? `${previous.rowNumbers.length} delete rows for ${record.email} were merged into one user operation.`
+        : `${previous.rowNumbers.length} compatible rows for ${record.email} were merged into one user operation.`;
+      if (!duplicateUserIssues.has(key)) {
+        duplicateUserIssues.set(key, duplicateIssue);
+        issues.push(duplicateIssue);
       }
-      issues.push({ severity: 'warning', rowNumber: record.rowNumber, message: `Compatible user add rows for ${record.email} were merged.` });
+      if (record.action === 'delete' || previous.action === 'delete') continue;
       if (previous.displayName && record.displayName && previous.displayName !== record.displayName) {
         issues.push({
           severity: 'error',
@@ -439,6 +453,7 @@ function simplePreview(
   roleName: IdentityModelRoleName | null,
   connections: string[],
   models: string[],
+  noAssignment = false,
 ): IdentityImportPreviewRow {
   const effects: string[] = [];
   if (action === 'add') {
@@ -448,6 +463,8 @@ function simplePreview(
       effects.push(`Assign Restricted Querier to every current shared model in ${connections.length} selected connection${connections.length === 1 ? '' : 's'}; models added later are not included`);
     } else if (roleName) {
       effects.push(`Assign ${identityModelRoleLabel(roleName)} to the resolved permission target${models.length + connections.length === 1 ? '' : 's'}`);
+    } else if (noAssignment) {
+      effects.push('Preserve the user and groups without applying a model-role change');
     }
   } else {
     if (groups.length > 0) effects.push(`Remove ${groups.length} matching group membership${groups.length === 1 ? '' : 's'}`);
@@ -460,7 +477,7 @@ function simplePreview(
     email,
     displayName,
     groups,
-    role: roleName ? identityModelRoleLabel(roleName) : '',
+    role: noAssignment ? IDENTITY_NO_ASSIGNMENT_LABEL : roleName ? identityModelRoleLabel(roleName) : '',
     connections,
     models,
     effects,
@@ -565,6 +582,7 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
   const issues: IdentityImportIssue[] = [];
   const records: IdentityImportRecord[] = [];
   const previewRows: IdentityImportPreviewRow[] = [];
+  const noAssignmentRows: number[] = [];
   const knownUnifiedHeaders = new Set(['record_type', 'action', 'email', 'display_name', 'group_name']);
   if (hasUnifiedContract) {
     headers.forEach((header) => {
@@ -586,8 +604,8 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
         continue;
       }
       const actionValue = normalizedKey(cell(row, 'action'));
-      const email = cell(row, 'email');
-      const displayName = cell(row, 'display_name');
+      const email = unescapeIdentityCsvValue(cell(row, 'email'));
+      const displayName = unescapeIdentityCsvValue(cell(row, 'display_name'));
       const roleValue = cell(row, 'role');
       if (actionValue !== 'add' && actionValue !== 'remove') {
         issues.push({ severity: 'error', rowNumber, message: 'Action must be add or remove.' });
@@ -619,9 +637,18 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
         issues.push({ severity: 'error', rowNumber, message: error instanceof Error ? error.message : String(error) });
         continue;
       }
-      const roleName = roleValue ? normalizeIdentityModelRole(roleValue) : null;
-      if (roleValue && !roleName) {
-        issues.push({ severity: 'error', rowNumber, message: 'Role must be Viewer, Restricted Querier, Querier, Modeler, Connection Admin, Admin, or No Access.' });
+      const noAssignment = isIdentityNoAssignment(roleValue);
+      const roleName = roleValue && !noAssignment ? normalizeIdentityModelRole(roleValue) : null;
+      if (roleValue && !roleName && !noAssignment) {
+        issues.push({ severity: 'error', rowNumber, message: `Role must be Viewer, Restricted Querier, Querier, Modeler, Connection Admin, Admin, No Access, or ${IDENTITY_NO_ASSIGNMENT_LABEL}.` });
+        continue;
+      }
+      if (noAssignment && actionValue !== 'add') {
+        issues.push({ severity: 'error', rowNumber, message: `${IDENTITY_NO_ASSIGNMENT_LABEL} is an export marker and can only be used with add.` });
+        continue;
+      }
+      if (noAssignment && (connections.length > 0 || models.length > 0)) {
+        issues.push({ severity: 'error', rowNumber, message: `${IDENTITY_NO_ASSIGNMENT_LABEL} cannot target a connection or model.` });
         continue;
       }
       if (!roleName && (connections.length > 0 || models.length > 0)) {
@@ -650,7 +677,8 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
         continue;
       }
 
-      previewRows.push(simplePreview(rowNumber, actionValue, email, displayName, groups, roleName, connections, models));
+      if (noAssignment) noAssignmentRows.push(rowNumber);
+      previewRows.push(simplePreview(rowNumber, actionValue, email, displayName, groups, roleName, connections, models, noAssignment));
       if (actionValue === 'add') {
         records.push({ ...source(rowNumber), type: 'user', action: 'upsert', email, displayName, attributes: {} });
         for (const groupName of groups) {
@@ -724,6 +752,13 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
       continue;
     }
     issues.push({ severity: 'error', rowNumber, message: 'record_type must be user, group, or membership.' });
+  }
+
+  if (noAssignmentRows.length > 0) {
+    issues.push({
+      severity: 'warning',
+      message: `${noAssignmentRows.length.toLocaleString()} row${noAssignmentRows.length === 1 ? '' : 's'} marked ${IDENTITY_NO_ASSIGNMENT_LABEL}; user and group changes remain available, but no model-role change will be applied for ${noAssignmentRows.length === 1 ? 'that row' : 'those rows'}.`,
+    });
   }
 
   const deduplicated = deduplicateRecords(records, issues);

@@ -849,6 +849,52 @@ test('user model-role handler performs a strictly scoped and sanitized list read
   assert.equal(JSON.stringify(payload).includes(PRIVATE_MARKER), false);
 });
 
+test('user model-role handler supports a complete unscoped list read', async () => {
+  let requestedUrl = '';
+  const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
+    action: 'list_model_roles',
+    user_id: ROLE_USER_ID,
+  }), {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: async (input) => {
+      requestedUrl = String(input);
+      return json({
+        membershipId: ROLE_MEMBERSHIP_ID,
+        results: [
+          {
+            roleName: 'QUERY_TOPICS',
+            baseRole: 'QUERY_TOPICS',
+            modelId: ROLE_MODEL_ID,
+            connectionId: ROLE_CONNECTION_ID,
+            priority: 20,
+            resolved: false,
+            from: { type: 'User Role' },
+          },
+          {
+            roleName: 'MODELER',
+            baseRole: 'MODELER',
+            modelId: '55555555-5555-4555-8555-555555555555',
+            connectionId: '66666666-6666-4666-8666-666666666666',
+            priority: 30,
+            resolved: true,
+            from: { type: 'GROUP' },
+          },
+        ],
+      });
+    },
+  });
+
+  assert.equal(response.status, 200);
+  const url = new URL(requestedUrl);
+  assert.equal(url.pathname, `/api/v1/users/${ROLE_USER_ID}/model-roles`);
+  assert.equal(url.searchParams.has('modelId'), false);
+  assert.equal(url.searchParams.has('connectionId'), false);
+  const payload = await response.json();
+  assert.equal(payload.results.length, 2);
+  assert.equal(payload.results[0].from.type, 'User Role');
+  assert.equal(payload.results[1].from.type, 'GROUP');
+});
+
 test('user model-role handler keeps its deadline active through a stalled response body', async () => {
   let forwardedSignal: AbortSignal | null | undefined;
   const response = await manageUsersHandler(identityHandlerRequest('manage-users', {
@@ -1194,6 +1240,21 @@ test('user model-role browser helpers preserve scope, cancellation, and validate
   assert.equal(requests[1].body.role_name, 'MODELER');
   assert.equal(requests[0].signal, controller.signal);
   assert.equal(requests[1].signal, controller.signal);
+});
+
+test('user model-role browser helper omits optional filters for a complete read', async (t) => {
+  let requestBody: Record<string, unknown> | undefined;
+  t.mock.method(globalThis, 'fetch', async (_input: string | URL | Request, init?: RequestInit) => {
+    requestBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    return json({ membershipId: ROLE_MEMBERSHIP_ID, results: [] });
+  });
+
+  const listed = await listUserModelRoles(BASE_URL, API_KEY, ROLE_USER_ID);
+
+  assert.deepEqual(listed.results, []);
+  assert.equal(requestBody?.action, 'list_model_roles');
+  assert.equal(Object.prototype.hasOwnProperty.call(requestBody, 'model_id'), false);
+  assert.equal(Object.prototype.hasOwnProperty.call(requestBody, 'connection_id'), false);
 });
 
 function accessEvidenceReader(
