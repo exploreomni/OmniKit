@@ -123,7 +123,9 @@ export const OMNI_API_CONTRACTS: OmniApiContract[] = [
   { id: 'scim-group-write', path: '/api/scim/v2/groups/:param', methods: ['PUT', 'PATCH'], status: 'documented_current', workflows: ['user_management'], docsUrl: 'https://docs.omni.co/api/user-groups/update-user-group', probeMode: 'controlled_write' },
   { id: 'scim-users-list', path: '/api/scim/v2/users', methods: ['GET'], status: 'documented_current', workflows: ['user_management', 'admin_readiness'], docsUrl: 'https://docs.omni.co/api/users/list-users', probeMode: 'read_only' },
   { id: 'scim-users-create', path: '/api/scim/v2/users', methods: ['POST'], status: 'documented_current', workflows: ['user_management'], docsUrl: 'https://docs.omni.co/api/users/create-user', probeMode: 'controlled_write' },
+  { id: 'scim-user-read', path: '/api/scim/v2/users/:param', methods: ['GET'], status: 'documented_current', workflows: ['user_management'], docsUrl: 'https://docs.omni.co/api/users/retrieve-user', probeMode: 'read_only' },
   { id: 'scim-user', path: '/api/scim/v2/users/:param', methods: ['PUT', 'DELETE'], status: 'documented_current', workflows: ['user_management'], docsUrl: 'https://docs.omni.co/api/users/replace-user', probeMode: 'controlled_write' },
+  { id: 'scim-user-update', path: '/api/scim/v2/users/:param', methods: ['PATCH'], status: 'documented_current', workflows: ['user_management'], docsUrl: 'https://docs.omni.co/api/users/update-user', probeMode: 'controlled_write' },
 ];
 
 function patternRegex(pattern: string): RegExp {

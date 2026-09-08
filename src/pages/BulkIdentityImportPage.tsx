@@ -5,6 +5,7 @@ import {
   Download,
   FileText,
   Loader2,
+  MinusCircle,
   Play,
   RefreshCw,
   ShieldCheck,
@@ -32,6 +33,61 @@ import {
 } from '@/services/userManagement/bulkIdentityImport';
 
 const MAX_CSV_BYTES = 5 * 1024 * 1024;
+const PERSONAL_CONTENT_CURRENT_LABELS: Record<IdentityImportPreflight['personalContentChanges'][number]['current'], string> = {
+  enabled: 'Enabled',
+  disabled: 'Disabled',
+  not_returned: 'Not returned by Omni',
+  new_user: 'New user',
+  invalid: 'Invalid current value',
+};
+const RESULT_STAGE_LABELS: Record<IdentityImportResult['stage'], string> = {
+  user: 'User', group: 'Group', membership: 'Group access', role: 'Model access', deprovision: 'Organization access',
+};
+const RESULT_FIELD_LABELS: Record<IdentityImportResult['field'], string> = {
+  user: 'Account', display_name: 'Display name', attribute: 'User attribute', allow_personal_content: 'Allow personal content',
+  group: 'Group', membership: 'Membership', role: 'Role', membership_revocation: 'Membership removal',
+};
+
+function isConfirmedNoChange(result: IdentityImportResult): boolean {
+  if (result.status !== 'skipped') return false;
+  const message = result.message.trim();
+  // Only explicit no-op evidence is folded away. Conflicts, unavailable identities,
+  // and unverified outcomes remain visible with the other review items.
+  return message === `${result.target} already exists.`
+    || message === `${result.target} does not exist.`
+    || message === 'The requested value already exists.'
+    || message === 'The requested value already existed before the write.'
+    || /^Personal content access (?:enabled|disabled) already; no change needed\.$/.test(message)
+    || (result.stage === 'membership' && /^[^\n]+ is (?:already in|not in) [^\n]+\.$/.test(message))
+    || (result.stage === 'role' && /^[^\n]+ is already assigned directly and is the verified effective role\.$/.test(message));
+}
+
+function IdentityImportResultEntry({ result }: { result: IdentityImportResult }) {
+  const noChange = isConfirmedNoChange(result);
+  const stage = RESULT_STAGE_LABELS[result.stage];
+  const field = RESULT_FIELD_LABELS[result.field];
+  const target = result.field === 'allow_personal_content' || result.field === 'display_name'
+    ? result.target.replace(new RegExp(` · ${result.field}$`), '') : result.target;
+  return (
+    <div className="flex items-start gap-3 px-5 py-3 text-xs">
+      {noChange ? <MinusCircle size={15} className="mt-0.5 shrink-0 text-content-tertiary" aria-hidden="true" />
+        : result.status === 'succeeded' ? <CheckCircle2 size={15} className="mt-0.5 shrink-0 text-green-700" aria-hidden="true" />
+          : result.status === 'failed' ? <XCircle size={15} className="mt-0.5 shrink-0 text-red-600" aria-hidden="true" />
+            : <AlertTriangle size={15} className="mt-0.5 shrink-0 text-amber-600" aria-hidden="true" />}
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+          <span className="font-semibold text-content-secondary">{stage === field ? field : `${stage} · ${field}`}</span>
+          <span className={noChange ? 'text-content-secondary' : result.status === 'failed' ? 'font-semibold text-red-700' : result.status === 'skipped' ? 'font-semibold text-amber-800' : 'text-green-700'}>
+            {noChange ? 'No change needed' : result.status === 'failed' ? 'Failed' : result.status === 'skipped' ? 'Skipped · review' : 'Succeeded'}
+          </span>
+        </div>
+        <div className="mt-1 break-all font-medium text-content-primary">{target}</div>
+        <p className="mt-1 break-words leading-5 text-content-secondary">{result.message}</p>
+        <p className="mt-1 text-[11px] text-content-tertiary">Source row{result.rowNumbers.length === 1 ? '' : 's'} {result.rowNumbers.join(', ')}</p>
+      </div>
+    </div>
+  );
+}
 
 type InterruptedIdentityJournal = {
   scope: IdentityImportPreflight['scope'];
@@ -382,13 +438,16 @@ export function BulkIdentityImportPage() {
   );
   const displayedResults = useMemo(() => {
     const rank: Record<IdentityImportResult['status'], number> = { failed: 0, skipped: 1, succeeded: 2 };
-    return [...results].sort((left, right) => rank[left.status] - rank[right.status]);
+    return results.filter((result) => !isConfirmedNoChange(result)).sort((left, right) => rank[left.status] - rank[right.status]);
   }, [results]);
+  const noChangeResults = useMemo(() => results.filter(isConfirmedNoChange), [results]);
   const failedResults = failedResultEntries.length;
   const skippedResults = results.length - successfulResults - failedResults;
+  const skippedForReview = skippedResults - noChangeResults.length;
+  const resultCountSummary = `${successfulResults} succeeded · ${failedResults} failed · ${noChangeResults.length} unchanged${skippedForReview ? ` · ${skippedForReview} skipped for review` : ''}`;
   const executionIncomplete = previewConsumed && Boolean(error);
   const executionFinished = previewConsumed && !running && !validating && Boolean(progress);
-  const terminalNeedsReview = failedResults > 0 || executionIncomplete;
+  const terminalNeedsReview = failedResults > 0 || skippedForReview > 0 || executionIncomplete;
   const firstFailure = failedResultEntries[0];
   const progressPercent = progress
     ? progress.completed >= progress.total
@@ -400,9 +459,10 @@ export function BulkIdentityImportPage() {
     ? results.length > 0
       ? `Execution stopped after recording ${results.length} result entr${results.length === 1 ? 'y' : 'ies'}. ${error}`
       : `Execution stopped before a result journal was returned. ${error}`
-    : failedResults > 0
-      ? `${failedResults} result${failedResults === 1 ? '' : 's'} need review. ${successfulResults} succeeded and ${skippedResults} skipped.`
-      : `Import finished with ${successfulResults} succeeded and ${skippedResults} skipped.`;
+    : terminalNeedsReview
+      ? `Import finished with review items. ${resultCountSummary}.`
+      : successfulResults === 0 ? `Import complete. No changes were needed (${noChangeResults.length} checks).`
+        : `Import complete. ${resultCountSummary}.`;
   const workflowDetail = progress
     ? running || validating
       ? `${progress.stage}: ${progress.message}`
@@ -415,7 +475,7 @@ export function BulkIdentityImportPage() {
       ? `${progress.completed}/${progress.total} steps complete · ${progressPercent}%`
       : executionIncomplete
         ? `${progress.completed}/${progress.total} steps processed before stopping`
-        : `Finished · ${successfulResults} succeeded · ${failedResults} failed · ${skippedResults} skipped`
+        : `Finished · ${resultCountSummary}`
     : undefined;
 
   const deprovisionTargets = useMemo(() => {
@@ -455,6 +515,18 @@ export function BulkIdentityImportPage() {
     return next;
   }, [preflight]);
 
+  const personalContentChangesByRow = useMemo(() => {
+    const next = new Map<number, IdentityImportPreflight['personalContentChanges']>();
+    preflight?.personalContentChanges?.forEach((change) => {
+      change.rowNumbers.forEach((rowNumber) => {
+        next.set(rowNumber, [...(next.get(rowNumber) || []), change]);
+      });
+    });
+    return next;
+  }, [preflight]);
+  const personalContentUpdates = preflight?.personalContentChanges?.filter((change) => change.disposition === 'set').length || 0;
+  const personalContentNoOps = preflight?.personalContentChanges?.filter((change) => change.disposition === 'noop').length || 0;
+
   return (
     <div className="space-y-5">
       <section className="card p-0 overflow-hidden">
@@ -465,7 +537,7 @@ export function BulkIdentityImportPage() {
               Bulk identity import
             </div>
             <p className="mt-1 text-xs text-content-secondary leading-5 max-w-3xl">
-              Use one CSV to provision users, manage group memberships, assign scoped model roles, or deprovision access. Every preview is bound to the selected Omni instance before changes can run.
+              Use one CSV to provision users, manage personal content settings and group memberships, assign scoped model roles, or deprovision access. Every preview is bound to the selected Omni instance before changes can run.
             </p>
           </div>
           <button
@@ -534,11 +606,17 @@ export function BulkIdentityImportPage() {
             }}
             className="input-field min-h-48 resize-y font-mono text-xs leading-5 disabled:opacity-60"
             spellCheck={false}
-            placeholder={'action,display_name,email,group,role,connection,model\nadd,Example Analyst,analyst@example.com,"Analytics Users, Finance Users",Restricted Querier,Production Warehouse,\nremove,,former.analyst@example.com,Legacy Users,,,'}
+            placeholder={'action,display_name,email,group,role,connection,model,allow_personal_content\nadd,Example user,user@example.com,Example group,Restricted Querier,Example connection,,\nremove,,former.user@example.com,Example group,,,,'}
           />
 
           <div className="rounded-card border border-border bg-surface-secondary px-4 py-3 text-xs leading-5 text-content-secondary">
-            <div className="font-semibold text-content-primary">Seven columns: action, display_name, email, group, role, connection, model</div>
+            <div className="font-semibold text-content-primary">Columns: action, display_name, email, group, role, connection, model · Optional: allow_personal_content</div>
+            <p className="mt-1">
+              On add rows, <code className="font-mono text-content-primary">allow_personal_content</code> accepts <code className="font-mono text-content-primary">true</code>, <code className="font-mono text-content-primary">false</code>, or blank. Blank preserves an existing setting or uses Omni&apos;s default for a new user. Leave this column blank on remove rows. Existing seven-column files remain accepted.
+            </p>
+            <p className="mt-1">
+              Allow personal content controls <span className="font-semibold text-content-primary">My documents</span>; it does not control all content sharing. Explicit values for new users are included at creation and verified afterward.
+            </p>
             <p className="mt-1">
               Separate multiple group, connection, or model names with commas. Escape a literal comma as <code className="font-mono text-content-primary">{'\\,'}</code> and a literal backslash as <code className="font-mono text-content-primary">{'\\\\'}</code>. CSV quoting still applies around cells containing commas.
             </p>
@@ -612,13 +690,7 @@ export function BulkIdentityImportPage() {
           {interruptedJournal.results.length > 0 && (
             <div className="max-h-64 divide-y divide-border overflow-y-auto">
               {interruptedJournal.results.map((result, index) => (
-                <div key={`${result.stage}-${result.field}-${result.target}-${index}`} className="px-5 py-3 text-xs">
-                  <div>
-                    <span className="font-semibold uppercase tracking-wider text-content-secondary">{result.status} · {result.stage} · {result.field}</span>
-                    <span className="ml-2 break-all font-medium text-content-primary">{result.target}</span>
-                  </div>
-                  <div className="mt-1 text-content-secondary">Source row{result.rowNumbers.length === 1 ? '' : 's'} {result.rowNumbers.join(', ')} · {result.message}</div>
-                </div>
+                <IdentityImportResultEntry key={`${result.stage}-${result.field}-${result.target}-${index}`} result={result} />
               ))}
             </div>
           )}
@@ -661,10 +733,12 @@ export function BulkIdentityImportPage() {
           </div>
 
           {preflight && (
-            <div className="grid border-b border-border bg-surface-secondary sm:grid-cols-2 lg:grid-cols-5">
+            <div className="grid border-b border-border bg-surface-secondary sm:grid-cols-2 lg:grid-cols-4">
               {[
                 ['Create users', preflight.changes.usersToCreate],
-                ['Fill user values', preflight.changes.usersToUpdate],
+                ['Update users', preflight.changes.usersToUpdate],
+                ['Personal content updates', personalContentUpdates],
+                ['Personal content already matches', personalContentNoOps],
                 ['Deprovision users', preflight.changes.usersToDelete],
                 ['Create groups', preflight.changes.groupsToCreate],
                 ['Add memberships', preflight.changes.membershipAdds],
@@ -692,7 +766,7 @@ export function BulkIdentityImportPage() {
                 <div className="text-xs text-content-secondary">{plan.previewRows.length.toLocaleString()} source row{plan.previewRows.length === 1 ? '' : 's'}</div>
               </div>
               <div className="max-h-[34rem] overflow-auto">
-                <table className="min-w-[1080px] w-full text-left text-xs">
+                <table className="min-w-[1240px] w-full text-left text-xs">
                   <thead className="sticky top-0 z-10 bg-surface-secondary text-[10px] uppercase tracking-wider text-content-secondary">
                     <tr>
                       <th className="px-4 py-2 font-semibold">Row</th>
@@ -700,6 +774,7 @@ export function BulkIdentityImportPage() {
                       <th className="px-4 py-2 font-semibold">User</th>
                       <th className="px-4 py-2 font-semibold">Groups</th>
                       <th className="px-4 py-2 font-semibold">Role and resolved scope</th>
+                      <th className="px-4 py-2 font-semibold">Allow personal content</th>
                       <th className="px-4 py-2 font-semibold">Planned effect</th>
                       <th className="px-4 py-2 font-semibold">Status</th>
                     </tr>
@@ -708,7 +783,9 @@ export function BulkIdentityImportPage() {
                     {plan.previewRows.map((row, index) => {
                       const rowIssues = issuesByRow.get(row.rowNumber) || [];
                       const rowRoleChanges = roleChangesByRow.get(row.rowNumber) || [];
-                      const rowHasError = rowIssues.some((issue) => issue.severity === 'error');
+                      const rowPersonalContentChanges = personalContentChangesByRow.get(row.rowNumber) || [];
+                      const rowHasError = rowIssues.some((issue) => issue.severity === 'error')
+                        || rowPersonalContentChanges.some((change) => change.disposition === 'blocked');
                       const rowHasWarning = rowIssues.some((issue) => issue.severity === 'warning');
                       return (
                         <tr key={`${row.rowNumber}-${row.action}-${index}`} className={row.destructive ? 'bg-red-50/60' : undefined}>
@@ -746,6 +823,30 @@ export function BulkIdentityImportPage() {
                                 {row.models.length > 0 && <div className="mt-0.5 text-content-secondary">Models: {row.models.join(', ')}</div>}
                               </div>
                             ) : '—'}
+                          </td>
+                          <td className="px-4 py-3 align-top">
+                            {rowPersonalContentChanges.length > 0 ? (
+                              <div className="space-y-2">
+                                {rowPersonalContentChanges.map((change) => (
+                                  <div key={`${change.email}-${change.requested}`} className="min-w-40">
+                                    <div className="font-medium text-content-primary">
+                                      {PERSONAL_CONTENT_CURRENT_LABELS[change.current]} → {change.requested ? 'Enabled' : 'Disabled'}
+                                    </div>
+                                    <div className={`mt-1 ${change.disposition === 'blocked' ? 'font-semibold text-red-700' : 'text-content-secondary'}`}>
+                                      {change.disposition === 'blocked' ? 'Blocked' : change.disposition === 'noop' ? 'Already matches · no change' : change.current === 'new_user' ? 'Set on creation' : 'Update setting'}
+                                    </div>
+                                    {change.rowNumbers.length > 1 && (
+                                      <div className="mt-1 text-content-secondary">Merged request · rows {change.rowNumbers.join(', ')}</div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+                            ) : row.allowPersonalContent !== undefined ? (
+                              <div>
+                                <div className="font-medium text-content-primary">Requested: {row.allowPersonalContent ? 'Enabled (true)' : 'Disabled (false)'}</div>
+                                <div className="mt-1 text-content-secondary">Current setting not checked</div>
+                              </div>
+                            ) : <span className="text-content-secondary">Blank · unchanged or default</span>}
                           </td>
                           <td className="px-4 py-3 align-top text-content-secondary">
                             <ul className="space-y-1">
@@ -876,7 +977,7 @@ export function BulkIdentityImportPage() {
                     : <CheckCircle2 size={18} className="mt-0.5 shrink-0 text-green-700" />}
                   <div className="min-w-0">
                     <div className={`text-sm font-semibold ${terminalNeedsReview ? 'text-amber-900' : 'text-green-900'}`}>
-                      {executionIncomplete ? 'Execution stopped' : failedResults > 0 ? `${failedResults} result${failedResults === 1 ? '' : 's'} need review` : 'Import finished successfully'}
+                      {executionIncomplete ? 'Execution stopped' : terminalNeedsReview ? `${failedResults + skippedForReview} result${failedResults + skippedForReview === 1 ? '' : 's'} need review` : successfulResults === 0 ? 'No changes needed' : 'Import finished successfully'}
                     </div>
                     <p className={`mt-1 text-xs leading-5 ${terminalNeedsReview ? 'text-amber-800' : 'text-green-800'}`}>
                       {terminalSummary}
@@ -919,13 +1020,13 @@ export function BulkIdentityImportPage() {
         >
           <div className="px-5 py-4 border-b border-border flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-center gap-3">
-              {failedResults > 0 || executionIncomplete
+              {terminalNeedsReview
                 ? <AlertTriangle size={20} className="text-amber-600" />
                 : <CheckCircle2 size={20} className="text-green-700" />}
               <div>
                 <div id="identity-import-results-heading" className="text-sm font-semibold text-content-primary">Import results · {preflight?.scope.label || selectedInstanceLabel}</div>
                 <p className="mt-0.5 text-xs text-content-secondary">
-                  {successfulResults} succeeded · {failedResults} failed · {skippedResults} skipped{executionIncomplete ? ' · execution stopped; review before retrying' : ''}
+                  {resultCountSummary}{executionIncomplete ? ' · execution stopped; review before retrying' : ''}
                 </p>
               </div>
             </div>
@@ -955,22 +1056,18 @@ export function BulkIdentityImportPage() {
               </div>
             )}
             {displayedResults.map((result, index) => (
-              <div key={`${result.stage}-${result.field}-${result.target}-${index}`} className="px-5 py-3 flex items-start gap-3 text-xs">
-                {result.status === 'succeeded'
-                  ? <CheckCircle2 size={14} className="mt-0.5 shrink-0 text-green-700" />
-                  : result.status === 'failed'
-                    ? <XCircle size={14} className="mt-0.5 shrink-0 text-red-600" />
-                    : <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-600" />}
-                <div className="min-w-0">
-                  <div>
-                    <span className="font-semibold uppercase tracking-wider text-content-secondary">{result.stage} · {result.field}</span>
-                    <span className="ml-2 break-all font-medium text-content-primary">{result.target}</span>
-                  </div>
-                  <div className="mt-1 text-content-secondary">Source row{result.rowNumbers.length === 1 ? '' : 's'} {result.rowNumbers.join(', ')} · {result.message}</div>
-                </div>
-              </div>
+              <IdentityImportResultEntry key={`${result.stage}-${result.field}-${result.target}-${index}`} result={result} />
             ))}
           </div>
+          {noChangeResults.length > 0 && (
+            <details className="border-t border-border bg-surface-secondary">
+              <summary className="cursor-pointer px-5 py-3 text-xs font-semibold text-content-secondary">No changes needed ({noChangeResults.length} checks)</summary>
+              <p className="px-5 pb-3 text-xs leading-5 text-content-secondary">These checks confirmed the requested state already held. The full details remain in the exported results.</p>
+              <div className="max-h-80 divide-y divide-border overflow-y-auto border-t border-border">
+                {noChangeResults.map((result, index) => <IdentityImportResultEntry key={`${result.stage}-${result.field}-${result.target}-${index}`} result={result} />)}
+              </div>
+            </details>
+          )}
         </section>
       )}
 

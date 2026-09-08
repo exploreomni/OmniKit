@@ -2010,6 +2010,24 @@ export async function listAllUsers(
   };
 }
 
+// Read the individual resource for settings verification. List/search results
+// can omit the user-attribute extension, even when the write succeeded.
+export async function getScimUser(baseUrl: string, apiKey: string, userId: string, options: { signal?: AbortSignal } = {}) {
+  if (!isNonBlankString(userId)) throw new Error('A valid user ID is required.');
+  const res = await safeFetch(
+    edgeFunctionUrl('manage-users'),
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, cache: 'no-store',
+      body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'get', user_id: userId }) },
+    'Read user details',
+    { deduplicate: false, retry: false },
+  );
+  const payload: unknown = await res.json();
+  if (scimCollectionResourceInvalidReason(payload, 'user') !== null || !isRecord(payload) || payload.id !== userId) {
+    throw new Error('OmniKit could not verify the exact user details.');
+  }
+  return payload as Record<string, unknown> & { id: string; userName: string };
+}
+
 export async function findUserByEmail(baseUrl: string, apiKey: string, email: string, options: { signal?: AbortSignal } = {}) {
   const normalizedEmail = email.trim().toLowerCase();
   if (
@@ -2321,10 +2339,12 @@ export async function createUser(baseUrl: string, apiKey: string, body: Record<s
   return res.json();
 }
 
-export async function updateUser(baseUrl: string, apiKey: string, userId: string, body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {
+export async function updateUser(baseUrl: string, apiKey: string, userId: string, body: Record<string, unknown>, options: { signal?: AbortSignal; removeAttributes?: string[] } = {}) {
   const res = await safeFetch(
     edgeFunctionUrl('manage-users'),
-    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'update', user_id: userId, user_data: body }) },
+    { method: 'POST', headers: defaultHeaders, signal: options.signal, body: JSON.stringify({ base_url: baseUrl, api_key: apiKey, action: 'update', user_id: userId, user_data: body,
+      ...(options.removeAttributes?.length ? { attribute_removals: options.removeAttributes } : {}),
+    }) },
     'Update user',
     { deduplicate: false, retry: false },
   );

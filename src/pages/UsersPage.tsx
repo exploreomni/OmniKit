@@ -515,9 +515,23 @@ export function UsersPage({ embedded = false }: { embedded?: boolean } = {}) {
     };
 
     if (editingUser) {
-      if (typeof editingUser.active === 'boolean') body.active = editingUser.active;
-      if (data.attributesDirty) body[USER_ATTRIBUTE_URN] = cloneScimUserAttributes(data.attributes);
-      await updateUser(connection.baseUrl, connection.apiKey, editingUser.id, body);
+      if (data.userName === editingUser.userName) delete body.userName;
+      if (data.displayName === (editingUser.displayName || '')) delete body.displayName;
+      const removeAttributes: string[] = [];
+      if (data.attributesDirty) {
+        const before = cloneScimUserAttributes(editingUser.attributes);
+        const after = cloneScimUserAttributes(data.attributes);
+        const changed = Object.create(null) as OmniUserAttributes;
+        for (const [name, value] of Object.entries(after)) {
+          if (!Object.prototype.hasOwnProperty.call(before, name) || JSON.stringify(before[name]) !== JSON.stringify(value)) changed[name] = value;
+        }
+        removeAttributes.push(...Object.keys(before).filter((name) => !Object.prototype.hasOwnProperty.call(after, name)));
+        if (Object.keys(changed).length) body[USER_ATTRIBUTE_URN] = changed;
+      }
+      // Never echo active or untouched system attributes while editing a name.
+      if (Object.keys(body).length || removeAttributes.length) {
+        await updateUser(connection.baseUrl, connection.apiKey, editingUser.id, body, { removeAttributes });
+      }
     } else {
       if (Object.keys(data.attributes).length > 0) {
         body[USER_ATTRIBUTE_URN] = cloneScimUserAttributes(data.attributes);

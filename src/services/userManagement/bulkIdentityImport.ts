@@ -6,6 +6,7 @@ import {
   deleteUser,
   findUserByEmail,
   getGroup,
+  getScimUser,
   listAllGroups,
   listAllUsers,
   listConnections,
@@ -32,6 +33,8 @@ const USER_ATTRIBUTE_URN = 'urn:omni:params:1.0:UserAttribute';
 const PATCH_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
 const OMNI_ID_PATTERN = /^[\w-]+$/;
 const SIMPLE_HEADERS = ['action', 'display_name', 'email', 'group', 'role', 'connection', 'model'] as const;
+const PERSONAL_CONTENT_HEADER = 'allow_personal_content';
+const PERSONAL_CONTENT_ATTRIBUTE = 'omni_allows_personal_content';
 const PERMISSION_MODEL_KINDS = ['SHARED', 'SHARED_EXTENSION'] as const;
 const IDENTITY_IMPORT_CONNECTION_TIMEOUT_MS = 15_000;
 const MODEL_ROLE_RANK: Readonly<Record<IdentityModelRoleName, number>> = {
@@ -53,6 +56,7 @@ export type IdentityImportRecord =
       email: string;
       displayName: string;
       attributes: Record<string, string>;
+      allowPersonalContent?: boolean;
     })
   | (RecordSource & { type: 'group'; action: 'ensure'; groupName: string })
   | (RecordSource & {
@@ -102,6 +106,7 @@ export type IdentityImportPreviewRow = {
   models: string[];
   effects: string[];
   destructive: boolean;
+  allowPersonalContent?: boolean;
 };
 
 export type IdentityImportPlan = {
@@ -158,6 +163,13 @@ export type IdentityImportPreflight = {
     models: NamedModel[];
   };
   roleChanges: ResolvedIdentityRoleChange[];
+  personalContentChanges: Array<{
+    email: string;
+    rowNumbers: number[];
+    current: 'enabled' | 'disabled' | 'not_returned' | 'new_user' | 'invalid';
+    requested: boolean;
+    disposition: 'set' | 'noop' | 'blocked';
+  }>;
   executionFingerprint: string;
   changes: {
     usersToCreate: number;
@@ -176,7 +188,7 @@ export type IdentityImportPreflight = {
 export type IdentityImportResult = {
   status: 'succeeded' | 'skipped' | 'failed';
   stage: 'user' | 'group' | 'membership' | 'role' | 'deprovision';
-  field: 'user' | 'display_name' | 'attribute' | 'group' | 'membership' | 'role' | 'membership_revocation';
+  field: 'user' | 'display_name' | 'attribute' | 'allow_personal_content' | 'group' | 'membership' | 'role' | 'membership_revocation';
   target: string;
   message: string;
   rowNumbers: number[];
@@ -226,7 +238,8 @@ export function identityImportPreflightProgressTotal(plan: IdentityImportPlan) {
       .filter((record): record is Extract<IdentityImportRecord, { type: 'role' }> => record.type === 'role')
       .map((record) => normalizedKey(record.email)),
   ).size;
-  return 1 + identityImportMembershipGroupCount(plan) + roleUsers;
+  const personalContentUsers = plan.records.filter((record) => record.type === 'user' && record.allowPersonalContent !== undefined).length;
+  return 1 + identityImportMembershipGroupCount(plan) + roleUsers + personalContentUsers;
 }
 
 function identityImportApplyProgressTotal(preflight: IdentityImportPreflight) {
@@ -342,6 +355,11 @@ function deduplicateRecords(records: IdentityImportRecord[], issues: IdentityImp
         issues.push(duplicateIssue);
       }
       if (record.action === 'delete' || previous.action === 'delete') continue;
+      if (record.allowPersonalContent !== undefined) {
+        if (previous.allowPersonalContent !== undefined && previous.allowPersonalContent !== record.allowPersonalContent) {
+          issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `Conflicting allow_personal_content values for ${record.email}. Choose one value per user.` });
+        } else previous.allowPersonalContent = record.allowPersonalContent;
+      }
       if (previous.displayName && record.displayName && previous.displayName !== record.displayName) {
         issues.push({
           severity: 'error',
@@ -454,10 +472,12 @@ function simplePreview(
   connections: string[],
   models: string[],
   noAssignment = false,
+  allowPersonalContent?: boolean,
 ): IdentityImportPreviewRow {
   const effects: string[] = [];
   if (action === 'add') {
     effects.push('Create the user if missing; otherwise fill only missing user values');
+    if (allowPersonalContent !== undefined) effects.push(`Explicitly ${allowPersonalContent ? 'enable' : 'disable'} personal content access, including when an existing value differs`);
     if (groups.length > 0) effects.push(`Ensure and add ${groups.length} group membership${groups.length === 1 ? '' : 's'}`);
     if (roleName === 'QUERY_TOPICS' && models.length === 0) {
       effects.push(`Assign Restricted Querier to every current shared model in ${connections.length} selected connection${connections.length === 1 ? '' : 's'}; models added later are not included`);
@@ -482,6 +502,7 @@ function simplePreview(
     models,
     effects,
     destructive: action === 'remove' && groups.length === 0 && !roleName,
+    ...(allowPersonalContent !== undefined ? { allowPersonalContent } : {}),
   };
 }
 
@@ -573,9 +594,9 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
   }
   if (simple) {
     const missingHeaders = SIMPLE_HEADERS.filter((header) => !headerIndex.has(header));
-    const unknownHeaders = headers.filter((header) => !SIMPLE_HEADERS.includes(header as typeof SIMPLE_HEADERS[number]));
+    const unknownHeaders = headers.filter((header) => header !== PERSONAL_CONTENT_HEADER && !SIMPLE_HEADERS.includes(header as typeof SIMPLE_HEADERS[number]));
     if (missingHeaders.length > 0 || unknownHeaders.length > 0) {
-      throw new Error(`The simple template requires exactly: ${SIMPLE_HEADERS.join(', ')}.`);
+      throw new Error(`The simple template requires: ${SIMPLE_HEADERS.join(', ')}. The optional column is ${PERSONAL_CONTENT_HEADER}.`);
     }
   }
 
@@ -595,11 +616,11 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
 
   for (const { row, rowNumber } of dataRows) {
     if (simple) {
-      if (row.length !== SIMPLE_HEADERS.length) {
+      if (row.length !== headers.length) {
         issues.push({
           severity: 'error',
           rowNumber,
-          message: 'Simple-template rows must contain exactly seven CSV fields. Quote cells that contain comma-separated lists.',
+          message: `Simple-template rows must contain exactly ${headers.length === 7 ? 'seven' : 'eight'} CSV fields to match the header. Quote cells that contain comma-separated lists.`,
         });
         continue;
       }
@@ -607,6 +628,16 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
       const email = unescapeIdentityCsvValue(cell(row, 'email'));
       const displayName = unescapeIdentityCsvValue(cell(row, 'display_name'));
       const roleValue = cell(row, 'role');
+      const personalContentValue = normalizedKey(cell(row, PERSONAL_CONTENT_HEADER));
+      if (personalContentValue && personalContentValue !== 'true' && personalContentValue !== 'false') {
+        issues.push({ severity: 'error', rowNumber, message: 'allow_personal_content must be true, false, or blank (leave unchanged).' });
+        continue;
+      }
+      const allowPersonalContent = personalContentValue ? personalContentValue === 'true' : undefined;
+      if (allowPersonalContent !== undefined && actionValue !== 'add') {
+        issues.push({ severity: 'error', rowNumber, message: 'allow_personal_content is only supported with add. Use add with false to disable personal content; remove is for revoking access.' });
+        continue;
+      }
       if (actionValue !== 'add' && actionValue !== 'remove') {
         issues.push({ severity: 'error', rowNumber, message: 'Action must be add or remove.' });
         continue;
@@ -678,9 +709,9 @@ export function parseIdentityImportCsv(content: string): IdentityImportPlan {
       }
 
       if (noAssignment) noAssignmentRows.push(rowNumber);
-      previewRows.push(simplePreview(rowNumber, actionValue, email, displayName, groups, roleName, connections, models, noAssignment));
+      previewRows.push(simplePreview(rowNumber, actionValue, email, displayName, groups, roleName, connections, models, noAssignment, allowPersonalContent));
       if (actionValue === 'add') {
-        records.push({ ...source(rowNumber), type: 'user', action: 'upsert', email, displayName, attributes: {} });
+        records.push({ ...source(rowNumber), type: 'user', action: 'upsert', email, displayName, attributes: {}, ...(allowPersonalContent !== undefined ? { allowPersonalContent } : {}) });
         for (const groupName of groups) {
           records.push({ ...source(rowNumber), type: 'group', action: 'ensure', groupName });
           records.push({ ...source(rowNumber), type: 'membership', action: 'add', email, groupName });
@@ -1156,8 +1187,24 @@ function resolveRoleTargets(
   return targets;
 }
 
+function personalContentState(user?: ScimUser): IdentityImportPreflight['personalContentChanges'][number]['current'] {
+  if (!user) return 'new_user';
+  const attributes = isRecord(user[USER_ATTRIBUTE_URN]) ? user[USER_ATTRIBUTE_URN] as Record<string, unknown> : {};
+  const entries = Object.entries(attributes).filter(([name]) => normalizedKey(name) === PERSONAL_CONTENT_ATTRIBUTE);
+  if (entries.length > 1) return 'invalid';
+  const value = entries[0]?.[1];
+  if (value === undefined || value === null) return 'not_returned';
+  if (value === true || typeof value === 'string' && normalizedKey(value) === 'true') return 'enabled';
+  if (value === false || typeof value === 'string' && normalizedKey(value) === 'false') return 'disabled';
+  return 'invalid';
+}
+
+function personalContentMatches(user: ScimUser, requested: boolean): boolean {
+  return personalContentState(user) === (requested ? 'enabled' : 'disabled');
+}
+
 function currentUserPatch(record: UserImportRecord, user: ScimUser, writableAttributeNames: ReadonlySet<string> = new Set()) {
-  const patch: Record<string, unknown> = { userName: user.userName };
+  const patch: Record<string, unknown> = {};
   const conflicts: string[] = [];
   let changed = false;
   let attributesChanged = false;
@@ -1172,10 +1219,8 @@ function currentUserPatch(record: UserImportRecord, user: ScimUser, writableAttr
   }
   const currentAttributes = isRecord(user[USER_ATTRIBUTE_URN]) ? user[USER_ATTRIBUTE_URN] as Record<string, unknown> : {};
   const nextAttributes = Object.create(null) as Record<string, unknown>;
-  for (const [attribute, value] of Object.entries(currentAttributes)) {
-    if (writableAttributeNames.has(normalizedKey(attribute))) nextAttributes[attribute] = value;
-  }
   for (const [attribute, value] of Object.entries(record.attributes)) {
+    if (!writableAttributeNames.has(normalizedKey(attribute))) continue;
     const currentEntry = findUserAttributeEntry(currentAttributes, attribute);
     const current = currentEntry?.[1];
     if (current === undefined || current === '') {
@@ -1185,6 +1230,13 @@ function currentUserPatch(record: UserImportRecord, user: ScimUser, writableAttr
     } else if (current !== value) {
       conflicts.push(`attribute_${attribute}`);
     }
+  }
+  // This explicit policy is not a missing-field completion. No other system
+  // attribute is made writable, and unrelated attributes are never resubmitted.
+  if (record.allowPersonalContent !== undefined && !personalContentMatches(user, record.allowPersonalContent)) {
+    nextAttributes[PERSONAL_CONTENT_ATTRIBUTE] = String(record.allowPersonalContent);
+    changed = true;
+    attributesChanged = true;
   }
   if (attributesChanged) patch[USER_ATTRIBUTE_URN] = nextAttributes;
   return { patch, changed, conflicts };
@@ -1199,7 +1251,7 @@ function findUserAttributeEntry(
 }
 
 type RequestedUserField = {
-  field: 'display_name' | 'attribute';
+  field: 'display_name' | 'attribute' | 'allow_personal_content';
   target: string;
   requested: string;
   current: unknown;
@@ -1227,6 +1279,11 @@ function requestedUserFields(record: UserImportRecord, user?: ScimUser): Request
       current: currentEntry?.[1],
     });
   }
+  if (record.allowPersonalContent !== undefined) {
+    const current = personalContentState(user);
+    fields.push({ field: 'allow_personal_content', target: `${record.email} · allow_personal_content`,
+      requested: String(record.allowPersonalContent), current: current === 'enabled' ? 'true' : current === 'disabled' ? 'false' : undefined });
+  }
   return fields;
 }
 
@@ -1234,6 +1291,10 @@ function completedExistingUserFieldResults(record: UserImportRecord, user: ScimU
   return requestedUserFields(record, user).map<IdentityImportResult>((field) => {
     const missing = field.current === undefined || field.current === '';
     const matches = field.current === field.requested;
+    if (field.field === 'allow_personal_content') {
+      return { status: matches ? 'skipped' : 'succeeded', stage: 'user', field: field.field, target: field.target,
+        message: `Personal content access ${field.requested === 'true' ? 'enabled' : 'disabled'}${matches ? ' already; no change needed.' : ' and verified.'}`, rowNumbers: record.rowNumbers };
+    }
     return {
       status: missing ? 'succeeded' : 'skipped',
       stage: 'user',
@@ -1252,6 +1313,7 @@ function completedExistingUserFieldResults(record: UserImportRecord, user: ScimU
 function requestedUserValuesMatch(record: UserImportRecord, user: ScimUser): boolean {
   if (normalizedKey(user.userName) !== normalizedKey(record.email)) return false;
   if (record.displayName && user.displayName !== record.displayName) return false;
+  if (record.allowPersonalContent !== undefined && !personalContentMatches(user, record.allowPersonalContent)) return false;
   const attributes = isRecord(user[USER_ATTRIBUTE_URN]) ? user[USER_ATTRIBUTE_URN] as Record<string, unknown> : {};
   return Object.entries(record.attributes).every(([name, value]) => findUserAttributeEntry(attributes, name)?.[1] === value);
 }
@@ -1261,6 +1323,10 @@ function appliedUserPatchMatches(patch: Record<string, unknown>, user: ScimUser)
   if (isRecord(patch[USER_ATTRIBUTE_URN])) {
     const actual = isRecord(user[USER_ATTRIBUTE_URN]) ? user[USER_ATTRIBUTE_URN] as Record<string, unknown> : {};
     for (const [name, value] of Object.entries(patch[USER_ATTRIBUTE_URN])) {
+      if (name === PERSONAL_CONTENT_ATTRIBUTE) {
+        if (!personalContentMatches(user, value === 'true')) return false;
+        continue;
+      }
       if (findUserAttributeEntry(actual, name)?.[1] !== value) return false;
     }
   }
@@ -1282,7 +1348,7 @@ function buildExecutionFingerprint(
     const requestedAttributeNames = [...new Set(
       userRecords
         .filter((record) => normalizedKey(record.email) === emailKey)
-        .flatMap((record) => Object.keys(record.attributes)),
+        .flatMap((record) => [...Object.keys(record.attributes), ...(record.allowPersonalContent !== undefined ? [PERSONAL_CONTENT_ATTRIBUTE] : [])]),
     )].sort();
     return [emailKey, (usersByEmail.get(emailKey) || [])
       .map((user) => {
@@ -1290,6 +1356,7 @@ function buildExecutionFingerprint(
         return {
           id: user.id,
           displayName: user.displayName ?? null,
+          ...(requestedAttributeNames.includes(PERSONAL_CONTENT_ATTRIBUTE) ? { personalContent: personalContentState(user) } : {}),
           attributes: requestedAttributeNames.map((name) => [name, findUserAttributeEntry(attributes, name)?.[1] ?? null]),
         };
       })
@@ -1330,9 +1397,10 @@ function buildExecutionFingerprint(
   return JSON.stringify({ users, groups, roles, changes });
 }
 
-async function readExactUser(baseUrl: string, apiKey: string, email: string, expectedId?: string, signal?: AbortSignal): Promise<ScimUser> {
-  const response = await findUserByEmail(baseUrl, apiKey, email, { signal });
-  const users = scimUsers(response.Resources || []);
+async function readExactUser(baseUrl: string, apiKey: string, email: string, expectedId?: string, signal?: AbortSignal, requireDetails = false): Promise<ScimUser> {
+  const users = requireDetails && expectedId !== undefined
+    ? [await getScimUser(baseUrl, apiKey, expectedId, { signal })]
+    : scimUsers((await findUserByEmail(baseUrl, apiKey, email, { signal })).Resources || []);
   if (
     users.length !== 1
     || !isOmniId(users[0].id)
@@ -1352,6 +1420,7 @@ export async function preflightIdentityImport(
   const roleRecords = plan.records.filter((record): record is Extract<IdentityImportRecord, { type: 'role' }> => record.type === 'role');
   const hasModelScopedRoleRecords = roleRecords.some((record) => record.roleName !== 'CONNECTION_ADMIN');
   const referencedAttributes = new Set(plan.records.flatMap((record) => record.type === 'user' ? Object.keys(record.attributes) : []));
+  const hasPersonalContentSettings = plan.records.some((record) => record.type === 'user' && record.allowPersonalContent !== undefined);
   const userCount = plan.records.filter((record) => record.type === 'user').length;
   const membershipGroups = new Map<string, string>();
   plan.records.forEach((record) => {
@@ -1376,7 +1445,7 @@ export async function preflightIdentityImport(
   const [userResponse, groupResponse, attributeResult, connectionResult, sharedModelResult, extensionModelResult] = await Promise.all([
     listAllUsers(baseUrl, apiKey, { pageSize: 100, maxPages: 200, signal: scope.signal }),
     listAllGroups(baseUrl, apiKey, { pageSize: 100, maxPages: 200, signal: scope.signal }),
-    referencedAttributes.size > 0
+    referencedAttributes.size > 0 || hasPersonalContentSettings
       ? listUserAttributes(baseUrl, apiKey, { signal: scope.signal }).then((payload) => ({ payload, error: null })).catch((error: unknown) => ({ payload: null, error }))
       : Promise.resolve({ payload: null, error: null }),
     roleRecords.length > 0 ? readIdentityImportConnections(baseUrl, apiKey, scope.signal) : Promise.resolve(null),
@@ -1410,6 +1479,27 @@ export async function preflightIdentityImport(
   const preflightAssertActive = () => {
     if (scope.signal?.aborted || (scope.isActive && !scope.isActive())) throw new Error('cancelled');
   };
+
+  // A SCIM list may omit system-setting values. Resolve only the users whose
+  // personal-content setting was explicitly requested, never the whole fleet.
+  for (const record of plan.records) {
+    if (record.type !== 'user' || record.allowPersonalContent === undefined) continue;
+    preflightAssertActive();
+    const matches = usersByEmail.get(normalizedKey(record.email)) || [];
+    if (matches.length === 1 && isOmniId(matches[0].id)) {
+      emitProgress('User settings', `Reading personal content access for ${record.email}...`);
+      const detail = await withRateLimitRetry(
+        () => readExactUser(baseUrl, apiKey, record.email, matches[0].id, scope.signal, true),
+        preflightAssertActive,
+        { signal: scope.signal },
+      );
+      preflightAssertActive();
+      const index = users.indexOf(matches[0]);
+      users[index] = detail;
+      usersByEmail.set(normalizedKey(record.email), [detail]);
+    }
+    reportProgress('User settings', `Checked personal content access for ${record.email}.`);
+  }
 
   const detailedGroups = (await mapWithConcurrency(
     [...membershipGroups.entries()],
@@ -1449,15 +1539,20 @@ export async function preflightIdentityImport(
     throw new Error('Omni returned duplicate model identities across the permission inventories.');
   }
   let attributeNames: string[] | null = null;
-  if (referencedAttributes.size > 0) {
+  let personalContentAvailable = false;
+  if (referencedAttributes.size > 0 || hasPersonalContentSettings) {
     if (attributeResult.error) {
-      issues.push({ severity: 'error', message: 'OmniKit could not verify user attribute definitions. Legacy attribute writes are blocked.' });
+      issues.push({ severity: 'error', message: 'OmniKit could not verify user attribute definitions. Requested attribute and personal content changes are blocked.' });
     } else {
       const definitions = extractAttributeDefinitions(attributeResult.payload);
       if (!definitions) {
-        issues.push({ severity: 'error', message: 'OmniKit could not verify writable user attribute definitions. Legacy attribute writes are blocked.' });
+        issues.push({ severity: 'error', message: 'OmniKit could not verify writable user attribute definitions. Requested attribute and personal content changes are blocked.' });
       } else {
         const definitionsByName = new Map(definitions.map((definition) => [normalizedKey(definition.name), definition]));
+        personalContentAvailable = definitionsByName.has(PERSONAL_CONTENT_ATTRIBUTE);
+        if (hasPersonalContentSettings && !personalContentAvailable) {
+          issues.push({ severity: 'error', message: 'Omni did not return the personal content setting definition. No personal content changes can be applied.' });
+        }
         attributeNames = definitions.filter((definition) => !definition.system).map((definition) => definition.name);
         referencedAttributes.forEach((attribute) => {
           const definition = definitionsByName.get(normalizedKey(attribute));
@@ -1468,6 +1563,7 @@ export async function preflightIdentityImport(
     }
   }
   const writableAttributeNames = new Set((attributeNames || []).map(normalizedKey));
+  const personalContentChanges: IdentityImportPreflight['personalContentChanges'] = [];
 
   let usersToCreate = 0;
   let usersToUpdate = 0;
@@ -1502,6 +1598,7 @@ export async function preflightIdentityImport(
         continue;
       }
       if (record.action === 'delete') {
+        if (record.allowPersonalContent !== undefined) issues.push({ severity: 'error', rowNumber: record.rowNumber, message: 'Personal content changes cannot be combined with deprovisioning.' });
         if (matches.length === 0) {
           noOps += 1;
           issues.push({ severity: 'warning', rowNumber: record.rowNumber, message: `${record.email} does not exist and will be skipped.` });
@@ -1510,6 +1607,16 @@ export async function preflightIdentityImport(
           issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `display_name does not match ${record.email}; deprovisioning is blocked.` });
         } else usersToDelete += 1;
         continue;
+      }
+      if (record.allowPersonalContent !== undefined) {
+        const current = personalContentState(matches[0]);
+        const blocked = typeof record.allowPersonalContent !== 'boolean' || !personalContentAvailable || current === 'invalid';
+        personalContentChanges.push({ email: record.email, rowNumbers: record.rowNumbers, current, requested: record.allowPersonalContent,
+          disposition: blocked ? 'blocked' : matches[0] && personalContentMatches(matches[0], record.allowPersonalContent) ? 'noop' : 'set' });
+        if (blocked) {
+          issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `Personal content access could not be verified for ${record.email}. Check the setting definition and user attribute value before applying changes.` });
+          continue;
+        }
       }
       if (matches.length === 0) {
         if (!record.displayName) issues.push({ severity: 'error', rowNumber: record.rowNumber, message: `${record.email} is new and requires display_name.` });
@@ -1730,6 +1837,7 @@ export async function preflightIdentityImport(
     issues,
     inventory: { users, groups, attributeNames, connections, models },
     roleChanges,
+    personalContentChanges,
     executionFingerprint: buildExecutionFingerprint(plan, usersByEmail, groupsByName, roleChanges, changes),
     changes,
   };
@@ -1874,6 +1982,7 @@ export async function executeIdentityImport(
     begin('Users', `Applying user changes for ${record.email}...`);
     const key = normalizedKey(record.email);
     const existing = usersByEmail.get(key);
+    let verifiedAfterWrite: ScimUser | undefined;
     try {
       if (existing) {
         const mutation = currentUserPatch(record, existing, writableAttributeNames);
@@ -1884,28 +1993,40 @@ export async function executeIdentityImport(
         } else {
           await updateUser(baseUrl, apiKey, existing.id, mutation.patch, { signal: scope.signal });
           const verified = await withRateLimitRetry(
-            () => readExactUser(baseUrl, apiKey, record.email, existing.id, scope.signal),
+            () => readExactUser(baseUrl, apiKey, record.email, existing.id, scope.signal, record.allowPersonalContent !== undefined),
             assertActive,
             { signal: scope.signal },
           );
           assertActive();
-          if (!appliedUserPatchMatches(mutation.patch, verified)) throw new Error('OmniKit could not verify the requested user completion.');
+          verifiedAfterWrite = verified;
+          if (!appliedUserPatchMatches(mutation.patch, verified)) {
+            throw new Error(record.allowPersonalContent !== undefined && !personalContentMatches(verified, record.allowPersonalContent)
+              ? personalContentState(verified) === 'not_returned'
+                ? 'Omni accepted the request, but the individual user response omitted the personal content setting. The change may have applied; check it in Omni before retrying.'
+                : 'Omni accepted the request, but the individual user response did not confirm the requested personal content setting. Check it in Omni before retrying.'
+              : 'OmniKit could not verify the requested user completion.');
+          }
           usersByEmail.set(key, verified);
           results.push(...completedExistingUserFieldResults(record, existing));
         }
       } else {
+        const createAttributes = { ...record.attributes,
+          ...(record.allowPersonalContent !== undefined ? { [PERSONAL_CONTENT_ATTRIBUTE]: String(record.allowPersonalContent) } : {}) };
         const response = await createUser(baseUrl, apiKey, {
           userName: record.email,
           displayName: record.displayName,
-          ...(Object.keys(record.attributes).length > 0 ? { [USER_ATTRIBUTE_URN]: record.attributes } : {}),
+          // Submit the setting at creation, never create with a weaker default
+          // and silently retry with a separate policy change.
+          ...(Object.keys(createAttributes).length > 0 ? { [USER_ATTRIBUTE_URN]: createAttributes } : {}),
         }, { signal: scope.signal });
         if (!isOmniId(response.id)) throw new Error('Omni did not return a valid user ID.');
         const verified = await withRateLimitRetry(
-          () => readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal),
+          () => readExactUser(baseUrl, apiKey, record.email, response.id, scope.signal, record.allowPersonalContent !== undefined),
           assertActive,
           { signal: scope.signal },
         );
         assertActive();
+        verifiedAfterWrite = verified;
         if (!requestedUserValuesMatch(record, verified)) throw new Error('OmniKit could not verify the requested new-user values.');
         usersByEmail.set(key, verified);
         results.push({ status: 'succeeded', stage: 'user', field: 'user', target: record.email, message: `Created ${record.email}.`, rowNumbers: record.rowNumbers });
@@ -1914,25 +2035,41 @@ export async function executeIdentityImport(
           stage: 'user',
           field: field.field,
           target: field.target,
-          message: `Created and verified the requested ${field.field === 'display_name' ? 'display name' : 'user attribute'}.`,
+          message: field.field === 'allow_personal_content' ? `Created user with personal content access ${field.requested === 'true' ? 'enabled' : 'disabled'} and verified it.`
+            : `Created and verified the requested ${field.field === 'display_name' ? 'display name' : 'user attribute'}.`,
           rowNumbers: record.rowNumbers,
         }));
       }
     } catch (error) {
       failedUsers.add(key);
-      results.push({ status: 'failed', stage: 'user', field: 'user', target: record.email, message: `User write outcome is unverified. Refresh and validate before retrying: ${error instanceof Error ? error.message : String(error)}`, rowNumbers: record.rowNumbers });
-      requestedUserFields(record, existing).forEach((field) => results.push({
-        status: field.current === undefined || field.current === '' ? 'failed' : 'skipped',
-        stage: 'user',
-        field: field.field,
-        target: field.target,
-        message: field.current === undefined || field.current === ''
-          ? 'The requested field outcome is unverified; reread the user before retrying.'
-          : field.current === field.requested
-            ? 'The requested value already existed before the write.'
-            : 'A different existing value was preserved.',
-        rowNumbers: record.rowNumbers,
-      }));
+      if (existing && record.allowPersonalContent !== undefined) {
+        // Keep one result per requested field. A settings verification failure
+        // is not an additional failed user creation or proof the user vanished.
+        const actualFields = verifiedAfterWrite ? requestedUserFields(record, verifiedAfterWrite) : [];
+        for (const field of requestedUserFields(record, existing)) {
+          const attempted = field.field === 'allow_personal_content' ? field.current !== field.requested : field.current === undefined || field.current === '';
+          const verified = actualFields.find((actual) => actual.target === field.target)?.current === field.requested;
+          results.push({ status: !attempted ? 'skipped' : verified ? 'succeeded' : 'failed', stage: 'user', field: field.field,
+            target: field.target, rowNumbers: record.rowNumbers,
+            message: !attempted ? field.current === field.requested ? 'The requested value already existed before the write.' : 'A different existing value was preserved.'
+              : verified ? 'The requested field change was verified.'
+                : `Field change could not be verified: ${error instanceof Error ? error.message : String(error)}` });
+        }
+      } else {
+        results.push({ status: 'failed', stage: 'user', field: 'user', target: record.email, message: `User write outcome is unverified. Refresh and validate before retrying: ${error instanceof Error ? error.message : String(error)}`, rowNumbers: record.rowNumbers });
+        requestedUserFields(record, existing).forEach((field) => results.push({
+          status: field.field === 'allow_personal_content' && field.current !== field.requested || field.current === undefined || field.current === '' ? 'failed' : 'skipped',
+          stage: 'user',
+          field: field.field,
+          target: field.target,
+          message: field.field === 'allow_personal_content' && field.current !== field.requested || field.current === undefined || field.current === ''
+            ? 'The requested field outcome is unverified; reread the user before retrying.'
+            : field.current === field.requested
+              ? 'The requested value already existed before the write.'
+              : 'A different existing value was preserved.',
+          rowNumbers: record.rowNumbers,
+        }));
+      }
     }
     report('Users', record.email);
   }
@@ -1967,7 +2104,7 @@ export async function executeIdentityImport(
       for (const record of groupRecords) {
         const userKey = normalizedKey(record.email);
         const user = usersByEmail.get(userKey);
-        if (!user || failedUsers.has(userKey)) {
+        if (!user) {
           results.push({ status: record.action === 'remove' ? 'skipped' : 'failed', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`, message: `User ${record.email} is unavailable.`, rowNumbers: record.rowNumbers });
           continue;
         }
@@ -1976,14 +2113,19 @@ export async function executeIdentityImport(
             results.push({ status: 'skipped', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`, message: `${record.email} is already in ${record.groupName}.`, rowNumbers: record.rowNumbers });
             continue;
           }
-          additions.push({ value: user.id, display: user.userName });
         } else {
           if (!existingMemberIds.has(user.id)) {
             results.push({ status: 'skipped', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`, message: `${record.email} is not in ${record.groupName}.`, rowNumbers: record.rowNumbers });
             continue;
           }
-          removals.push(user.id);
         }
+        if (failedUsers.has(userKey)) {
+          results.push({ status: 'failed', stage: 'membership', field: 'membership', target: `${record.email} → ${record.groupName}`,
+            message: 'Membership change was not attempted because this user’s preceding change could not be verified. Validate a fresh preview before retrying.', rowNumbers: record.rowNumbers });
+          continue;
+        }
+        if (record.action === 'add') additions.push({ value: user.id, display: user.userName });
+        else removals.push(user.id);
         actionable.push(record);
       }
       pendingOnFailure = actionable;
@@ -2143,9 +2285,9 @@ export async function executeIdentityImport(
 }
 
 export const IDENTITY_IMPORT_TEMPLATE: string[][] = [
-  [...SIMPLE_HEADERS],
-  ['add', 'Example Analyst', 'analyst@example.com', 'Analytics Users, Finance Users', 'Restricted Querier', 'Production Warehouse', ''],
-  ['add', 'Example Administrator', 'admin@example.com', '', 'Connection Admin', 'Production Warehouse', ''],
-  ['remove', '', 'former.analyst@example.com', 'Legacy Users', '', '', ''],
-  ['remove', 'Departed User', 'departed.user@example.com', '', '', '', ''],
+  [...SIMPLE_HEADERS, PERSONAL_CONTENT_HEADER],
+  ['add', 'Example Analyst', 'analyst@example.com', 'Analytics Users, Finance Users', 'Restricted Querier', 'Production Warehouse', '', 'false'],
+  ['add', 'Example Administrator', 'admin@example.com', '', 'Connection Admin', 'Production Warehouse', '', ''],
+  ['remove', '', 'former.analyst@example.com', 'Legacy Users', '', '', '', ''],
+  ['remove', 'Departed User', 'departed.user@example.com', '', '', '', '', ''],
 ];

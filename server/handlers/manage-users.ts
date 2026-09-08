@@ -67,12 +67,13 @@ export interface ManageUsersDependencies {
 interface RequestBody {
   base_url: string;
   api_key: string;
-  action: "list" | "list_attributes" | "find" | "create" | "update" | "delete" | "list_model_roles" | "assign_model_role" | "debug_access";
+  action: "list" | "list_attributes" | "find" | "get" | "create" | "update" | "delete" | "list_model_roles" | "assign_model_role" | "debug_access";
   count?: number;
   start_index?: number;
   email?: string;
   user_id?: string;
   user_data?: Record<string, unknown>;
+  attribute_removals?: unknown;
   role_name?: UserModelRoleName;
   model_id?: string;
   connection_id?: string;
@@ -95,12 +96,20 @@ const OMNI_ID_PATTERN = /^[\w-]+$/;
 const MAX_MODEL_ROLE_RECORDS = 1_000;
 const MAX_MODEL_ROLE_RESPONSE_BYTES = 512 * 1024;
 const USER_REQUEST_TIMEOUT_MS = 15_000;
+const USER_ATTRIBUTE_URN = 'urn:omni:params:1.0:UserAttribute';
+const USER_PATCH_SCHEMA = 'urn:ietf:params:scim:api:messages:2.0:PatchOp';
+const PERSONAL_CONTENT_ATTRIBUTE = 'omni_allows_personal_content';
+const MAX_USER_MUTATION_BYTES = 256 * 1024;
+const MAX_USER_ATTRIBUTES = 128;
+const MAX_USER_ATTRIBUTE_STRING_LENGTH = 16 * 1024;
+const MAX_USER_ATTRIBUTE_ARRAY_ENTRIES = 1_000;
 const MODEL_ROLE_TIMEOUT_MS = 15_000;
 const MAX_MODEL_ROLE_RETRY_AFTER_MS = 60_000;
 const MODEL_ROLE_VERIFICATION_DELAYS_MS = [0, 250, 750] as const;
 const RETRYABLE_MODEL_ROLE_VERIFICATION_STATUSES = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
 class ModelRoleRequestError extends Error {}
+class UserMutationRequestError extends Error {}
 
 class ModelRoleResponseError extends Error {
   readonly diagnostic?: string;
@@ -160,6 +169,120 @@ function json(data: unknown, status = 200): Response {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return isRecord(value) && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+}
+
+function isSafeUserId(value: unknown): value is string {
+  // Keep opaque IDs supported; the entire ID is encoded as one URL segment.
+  if (typeof value !== 'string' || !value.length || value.length > 256
+    || value.trim() !== value || [...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || (code >= 127 && code <= 159);
+    })
+    || value === '.' || value === '..') return false;
+  try { encodeURIComponent(value); return true; } catch { return false; }
+}
+
+function isSafeUserAttributePath(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 256
+    && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(value)
+    && !['__proto__', 'prototype', 'constructor'].includes(value.toLowerCase());
+}
+
+function isUserAttributeValue(value: unknown): boolean {
+  if (value === null || typeof value === 'boolean') return true;
+  if (typeof value === 'string') return value.length <= MAX_USER_ATTRIBUTE_STRING_LENGTH;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (!Array.isArray(value) || value.length > MAX_USER_ATTRIBUTE_ARRAY_ENTRIES) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index)) return false;
+  }
+  return value.every((item) => typeof item === 'string' && item.length <= MAX_USER_ATTRIBUTE_STRING_LENGTH)
+    || value.every((item) => typeof item === 'number' && Number.isFinite(item));
+}
+
+function normalizeUserAttributes(value: unknown): Record<string, unknown> {
+  if (!isPlainRecord(value) || Object.keys(value).length > MAX_USER_ATTRIBUTES) {
+    throw new UserMutationRequestError('User attributes must be a bounded object.');
+  }
+  const normalized = Object.create(null) as Record<string, unknown>;
+  const names = new Set<string>();
+  for (const [name, attribute] of Object.entries(value)) {
+    if (!isSafeUserAttributePath(name) || names.has(name.toLowerCase())) {
+      throw new UserMutationRequestError('A user attribute reference is unsafe or duplicated.');
+    }
+    names.add(name.toLowerCase());
+    if (name.toLowerCase() === PERSONAL_CONTENT_ATTRIBUTE) {
+      if (name !== PERSONAL_CONTENT_ATTRIBUTE || ![true, false, 'true', 'false'].includes(attribute as boolean | string)) {
+        throw new UserMutationRequestError('Personal content must be exactly true or false.');
+      }
+      normalized[name] = String(attribute);
+    } else {
+      if (!isUserAttributeValue(attribute)) throw new UserMutationRequestError('A user attribute value is invalid.');
+      normalized[name] = attribute;
+    }
+  }
+  return normalized;
+}
+
+function normalizeUserMutation(value: unknown, create: boolean): Record<string, unknown> {
+  if (!isPlainRecord(value) || new TextEncoder().encode(JSON.stringify(value)).byteLength > MAX_USER_MUTATION_BYTES) {
+    throw new UserMutationRequestError('user_data must be a bounded object.');
+  }
+  const normalized: Record<string, unknown> = {};
+  for (const [key, field] of Object.entries(value)) {
+    if (key === USER_ATTRIBUTE_URN) normalized[key] = normalizeUserAttributes(field);
+    else if (key === 'userName') {
+      if (!isSafeFilterEmail(field)) throw new UserMutationRequestError('A valid userName email is required.');
+      normalized[key] = field;
+    } else if (key === 'displayName') {
+      if (typeof field !== 'string' || field.length > MAX_USER_ATTRIBUTE_STRING_LENGTH) {
+        throw new UserMutationRequestError('displayName must be a bounded string.');
+      }
+      normalized[key] = field;
+    } else if (key === 'active') {
+      if (typeof field !== 'boolean') throw new UserMutationRequestError('active must be a boolean.');
+      normalized[key] = field;
+    } else {
+      throw new UserMutationRequestError('user_data contains an unsupported field.');
+    }
+  }
+  if (create && !Object.prototype.hasOwnProperty.call(normalized, 'userName')) {
+    throw new UserMutationRequestError('A valid userName email is required for create action.');
+  }
+  return normalized;
+}
+
+function userPatchBody(value: unknown, removals: unknown): Record<string, unknown> {
+  const normalized = normalizeUserMutation(value, false);
+  const operations: Array<{ op: 'replace' | 'remove'; path: string; value?: unknown }> = [];
+  const replacedAttributes = new Set<string>();
+  for (const [key, field] of Object.entries(normalized)) {
+    if (key === USER_ATTRIBUTE_URN) {
+      for (const [name, attribute] of Object.entries(field as Record<string, unknown>)) {
+        replacedAttributes.add(name.toLowerCase());
+        operations.push({ op: 'replace', path: `${USER_ATTRIBUTE_URN}:${name}`, value: attribute });
+      }
+    } else operations.push({ op: 'replace', path: key, value: field });
+  }
+  if (removals !== undefined) {
+    if (!Array.isArray(removals) || removals.length > MAX_USER_ATTRIBUTES) {
+      throw new UserMutationRequestError('attribute_removals must be a bounded list of attribute references.');
+    }
+    const removed = new Set<string>();
+    for (const name of removals) {
+      if (!isSafeUserAttributePath(name) || removed.has(name.toLowerCase()) || replacedAttributes.has(name.toLowerCase())) {
+        throw new UserMutationRequestError('Attribute removals must be safe, unique, and not overlap replacements.');
+      }
+      removed.add(name.toLowerCase());
+      operations.push({ op: 'remove', path: `${USER_ATTRIBUTE_URN}:${name}` });
+    }
+  }
+  if (!operations.length) throw new UserMutationRequestError('At least one explicit user change is required.');
+  return { schemas: [USER_PATCH_SCHEMA], Operations: operations };
 }
 
 async function performUserRequest(
@@ -667,7 +790,9 @@ export default async function handler(
   dependencies: ManageUsersDependencies = {},
 ): Promise<Response> {
   try {
-    const body: RequestBody = await req.json();
+    const parsedBody: unknown = await req.json().catch(() => undefined);
+    if (!isPlainRecord(parsedBody)) return json({ error: 'A JSON request object is required.' }, 400);
+    const body = parsedBody as unknown as RequestBody;
     const { base_url, api_key, action } = body;
 
     if (action === 'debug_access') {
@@ -682,12 +807,13 @@ export default async function handler(
       ));
     }
 
+    if (typeof base_url !== 'string') return json({ error: 'A valid base_url is required.' }, 400);
     const urlError = validateBaseUrl(base_url);
     if (urlError) {
       return new Response(JSON.stringify({ error: urlError }), { status: 400, headers: jsonHeaders });
     }
 
-    if (!api_key || !action) {
+    if (typeof api_key !== 'string' || !api_key.trim() || !action) {
       return new Response(
         JSON.stringify({ error: "base_url, api_key, and action are required." }),
         { status: 400, headers: jsonHeaders }
@@ -734,39 +860,48 @@ export default async function handler(
         break;
       }
 
-      case "create": {
-        if (!body.user_data) {
-          return new Response(
-            JSON.stringify({ error: "user_data is required for create action." }),
-            { status: 400, headers: jsonHeaders }
-          );
+      case "get": {
+        if (!isSafeUserId(body.user_id)) {
+          return json({ error: 'A valid user_id is required for get action.' }, 400);
         }
+        upstreamUrl = `${scimBase}/${encodeURIComponent(body.user_id)}`;
+        upstreamInit = {
+          method: 'GET',
+          headers: { ...authHeaders, 'Cache-Control': 'no-cache, no-store' },
+          cache: 'no-store',
+        };
+        break;
+      }
+
+      case "create": {
+        if (body.attribute_removals !== undefined) throw new UserMutationRequestError('Attribute removals are only supported for update action.');
+        const userData = normalizeUserMutation(body.user_data, true);
         upstreamInit = {
           method: "POST",
           headers: authHeaders,
-          body: JSON.stringify(body.user_data),
+          body: JSON.stringify(userData),
         };
         break;
       }
 
       case "update": {
-        if (!body.user_id || !body.user_data) {
+        if (!isSafeUserId(body.user_id)) {
           return new Response(
-            JSON.stringify({ error: "user_id and user_data are required for update action." }),
+            JSON.stringify({ error: "A valid user_id is required for update action." }),
             { status: 400, headers: jsonHeaders }
           );
         }
         upstreamUrl = `${scimBase}/${encodeURIComponent(body.user_id)}`;
         upstreamInit = {
-          method: "PUT",
+          method: "PATCH",
           headers: authHeaders,
-          body: JSON.stringify(body.user_data),
+          body: JSON.stringify(userPatchBody(body.user_data, body.attribute_removals)),
         };
         break;
       }
 
       case "delete": {
-        if (!body.user_id) {
+        if (!isSafeUserId(body.user_id)) {
           return new Response(
             JSON.stringify({ error: "user_id is required for delete action." }),
             { status: 400, headers: jsonHeaders }
@@ -849,6 +984,7 @@ export default async function handler(
       return json({ error: 'Unlock the native vault before collecting identity access evidence.', code: 'VAULT_LOCKED' }, 423);
     }
     if (error instanceof ModelRoleRequestError) return json({ error: error.message }, 400);
+    if (error instanceof UserMutationRequestError) return json({ error: error.message, code: 'INVALID_USER_MUTATION' }, 400);
     if (error instanceof ModelRoleResponseError) {
       const message = error.code === "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED"
         ? "Omni did not verify the requested user model-role assignment."
