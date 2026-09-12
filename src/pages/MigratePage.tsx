@@ -21,7 +21,7 @@ export function MigratePage() {
           ? 'Internal rollback mode for the legacy dashboard migration workflow.'
           : !safeCopyEnabled
             ? 'Dashboard migration is temporarily unavailable while the safe-copy workflow is disabled.'
-          : 'Choose dashboards and one or more destinations. OmniKit safely copies and verifies each destination automatically.'}
+          : 'Choose dashboards, check each destination, and deploy with visible progress and verification.'}
         icon={<Blobby mood="migration" size={58} className="motion-safe:animate-float" style={{ animationDuration: '3.4s' }} />}
       />
       {legacyRollbackEnabled ? (

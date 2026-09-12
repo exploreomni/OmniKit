@@ -44,6 +44,9 @@ export interface SchemaMapRule {
 
 export interface TranslatedYamlFile {
   fileName: string;
+  targetOriginal?: string | null;
+  additiveStatus?: 'new' | 'additive' | 'unchanged' | 'conflict';
+  reviewToken?: string;
   original: string;
   deterministic: string;
   translated: string;

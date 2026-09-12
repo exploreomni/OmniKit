@@ -5,6 +5,7 @@ import {
   DashboardSafeCopyError,
   type DashboardSafeCopyIntent,
   canonicalDashboardSafeCopyIntent,
+  parseDashboardSafeCopyIntent,
 } from '../../shared/dashboardSafeCopyContract';
 import {
   getJob,
@@ -40,6 +41,7 @@ function canonicalIntentPayload(intent: DashboardSafeCopyIntent): string {
     profile: intent.profile,
     source: intent.source,
     destinations: intent.destinations,
+    ...(intent.deployment ? { deployment: intent.deployment } : {}),
   });
 }
 
@@ -49,10 +51,13 @@ export function dashboardSafeCopyIntentHash(intent: DashboardSafeCopyIntent): st
 }
 
 function assertPersistenceStableIntent(intent: DashboardSafeCopyIntent): void {
-  const folderPaths = intent.destinations.flatMap((destination) => (
-    destination.folderPath ? [destination.folderPath] : []
-  ));
-  if (folderPaths.some((value) => redactSensitiveText(value) !== value)) {
+  const evidenceText = intent.destinations.flatMap((destination) => [
+    ...(destination.folderPath ? [destination.folderPath] : []),
+    ...(destination.topicMappings || []).flatMap((mapping) => [mapping.sourceTopicName, mapping.targetTopicName]),
+    ...(destination.queryViewMappings || []).flatMap((mapping) => [mapping.sourceQueryViewName, mapping.targetQueryViewName]),
+  ]);
+  if (intent.deployment) evidenceText.push(intent.deployment.planId);
+  if (evidenceText.some((value) => redactSensitiveText(value) !== value)) {
     throw new DashboardSafeCopyError(
       'SAFE_COPY_INVALID_DESTINATION',
       'Safe-copy scope contains a value that cannot be stored as exact non-secret reconciliation evidence.',
@@ -153,7 +158,7 @@ function storedIntent(job: MigrationJob): DashboardSafeCopyIntent | undefined {
   const requestId = detailString(job, 'safeCopyRequestId');
   if (!requestId) return undefined;
   try {
-    return canonicalDashboardSafeCopyIntent({
+    return parseDashboardSafeCopyIntent({
       profile: 'safe_copy_v1',
       requestId,
       source: {
@@ -168,7 +173,15 @@ function storedIntent(job: MigrationJob): DashboardSafeCopyIntent | undefined {
         modelId: target.targetModelId || '',
         ...(target.targetFolderId ? { folderId: target.targetFolderId } : {}),
         ...(target.targetFolderPath ? { folderPath: target.targetFolderPath } : {}),
+        ...(target.workbookCopy ? { workbookCopy: { ...target.workbookCopy } } : {}),
+        ...(target.topicMappings?.length ? { topicMappings: target.topicMappings.map((mapping) => ({
+          sourceTopicName: mapping.sourceTopicName, action: mapping.action, targetTopicName: mapping.targetTopicName,
+        })) } : {}),
+        ...(target.queryViewMappings?.length ? { queryViewMappings: target.queryViewMappings.map((mapping) => ({
+          sourceQueryViewName: mapping.sourceQueryViewName, action: mapping.action, targetQueryViewName: mapping.targetQueryViewName,
+        })) } : {}),
       })),
+      ...(job.details?.safeCopyDeployment ? { deployment: job.details.safeCopyDeployment } : {}),
     });
   } catch {
     return undefined;
@@ -382,6 +395,9 @@ function migrationTargets(intent: DashboardSafeCopyIntent): MigrationTarget[] {
       targetModelId: destination.modelId,
       targetFolderId: destination.folderId,
       targetFolderPath: destination.folderPath,
+      ...(destination.workbookCopy ? { workbookCopy: { ...destination.workbookCopy } } : {}),
+      ...(destination.topicMappings ? { topicMappings: destination.topicMappings.map((mapping) => ({ ...mapping })) } : {}),
+      ...(destination.queryViewMappings ? { queryViewMappings: destination.queryViewMappings.map((mapping) => ({ ...mapping })) } : {}),
     };
   });
 }
@@ -563,6 +579,7 @@ export function createDashboardSafeCopyJob(
       safeCopyResolverVersion: DASHBOARD_SAFE_COPY_RESOLVER_VERSION,
       safeCopyPreparationState: 'queued',
       safeCopyTargetCount: targets.length,
+      ...(intent.deployment ? { safeCopyDeployment: intent.deployment } : {}),
     },
     items: [],
   };

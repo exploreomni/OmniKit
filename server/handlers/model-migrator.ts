@@ -28,6 +28,11 @@ import {
 } from '../services/modelMigration/helpers';
 import { runAiDialectPass, shouldRunAiDialectPass } from '../services/modelMigration/aiTranslation';
 import { redactSensitiveText } from '../services/jobSanitizer';
+import { resolveDashboardRepairScope, validateDashboardRepairModels, withDashboardRepairSubmission } from '../services/dashboardDeploymentPlans';
+import { dashboardSafeCopyStateHash } from '../services/dashboardSafeCopyRuntime';
+import { assertDashboardRepairYamlPreservesTarget, mergeDashboardRepairYaml } from '../services/dashboardRepairYaml';
+import { issueDashboardRepairApproval, verifyDashboardRepairApproval } from '../services/dashboardRepairApproval';
+import { dashboardRepairInstanceBoundaryHash, readDashboardRepairSourceBinding, type DashboardRepairSourceBinding } from '../services/dashboardRepairRuntime';
 
 export type ModelMigratorDocumentKind = 'dashboard' | 'workbook' | 'unknown';
 
@@ -98,6 +103,42 @@ function requireUnlocked(): Response | null {
 
 function cleanString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function repairConflict(message: string): never {
+  throw Object.assign(new Error(message), { statusCode: 409 });
+}
+
+function assertActionableRepairScope(scope: ReturnType<typeof resolveDashboardRepairScope>) {
+  if (scope.target.status !== 'model_changes_required' || scope.target.repairJobId) {
+    repairConflict('Return to dashboard deployment and recheck this destination before starting another dependency repair.');
+  }
+  const names = scope.target.sourceModelIds.flatMap((modelId) => scope.target.requiredFilesByModelId[modelId] || []);
+  if (scope.target.sourceModelIds.some((modelId) => !scope.target.requiredFilesByModelId[modelId]?.length)
+    || new Set(names).size !== names.length || names.length !== scope.target.requiredFiles.length
+    || names.some((name) => !scope.target.requiredFiles.includes(name))) {
+    repairConflict('The required dependency files have incomplete or conflicting source model ownership.');
+  }
+  dashboardRepairInstanceBoundaryHash(scope.plan.intent.source.instanceId, scope.destination.instanceId,
+    scope.destination.modelId, Object.keys(scope.plan.sourceModelHashes));
+}
+
+function repairSourceBindingInput(scope: ReturnType<typeof resolveDashboardRepairScope>, instanceBoundaryHash: string) {
+  const documentIds = scope.plan.intent.source.documentIds;
+  if (!documentIds.length || documentIds.some((id) => !Object.hasOwn(scope.plan.sourceHashes, id))
+    || scope.target.sourceModelIds.some((id) => !Object.hasOwn(scope.plan.sourceModelHashes, id))) {
+    repairConflict('The repair plan is missing selected source evidence. Recheck dashboard readiness.');
+  }
+  return { sourceId: scope.plan.intent.source.instanceId, targetId: scope.destination.instanceId,
+    targetModelId: scope.destination.modelId, sourceModelIds: Object.keys(scope.plan.sourceModelHashes), instanceBoundaryHash,
+    sourceDocumentHashes: Object.fromEntries(documentIds.map((id) => [id, scope.plan.sourceHashes[id]])),
+    reviewedWorkbookCopies: scope.plan.workbookCopies || {} };
+}
+
+function assertRepairYamlHash(files: Record<string, string>, expected: string | undefined, side: string) {
+  if (!expected || dashboardSafeCopyStateHash(files) !== expected) {
+    repairConflict(`${side} model changed or could not be verified against the reviewed plan. Return to dashboard deployment and recheck.`);
+  }
 }
 
 function canUseModelMigratorInstance(instance: SavedInstance, usage: 'source' | 'destination'): boolean {
@@ -304,6 +345,7 @@ function parseAcceptedFiles(value: unknown): ModelMigrationAcceptedFile[] {
       fileName: cleanString(item.fileName) || '',
       yaml: typeof item.yaml === 'string' ? item.yaml : '',
       previousChecksum: cleanString(item.previousChecksum),
+      reviewToken: cleanString(item.reviewToken),
     }))
     .filter((file) => file.fileName && file.yaml);
 }
@@ -460,7 +502,7 @@ export function buildModelMigratorInventory(
   });
 }
 
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(req: Request, dependencies: { createJob?: typeof createModelMigrationJob } = {}): Promise<Response> {
   try {
     const locked = requireUnlocked();
     if (locked) return locked;
@@ -579,6 +621,16 @@ export default async function handler(req: Request): Promise<Response> {
       const modelId = cleanString(body.modelId);
       const targetModelId = cleanString(body.targetModelId);
       if (!sourceInstanceId || !modelId) return json({ error: 'sourceInstanceId and modelId are required.' }, 400);
+      const repairScope = body.dashboardRepair !== undefined ? resolveDashboardRepairScope(body.dashboardRepair) : null;
+      if (repairScope) {
+        assertActionableRepairScope(repairScope);
+        if (sourceInstanceId !== repairScope.plan.intent.source.instanceId
+          || targetInstanceId !== repairScope.destination.instanceId
+          || targetModelId !== repairScope.destination.modelId
+          || !repairScope.target.sourceModelIds.includes(modelId)) {
+          repairConflict('The requested model translation does not match the saved dashboard dependency scope.');
+        }
+      }
       const secret = getInstance(sourceInstanceId);
       if (!secret) return json({ error: 'Source instance not found.' }, 404);
       if (!canUseModelMigratorInstance(secret, 'source')) return modelMigratorRoleError('source');
@@ -591,23 +643,63 @@ export default async function handler(req: Request): Promise<Response> {
       const schemaMap = parseSchemaMap(typeof body.schemaMapText === 'string' ? body.schemaMapText : '');
       const sourceDialect = cleanString(body.sourceDialect) || 'source';
       const targetDialect = cleanString(body.targetDialect) || 'target';
-      const client = new OmniClient(secret);
+      const client = new OmniClient(secret, { signal: req.signal });
+      const repairBinding = repairScope ? await readDashboardRepairSourceBinding(repairSourceBindingInput(repairScope,
+        dashboardRepairInstanceBoundaryHash(sourceInstanceId, targetInstanceId!, targetModelId!, Object.keys(repairScope.plan.sourceModelHashes))), client) : undefined;
       const yaml = await client.getModelYaml(modelId, { includeChecksums: true });
+      if (repairScope) assertRepairYamlHash(yaml.files, repairScope.plan.sourceModelHashes[modelId], 'Source');
       let targetYamlFiles: Record<string, string> = {};
+      let targetChecksums: Record<string, string> = {};
       if (targetSecret && targetModelId) {
         try {
-          targetYamlFiles = (await new OmniClient(targetSecret).getModelYaml(targetModelId, { includeChecksums: true })).files;
+          const targetYaml = await new OmniClient(targetSecret, { signal: req.signal }).getModelYaml(targetModelId, { includeChecksums: true });
+          targetYamlFiles = targetYaml.files;
+          targetChecksums = targetYaml.checksums || {};
         } catch {
+          if (repairScope) repairConflict('The destination model could not be read. Dependency repair requires its authored YAML and checksums.');
           targetYamlFiles = {};
         }
       }
+      if (repairScope) {
+        assertRepairYamlHash(targetYamlFiles, repairScope.target.modelHash, 'Destination');
+        if (dashboardRepairInstanceBoundaryHash(sourceInstanceId, targetInstanceId!, targetModelId!, Object.keys(repairScope.plan.sourceModelHashes)) !== repairBinding!.instanceBoundaryHash) {
+          repairConflict('A saved instance changed while preparing the repair. Prepare fresh differences.');
+        }
+      }
+      const requiredFiles = repairScope?.target.requiredFilesByModelId[modelId];
+      const sourceFiles = requiredFiles ? Object.fromEntries(requiredFiles.map((fileName) => {
+        if (typeof yaml.files[fileName] !== 'string') repairConflict('A required dependency file is missing from the source model. Recheck dashboard deployment.');
+        if (targetYamlFiles[fileName] !== undefined && !targetChecksums[fileName]) repairConflict('A required destination file has no checksum. Recheck dashboard deployment before repairing.');
+        return [fileName, yaml.files[fileName]];
+      })) : yaml.files;
       const files = buildTranslatedYamlFiles({
-        files: yaml.files,
+        files: sourceFiles,
         schemaMap,
         sourceDialect,
         targetDialect,
       });
-      if (body.runAi === true) {
+      if (repairScope) for (const file of files) {
+        file.targetOriginal = targetYamlFiles[file.fileName] ?? null;
+        try {
+          file.deterministic = mergeDashboardRepairYaml(targetYamlFiles[file.fileName], file.deterministic || file.translated);
+          file.translated = file.deterministic;
+          file.additiveStatus = file.targetOriginal === null ? 'new' : file.targetOriginal === file.deterministic ? 'unchanged' : 'additive';
+          if (file.additiveStatus !== 'unchanged') file.reviewToken = issueDashboardRepairApproval({
+            ...repairBinding!,
+            planId: repairScope.plan.id, revision: repairScope.plan.revision, targetId: repairScope.target.targetId,
+            sourceModelId: modelId, sourceModelHash: repairScope.plan.sourceModelHashes[modelId], targetModelHash: repairScope.target.modelHash!,
+            fileName: file.fileName, yaml: file.deterministic, previousChecksum: targetChecksums[file.fileName],
+          });
+        } catch (error) {
+          file.blocked = true;
+          file.additiveStatus = 'conflict';
+          file.warnings.push(error instanceof Error ? error.message : 'This proposal changes an existing definition.');
+        }
+        file.changed = file.targetOriginal !== file.deterministic;
+        file.reviewRequired = true;
+        file.warnings.push('Additive-only repair: existing definitions cannot be changed or deleted. Review the destination diff before accepting. Conflicts cannot be overridden.');
+      }
+      if (body.runAi === true && !repairScope) {
         for (const file of files) {
           if (!shouldRunAiDialectPass(file.fileName, file.translated)) {
             file.warnings.push('No SQL-bearing section detected; AI dialect pass was skipped for this file.');
@@ -617,10 +709,12 @@ export default async function handler(req: Request): Promise<Response> {
           try {
             const result = await runAiDialectPass(client, modelId, prompt);
             if (result.yaml) {
-              file.aiDraft = result.yaml;
+              const aiDraft = repairScope ? mergeDashboardRepairYaml(targetYamlFiles[file.fileName], result.yaml) : result.yaml;
+              if (repairScope) assertDashboardRepairYamlPreservesTarget({ sourceYaml: sourceFiles[file.fileName], targetYaml: targetYamlFiles[file.fileName], acceptedYaml: aiDraft });
+              file.aiDraft = aiDraft;
               file.aiJobId = result.jobId;
-              file.translated = result.yaml;
-              file.changed = file.original !== result.yaml;
+              file.translated = aiDraft;
+              file.changed = file.original !== aiDraft;
               file.reviewRequired = true;
               file.warnings.push(`AI dialect pass applied from Omni AI job ${result.jobId || 'unknown'}. Review before accepting.`);
             }
@@ -639,8 +733,10 @@ export default async function handler(req: Request): Promise<Response> {
       }
       return json({
         files,
-        checksums: yaml.checksums || {},
-        semanticDecisions: buildSemanticDifferenceDecisions({ sourceFiles: yaml.files, targetFiles: targetYamlFiles }),
+        checksums: repairScope ? Object.fromEntries((requiredFiles || []).filter((name) => targetChecksums[name]).map((name) => [name, targetChecksums[name]])) : yaml.checksums || {},
+        semanticDecisions: buildSemanticDifferenceDecisions({ sourceFiles, targetFiles: targetYamlFiles }).filter((decision) => !repairScope
+          || Boolean(decision.sourceFileName && requiredFiles?.includes(decision.sourceFileName)
+            && (!decision.targetFileName || requiredFiles?.includes(decision.targetFileName)))),
         prompts: files.map((file) => ({
           fileName: file.fileName,
           prompt: promptForYamlFile({ sourceDialect, targetDialect, fileName: file.fileName, schemaMap, yaml: file.translated }),
@@ -723,19 +819,117 @@ export default async function handler(req: Request): Promise<Response> {
       if (!sourceInstance || !targetInstance) return json({ error: 'Source or target instance not found.' }, 404);
       if (!canUseModelMigratorInstance(sourceInstance, 'source')) return modelMigratorRoleError('source');
       if (!canUseModelMigratorInstance(targetInstance, 'destination')) return modelMigratorRoleError('destination');
-      const job = await createModelMigrationJob({
-        sourceId,
-        targetId,
-        targetLabel: cleanString(body.targetLabel),
-        models,
-        content: parseContentInputs(body.content),
-        replaceSameNamed: body.replaceSameNamed !== false,
-        mergeAfterValidation: body.mergeAfterValidation === true,
-        publishDrafts: body.publishDrafts === true,
-        deleteBranch: body.deleteBranch === true,
-        postMigrationActions: parsePostMigrationActions(body.postMigrationActions),
-      });
-      return json({ job });
+      const initialRepairScope = body.dashboardRepair !== undefined ? resolveDashboardRepairScope(body.dashboardRepair) : null;
+      const repairBoundaryHash = initialRepairScope ? dashboardRepairInstanceBoundaryHash(sourceId, targetId,
+        initialRepairScope.destination.modelId, Object.keys(initialRepairScope.plan.sourceModelHashes)) : undefined;
+      const submit = async (linkRepair?: (jobId: string) => unknown): Promise<Response> => {
+        const repairScope = body.dashboardRepair !== undefined
+          ? await validateDashboardRepairModels(body.dashboardRepair, sourceId, targetId, models) : null;
+        let jobModels = models;
+        let repairBinding: DashboardRepairSourceBinding | undefined;
+        if (repairScope) {
+          assertActionableRepairScope(repairScope);
+          const selectedModelIds = models.map((model) => model.sourceModelId);
+          if (new Set(selectedModelIds).size !== selectedModelIds.length
+            || selectedModelIds.some((id) => !repairScope.target.sourceModelIds.includes(id))
+            || models.some((model) => model.mode !== 'translate' || model.contentRepairActions?.length
+              || model.semanticDecisions?.some((decision) => decision.acceptedYaml || !decision.sourceFileName
+                || !repairScope.target.requiredFilesByModelId[model.sourceModelId].includes(decision.sourceFileName)
+                || (decision.targetFileName && !repairScope.target.requiredFilesByModelId[model.sourceModelId].includes(decision.targetFileName))))
+            || (body.content !== undefined && (!Array.isArray(body.content) || body.content.length > 0))
+            || (body.postMigrationActions !== undefined && (!Array.isArray(body.postMigrationActions) || body.postMigrationActions.length > 0))
+            || body.mergeAfterValidation === true || body.publishDrafts === true || body.deleteBranch === true) {
+            repairConflict('Dashboard dependency repair permits only reviewed scoped YAML on working branches, without content migration, automatic publish, or post-actions.');
+          }
+          const sourceClient = new OmniClient(sourceInstance, { signal: req.signal });
+          repairBinding = await readDashboardRepairSourceBinding(repairSourceBindingInput(repairScope, repairBoundaryHash!), sourceClient);
+          const targetYaml = await new OmniClient(targetInstance, { signal: req.signal }).getModelYaml(repairScope.destination.modelId, { includeChecksums: true, fullyResolved: false });
+          assertRepairYamlHash(targetYaml.files, repairScope.target.modelHash, 'Destination');
+          for (const sourceModelId of Object.keys(repairScope.plan.sourceModelHashes)) {
+            const sourceYaml = await sourceClient.getModelYaml(sourceModelId, { includeChecksums: true, fullyResolved: false });
+            assertRepairYamlHash(sourceYaml.files, repairScope.plan.sourceModelHashes[sourceModelId], 'Source');
+            if (!repairScope.target.sourceModelIds.includes(sourceModelId)) continue;
+            const model = models.find((candidate) => candidate.sourceModelId === sourceModelId);
+            if (!model) {
+              // A browser's unchanged label is not proof: independently verify every omitted dependency.
+              for (const fileName of repairScope.target.requiredFilesByModelId[sourceModelId]) {
+                const sourceFile = sourceYaml.files[fileName];
+                const targetFile = targetYaml.files[fileName];
+                if (typeof sourceFile !== 'string' || typeof targetFile !== 'string'
+                  || mergeDashboardRepairYaml(targetFile, sourceFile) !== targetFile) {
+                  repairConflict('An omitted source model still requires dependency changes. Review and accept its additions before staging this repair.');
+                }
+              }
+              continue;
+            }
+            const names = (model.acceptedFiles || []).map((file) => file.fileName);
+            if (names.length !== new Set(names).size) repairConflict('A dependency repair cannot write the same file more than once.');
+            for (const file of model.acceptedFiles || []) {
+              if (typeof sourceYaml.files[file.fileName] !== 'string') repairConflict('A required source dependency file is unavailable. Recheck dashboard deployment.');
+              const previousChecksum = targetYaml.checksums?.[file.fileName];
+              if ((targetYaml.files[file.fileName] !== undefined && !previousChecksum) || file.previousChecksum !== previousChecksum) {
+                repairConflict('Accepted dependency YAML does not carry the reviewed destination checksum. Prepare differences again.');
+              }
+              assertDashboardRepairYamlPreservesTarget({
+                sourceYaml: sourceYaml.files[file.fileName], targetYaml: targetYaml.files[file.fileName], acceptedYaml: file.yaml,
+              });
+              verifyDashboardRepairApproval(file.reviewToken, { ...repairBinding, planId: repairScope.plan.id, revision: repairScope.plan.revision,
+                targetId: repairScope.target.targetId, sourceModelId: model.sourceModelId,
+                sourceModelHash: repairScope.plan.sourceModelHashes[model.sourceModelId], targetModelHash: repairScope.target.modelHash!,
+                fileName: file.fileName, yaml: file.yaml, previousChecksum: file.previousChecksum });
+            }
+          }
+          // All reviewed additions target one shared model, so stage their union on one branch.
+          // Per-source approval checks above remain separate; hashes retain every source, including no-ops.
+          const acceptedFiles = new Map<string, ModelMigrationAcceptedFile>();
+          for (const model of models) for (const file of model.acceptedFiles || []) {
+            const existing = acceptedFiles.get(file.fileName);
+            if (existing && (existing.yaml !== file.yaml || existing.previousChecksum !== file.previousChecksum)) {
+              repairConflict('Source models propose conflicting changes to the same destination file. Review that dependency explicitly.');
+            }
+            if (file.yaml !== targetYaml.files[file.fileName]) acceptedFiles.set(file.fileName, file);
+          }
+          if (!acceptedFiles.size) repairConflict('All reviewed definitions already exist. Recheck readiness instead of creating a repair job.');
+          jobModels = [{ ...models[0], acceptedFiles: [...acceptedFiles.values()],
+            semanticDecisions: models.flatMap((model) => model.semanticDecisions || []),
+            contentRepairActions: [], mergeHandoffRequired: models.some((model) => model.mergeHandoffRequired === true) }];
+          // Reread the local plan after remote checks; another review may have replaced this revision.
+          resolveDashboardRepairScope(body.dashboardRepair);
+          if (dashboardRepairInstanceBoundaryHash(sourceId, targetId, repairScope.destination.modelId,
+            Object.keys(repairScope.plan.sourceModelHashes)) !== repairBinding.instanceBoundaryHash) {
+            repairConflict('A saved instance changed while verifying the repair. Prepare fresh differences.');
+          }
+          req.signal.throwIfAborted();
+        }
+        const job = await (dependencies.createJob || createModelMigrationJob)({
+          sourceId,
+          targetId,
+          targetLabel: cleanString(body.targetLabel),
+          models: jobModels,
+          content: parseContentInputs(body.content),
+          replaceSameNamed: repairScope ? false : body.replaceSameNamed !== false,
+          mergeAfterValidation: body.mergeAfterValidation === true,
+          publishDrafts: body.publishDrafts === true,
+          deleteBranch: body.deleteBranch === true,
+          postMigrationActions: parsePostMigrationActions(body.postMigrationActions),
+          ...(repairScope ? { dashboardRepair: {
+            ...repairBinding!,
+            planId: repairScope.plan.id, targetId: repairScope.target.targetId, revision: repairScope.plan.revision,
+            additiveOnly: true, targetModelHash: repairScope.target.modelHash,
+            sourceModelHashes: repairScope.plan.sourceModelHashes,
+            approvedFilesHash: dashboardSafeCopyStateHash(jobModels.flatMap((model) => (model.acceptedFiles || []).map(({ fileName, yaml, previousChecksum }) => ({ fileName, yaml, previousChecksum })))),
+          } } : {}),
+        });
+        if (repairScope && linkRepair) {
+          try {
+            linkRepair(job.id);
+          } catch {
+            return json({ job, warning: 'The repair job was created, but its plan link could not be saved. Keep this job identity and recheck the deployment plan before starting another repair.' });
+          }
+        }
+        return json({ job });
+      };
+      return await (body.dashboardRepair !== undefined ? withDashboardRepairSubmission(body.dashboardRepair, submit) : submit());
     }
 
     const instanceId = parts[0];

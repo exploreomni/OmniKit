@@ -32,6 +32,7 @@ import {
   OmniResponseLimitError,
   OmniResponseReadDeadlineError,
   type OmniDocumentInventoryPagination,
+  type OmniDocumentInventoryProgress,
   type OmniDocumentRecord,
   type OmniModelRecord,
 } from '../services/omniClient';
@@ -44,6 +45,8 @@ import {
   readThroughCache,
   readThroughCacheResult,
 } from '../services/readThroughCache';
+import { DashboardLookupError, dashboardReferenceIdentifier, lookupDashboardDocument } from '../services/dashboardDocumentLookup';
+import { documentInventoryStream, observeDocumentInventory, publishDocumentInventoryProgress } from '../services/documentInventoryProgress';
 import {
   INSTANCE_CONNECTION_DIAGNOSTICS,
   INSTANCE_CONNECTION_ERROR_CODES,
@@ -60,12 +63,15 @@ const DOCUMENT_INVENTORY_TRANSPORT_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DOCUMENT_METADATA_TRANSPORT_MAX_RESPONSE_BYTES = 16 * 1024 * 1024;
 const MAX_DOCUMENT_METADATA_IDS = 50;
 const MAX_DOCUMENT_IDENTIFIER_LENGTH = 256;
+// Selection convenience only. Deployment readiness still reads current artifacts.
+const DOCUMENT_SELECTION_CACHE_TTL_MS = 15 * 60 * 1000;
 
 export interface InstanceHandlerDependencies {
   probeFetch?: typeof fetch;
   validateProbeOutbound?: (url: string) => Promise<void>;
   probeLookup?: typeof dnsLookup;
   pinnedRequest?: typeof httpsRequest;
+  onDocumentInventoryProgress?: (progress: OmniDocumentInventoryProgress) => void;
 }
 
 export class InstanceValidationDeadlineError extends Error {
@@ -1174,6 +1180,79 @@ export default async function handler(
       });
     }
 
+    if (req.method === 'GET' && (parts[1] === 'document-lookup'
+      || (parts[1] === 'documents' && url.searchParams.has('documentIds')
+        && url.searchParams.get('allFolders') === 'true'
+        && url.searchParams.get('includeModelDetails') !== 'true'))) {
+      const secret = getInstance(id);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const connectionId = cleanString(url.searchParams.get('connectionId'));
+      if (!connectionId) return json({ error: 'Select a source connection before adding dashboards.' }, 400);
+      const single = parts[1] === 'document-lookup';
+      const references = single ? [url.searchParams.get('reference') || '']
+        : (url.searchParams.get('documentIds') || '').split(',');
+      if (!references.length || references.length > MAX_DOCUMENT_METADATA_IDS) {
+        return json({ error: `Select between 1 and ${MAX_DOCUMENT_METADATA_IDS} dashboard identifiers.`, code: 'DOCUMENT_METADATA_BATCH_TOO_LARGE' }, 400);
+      }
+      try {
+        const identifiers = [...new Set(references.map((reference) => dashboardReferenceIdentifier(reference, secret.baseUrl)))];
+        const scope = documentInventoryCredentialScope(secret);
+        const client = new OmniClient(secret, {
+          requestTimeoutMs: DOCUMENT_INVENTORY_REQUEST_TIMEOUT_MS,
+          maxReadRetries: DOCUMENT_INVENTORY_MAX_READ_RETRIES,
+          fetchImpl: (input, init) => pinnedOmniFetch(input, init, dependencies, DOCUMENT_METADATA_TRANSPORT_MAX_RESPONSE_BYTES),
+        });
+        const forceRefresh = url.searchParams.get('forceRefresh') === 'true';
+        const result = await readThroughCacheResult(
+          `instance:${id}:documents:explicit:${scope}:${JSON.stringify({ connectionId, identifiers: [...identifiers].sort() })}`,
+          async (signal) => {
+            const documents: OmniDocumentRecord[] = [];
+            for (const identifier of identifiers) {
+              documents.push(await lookupDashboardDocument(client, identifier, connectionId, signal, async (modelId, modelSignal) => {
+                const models = await readThroughCacheResult(
+                  `instance:${id}:documents:lookup-model:${scope}:${JSON.stringify({ connectionId, modelId })}`,
+                  async (sharedSignal) => {
+                    const shared = await client.listModels({ modelId, connectionId, modelKind: 'SHARED' }, sharedSignal);
+                    if (shared.some((model) => model.id === modelId && model.connectionId === connectionId && !model.deletedAt)) return shared;
+                    return client.listModels({ modelId, connectionId, modelKind: 'SHARED_EXTENSION' }, sharedSignal);
+                  },
+                  { signal: modelSignal, ttlMs: DOCUMENT_SELECTION_CACHE_TTL_MS, forceRefresh },
+                );
+                return models.value;
+              }));
+            }
+            return documents;
+          },
+          { signal: req.signal, ttlMs: DOCUMENT_SELECTION_CACHE_TTL_MS, forceRefresh },
+        );
+        const current = isVaultUnlocked() ? getInstance(id) : undefined;
+        if (!current || !sameCredentialBoundary(secret, current)) {
+          return json({ error: 'The saved instance changed during dashboard lookup. Select it again.', code: 'INSTANCE_CREDENTIAL_CHANGED' }, 409);
+        }
+        if (single) return json({ document: result.value[0] });
+        return json({ documents: result.value, inventory: {
+          complete: true, scope: 'explicit_documents', cache: result.cache,
+          pagination: { pages: 0, pageSize: 0, returnedRecords: result.value.length },
+          sourceRecordCount: result.value.length, matchedRecordCount: result.value.length,
+          excluded: { missingConnectionId: 0, otherConnection: 0, missingDashboardEvidence: 0 },
+        } });
+      } catch (error) {
+        if (error instanceof DashboardLookupError) return json({ error: error.message, code: error.code }, 422);
+        if (req.signal.aborted) return json({ error: 'Dashboard lookup cancelled.', code: 'DOCUMENT_LOOKUP_CANCELLED' }, 499);
+        if (error instanceof OmniClientError && error.status === 422) {
+          return json({ error: 'This dashboard uses a classic layout that the direct-link API cannot read. Use Browse all dashboards instead.', code: 'DOCUMENT_LOOKUP_CLASSIC_LAYOUT' }, 422);
+        }
+        throw error;
+      }
+    }
+
+    if (req.method === 'GET' && parts[1] === 'documents' && url.searchParams.get('stream') === 'true') {
+      url.searchParams.delete('stream');
+      return documentInventoryStream(req.signal, (signal, onDocumentInventoryProgress) => handler(
+        new Request(url, { signal }), { ...dependencies, onDocumentInventoryProgress },
+      ));
+    }
+
     if (req.method === 'GET' && parts[1] === 'documents') {
       const secret = getInstance(id);
       if (!secret) return json({ error: 'Instance not found.' }, 404);
@@ -1223,11 +1302,14 @@ export default async function handler(
       const loadInventory = () => readThroughCacheResult(
         inventoryKey,
         async (signal) => buildCachedDashboardInventory(
-          await inventoryClient.listDocumentInventory({ includeLabels: true, folderId }, signal),
+          await inventoryClient.listDocumentInventory({ includeLabels: true, folderId,
+            onProgress: (progress) => publishDocumentInventoryProgress(inventoryKey, progress),
+          }, signal),
         ),
-        { signal: req.signal, forceRefresh },
+        { signal: req.signal, forceRefresh, ttlMs: DOCUMENT_SELECTION_CACHE_TTL_MS },
       );
       let inventoryResult: Awaited<ReturnType<typeof loadInventory>>;
+      const stopObserving = observeDocumentInventory(inventoryKey, dependencies.onDocumentInventoryProgress);
       try {
         inventoryResult = await timings.time(
           'list-document-inventory',
@@ -1272,7 +1354,7 @@ export default async function handler(
           }, 502);
         }
         throw error;
-      }
+      } finally { stopObserving(); }
 
       const inventory = inventoryResult.value;
       const partitionStartedAt = Date.now();
@@ -1329,6 +1411,10 @@ export default async function handler(
       const selectedConnectionDashboardCount = connectionId
         ? dashboardsForConnection(inventory, connectionId).length
         : connectionOwnedDashboardCount;
+      const current = isVaultUnlocked() ? getInstance(id) : undefined;
+      if (!current || !sameCredentialBoundary(secret, current)) {
+        return json({ error: 'The saved instance changed during dashboard browsing. Select it again.', code: 'INSTANCE_CREDENTIAL_CHANGED' }, 409);
+      }
       return json({
         documents,
         inventory: {
@@ -1390,6 +1476,61 @@ export default async function handler(
         connectionId,
       );
       return json({ models });
+    }
+
+    if (req.method === 'GET' && parts.length === 2 && parts[1] === 'folder-inventory') {
+      const secret = getInstance(id);
+      if (!secret) return json({ error: 'Instance not found.' }, 404);
+      const client = new OmniClient(secret, {
+        requestTimeoutMs: DOCUMENT_INVENTORY_REQUEST_TIMEOUT_MS,
+        maxReadRetries: DOCUMENT_INVENTORY_MAX_READ_RETRIES,
+        fetchImpl: (input, init) => pinnedOmniFetch(
+          input,
+          init,
+          dependencies,
+          DOCUMENT_INVENTORY_TRANSPORT_MAX_RESPONSE_BYTES,
+        ),
+      });
+      const cacheKey = `instance:${id}:folder-inventory:v1:${secret.updatedAt}:${documentInventoryCredentialScope(secret)}`;
+      try {
+        const result = await readThroughCacheResult(
+          cacheKey,
+          async (signal) => {
+            const inventory = await client.listFolderInventory(signal);
+            if (inventory.pagination.complete !== true) throw new OmniPaginationError();
+            return inventory;
+          },
+          { signal: req.signal, forceRefresh: url.searchParams.get('forceRefresh') === 'true' },
+        );
+        return json({ ...result.value, cache: result.cache });
+      } catch (error) {
+        if (req.signal.aborted || isAbortFailure(error, req.signal)) {
+          return json({
+            error: 'The folder inventory request was cancelled.',
+            code: 'FOLDER_INVENTORY_CANCELLED',
+            pagination: { complete: false },
+          }, 499);
+        }
+        if (
+          error instanceof OmniDocumentInventoryDeadlineError
+          || error instanceof OmniResponseReadDeadlineError
+          || error instanceof OmniRequestDeadlineError
+        ) {
+          return json({
+            error: 'The complete Omni folder inventory exceeded its bounded deadline. Retry the inventory.',
+            code: error.code,
+            pagination: { complete: false },
+          }, 504);
+        }
+        if (error instanceof OmniPaginationError || error instanceof OmniResponseLimitError) {
+          return json({
+            error: 'Omni did not return a complete, bounded folder inventory. No partial catalog was accepted.',
+            code: error.code,
+            pagination: { complete: false },
+          }, 502);
+        }
+        throw error;
+      }
     }
 
     if (req.method === 'GET' && parts[1] === 'folders') {

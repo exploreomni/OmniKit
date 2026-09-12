@@ -10,6 +10,11 @@ export type DashboardSafeCopyExecutionExceptionCode =
   | 'DUPLICATE_DESTINATION_SCOPE'
   | 'TARGET_REPROOF_FAILED'
   | 'TARGET_EXECUTION_FAILED'
+  | 'SOURCE_SNAPSHOT_CHANGED'
+  | 'SOURCE_MODEL_SNAPSHOT_CHANGED'
+  | 'MODEL_SNAPSHOT_CHANGED'
+  | 'REPAIR_REQUIRED'
+  | 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED'
   | 'SEMANTIC_CHANGE_UNSAFE'
   | 'SEMANTIC_APPLY_FAILED'
   | 'SEMANTIC_OUTCOME_UNCERTAIN'
@@ -43,6 +48,9 @@ export interface DashboardSafeCopyExecutionTarget {
   folderId?: string;
   folderPath?: string;
   sourceDocumentIds: string[];
+  /** Version 2 dashboard deployments may never mutate model dependencies. */
+  contentOnly?: true;
+  workbookCopy?: { stagingFolderId: string };
   /** Exact durable document proofs that the runtime has already revalidated for this target. */
   skipDocumentIds?: string[];
   /**
@@ -225,11 +233,19 @@ export interface DashboardSafeCopyTargetState {
   attempts: DashboardSafeCopyAttemptEvidence[];
 }
 
+export interface DashboardSafeCopyDispatchGuard {
+  /** Abort queued transport when this write's bounded execution window closes. */
+  signal?: AbortSignal;
+  /** Must be checked after asynchronous preparation and immediately before the external write. */
+  assertCanDispatch(): void;
+}
+
 export interface DashboardSafeCopyExecutorDependencies {
   reproveTarget(target: DashboardSafeCopyExecutionTarget): Promise<DashboardSafeCopyReprovedTarget>;
   applySemanticChange(
     target: DashboardSafeCopyReprovedTarget,
     attempt: DashboardSafeCopyAttemptEvidence,
+    guard?: DashboardSafeCopyDispatchGuard,
   ): Promise<void>;
   reconcileSemanticChange(
     target: DashboardSafeCopyReprovedTarget,
@@ -248,6 +264,7 @@ export interface DashboardSafeCopyExecutorDependencies {
     document: DashboardSafeCopyPreparedDocument,
     chosenName: string,
     attempt: DashboardSafeCopyAttemptEvidence,
+    guard?: DashboardSafeCopyDispatchGuard,
   ): Promise<{ documentId?: string; identifier?: string }>;
   verifyDocument(
     target: DashboardSafeCopyReprovedTarget,
@@ -286,6 +303,16 @@ class TargetDeadlineError extends Error {
 
 function clean(value: string | undefined): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function deploymentFailure(error: unknown): { code: DashboardSafeCopyExecutionExceptionCode; message: string } | undefined {
+  if (!error || typeof error !== 'object' || !('code' in error)) return undefined;
+  if (error.code === 'SAFE_COPY_SOURCE_DRIFT') return { code: 'SOURCE_SNAPSHOT_CHANGED', message: 'The source dashboard changed after approval. Rerun compatibility checks.' };
+  if (error.code === 'SAFE_COPY_SOURCE_MODEL_DRIFT') return { code: 'SOURCE_MODEL_SNAPSHOT_CHANGED', message: 'A source model changed after approval. Rerun compatibility checks.' };
+  if (error.code === 'SAFE_COPY_MODEL_DRIFT') return { code: 'MODEL_SNAPSHOT_CHANGED', message: 'The destination model changed after approval. Rerun compatibility checks.' };
+  if (error.code === 'SAFE_COPY_REPAIR_REQUIRED') return { code: 'REPAIR_REQUIRED', message: 'Repair dependencies in Model Migrator, then rerun compatibility checks.' };
+  if (error.code === 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED') return { code: 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED', message: 'Workbook-local copying requires proven access-restricted staging and a reviewed production adapter. No dashboard or shared-model write was dispatched.' };
+  return undefined;
 }
 
 function canonicalText(value: string): string {
@@ -368,6 +395,41 @@ function withDeadline<T>(promise: Promise<T>, deadlineAt: number, now: () => num
         reject(error);
       },
     );
+  });
+}
+
+function withWriteDeadline<T>(
+  dispatch: (guard: DashboardSafeCopyDispatchGuard) => Promise<T>,
+  deadlineAt: number,
+  now: () => number,
+): Promise<T> {
+  const remaining = deadlineAt - now();
+  if (remaining <= 0) return Promise.reject(new TargetDeadlineError());
+  let expired = false;
+  const controller = new AbortController();
+  const guard: DashboardSafeCopyDispatchGuard = {
+    signal: controller.signal,
+    assertCanDispatch() {
+      if (expired || now() >= deadlineAt) throw new TargetDeadlineError();
+    },
+  };
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      expired = true;
+      const error = new TargetDeadlineError();
+      controller.abort(error);
+      reject(error);
+    }, remaining);
+    Promise.resolve().then(() => {
+      guard.assertCanDispatch();
+      return dispatch(guard);
+    }).then((value) => {
+      clearTimeout(timer);
+      resolve(value);
+    }, (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
   });
 }
 
@@ -583,7 +645,7 @@ async function applySemanticChange(
     );
   }
   try {
-    await withDeadline(dependencies.applySemanticChange(target, attempt), deadlineAt, dependencies.now || Date.now);
+    await withWriteDeadline((guard) => dependencies.applySemanticChange(target, attempt, guard), deadlineAt, dependencies.now || Date.now);
     const reconciled = await withDeadline(
       dependencies.reconcileSemanticChange(target, attempt),
       deadlineAt,
@@ -654,17 +716,18 @@ async function executeDocument(
       dependencies.now || Date.now,
     );
   } catch (error) {
-    const code = error instanceof TargetDeadlineError ? 'TARGET_DEADLINE_EXCEEDED' : 'DOCUMENT_PREPARATION_FAILED';
+    const drift = deploymentFailure(error);
+    const code = drift?.code || (error instanceof TargetDeadlineError ? 'TARGET_DEADLINE_EXCEEDED' : 'DOCUMENT_PREPARATION_FAILED');
     return {
       sourceDocumentId,
       status: 'needs_attention',
       exception: exception(
         target.targetId,
         code,
-        code === 'TARGET_DEADLINE_EXCEEDED'
+        drift?.message || (code === 'TARGET_DEADLINE_EXCEEDED'
           ? 'Preparation exceeded the bounded destination deadline.'
-          : 'The source dashboard could not be prepared as content-only copy data.',
-        code !== 'TARGET_DEADLINE_EXCEEDED',
+          : 'The source dashboard could not be prepared as content-only copy data.'),
+        !drift && code !== 'TARGET_DEADLINE_EXCEEDED',
         sourceDocumentId,
       ),
     };
@@ -805,8 +868,8 @@ async function executeDocument(
 
   let returned: { documentId?: string; identifier?: string } | undefined;
   try {
-    returned = await withDeadline(
-      dependencies.createDocument(target, document, chosenName, attempt),
+    returned = await withWriteDeadline(
+      (guard) => dependencies.createDocument(target, document, chosenName, attempt, guard),
       deadlineAt,
       dependencies.now || Date.now,
     );
@@ -814,6 +877,7 @@ async function executeDocument(
     const classification = dependencies.classifyWriteFailure?.(error) || 'uncertain';
     if (classification === 'definitely_not_committed') {
       attempt = await persistAttempt(dependencies, attempt, 'failed_prewrite', {}, deadlineAt);
+      const drift = deploymentFailure(error);
       return {
         sourceDocumentId,
         status: 'needs_attention',
@@ -822,9 +886,9 @@ async function executeDocument(
         expectedPayloadHash: document.expectedPayloadHash,
         exception: exception(
           target.targetId,
-          'IMPORT_FAILED',
-          'The destination did not accept the dashboard create request.',
-          true,
+          drift?.code || 'IMPORT_FAILED',
+          drift?.message || 'The destination did not accept the dashboard create request.',
+          !drift,
           sourceDocumentId,
         ),
       };
@@ -1005,6 +1069,14 @@ async function executeTarget(
   skipSemanticChange = false,
 ): Promise<DashboardSafeCopyTargetResult> {
   const now = dependencies.now || Date.now;
+  if (targetInput.contentOnly && (target.semanticChange.mode !== 'none' || skipSemanticChange)) {
+    return failedTarget(target.targetId, exception(
+      target.targetId,
+      'SEMANTIC_CHANGE_UNSAFE',
+      'Repair dependencies in Model Migrator before deploying dashboard content.',
+      false,
+    ));
+  }
   if (!skipSemanticChange) {
     const semanticIssue = await applySemanticChange(input, target, dependencies, deadlineAt);
     if (semanticIssue) return failedTarget(target.targetId, semanticIssue);
@@ -1165,6 +1237,8 @@ async function executeTargetLifecycle(
       Boolean(semanticSkip),
     );
   } catch (error) {
+    const drift = deploymentFailure(error);
+    if (drift) return failedTarget(targetInput.targetId, exception(targetInput.targetId, drift.code, drift.message, false));
     return error instanceof TargetDeadlineError
       ? deadlineFailure(targetInput.targetId)
       : containedFailure(targetInput.targetId);
@@ -1181,7 +1255,19 @@ export async function executeDashboardSafeCopy(
     scopeCounts.set(key, (scopeCounts.get(key) || 0) + 1);
   }
   const concurrency = Math.max(1, Math.min(4, dependencies.targetConcurrency || DEFAULT_TARGET_CONCURRENCY));
-  const targets = await mapWithConcurrency(input.targets, concurrency, async (target) => {
+  const queuedAt = (dependencies.now || Date.now)();
+  const byModel = new Map<string, DashboardSafeCopyExecutionTarget[]>();
+  for (const target of input.targets) {
+    const modelKey = JSON.stringify([target.destinationInstanceId, target.modelId]);
+    byModel.set(modelKey, [...(byModel.get(modelKey) || []), target]);
+  }
+  const results = new Map<string, DashboardSafeCopyTargetResult>();
+  const executeScheduledTarget = async (originalTarget: DashboardSafeCopyExecutionTarget): Promise<void> => {
+    // Model-sharing folder routes serialize, without charging queue time to their work budget.
+    const queuedFor = Math.max(0, (dependencies.now || Date.now)() - queuedAt);
+    const target = originalTarget.deadlineAt === undefined ? originalTarget : {
+      ...originalTarget, deadlineAt: originalTarget.deadlineAt + queuedFor,
+    };
     let result: DashboardSafeCopyTargetResult;
     if ((scopeCounts.get(inputScopeKey(target)) || 0) > 1) {
       result = failedTarget(target.targetId, exception(
@@ -1198,8 +1284,12 @@ export async function executeDashboardSafeCopy(
     } catch {
       // Target execution remains isolated; the runtime performs a final exact-ledger retry.
     }
-    return result;
+    results.set(target.targetId, result);
+  };
+  await mapWithConcurrency([...byModel.values()], concurrency, async (modelTargets) => {
+    for (const target of modelTargets) await executeScheduledTarget(target);
   });
+  const targets = input.targets.map((target) => results.get(target.targetId)!);
   return { jobId: input.jobId, status: overallStatus(targets), targets };
 }
 
@@ -1560,6 +1650,8 @@ export async function retryDashboardSafeCopyTarget(
       reconciled.semanticVerified,
     );
   } catch (error) {
+    const drift = deploymentFailure(error);
+    if (drift) return failedTarget(targetId, exception(targetId, drift.code, drift.message, false));
     return error instanceof TargetDeadlineError
       ? deadlineFailure(targetId)
       : containedFailure(targetId);

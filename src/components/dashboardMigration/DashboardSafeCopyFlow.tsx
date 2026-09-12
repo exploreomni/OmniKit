@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
-import { useNavigate } from 'react-router';
+import { useLocation, useNavigate } from 'react-router';
 import { useConnection } from '@/hooks/useConnection';
 import { ApiError } from '@/services/omniApi';
 import {
@@ -8,26 +8,35 @@ import {
   ArrowRight,
   Check,
   CheckCircle2,
+  ChevronDown,
   Copy,
   Database,
   ExternalLink,
   FileText,
   FolderInput,
   Loader2,
+  Plus,
   RefreshCw,
   RotateCcw,
+  Trash2,
 } from 'lucide-react';
 
 import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { ComboBox } from '@/components/ui/ComboBox';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
+import { DashboardReadinessReview } from './DashboardReadinessReview';
+import { dashboardReadinessIsStale, staleDashboardReadiness } from './dashboardReadinessPresentation';
+import { DestinationFolderPicker } from './DestinationFolderPicker';
+import { DESTINATIONS_PER_PAGE, destinationPage } from './dashboardDestinationSelection';
+import { destinationFolderCacheKey, EMPTY_FOLDER_CATALOG, useDashboardDestinationFolders } from './useDashboardDestinationFolders';
+import { hasVerifiedDashboardSelection, mergeVerifiedDashboardDocuments, sourceConnectionEmptyLabel, sourceConnectionLoadError } from './dashboardSourceSelection';
 import {
-  createDashboardSafeCopyJob,
   getMigrationJob,
   getVaultStatus,
   listInstanceDocuments,
-  listInstanceModelTopics,
+  lookupInstanceDocument,
+  streamInstanceDocuments,
   listMigrationJobs,
   listModelMigratorConnections,
   listModelMigratorModels,
@@ -36,6 +45,7 @@ import {
   subscribeMigrationJob,
   type InstanceDocument,
   type InstanceDocumentInventory,
+  type InstanceDocumentsProgress,
   type InstanceModel,
   type MigrationJob,
   type ModelMigratorConnection,
@@ -47,6 +57,16 @@ import { modelDisplayLabel, sortDocuments, sortModels, sortSavedInstances } from
 // that share a name, rather than each rendering its own option shape.
 import { buildConnectionComboBoxOptions } from './dashboardMigrationUtils';
 import { createDashboardSafeCopyModelMigratorHandoff } from '@/services/modelMigratorHandoff';
+import {
+  createDashboardDeploymentPlan,
+  deployDashboardDeploymentPlan,
+  getDashboardDeploymentPlan,
+  recheckDashboardDeploymentPlan,
+  updateDashboardDeploymentPlan,
+  type DashboardDeploymentPlan,
+  type DashboardDeploymentTargetUpdate,
+  type DashboardReadinessProgressEvent,
+} from '@/services/dashboardDeploymentPlans';
 import {
   createDashboardSafeCopyDraft,
   DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS,
@@ -74,7 +94,7 @@ const MAX_DESTINATIONS = 100;
 const DASHBOARD_PAGE_SIZE = 100;
 const PROGRESS_DOCUMENT_PAGE_SIZE = 20;
 const TRACKING_REFRESH_MS = 4_000;
-const STEP_LABELS = ['Choose dashboards', 'Choose destinations', 'Review dependencies', 'Move & track'] as const;
+const STEP_LABELS = ['Choose dashboards', 'Choose destinations', 'Review readiness', 'Deploy and track'] as const;
 
 interface DestinationCatalog {
   connections: ModelMigratorConnection[];
@@ -83,6 +103,18 @@ interface DestinationCatalog {
   loaded: boolean;
   error: string;
 }
+
+interface SourceConnectionCatalog {
+  instanceId: string;
+  connections: ModelMigratorConnection[];
+  loading: boolean;
+  loaded: boolean;
+  error: string;
+}
+
+const EMPTY_SOURCE_CONNECTION_CATALOG: SourceConnectionCatalog = {
+  instanceId: '', connections: [], loading: false, loaded: false, error: '',
+};
 
 const EMPTY_DESTINATION_CATALOG: DestinationCatalog = {
   connections: [],
@@ -180,7 +212,7 @@ function documentSearchText(document: InstanceDocument): string {
   ].filter(Boolean).join(' ').toLocaleLowerCase('en-US');
 }
 
-const DESTINATION_ACCESS_NOTICE = 'Source sharing is not copied. Inherited access follows the destination folder shown here; OmniKit verifies that the copied dashboard has no unexpected non-owner direct grant.';
+const DESTINATION_ACCESS_NOTICE = 'Source sharing is not copied. Access inherited from the destination folder and business acceptance still require your review.';
 
 function destinationFolderLabel(folderPath?: string, folderId?: string): string {
   const path = (folderPath || '').normalize('NFKC').trim().slice(0, 512);
@@ -214,8 +246,15 @@ function sameDestinationResolution(
   return row.connectionId === connectionId && row.modelId === modelId;
 }
 
+function sameDocumentScope(left: string[], right: string[]): boolean {
+  const expected = new Set(right);
+  return left.length === expected.size && new Set(left).size === left.length && left.every((id) => expected.has(id));
+}
+
 export function DashboardSafeCopyFlow() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const returnPlanId = new URLSearchParams(location.search).get('planId') || '';
   const { connection } = useConnection();
   const [draft, dispatchDraft] = useReducer(
     dashboardSafeCopyDraftReducer,
@@ -224,16 +263,28 @@ export function DashboardSafeCopyFlow() {
   );
   const [vaultStatus, setVaultStatus] = useState<VaultStatus | null>(null);
   const [instances, setInstances] = useState<SavedInstancePublic[]>([]);
-  const [sourceConnections, setSourceConnections] = useState<ModelMigratorConnection[]>([]);
+  const [sourceConnectionCatalog, setSourceConnectionCatalog] = useState<SourceConnectionCatalog>(EMPTY_SOURCE_CONNECTION_CATALOG);
   const [documents, setDocuments] = useState<InstanceDocument[]>([]);
   const [dashboardInventory, setDashboardInventory] = useState<InstanceDocumentInventory | null>(null);
   const [destinationCatalogs, setDestinationCatalogs] = useState<Record<string, DestinationCatalog>>({});
   const [job, setJob] = useState<MigrationJob | null>(null);
+  const [deploymentPlan, setDeploymentPlan] = useState<DashboardDeploymentPlan | null>(null);
+  const [topicRepairBusy, setTopicRepairBusy] = useState(false);
+  const latestDeploymentPlan = useRef(deploymentPlan);
+  latestDeploymentPlan.current = deploymentPlan;
+  const [checkingReadiness, setCheckingReadiness] = useState(false);
+  const [readinessProgress, setReadinessProgress] = useState<DashboardReadinessProgressEvent | null>(null);
+  const [readinessStartedAt, setReadinessStartedAt] = useState<number | null>(null);
+  const [savingPlanTargetId, setSavingPlanTargetId] = useState('');
   const [search, setSearch] = useState('');
   const [visibleDashboardCount, setVisibleDashboardCount] = useState(DASHBOARD_PAGE_SIZE);
   const [loading, setLoading] = useState(true);
-  const [loadingSourceConnections, setLoadingSourceConnections] = useState(false);
   const [loadingDashboards, setLoadingDashboards] = useState(false);
+  const [loadingDashboardLookup, setLoadingDashboardLookup] = useState(false);
+  const [dashboardReference, setDashboardReference] = useState('');
+  const [dashboardBrowseProgress, setDashboardBrowseProgress] = useState<InstanceDocumentsProgress | null>(null);
+  const [dashboardBrowseStartedAt, setDashboardBrowseStartedAt] = useState<number | null>(null);
+  const [dashboardBrowseElapsed, setDashboardBrowseElapsed] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [retryingTargetIds, setRetryingTargetIds] = useState<string[]>([]);
   const [trackingRevision, setTrackingRevision] = useState(0);
@@ -242,6 +293,11 @@ export function DashboardSafeCopyFlow() {
   const [progressAnnouncement, setProgressAnnouncement] = useState('');
   const [visibleProgressDocuments, setVisibleProgressDocuments] = useState<Record<string, number>>({});
   const [expandedProgressTargetId, setExpandedProgressTargetId] = useState('');
+  const [newDestinationInstanceId, setNewDestinationInstanceId] = useState('');
+  const [destinationSearch, setDestinationSearch] = useState('');
+  const [destinationPageIndex, setDestinationPageIndex] = useState(0);
+  const [expandedDestinationId, setExpandedDestinationId] = useState<string | null>(null);
+  const destinationFolders = useDashboardDestinationFolders(Boolean(vaultStatus?.unlocked));
   const headingRef = useRef<HTMLHeadingElement>(null);
   const submitGuardRef = useRef(false);
   const retryGuardRef = useRef(new Set<string>());
@@ -249,8 +305,21 @@ export function DashboardSafeCopyFlow() {
   const dashboardRequestRef = useRef(0);
   const destinationRequestRef = useRef<Record<string, number>>({});
   const sourceConnectionAbortRef = useRef<AbortController | null>(null);
+  const sourceConnectionContextRef = useRef({ instanceId: draft.sourceId, step: draft.step, jobId: draft.jobId, planId: draft.planId || returnPlanId, unlocked: Boolean(vaultStatus?.unlocked) });
+  sourceConnectionContextRef.current = { instanceId: draft.sourceId, step: draft.step, jobId: draft.jobId, planId: draft.planId || returnPlanId, unlocked: Boolean(vaultStatus?.unlocked) };
   const dashboardAbortRef = useRef<AbortController | null>(null);
+  const dashboardHydrationKeyRef = useRef('');
+  const dashboardScope = JSON.stringify([draft.sourceId, draft.sourceConnectionId]);
+  const dashboardScopeRef = useRef(dashboardScope);
+  dashboardScopeRef.current = dashboardScope;
+  const verifiedDocumentsScopeRef = useRef('');
+  const selectedScopeRef = useRef({ ids: draft.selectedDocumentIds, destinations: draft.destinations.length });
+  selectedScopeRef.current = { ids: draft.selectedDocumentIds, destinations: draft.destinations.length };
   const destinationAbortRef = useRef<Record<string, AbortController>>({});
+  const planAbortRef = useRef<AbortController | null>(null);
+  const planRequestRef = useRef(0);
+  const planIdentityRef = useRef(draft.requestId);
+  const planRestoreKeyRef = useRef('');
   const jobRef = useRef<MigrationJob | null>(null);
   const announcedProgressRef = useRef<{ jobId: string; values: Map<string, string> }>({
     jobId: '',
@@ -266,16 +335,24 @@ export function DashboardSafeCopyFlow() {
     [instances],
   );
   const sourceInstance = instances.find((instance) => instance.id === draft.sourceId);
-  const selectedDestinationIds = useMemo(
-    () => new Set(draft.destinations.map((row) => row.instanceId)),
-    [draft.destinations],
-  );
+  const currentPlan = deploymentPlan && deploymentPlan.id === draft.planId ? deploymentPlan : null;
+  const sourcePlanRestoring = Boolean((draft.planId || returnPlanId) && !currentPlan);
+  const sourceCatalog = sourceConnectionCatalog.instanceId === draft.sourceId ? sourceConnectionCatalog : EMPTY_SOURCE_CONNECTION_CATALOG;
+  const sourceConnections = sourceCatalog.connections;
+  const sourceConnectionOptions = buildConnectionComboBoxOptions(sourceConnections);
+  if (draft.sourceConnectionId && !sourceConnectionOptions.some((option) => option.value === draft.sourceConnectionId)) {
+    sourceConnectionOptions.unshift({ value: draft.sourceConnectionId, label: `Selected connection (${draft.sourceConnectionId})`, subtitle: sourceCatalog.loaded ? 'Saved selection — not in the returned catalog' : 'Saved selection — connection catalog not loaded' });
+  }
+  const readyTargetIds = checkingReadiness || dashboardReadinessIsStale(currentPlan) ? [] : currentPlan?.targets.filter((row) => row.status === 'ready' && !row.deploymentJobId).map((row) => row.targetId) || [];
+  const selectedReadyTargetIds = (draft.selectedTargetIds || []).filter((id) => readyTargetIds.includes(id));
+  const heldTargetCount = draft.destinations.length - selectedReadyTargetIds.length;
   const selectedDocumentIds = useMemo(() => new Set(draft.selectedDocumentIds), [draft.selectedDocumentIds]);
   const filteredDocuments = useMemo(() => {
+    if (verifiedDocumentsScopeRef.current !== dashboardScope) return [];
     const query = search.trim().toLocaleLowerCase('en-US');
     const sorted = sortDocuments(documents);
     return query ? sorted.filter((document) => documentSearchText(document).includes(query)) : sorted;
-  }, [documents, search]);
+  }, [dashboardScope, documents, search]);
   const visibleDocuments = useMemo(
     () => filteredDocuments.slice(0, visibleDashboardCount),
     [filteredDocuments, visibleDashboardCount],
@@ -322,6 +399,20 @@ export function DashboardSafeCopyFlow() {
     () => new Map(instances.map((instance) => [instance.id, instance])),
     [instances],
   );
+  const destinationRows = draft.destinations.map((destination, destinationIndex) => {
+    const instance = instanceById.get(destination.instanceId);
+    const catalog = destinationCatalogs[destination.instanceId] || EMPTY_DESTINATION_CATALOG;
+    const connectionLabel = catalog.connections.find((row) => row.id === destination.connectionId)?.name || destination.connectionId || 'Choose connection';
+    const model = catalog.models.find((row) => row.id === destination.modelId);
+    const modelLabel = model ? modelDisplayLabel(model) : destination.modelId || 'Choose model';
+    const folderLabel = destinationFolderLabel(destination.folderPath, destination.folderId);
+    return { destination, destinationIndex, instance, catalog, connectionLabel, modelLabel, folderLabel };
+  });
+  const filteredDestinations = destinationRows.filter((row) => [row.instance?.label, row.instance?.baseUrl, row.connectionLabel, row.modelLabel, row.folderLabel]
+    .some((value) => value?.toLocaleLowerCase('en-US').includes(destinationSearch.trim().toLocaleLowerCase('en-US'))));
+  const destinationWindow = destinationPage(filteredDestinations, destinationPageIndex);
+  const activeDestinationId = expandedDestinationId ?? destinationWindow.rows[0]?.destination.targetId;
+  const activeDestinationInstanceId = draft.destinations.find((row) => row.targetId === activeDestinationId)?.instanceId;
 
   useEffect(() => {
     setVisibleProgressDocuments({});
@@ -373,6 +464,68 @@ export function DashboardSafeCopyFlow() {
   }, [draft]);
 
   useEffect(() => {
+    if (planIdentityRef.current === draft.requestId) return;
+    planIdentityRef.current = draft.requestId;
+    if (draft.planId) return;
+    planAbortRef.current?.abort();
+    planRequestRef.current += 1;
+    setCheckingReadiness(false);
+    setReadinessStartedAt(null);
+    setReadinessProgress(null);
+    setSavingPlanTargetId('');
+    setDeploymentPlan(null);
+    planRestoreKeyRef.current = '';
+    if (returnPlanId) navigate(location.pathname, { replace: true });
+  }, [draft.requestId, draft.planId, returnPlanId, location.pathname, navigate]);
+
+  useEffect(() => {
+    const planId = returnPlanId || draft.planId;
+    if (!planId || !vaultStatus?.unlocked || planRestoreKeyRef.current === planId) return;
+    const controller = new AbortController();
+    planAbortRef.current?.abort();
+    planAbortRef.current = controller;
+    const request = ++planRequestRef.current;
+    planRestoreKeyRef.current = planId;
+    let completed = false;
+    setCheckingReadiness(true);
+    setError('');
+    void (async () => {
+      const restored = await getDashboardDeploymentPlan(planId, controller.signal);
+      if (controller.signal.aborted || planRequestRef.current !== request) return;
+      if (restored.plan.id !== planId) throw new Error('The server returned a different deployment plan. Nothing was restored.');
+      // Opening or returning from a review is not evidence that anything changed.
+      // Restore the saved plan only; readiness is rechecked by an explicit action.
+      const response = restored;
+      if (controller.signal.aborted || planRequestRef.current !== request) return;
+      completed = true;
+      if (!draft.jobId || draft.planId !== response.plan.id) {
+        jobRef.current = null;
+        setJob(null);
+      }
+      setDeploymentPlan(response.plan);
+      dispatchDraft({ type: 'restore_plan', plan: response.plan });
+      if (!draft.jobId && draft.deploymentRequestId) {
+        const history = await listMigrationJobs();
+        if (controller.signal.aborted || planRequestRef.current !== request) return;
+        const matches = history.jobs.filter((candidate) => isDashboardSafeCopyJobForRequest(candidate, draft.deploymentRequestId!)
+          && sameDocumentScope(candidate.documentIds, response.plan.intent.source.documentIds)
+          && (!draft.selectedTargetIds?.length || sameDocumentScope((candidate.targets || []).map((row) => row.id), draft.selectedTargetIds)));
+        if (matches.length === 1) dispatchDraft({ type: 'attach_job', jobId: matches[0].id, requestId: draft.deploymentRequestId });
+      }
+    })().catch((loadError) => {
+      if (!controller.signal.aborted && planRequestRef.current === request) setError(loadError instanceof Error ? loadError.message : 'Could not restore this deployment plan.');
+    }).finally(() => {
+      if (!controller.signal.aborted && planRequestRef.current === request) setCheckingReadiness(false);
+    });
+    return () => {
+      controller.abort();
+      if (!completed && planRestoreKeyRef.current === planId) planRestoreKeyRef.current = '';
+    };
+  // Reopening a plan restores server-owned scope, without polling readiness.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [returnPlanId, vaultStatus?.unlocked]);
+
+  useEffect(() => {
     // headingRef is shared by the three per-step headings, so a re-render
     // between this effect and the frame callback can replace the node the focus
     // was applied to and silently drop it — and this effect will not run again,
@@ -402,18 +555,18 @@ export function DashboardSafeCopyFlow() {
         const nextInstances = sortSavedInstances(saved.instances);
         setVaultStatus(status);
         setInstances(nextInstances);
-        if (draft.jobId) return;
+        if (draft.jobId || draft.planId || returnPlanId) return;
         if (status.unlocked) {
           try {
             const history = await listMigrationJobs();
             if (!active) return;
             const matches = history.jobs.filter((candidate) => (
-              isDashboardSafeCopyJobForRequest(candidate, draft.requestId)
+              isDashboardSafeCopyJobForRequest(candidate, draft.deploymentRequestId || draft.requestId)
             ));
             if (matches.length === 1) {
               const recovered = { ...draft, step: 2 as const, jobId: matches[0].id };
               writeDashboardSafeCopyDraft(recovered);
-              dispatchDraft({ type: 'attach_job', jobId: matches[0].id });
+              dispatchDraft({ type: 'attach_job', jobId: matches[0].id, requestId: draft.deploymentRequestId || draft.requestId });
               setMessage('Recovered the prior dashboard move from its durable request identity.');
               return;
             }
@@ -459,6 +612,8 @@ export function DashboardSafeCopyFlow() {
     dashboardRequestRef.current += 1;
     sourceConnectionAbortRef.current?.abort();
     dashboardAbortRef.current?.abort();
+    planAbortRef.current?.abort();
+    planRequestRef.current += 1;
     Object.entries(destinationAbortRef.current).forEach(([instanceId, controller]) => {
       destinationRequestRef.current[instanceId] = (destinationRequestRef.current[instanceId] || 0) + 1;
       controller.abort();
@@ -466,85 +621,186 @@ export function DashboardSafeCopyFlow() {
   }, []);
 
   const loadSourceConnections = useCallback(async (instanceId: string) => {
-    if (!instanceId) return;
+    const context = sourceConnectionContextRef.current;
+    if (!instanceId || context.instanceId !== instanceId || context.step !== 0 || context.jobId || !context.unlocked) return;
     sourceConnectionAbortRef.current?.abort();
     const controller = new AbortController();
     sourceConnectionAbortRef.current = controller;
     const request = sourceConnectionRequestRef.current + 1;
     sourceConnectionRequestRef.current = request;
-    setLoadingSourceConnections(true);
-    setError('');
+    const isCurrent = () => !controller.signal.aborted && sourceConnectionRequestRef.current === request
+      && sourceConnectionContextRef.current.instanceId === instanceId && sourceConnectionContextRef.current.step === 0
+      && !sourceConnectionContextRef.current.jobId && sourceConnectionContextRef.current.unlocked;
+    setSourceConnectionCatalog((current) => ({ ...(current.instanceId === instanceId ? current : EMPTY_SOURCE_CONNECTION_CATALOG), instanceId, loading: true, error: '' }));
     try {
       const response = await listModelMigratorConnections(instanceId, controller.signal);
-      if (sourceConnectionRequestRef.current !== request) return;
+      if (!isCurrent()) return;
       const connections = response.connections.filter((row) => !row.deletedAt);
-      setSourceConnections(connections);
-      dispatchDraft({
-        type: 'resolve_source_connections',
-        sourceId: instanceId,
-        connectionIds: connections.map((row) => row.id),
-        requestId: newDashboardSafeCopyRequestId(),
-      });
+      setSourceConnectionCatalog({ instanceId, connections, loading: false, loaded: true, error: '' });
+      // A background picker catalog must never rewrite a restored plan's source binding.
+      if (!sourceConnectionContextRef.current.planId) {
+        dispatchDraft({
+          type: 'resolve_source_connections',
+          sourceId: instanceId,
+          connectionIds: connections.map((row) => row.id),
+          requestId: newDashboardSafeCopyRequestId(),
+        });
+      }
     } catch (loadError) {
-      if (controller.signal.aborted) return;
-      if (sourceConnectionRequestRef.current === request) {
-        setSourceConnections([]);
-        setError(loadError instanceof Error ? loadError.message : 'Could not load source connections.');
+      if (isCurrent()) {
+        setSourceConnectionCatalog((current) => current.instanceId === instanceId ? {
+          ...current, loading: false,
+          error: sourceConnectionLoadError(loadError),
+        } : current);
       }
     } finally {
-      if (sourceConnectionRequestRef.current === request) setLoadingSourceConnections(false);
+      if (isCurrent()) setSourceConnectionCatalog((current) => current.instanceId === instanceId ? { ...current, loading: false } : current);
     }
   }, []);
 
   useEffect(() => {
-    if (!draft.jobId && draft.sourceId) void loadSourceConnections(draft.sourceId);
-  }, [draft.jobId, draft.sourceId, loadSourceConnections]);
+    if (draft.jobId || draft.step !== 0 || !draft.sourceId || !vaultStatus?.unlocked || sourcePlanRestoring) return;
+    void loadSourceConnections(draft.sourceId);
+    return () => {
+      sourceConnectionAbortRef.current?.abort();
+      sourceConnectionRequestRef.current += 1;
+      setSourceConnectionCatalog((current) => current.loading ? { ...current, loading: false } : current);
+    };
+  }, [draft.jobId, draft.sourceId, draft.step, loadSourceConnections, sourcePlanRestoring, vaultStatus?.unlocked]);
 
-  const loadDashboards = useCallback(async (forceRefresh = false) => {
+  // Changing the source cancels work; it never starts a whole-instance scan.
+  useEffect(() => {
+    dashboardAbortRef.current?.abort();
+    dashboardRequestRef.current += 1;
+    dashboardHydrationKeyRef.current = '';
+    verifiedDocumentsScopeRef.current = '';
+    setDocuments([]);
+    setDashboardInventory(null);
+    setLoadingDashboards(false);
+    setLoadingDashboardLookup(false);
+    setDashboardReference('');
+    setDashboardBrowseProgress(null);
+    setDashboardBrowseStartedAt(null);
+    setDashboardBrowseElapsed(0);
+    setVisibleDashboardCount(DASHBOARD_PAGE_SIZE);
+  }, [dashboardScope]);
+
+  useEffect(() => {
+    if (!loadingDashboards || dashboardBrowseStartedAt === null) return;
+    // Display elapsed time only. No network polling or synthetic page progress.
+    const updateElapsed = () => setDashboardBrowseElapsed(Math.floor((Date.now() - dashboardBrowseStartedAt) / 1000));
+    updateElapsed();
+    const timer = window.setInterval(updateElapsed, 1000);
+    return () => window.clearInterval(timer);
+  }, [dashboardBrowseStartedAt, loadingDashboards]);
+
+  const loadDashboards = useCallback(async (selectedIds?: string[], forceRefresh = false) => {
     if (!draft.sourceId || !draft.sourceConnectionId) return;
     dashboardAbortRef.current?.abort();
     const controller = new AbortController();
     dashboardAbortRef.current = controller;
     const request = dashboardRequestRef.current + 1;
     dashboardRequestRef.current = request;
-    setLoadingDashboards(true);
+    const scope = JSON.stringify([draft.sourceId, draft.sourceConnectionId]);
+    const isCurrent = () => !controller.signal.aborted && dashboardRequestRef.current === request && dashboardScopeRef.current === scope;
+    const browsing = !selectedIds;
+    setLoadingDashboards(browsing);
+    setLoadingDashboardLookup(!browsing);
+    if (browsing) {
+      setDashboardBrowseProgress(null);
+      setDashboardBrowseStartedAt(Date.now());
+      setDashboardBrowseElapsed(0);
+    }
     setError('');
+    setMessage('');
     try {
-      const response = await listInstanceDocuments(draft.sourceId, {
+      const options = {
         connectionId: draft.sourceConnectionId,
         allFolders: true,
         includeModelDetails: false,
         forceRefresh,
         signal: controller.signal,
-      });
-      if (dashboardRequestRef.current !== request) return;
-      setDocuments(response.documents);
-      setDashboardInventory(response.inventory);
-      dispatchDraft({
-        type: 'prune_documents',
-        sourceId: draft.sourceId,
-        sourceConnectionId: draft.sourceConnectionId,
-        availableDocumentIds: response.documents.map(sourceDocumentId),
-        requestId: newDashboardSafeCopyRequestId(),
-      });
-      if (!response.inventory.complete) {
-        setError('Omni returned an incomplete dashboard inventory. Refresh before selecting dashboards.');
+      };
+      const response = selectedIds
+        ? await listInstanceDocuments(draft.sourceId, { ...options, documentIds: selectedIds })
+        : await streamInstanceDocuments(draft.sourceId, { ...options, onProgress: (progress) => { if (isCurrent()) setDashboardBrowseProgress(progress); } });
+      if (!isCurrent()) return;
+      if (!response.inventory.complete || response.inventory.scope !== (browsing ? 'credential' : 'explicit_documents')) {
+        throw new Error('The dashboard response did not confirm the requested scope. No partial results were added.');
       }
+      const verified = mergeVerifiedDashboardDocuments([], response.documents, draft.sourceConnectionId);
+      if (selectedIds && !hasVerifiedDashboardSelection(verified, selectedIds, draft.sourceConnectionId)) throw new Error('Some saved dashboard selections could not be verified. Add them by link or browse to review the source.');
+      verifiedDocumentsScopeRef.current = scope;
+      setDocuments((current) => mergeVerifiedDashboardDocuments(current, verified, draft.sourceConnectionId));
+      if (browsing) setDashboardInventory(response.inventory);
     } catch (loadError) {
       if (controller.signal.aborted) return;
-      if (dashboardRequestRef.current === request) {
-        setDocuments([]);
-        setDashboardInventory(null);
-        setError(loadError instanceof Error ? loadError.message : 'Could not load the complete dashboard inventory.');
+      if (isCurrent()) {
+        setError(loadError instanceof Error ? loadError.message : 'Could not finish loading dashboards. Previously verified choices were kept.');
       }
     } finally {
-      if (dashboardRequestRef.current === request) setLoadingDashboards(false);
+      if (isCurrent()) {
+        setLoadingDashboards(false);
+        setLoadingDashboardLookup(false);
+      }
     }
   }, [draft.sourceConnectionId, draft.sourceId]);
 
   useEffect(() => {
-    if (!draft.jobId && draft.sourceId && draft.sourceConnectionId) void loadDashboards(false);
-  }, [draft.jobId, draft.sourceConnectionId, draft.sourceId, loadDashboards]);
+    if (draft.jobId || !draft.sourceId || !draft.sourceConnectionId || loadingDashboards || loadingDashboardLookup) return;
+    const known = new Set(documents.map(sourceDocumentId));
+    const missing = draft.selectedDocumentIds.filter((id) => !known.has(id));
+    if (missing.length === 0) return;
+    const key = JSON.stringify([dashboardScope, missing]);
+    if (dashboardHydrationKeyRef.current === key) return;
+    dashboardHydrationKeyRef.current = key;
+    // Restored plans revalidate their exact IDs, not the entire source catalog.
+    void loadDashboards(missing);
+  }, [dashboardScope, documents, draft.jobId, draft.selectedDocumentIds, draft.sourceConnectionId, draft.sourceId, loadDashboards, loadingDashboardLookup, loadingDashboards]);
+
+  function cancelDashboardLoading() {
+    dashboardAbortRef.current?.abort();
+    dashboardRequestRef.current += 1;
+    setLoadingDashboards(false);
+    setLoadingDashboardLookup(false);
+    setMessage('Dashboard loading canceled. Previously verified dashboards and selections were kept; no partial browse results were added.');
+  }
+
+  async function addDashboardByReference() {
+    const reference = dashboardReference.trim();
+    if (!reference || !draft.sourceId || !draft.sourceConnectionId || loadingDashboards || loadingDashboardLookup) return;
+    dashboardAbortRef.current?.abort();
+    const controller = new AbortController();
+    dashboardAbortRef.current = controller;
+    const request = ++dashboardRequestRef.current;
+    const scope = dashboardScope;
+    const isCurrent = () => !controller.signal.aborted && dashboardRequestRef.current === request && dashboardScopeRef.current === scope;
+    setLoadingDashboardLookup(true);
+    setError('');
+    setMessage('');
+    try {
+      const response = await lookupInstanceDocument(draft.sourceId, { connectionId: draft.sourceConnectionId, reference, signal: controller.signal });
+      if (!isCurrent()) return;
+      const verified = mergeVerifiedDashboardDocuments([], [response.document], draft.sourceConnectionId);
+      verifiedDocumentsScopeRef.current = scope;
+      setDocuments((current) => mergeVerifiedDashboardDocuments(current, verified, draft.sourceConnectionId));
+      const documentId = sourceDocumentId(response.document);
+      const selected = selectedScopeRef.current;
+      const limit = selected.destinations ? Math.min(MAX_SELECTED_DASHBOARDS, Math.floor(DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS / selected.destinations)) : MAX_SELECTED_DASHBOARDS;
+      if (!selected.ids.includes(documentId)) {
+        if (selected.ids.length >= limit) setMessage(`Dashboard verified, but the ${limit}-dashboard selection limit has been reached.`);
+        else {
+          dispatchDraft({ type: 'toggle_document', documentId, limit, requestId: newDashboardSafeCopyRequestId() });
+          setMessage('Dashboard verified and selected. You can add another link or continue to destinations.');
+        }
+      } else setMessage('This dashboard is already verified and selected.');
+      setDashboardReference('');
+    } catch (lookupError) {
+      if (isCurrent()) setError(lookupError instanceof Error ? lookupError.message : 'The dashboard could not be verified. Nothing was added.');
+    } finally {
+      if (isCurrent()) setLoadingDashboardLookup(false);
+    }
+  }
 
   const loadDestinationCatalog = useCallback(async (instanceId: string) => {
     const instance = instances.find((row) => row.id === instanceId);
@@ -572,25 +828,6 @@ export function DashboardSafeCopyFlow() {
         error: '',
       };
       setDestinationCatalogs((current) => ({ ...current, [instanceId]: catalog }));
-      const destination = draft.destinations.find((row) => row.instanceId === instanceId);
-      if (destination) {
-        const resolution = resolveDashboardSafeCopyDestinationDefaults({
-          instance,
-          connections: catalog.connections,
-          models: catalog.models,
-          current: destination,
-        });
-        const modelId = destination.requiresModelChoice ? '' : resolution.modelId;
-        if (!sameDestinationResolution(destination, resolution.connectionId, modelId)) {
-          dispatchDraft({
-            type: 'resolve_destination',
-            instanceId,
-            connectionId: resolution.connectionId,
-            modelId,
-            requestId: newDashboardSafeCopyRequestId(),
-          });
-        }
-      }
     } catch (loadError) {
       if (controller.signal.aborted) return;
       if (destinationRequestRef.current[instanceId] !== request) return;
@@ -604,65 +841,31 @@ export function DashboardSafeCopyFlow() {
         },
       }));
     }
-  }, [draft.destinations, instances]);
+  }, [instances]);
 
   useEffect(() => {
-    if (draft.jobId) return;
+    if (draft.jobId || draft.step !== 1 || !activeDestinationInstanceId) return;
+    const catalog = destinationCatalogs[activeDestinationInstanceId];
+    if (!catalog?.loading && !catalog?.loaded && !catalog?.error) void loadDestinationCatalog(activeDestinationInstanceId);
+  }, [destinationCatalogs, activeDestinationInstanceId, draft.jobId, draft.step, loadDestinationCatalog]);
+
+  useEffect(() => {
+    if (draft.jobId || draft.planId) return;
     for (const destination of draft.destinations) {
       const catalog = destinationCatalogs[destination.instanceId];
-      if (!catalog?.loading && !catalog?.loaded) void loadDestinationCatalog(destination.instanceId);
+      const instance = instances.find((row) => row.id === destination.instanceId);
+      if (!catalog?.loaded || !instance) continue;
+      const resolution = resolveDashboardSafeCopyDestinationDefaults({ instance, connections: catalog.connections, models: catalog.models, current: destination });
+      const modelId = destination.requiresModelChoice ? destination.modelId : resolution.modelId;
+      if (!sameDestinationResolution(destination, resolution.connectionId, modelId)) {
+        dispatchDraft({ type: 'update_destination', targetId: destination.targetId, patch: { connectionId: resolution.connectionId, modelId }, requestId: newDashboardSafeCopyRequestId() });
+      }
     }
-  }, [destinationCatalogs, draft.destinations, draft.jobId, loadDestinationCatalog]);
-
-  // Dependency detection: when entering the dependency step, auto-populate topic mappings
-  useEffect(() => {
-    if (draft.step !== 2 || draft.jobId) return;
-    const selectedDocs = documents.filter((doc) => draft.selectedDocumentIds.includes(doc.id));
-    const sourceTopicNames = [...new Set(
-      selectedDocs.flatMap((doc) => doc.topicNames || []).filter(Boolean),
-    )];
-    if (sourceTopicNames.length === 0) return;
-    const needsUpdate = draft.destinations.some((dest) => !dest.topicMappings || dest.topicMappings.length === 0);
-    if (!needsUpdate) return;
-    const updatedDestinations = draft.destinations.map((dest) => {
-      if (dest.topicMappings && dest.topicMappings.length > 0) return dest;
-      return {
-        ...dest,
-        topicMappings: sourceTopicNames.map((name) => ({
-          sourceTopicName: name,
-          action: 'copy_source' as const,
-          targetTopicName: name,
-        })),
-      };
-    });
-    dispatchDraft({ type: 'patch_plan', patch: { destinations: updatedDestinations }, requestId: draft.requestId });
-    // Also attempt to check destination topics for auto-mapping
-    for (const dest of draft.destinations) {
-      if (!dest.modelId || !dest.instanceId) continue;
-      listInstanceModelTopics(dest.instanceId, dest.modelId)
-        .then(({ topics }) => {
-          if (topics.length === 0) return;
-          const targetTopicNames = new Set(topics.map((t) => t.name.toLowerCase()));
-          const autoMapped = sourceTopicNames.map((name) => ({
-            sourceTopicName: name,
-            action: targetTopicNames.has(name.toLowerCase()) ? 'map_existing' as const : 'copy_source' as const,
-            targetTopicName: name,
-          }));
-          dispatchDraft({
-            type: 'patch_plan',
-            patch: {
-              destinations: draft.destinations.map((d) => d.targetId === dest.targetId ? { ...d, topicMappings: autoMapped } : d),
-            },
-            requestId: draft.requestId,
-          });
-        })
-        .catch(() => { /* destination topic lookup is best-effort */ });
-    }
-  }, [draft.step, draft.jobId, draft.selectedDocumentIds, documents, draft.destinations, draft.requestId]);
+  }, [destinationCatalogs, draft.destinations, draft.jobId, draft.planId, instances]);
 
   useEffect(() => {
     const jobId = draft.jobId;
-    if (!jobId) return undefined;
+    if (!jobId || (draft.planId && !currentPlan)) return undefined;
     let active = true;
     let terminal = false;
     let rejected = false;
@@ -681,7 +884,8 @@ export function DashboardSafeCopyFlow() {
     };
     const applyJob = (next: MigrationJob): boolean => {
       if (!active || rejected) return false;
-      if (next.id !== jobId || !isDashboardSafeCopyJobForRequest(next, draft.requestId)) {
+      if (next.id !== jobId || !isDashboardSafeCopyJobForRequest(next, draft.requestId)
+        || (currentPlan && !sameDocumentScope(next.documentIds, currentPlan.intent.source.documentIds))) {
         rejectRestoredJob('The saved job did not match this safe dashboard move and was not opened.');
         return false;
       }
@@ -728,7 +932,7 @@ export function DashboardSafeCopyFlow() {
       unsubscribe();
       window.clearInterval(refreshTimer);
     };
-  }, [draft.jobId, draft.requestId, trackingRevision]);
+  }, [draft.jobId, draft.requestId, draft.planId, currentPlan, trackingRevision]);
 
   function chooseSource(instanceId: string) {
     // Re-selecting the instance that is already chosen must not disturb an
@@ -742,7 +946,7 @@ export function DashboardSafeCopyFlow() {
     dashboardAbortRef.current?.abort();
     sourceConnectionRequestRef.current += 1;
     dashboardRequestRef.current += 1;
-    setSourceConnections([]);
+    setSourceConnectionCatalog(EMPTY_SOURCE_CONNECTION_CATALOG);
     setDocuments([]);
     setDashboardInventory(null);
     setVisibleDashboardCount(DASHBOARD_PAGE_SIZE);
@@ -755,6 +959,7 @@ export function DashboardSafeCopyFlow() {
   }
 
   function chooseSourceConnection(connectionId: string) {
+    if (connectionId === draft.sourceConnectionId) return;
     dashboardAbortRef.current?.abort();
     dashboardRequestRef.current += 1;
     setDocuments([]);
@@ -769,7 +974,7 @@ export function DashboardSafeCopyFlow() {
   }
 
   function toggleDocument(documentId: string) {
-    if (!dashboardInventory?.complete) return;
+    if (verifiedDocumentsScopeRef.current !== dashboardScope || !hasVerifiedDashboardSelection(documents, [documentId], draft.sourceConnectionId)) return;
     if (!selectedDocumentIds.has(documentId) && draft.selectedDocumentIds.length >= MAX_SELECTED_DASHBOARDS) {
       setError(`A move supports at most ${MAX_SELECTED_DASHBOARDS} dashboards.`);
       return;
@@ -806,37 +1011,47 @@ export function DashboardSafeCopyFlow() {
     }
   }
 
-  function toggleDestination(instanceId: string) {
-    if (selectedDestinationIds.has(instanceId)) {
-      destinationAbortRef.current[instanceId]?.abort();
-      delete destinationAbortRef.current[instanceId];
-      setDestinationCatalogs((current) => {
-        const next = { ...current };
-        delete next[instanceId];
-        return next;
-      });
-    }
-    if (!selectedDestinationIds.has(instanceId) && draft.destinations.length >= MAX_DESTINATIONS) {
+  function addDestination(instanceId = '') {
+    if (draft.destinations.length >= MAX_DESTINATIONS) {
       setError(`A move supports at most ${MAX_DESTINATIONS} destinations.`);
       return;
     }
     if (
-      !selectedDestinationIds.has(instanceId)
-      && draft.selectedDocumentIds.length * (draft.destinations.length + 1) > DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS
+      draft.selectedDocumentIds.length * (draft.destinations.length + 1) > DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS
     ) {
       setError(`A move supports at most ${DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS.toLocaleString()} dashboard-destination copies.`);
       return;
     }
+    const chosenInstanceId = instanceId || (destinationInstances.length === 1 ? destinationInstances[0].id : '');
+    const instance = instanceById.get(chosenInstanceId);
+    const targetId = newDashboardSafeCopyRequestId();
     dispatchDraft({
-      type: 'toggle_destination',
-      instanceId,
+      type: 'add_destination',
+      destination: { targetId, instanceId: chosenInstanceId, connectionId: '', modelId: '', folderId: instance?.defaultFolderId || '', folderPath: instance?.defaultFolderPath || '' },
       limit: MAX_DESTINATIONS,
       requestId: newDashboardSafeCopyRequestId(),
     });
+    setExpandedDestinationId(targetId);
+    setDestinationSearch('');
+    setDestinationPageIndex(Math.floor(draft.destinations.length / DESTINATIONS_PER_PAGE));
+    setNewDestinationInstanceId('');
     setError('');
   }
 
-  function setDestinationConnection(instanceId: string, connectionId: string) {
+  function updateDestination(targetId: string, patch: Partial<Omit<DashboardSafeCopyDestinationDraft, 'targetId'>>) {
+    dispatchDraft({ type: 'update_destination', targetId, patch, requestId: newDashboardSafeCopyRequestId() });
+    setError('');
+  }
+
+  function setDestinationInstance(targetId: string, instanceId: string) {
+    const instance = instanceById.get(instanceId);
+    updateDestination(targetId, { instanceId, connectionId: '', modelId: '', requiresModelChoice: false, folderId: instance?.defaultFolderId || '', folderPath: instance?.defaultFolderPath || '' });
+  }
+
+  function setDestinationConnection(targetId: string, connectionId: string) {
+    const destination = draft.destinations.find((row) => row.targetId === targetId);
+    if (!destination) return;
+    const instanceId = destination.instanceId;
     const catalog = destinationCatalogs[instanceId] || EMPTY_DESTINATION_CATALOG;
     const instance = instances.find((row) => row.id === instanceId);
     if (!instance) return;
@@ -846,33 +1061,138 @@ export function DashboardSafeCopyFlow() {
       models: catalog.models,
       current: { connectionId, modelId: '' },
     });
-    dispatchDraft({
-      type: 'resolve_destination',
-      instanceId,
+    updateDestination(targetId, {
       connectionId: resolution.connectionId,
       modelId: resolution.modelId,
-      requestId: newDashboardSafeCopyRequestId(),
-      manual: true,
+      requiresModelChoice: false,
     });
   }
 
-  function setDestinationModel(instanceId: string, modelId: string) {
+  function setDestinationModel(targetId: string, modelId: string) {
+    const destination = draft.destinations.find((row) => row.targetId === targetId);
+    if (!destination) return;
+    const instanceId = destination.instanceId;
     const catalog = destinationCatalogs[instanceId] || EMPTY_DESTINATION_CATALOG;
     const model = catalog.models.find((row) => row.id === modelId);
-    const destination = draft.destinations.find((row) => row.instanceId === instanceId);
-    if (!destination) return;
-    dispatchDraft({
-      type: 'resolve_destination',
-      instanceId,
+    updateDestination(targetId, {
       modelId,
       connectionId: model?.connectionId || destination.connectionId,
-      requestId: newDashboardSafeCopyRequestId(),
-      manual: true,
+      requiresModelChoice: false,
     });
+  }
+
+  async function checkReadiness() {
+    if (checkingReadiness || savingPlanTargetId || draft.jobId || submitting) return;
+    planAbortRef.current?.abort();
+    const controller = new AbortController();
+    planAbortRef.current = controller;
+    const request = ++planRequestRef.current;
+    const identity = draft.requestId;
+    setCheckingReadiness(true);
+    setReadinessStartedAt(Date.now());
+    setReadinessProgress(null);
+    setDeploymentPlan(staleDashboardReadiness);
+    setError('');
+    setMessage('');
+    const onProgress = (progress: DashboardReadinessProgressEvent) => {
+      if (!controller.signal.aborted && request === planRequestRef.current && identity === planIdentityRef.current) setReadinessProgress(progress);
+    };
+    try {
+      const restoringPlanId = !currentPlan ? draft.planId || returnPlanId : '';
+      const response = currentPlan
+        ? await recheckDashboardDeploymentPlan(currentPlan.id, controller.signal, onProgress)
+        : restoringPlanId ? await recheckDashboardDeploymentPlan(restoringPlanId, controller.signal, onProgress)
+        : await createDashboardDeploymentPlan(dashboardSafeCopyIntentFromDraft(draft, instances), controller.signal, onProgress);
+      if (controller.signal.aborted || request !== planRequestRef.current || identity !== planIdentityRef.current) return;
+      if ((currentPlan || restoringPlanId) ? response.plan.id !== (currentPlan?.id || restoringPlanId) : response.plan.intent.requestId !== identity) throw new Error('The readiness result did not match these dashboard choices. Recheck before deploying.');
+      setDeploymentPlan(response.plan);
+      planRestoreKeyRef.current = response.plan.id;
+      dispatchDraft({ type: 'restore_plan', plan: response.plan });
+      navigate(`${location.pathname}?planId=${encodeURIComponent(response.plan.id)}`, { replace: true });
+    } catch (planError) {
+      if (!controller.signal.aborted && request === planRequestRef.current) {
+        setDeploymentPlan(staleDashboardReadiness);
+        setError(planError instanceof Error ? planError.message : 'Could not verify deployment readiness.');
+      }
+    } finally {
+      if (request === planRequestRef.current) {
+        setCheckingReadiness(false);
+        setReadinessStartedAt(null);
+      }
+    }
+  }
+
+  function cancelReadiness() {
+    if (!checkingReadiness || readinessStartedAt === null) return;
+    planAbortRef.current?.abort();
+    planRequestRef.current += 1;
+    setCheckingReadiness(false);
+    setReadinessStartedAt(null);
+    setDeploymentPlan(staleDashboardReadiness);
+    setError('');
+    setMessage('Readiness check canceled. Previous findings are stale and cannot authorize deployment. Choose Recheck readiness when you are ready.');
+  }
+
+  async function savePlanTargetChoices(update: DashboardDeploymentTargetUpdate) {
+    if (!currentPlan || update.revision !== currentPlan.revision || checkingReadiness || savingPlanTargetId || submitting || draft.jobId) return;
+    const target = currentPlan.targets.find((row) => row.targetId === update.targetId);
+    if (!target || target.deploymentJobId || target.repairJobId) return;
+    planAbortRef.current?.abort();
+    const controller = new AbortController();
+    planAbortRef.current = controller;
+    const request = ++planRequestRef.current;
+    const identity = draft.requestId;
+    setSavingPlanTargetId(update.targetId);
+    setError('');
+    setMessage('');
+    try {
+      const response = await updateDashboardDeploymentPlan(currentPlan.id, update, controller.signal);
+      if (controller.signal.aborted || request !== planRequestRef.current || identity !== planIdentityRef.current) return;
+      if (response.plan.id !== currentPlan.id || response.plan.revision < update.revision || !response.plan.targets.some((row) => row.targetId === update.targetId)) throw new Error('The saved plan response did not match these choices. Reopen the plan before continuing.');
+      setDeploymentPlan(response.plan);
+      dispatchDraft({ type: 'restore_plan', plan: response.plan });
+      setMessage('Plan choices saved. Finish reviewing any other choices, then select Recheck readiness. Saving a choice does not establish compatibility or safe staging access.');
+    } catch (saveError) {
+      if (!controller.signal.aborted && request === planRequestRef.current) setError(saveError instanceof Error ? saveError.message : 'The plan choices could not be saved.');
+    } finally {
+      if (request === planRequestRef.current) setSavingPlanTargetId('');
+    }
+  }
+
+  function resolveInModelMigrator(targetId: string) {
+    if (!currentPlan || checkingReadiness || savingPlanTargetId) return;
+    writeDashboardSafeCopyDraft(draft);
+    navigate('/models/migrate', { state: { version: 2, source: 'dashboard_deployment_plan', planId: currentPlan.id, targetId } });
+  }
+
+  async function returnToPlan() {
+    if (!currentPlan || checkingReadiness) return;
+    planAbortRef.current?.abort();
+    const controller = new AbortController();
+    planAbortRef.current = controller;
+    const request = ++planRequestRef.current;
+    setCheckingReadiness(true);
+    setError('');
+    try {
+      const response = await getDashboardDeploymentPlan(currentPlan.id, controller.signal);
+      if (controller.signal.aborted || request !== planRequestRef.current) return;
+      if (response.plan.id !== currentPlan.id) throw new Error('The saved plan did not match this deployment.');
+      const next = { ...createDashboardSafeCopyDraft(), planId: response.plan.id, requestId: response.plan.intent.requestId };
+      dispatchDraft({ type: 'reset', draft: next });
+      dispatchDraft({ type: 'restore_plan', plan: response.plan });
+      setDeploymentPlan(response.plan);
+      jobRef.current = null;
+      setJob(null);
+      setMessage('The plan is ready to review. Previously deployed destinations remain recorded.');
+    } catch (planError) {
+      if (!controller.signal.aborted && request === planRequestRef.current) setError(planError instanceof Error ? planError.message : 'Could not reopen the deployment plan.');
+    } finally {
+      if (request === planRequestRef.current) setCheckingReadiness(false);
+    }
   }
 
   function goToStep(step: DashboardSafeCopyStep) {
-    if (draft.jobId) return;
+    if (draft.jobId || checkingReadiness || savingPlanTargetId || topicRepairBusy) return;
     dispatchDraft({ type: 'set_step', step });
     setError('');
     setMessage('');
@@ -880,15 +1200,8 @@ export function DashboardSafeCopyFlow() {
 
   async function startMove() {
     if (submitGuardRef.current || submitting) return;
-    const completeDestinations = draft.destinations.every((row) => row.connectionId && row.modelId);
-    if (
-      !draft.sourceId
-      || !draft.sourceConnectionId
-      || draft.selectedDocumentIds.length === 0
-      || draft.destinations.length === 0
-      || !completeDestinations
-    ) {
-      setError('Complete the source, dashboard, and destination choices before moving.');
+    if (!currentPlan || checkingReadiness || savingPlanTargetId || topicRepairBusy || selectedReadyTargetIds.length === 0) {
+      setError('Check readiness and explicitly select at least one ready destination before deploying.');
       return;
     }
     if (draft.selectedDocumentIds.length * draft.destinations.length > DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS) {
@@ -898,23 +1211,28 @@ export function DashboardSafeCopyFlow() {
     submitGuardRef.current = true;
     setSubmitting(true);
     setError('');
-    setMessage('Starting one safe copy to every selected destination...');
-    const requestDraft = { ...draft, step: 2 as const };
+    setMessage('Starting the selected ready destinations...');
+    const deploymentRequestId = draft.deploymentRequestId || newDashboardSafeCopyRequestId();
+    const requestDraft = { ...draft, step: 3 as const, deploymentRequestId };
+    dispatchDraft({ type: 'prepare_deployment', deploymentRequestId });
     writeDashboardSafeCopyDraft(requestDraft);
     try {
-      const response = await createDashboardSafeCopyJob(dashboardSafeCopyIntentFromDraft(requestDraft, instances));
-      if (!isDashboardSafeCopyJobForRequest(response.job, requestDraft.requestId)) {
+      const response = await deployDashboardDeploymentPlan(currentPlan.id, currentPlan.revision, selectedReadyTargetIds, deploymentRequestId);
+      if (!isDashboardSafeCopyJobForRequest(response.job, deploymentRequestId)
+        || !sameDocumentScope(response.job.documentIds, currentPlan.intent.source.documentIds)
+        || !sameDocumentScope((response.job.targets || []).map((row) => row.id), selectedReadyTargetIds)) {
         throw new Error('The server returned a job that did not match this safe dashboard move. Nothing was attached locally.');
       }
-      const attachedDraft = { ...requestDraft, jobId: response.job.id };
+      const attachedDraft = { ...requestDraft, requestId: deploymentRequestId, jobId: response.job.id };
       writeDashboardSafeCopyDraft(attachedDraft);
       const current = jobRef.current;
       if (!current || shouldApplyDashboardSafeCopyJobSnapshot(current, response.job, { allowTerminalReopen: true })) {
         jobRef.current = response.job;
         setJob(response.job);
       }
-      dispatchDraft({ type: 'attach_job', jobId: response.job.id });
-      setMessage(response.replayed ? 'Resumed the existing move.' : 'Move started. You can leave this page and return to the same job.');
+      setDeploymentPlan(response.plan);
+      dispatchDraft({ type: 'attach_job', jobId: response.job.id, requestId: deploymentRequestId });
+      setMessage('Deployment started. You can leave this page and return to the same job.');
     } catch (startError) {
       setError(startError instanceof Error ? startError.message : 'Could not start the dashboard move.');
       setMessage('');
@@ -969,7 +1287,7 @@ export function DashboardSafeCopyFlow() {
     setDocuments([]);
     setDashboardInventory(null);
     setDestinationCatalogs({});
-    setSourceConnections([]);
+    setSourceConnectionCatalog(EMPTY_SOURCE_CONNECTION_CATALOG);
     setSearch('');
     setVisibleDashboardCount(DASHBOARD_PAGE_SIZE);
     setError('');
@@ -1006,17 +1324,23 @@ export function DashboardSafeCopyFlow() {
     setDocuments([]);
     setDashboardInventory(null);
     setDestinationCatalogs({});
-    setSourceConnections([]);
+    setSourceConnectionCatalog(EMPTY_SOURCE_CONNECTION_CATALOG);
     setSearch('');
     setError('');
     setMessage('');
   }
 
+  // Saved scope preserves navigation while its display catalog is unavailable;
+  // it never changes server-owned readiness or authorizes deployment.
+  const savedSourceScopeMatches = Boolean(currentPlan && draft.selectedDocumentIds.length > 0
+    && currentPlan.intent.source.instanceId === draft.sourceId
+    && currentPlan.intent.source.connectionId === draft.sourceConnectionId
+    && sameDocumentScope(currentPlan.intent.source.documentIds, draft.selectedDocumentIds));
   const sourceReady = Boolean(
     draft.sourceId
     && draft.sourceConnectionId
-    && dashboardInventory?.complete
-    && draft.selectedDocumentIds.length > 0,
+    && (savedSourceScopeMatches || (verifiedDocumentsScopeRef.current === dashboardScope
+      && hasVerifiedDashboardSelection(documents, draft.selectedDocumentIds, draft.sourceConnectionId))),
   );
   const destinationsReady = draft.destinations.length > 0
     && draft.destinations.every((row) => row.connectionId && row.modelId);
@@ -1042,14 +1366,14 @@ export function DashboardSafeCopyFlow() {
   return (
     <div className="space-y-5">
       <nav className="card p-3" aria-label="Dashboard move steps">
-        <ol className="grid gap-2 sm:grid-cols-3">
+        <ol className="grid grid-cols-2 gap-2 xl:grid-cols-4">
           {STEP_LABELS.map((label, index) => {
             const step = index as DashboardSafeCopyStep;
-            const enabled = !draft.jobId && (
+            const enabled = !draft.jobId && !submitting && !checkingReadiness && !savingPlanTargetId && (
               step === 0
               || (step === 1 && sourceReady)
               || (step === 2 && sourceReady && destinationsReady)
-              || (step === 3 && sourceReady && destinationsReady)
+              || (step === 3 && Boolean(currentPlan) && !checkingReadiness && selectedReadyTargetIds.length > 0)
             );
             return (
               <li key={label}>
@@ -1083,7 +1407,7 @@ export function DashboardSafeCopyFlow() {
               Choose dashboards
             </h2>
             <p className="mt-1 text-sm text-content-secondary">
-              Choose one source connection, then select dashboards from its complete inventory. Folder boundaries are discovered automatically.
+              Choose a source connection, then add dashboards by link or identifier. Browse the full accessible catalog only when you need to find a dashboard.
             </p>
             <div className="mt-5 grid gap-4 md:grid-cols-2">
               <div>
@@ -1105,18 +1429,24 @@ export function DashboardSafeCopyFlow() {
               <div>
                 <label className="mb-1.5 block text-sm font-semibold text-content-primary">Source connection</label>
                 <ComboBox
-                  options={buildConnectionComboBoxOptions(sourceConnections)}
+                  options={sourceConnectionOptions}
                   value={draft.sourceConnectionId}
                   onChange={chooseSourceConnection}
                   allowFreeText={false}
                   disabled={!draft.sourceId}
-                  isLoading={loadingSourceConnections}
+                  isLoading={sourceCatalog.loading}
                   loadingLabel="Loading source connections..."
                   placeholder="Choose a source connection"
-                  emptyLabel="No active source connections found"
+                  emptyLabel={sourceConnectionEmptyLabel(sourceCatalog)}
                   ariaLabel="Source connection"
                   optionLayout="stacked"
                 />
+                {sourceCatalog.error && <div role="alert" className="mt-2 rounded-card border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-950">
+                  <p className="font-semibold">Source connection catalog could not be loaded</p>
+                  <p>{sourceCatalog.error}</p>
+                  <p>Saved choices are unchanged. This catalog message is separate from dashboard readiness.{sourceCatalog.connections.length > 0 ? ' Previously loaded connections are still shown.' : ''}</p>
+                  <button type="button" className="btn-secondary btn-sm mt-2" disabled={sourceCatalog.loading || !draft.sourceId} onClick={() => void loadSourceConnections(draft.sourceId)}>Retry source connections</button>
+                </div>}
               </div>
             </div>
           </div>
@@ -1126,16 +1456,21 @@ export function DashboardSafeCopyFlow() {
               <div>
                 <h3 className="text-base font-semibold text-content-primary">Dashboards</h3>
                 <p className="mt-1 text-xs text-content-secondary">
-                  {dashboardInventory?.complete
-                    ? `${dashboardInventory.matchedRecordCount} dashboards in a complete connection-scoped inventory.`
-                    : draft.sourceConnectionId ? 'Loading a complete connection-scoped inventory.' : 'Choose a source connection to load dashboards.'}
+                  {dashboardInventory?.complete && dashboardInventory.scope === 'credential'
+                    ? `Browse completed: ${dashboardInventory.matchedRecordCount} dashboards returned for this connection. Previously verified dashboards are also kept below.`
+                    : documents.length > 0 ? `${documents.length} dashboards individually verified. The full catalog has not been browsed.`
+                    : draft.sourceConnectionId ? 'Add a known dashboard without scanning the full catalog, or choose to browse.' : 'Choose a source connection to add dashboards.'}
                 </p>
+                {dashboardInventory?.complete && <p className="mt-1 text-xs text-content-secondary">
+                  {dashboardInventory.cache.status === 'hit' ? 'Reused complete cached inventory' : dashboardInventory.cache.status === 'shared' ? 'Reused a completed shared inventory request' : 'Complete inventory fetched'}
+                  {' · '}{new Date(dashboardInventory.cache.fetchedAt).toLocaleString()}. This timestamp describes the browse result, not every retained dashboard. Readiness checks the selected dashboards again.
+                </p>}
               </div>
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
                   onClick={selectAllMatching}
-                  disabled={!dashboardInventory?.complete || filteredDocuments.length === 0}
+                  disabled={filteredDocuments.length === 0}
                   className="btn-secondary btn-sm"
                 >
                   Select matching
@@ -1154,15 +1489,27 @@ export function DashboardSafeCopyFlow() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => void loadDashboards(true)}
-                  disabled={!draft.sourceConnectionId || loadingDashboards}
+                  onClick={() => void loadDashboards()}
+                  disabled={!draft.sourceConnectionId || loadingDashboards || loadingDashboardLookup}
                   className="btn-secondary btn-sm"
                 >
-                  {loadingDashboards ? <Loader2 size={13} className="motion-safe:animate-spin" aria-hidden="true" /> : <RefreshCw size={13} aria-hidden="true" />}
-                  Refresh
+                  Browse all dashboards
                 </button>
+                {dashboardInventory?.complete && <button type="button" onClick={() => void loadDashboards(undefined, true)} disabled={!draft.sourceConnectionId || loadingDashboards || loadingDashboardLookup} className="btn-secondary btn-sm" title="Fetch a new catalog from Omni instead of reusing the cached browse result">
+                  <RefreshCw size={13} aria-hidden="true" />Refresh catalog
+                </button>}
               </div>
             </div>
+            <form className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-end" onSubmit={(event) => { event.preventDefault(); void addDashboardByReference(); }}>
+              <label className="min-w-0 flex-1 text-sm font-semibold text-content-primary">
+                Dashboard link or identifier
+                <input value={dashboardReference} onChange={(event) => setDashboardReference(event.target.value)} disabled={!draft.sourceConnectionId || loadingDashboards || loadingDashboardLookup} placeholder="Paste a dashboard link or identifier" className="input-field mt-1 w-full" autoComplete="off" />
+              </label>
+              <button type="submit" className="btn-primary justify-center" disabled={!draft.sourceConnectionId || !dashboardReference.trim() || loadingDashboards || loadingDashboardLookup}>
+                <Plus size={14} aria-hidden="true" />Add dashboard by link
+              </button>
+            </form>
+            <p className="mt-2 text-xs text-content-secondary">Each added dashboard must belong to the selected instance and connection. This only verifies selection; it does not copy anything.</p>
             <div className="mt-4">
               <SearchInput
                 value={search}
@@ -1174,12 +1521,20 @@ export function DashboardSafeCopyFlow() {
               />
             </div>
             {loadingDashboards && (
-              <div role="status" className="mt-4 flex items-center gap-2 rounded-card bg-surface-secondary px-3 py-3 text-sm text-content-secondary">
-                <Loader2 size={15} className="motion-safe:animate-spin" aria-hidden="true" />
-                Loading every dashboard in this connection...
+              <div className="mt-4 rounded-card bg-surface-secondary px-3 py-3 text-sm text-content-secondary">
+                <div role="status" aria-live="polite" className="flex items-center gap-2"><Loader2 size={15} className="motion-safe:animate-spin" aria-hidden="true" />
+                  {dashboardBrowseProgress ? `${dashboardBrowseProgress.pages} pages received · ${dashboardBrowseProgress.returnedRecords.toLocaleString()} source records scanned${dashboardBrowseProgress.reportedTotalRecords !== undefined ? ` · reported total ${dashboardBrowseProgress.reportedTotalRecords.toLocaleString()}` : ''}` : 'Waiting for the first inventory page or a complete cached result…'}
+                </div>
+                <p className="mt-1">Elapsed: {dashboardBrowseElapsed}s. Results are added only after the full accessible catalog is complete.</p>
+                <button type="button" onClick={cancelDashboardLoading} className="btn-secondary btn-sm mt-2">Cancel browsing</button>
               </div>
             )}
-            {!loadingDashboards && dashboardInventory?.complete && (
+            {loadingDashboardLookup && <div role="status" className="mt-4 flex flex-wrap items-center gap-2 rounded-card bg-surface-secondary px-3 py-3 text-sm text-content-secondary">
+              <Loader2 size={15} className="motion-safe:animate-spin" aria-hidden="true" />Verifying the requested dashboard identifiers…
+              <button type="button" onClick={cancelDashboardLoading} className="btn-secondary btn-sm">Cancel verification</button>
+            </div>}
+            {!loadingDashboards && dashboardInventory?.complete && documents.length === 0 && <p className="mt-4 text-sm text-content-secondary">No accessible dashboards were returned for this connection.</p>}
+            {documents.length > 0 && (
               <div className="mt-4 max-h-[32rem] overflow-y-auto rounded-card border border-border" aria-label="Available dashboards">
                 {visibleDocuments.map((document) => {
                   const documentId = sourceDocumentId(document);
@@ -1198,7 +1553,7 @@ export function DashboardSafeCopyFlow() {
                       <span className="min-w-0 flex-1">
                         <span className="block truncate text-sm font-semibold text-content-primary">{document.name}</span>
                         <span className="mt-0.5 block truncate text-xs text-content-secondary">
-                          {document.folderPath || 'Top level'}
+                          {document.folderPath || 'Folder details not supplied'}
                           {(document.baseModelName || document.baseModelId) ? ` · ${document.baseModelName || document.baseModelId}` : ''}
                         </span>
                       </span>
@@ -1242,328 +1597,149 @@ export function DashboardSafeCopyFlow() {
       {draft.step === 1 && !draft.jobId && (
         <section className="space-y-5" aria-labelledby="safe-copy-destinations-heading">
           <div className="card p-5">
-            <h2 ref={headingRef} tabIndex={-1} id="safe-copy-destinations-heading" className="text-lg font-semibold text-content-primary">
-              Choose destinations
-            </h2>
-            <p className="mt-1 text-sm text-content-secondary">
-              Every selected dashboard moves to every selected destination. Saved defaults and sole choices are applied automatically.
-            </p>
-            <div className="mt-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-              {destinationInstances.map((instance) => {
-                const selected = selectedDestinationIds.has(instance.id);
-                return (
-                  <label
-                    key={instance.id}
-                    className={`flex cursor-pointer items-start gap-3 rounded-card border p-4 ${selected ? 'border-omni-300 bg-omni-50' : 'border-border bg-white hover:bg-surface-secondary'}`}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={selected}
-                      onChange={() => toggleDestination(instance.id)}
-                      className="mt-0.5 h-4 w-4 accent-omni-600"
-                    />
-                    <span className="min-w-0">
-                      <span className="block truncate text-sm font-semibold text-content-primary">{instance.label}</span>
-                      <span className="mt-1 block truncate text-xs text-content-secondary">{instance.baseUrl.replace(/^https?:\/\//, '')}</span>
-                      {instance.id === draft.sourceId && <span className="mt-1 block text-[11px] font-semibold text-amber-700">Same saved instance</span>}
-                    </span>
-                  </label>
-                );
-              })}
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <h2 ref={headingRef} tabIndex={-1} id="safe-copy-destinations-heading" className="text-lg font-semibold text-content-primary">Choose destinations</h2>
+                <p className="mt-1 max-w-2xl text-sm leading-6 text-content-secondary">
+                  Each dashboard will be copied to every destination you include. Add another row to use the same instance with a different connection, model, or folder.
+                </p>
+              </div>
+              <span className="rounded-full bg-omni-50 px-3 py-1 text-xs font-semibold text-omni-800">{draft.destinations.length} destinations</span>
             </div>
+            {draft.destinations.length === 0 && (
+              <div className="mt-5 rounded-card border border-dashed border-border bg-surface-secondary p-6 text-center">
+                <Database size={24} className="mx-auto text-omni-600" aria-hidden="true" />
+                <p className="mt-3 text-sm font-semibold text-content-primary">Where should these dashboards go?</p>
+                <p className="mt-1 text-xs text-content-secondary">Start with one destination. Saved defaults stay editable.</p>
+              </div>
+            )}
+            {destinationInstances.length > 0 ? (
+              <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
+                <div className="min-w-0 flex-1">
+                  <ComboBox options={destinationInstances.map((instance) => ({ value: instance.id, label: instance.label, subtitle: instance.baseUrl.replace(/^https?:\/\//, '') }))}
+                    value={newDestinationInstanceId} onChange={setNewDestinationInstanceId} allowFreeText={false} ariaLabel="Instance to add as a destination" placeholder={`Search ${destinationInstances.length} destination instance${destinationInstances.length === 1 ? '' : 's'}…`} optionLayout="stacked" maxVisibleOptions={30} />
+                </div>
+                <button type="button" className="btn-secondary justify-center" onClick={() => addDestination(newDestinationInstanceId)} disabled={!newDestinationInstanceId || submitting || draft.destinations.length >= MAX_DESTINATIONS}><Plus size={14} aria-hidden="true" />Add destination</button>
+              </div>
+            ) : <p className="mt-4 text-sm text-content-secondary">Add a saved destination instance to continue.</p>}
+            {draft.destinations.length > 1 && (
+              <div className="mt-4 border-t border-border pt-4">
+                <SearchInput value={destinationSearch} onChange={(value) => { setDestinationSearch(value); setDestinationPageIndex(0); setExpandedDestinationId(null); }} ariaLabel="Search selected destinations" placeholder="Find a selected instance, connection, model, or folder…" />
+                <p className="mt-2 text-xs text-content-secondary">{filteredDestinations.length} of {draft.destinations.length} selected destinations · Expand one row to edit its settings.</p>
+              </div>
+            )}
           </div>
 
-          {draft.destinations.map((destination, destinationIndex) => {
-            const instance = instances.find((row) => row.id === destination.instanceId);
-            const catalog = destinationCatalogs[destination.instanceId] || EMPTY_DESTINATION_CATALOG;
-            const automaticResolution = instance ? resolveDashboardSafeCopyDestinationDefaults({
-              instance,
-              connections: catalog.connections,
-              models: catalog.models,
-              current: destination,
-            }) : { connectionId: '', modelId: '', needsConnection: true, needsModel: true };
-            const resolution = destination.requiresModelChoice && !destination.modelId
-              ? { ...automaticResolution, modelId: '', needsModel: true }
-              : automaticResolution;
-            const selectedConnection = catalog.connections.find((row) => row.id === destination.connectionId);
-            const selectedModel = catalog.models.find((row) => row.id === destination.modelId);
-            const modelOptions = catalog.models.filter((model) => (
-              !destination.connectionId || !model.connectionId || model.connectionId === destination.connectionId
-            ));
+          {destinationWindow.rows.map(({ destination, destinationIndex, instance, catalog, connectionLabel, modelLabel, folderLabel }) => {
+            const modelOptions = catalog.models.filter((model) => model.connectionId === destination.connectionId);
+            const rowLabel = `Destination ${destinationIndex + 1}`;
+            const expanded = destination.targetId === activeDestinationId;
             return (
-              <article key={destination.targetId} className="card p-5" aria-labelledby={`destination-${destination.targetId}`}>
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-                  <div>
-                    <h3 id={`destination-${destination.targetId}`} className="text-base font-semibold text-content-primary">
-                      {instance?.label || destination.instanceId}
+              <article key={destination.targetId} className={`card ${expanded ? 'p-5' : 'px-5 py-3'}`} aria-labelledby={`destination-${destination.targetId}`}>
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0 flex-1">
+                    <h3 id={`destination-${destination.targetId}`}>
+                      <button type="button" className="flex w-full items-start gap-2 text-left text-sm font-semibold text-content-primary" aria-label={`Edit ${rowLabel.toLowerCase()}`} aria-expanded={expanded} aria-controls={`destination-editor-${destination.targetId}`}
+                        onClick={() => setExpandedDestinationId(expanded ? '' : destination.targetId)}>
+                        <ChevronDown size={16} className={`mt-0.5 shrink-0 ${expanded ? '' : '-rotate-90'}`} aria-hidden="true" />
+                        <span className="min-w-0 truncate">{destinationIndex + 1}. {instance?.label || 'Choose instance'}</span>
+                      </button>
                     </h3>
-                    <p className="mt-1 text-xs text-content-secondary">
-                      Folder: {destinationFolderLabel(instance?.defaultFolderPath, instance?.defaultFolderId)}
-                    </p>
+                    <p className="mt-1 truncate pl-6 text-xs text-content-secondary" title={`${connectionLabel} → ${modelLabel} → ${folderLabel}`}>{connectionLabel} → {modelLabel} → {folderLabel}</p>
+                    {(!destination.connectionId || !destination.modelId) && <p className="mt-1 pl-6 text-xs text-amber-800">Setup needed</p>}
                   </div>
-                  {catalog.loading
-                    ? <StatusChip status="in_progress" label="Resolving defaults" size="xs" />
-                    : destination.connectionId && destination.modelId
-                      ? <StatusChip status="ready" label="Ready" size="xs" />
-                      : <StatusChip status="warning" label="Choice needed" size="xs" />}
+                  <button type="button" className="btn-secondary btn-sm" aria-label={`Remove ${rowLabel.toLowerCase()}`} onClick={() => { dispatchDraft({ type: 'remove_destination', targetId: destination.targetId, requestId: newDashboardSafeCopyRequestId() }); if (expanded) setExpandedDestinationId(null); }}><Trash2 size={14} aria-hidden="true" /><span className="hidden sm:inline">Remove</span></button>
                 </div>
-
-                {catalog.error && (
-                  <div role="alert" className="mt-4 rounded-card border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-                    {catalog.error}
-                    <button type="button" onClick={() => void loadDestinationCatalog(destination.instanceId)} className="btn-secondary btn-sm mt-2">
-                      <RefreshCw size={13} aria-hidden="true" /> Retry
-                    </button>
+                {expanded && <div id={`destination-editor-${destination.targetId}`}>
+                <div className="mt-4 grid min-w-0 gap-4 md:grid-cols-2">
+                  <div>
+                    <div className="mb-1.5 text-xs font-semibold text-content-secondary">Instance</div>
+                    <ComboBox options={destinationInstances.map((row) => ({ value: row.id, label: row.label, subtitle: row.baseUrl.replace(/^https?:\/\//, '') }))} value={destination.instanceId} onChange={(value) => setDestinationInstance(destination.targetId, value)} allowFreeText={false} ariaLabel={`${rowLabel} instance`} placeholder="Choose instance" optionLayout="stacked" maxVisibleOptions={30} />
                   </div>
-                )}
-
-                {!catalog.error && catalog.loaded && (
-                  <div className="mt-4 grid gap-4 md:grid-cols-2">
-                    <div>
-                      <div className="text-xs font-semibold uppercase tracking-[0.12em] text-content-secondary">Connection</div>
-                      {resolution.needsConnection ? (
-                        <div className="mt-1.5">
-                          <ComboBox
-                            options={buildConnectionComboBoxOptions(catalog.connections)}
-                            value={destination.connectionId}
-                            onChange={(value) => setDestinationConnection(destination.instanceId, value)}
-                            allowFreeText={false}
-                            placeholder="Choose connection"
-                            emptyLabel="No active destination connections"
-                            // Named then numbered, and ending in "connection":
-                            // the tenant says where the write lands, the index
-                            // disambiguates two rows for the same instance, and
-                            // ComboBox derives the listbox name by appending
-                            // " options" — so the trailing word has to be
-                            // "connection" for that derived name to read.
-                            ariaLabel={`${instance?.label || destination.instanceId} destination ${destinationIndex + 1} connection`}
-                            optionLayout="stacked"
-                          />
-                        </div>
-                      ) : (
-                        <div className="mt-1.5 flex items-start gap-2 rounded-card bg-surface-secondary px-3 py-2 text-sm text-content-primary">
-                          <Check size={14} className="mt-0.5 flex-shrink-0 text-green-700" aria-hidden="true" />
-                          <span className="min-w-0">
-                            <span className="block">{selectedConnection?.name || destination.connectionId}</span>
-                            {/* Two connections on one instance can share a name. Once
-                                the picker is replaced by this summary the name alone
-                                no longer identifies which one will be written to, so
-                                keep the database and the id visible here. */}
-                            {selectedConnection?.database && (
-                              <span className="mt-0.5 block break-words text-xs text-content-secondary">
-                                {selectedConnection.database}
-                              </span>
-                            )}
-                            {destination.connectionId && selectedConnection?.name !== destination.connectionId && (
-                              <span className="mt-0.5 block break-all font-mono text-[10px] text-content-tertiary">
-                                {destination.connectionId}
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                    <div>
-                      <div className="text-xs font-semibold uppercase tracking-[0.12em] text-content-secondary">Model</div>
-                      {resolution.needsModel ? (
-                        <div className="mt-1.5">
-                          <ComboBox
-                            options={modelOptions.map((model) => ({
-                              value: model.id,
-                              label: modelDisplayLabel(model),
-                              subtitle: model.connectionName || model.connectionId,
-                            }))}
-                            value={destination.modelId}
-                            onChange={(value) => setDestinationModel(destination.instanceId, value)}
-                            allowFreeText={false}
-                            disabled={!destination.connectionId}
-                            placeholder={destination.connectionId ? 'Choose model' : 'Choose connection first'}
-                            emptyLabel="No shared models for this connection"
-                            ariaLabel={`Destination model for ${instance?.label || destination.instanceId}`}
-                            optionLayout="stacked"
-                          />
-                        </div>
-                      ) : (
-                        <div className="mt-1.5 flex items-center gap-2 rounded-card bg-surface-secondary px-3 py-2 text-sm text-content-primary">
-                          <Check size={14} className="text-green-700" aria-hidden="true" />
-                          {selectedModel ? modelDisplayLabel(selectedModel) : destination.modelId}
-                        </div>
-                      )}
-                    </div>
+                  <div>
+                    <div className="mb-1.5 text-xs font-semibold text-content-secondary">Connection</div>
+                    <ComboBox options={buildConnectionComboBoxOptions(catalog.connections)} value={destination.connectionId} onChange={(value) => setDestinationConnection(destination.targetId, value)} allowFreeText={false} ariaLabel={`${instance?.label || 'Saved instance'} destination ${destinationIndex + 1} connection`} placeholder={catalog.loading ? 'Loading connections…' : 'Choose connection'} disabled={!destination.instanceId || catalog.loading} emptyLabel="No active destination connections" optionLayout="stacked" />
                   </div>
-                )}
+                  <div>
+                    <div className="mb-1.5 text-xs font-semibold text-content-secondary">Model</div>
+                    <ComboBox options={modelOptions.map((model) => ({ value: model.id, label: modelDisplayLabel(model), subtitle: model.connectionName || model.connectionId }))} value={destination.modelId} onChange={(value) => setDestinationModel(destination.targetId, value)} allowFreeText={false} ariaLabel={`${rowLabel} model`} disabled={!destination.connectionId || catalog.loading} placeholder={destination.connectionId ? 'Choose model' : 'Choose connection first'} emptyLabel="No shared models for this connection" optionLayout="stacked" />
+                  </div>
+                  <DestinationFolderPicker rowLabel={rowLabel} folderId={destination.folderId} folderPath={destination.folderPath} disabled={!instance}
+                    catalog={instance ? destinationFolders.catalogs[destinationFolderCacheKey(instance)] || EMPTY_FOLDER_CATALOG : EMPTY_FOLDER_CATALOG}
+                    onLoad={(force) => { if (instance) void destinationFolders.load(instance, force); }} onChange={(patch) => updateDestination(destination.targetId, patch)} />
+                </div>
+                {catalog.loading && <p role="status" className="mt-3 flex items-center gap-2 text-xs text-content-secondary"><Loader2 size={13} className="motion-safe:animate-spin" aria-hidden="true" />Loading destination choices…</p>}
+                {catalog.error && <div role="alert" className="mt-4 rounded-card border border-red-200 bg-red-50 p-3 text-xs text-red-700">{catalog.error}<button type="button" onClick={() => void loadDestinationCatalog(destination.instanceId)} className="btn-secondary btn-sm ml-2"><RefreshCw size={13} aria-hidden="true" />Retry</button></div>}
+                </div>}
               </article>
             );
           })}
-
-          <details className="card p-5">
-            <summary className="cursor-pointer text-sm font-semibold text-content-primary">
-              Advanced options
-            </summary>
-            <div className="mt-4 space-y-3">
-              <label className="flex items-center gap-3 text-sm text-content-primary">
-                <input
-                  type="checkbox"
-                  checked={draft.emptyFirst || false}
-                  onChange={() => dispatchDraft({ type: 'patch_plan', patch: { emptyFirst: !draft.emptyFirst }, requestId: draft.requestId })}
-                  className="h-4 w-4 accent-omni-600"
-                />
-                Empty destination folder before deploying
-              </label>
-              <label className="flex items-center gap-3 text-sm text-content-primary">
-                <input
-                  type="checkbox"
-                  checked={draft.deleteSourceOnSuccess || false}
-                  onChange={() => dispatchDraft({ type: 'patch_plan', patch: { deleteSourceOnSuccess: !draft.deleteSourceOnSuccess }, requestId: draft.requestId })}
-                  className="h-4 w-4 accent-omni-600"
-                />
-                Delete source dashboards after successful migration
-              </label>
-              <label className="flex items-center gap-3 text-sm text-content-primary">
-                <input
-                  type="checkbox"
-                  checked={draft.refreshSchemaOnComplete || false}
-                  onChange={() => dispatchDraft({ type: 'patch_plan', patch: { refreshSchemaOnComplete: !draft.refreshSchemaOnComplete }, requestId: draft.requestId })}
-                  className="h-4 w-4 accent-omni-600"
-                />
-                Trigger schema refresh after landing
-              </label>
-            </div>
-          </details>
-
+          {draft.destinations.length > 0 && filteredDestinations.length === 0 && <p role="status" className="card p-5 text-sm text-content-secondary">No selected destinations match this search. Clear the search to see all destinations.</p>}
+          {destinationWindow.pageCount > 1 && (
+            <nav aria-label="Selected destination pages" className="flex items-center justify-between gap-3">
+              <button type="button" className="btn-secondary btn-sm" disabled={destinationWindow.page === 0} onClick={() => { setDestinationPageIndex(destinationWindow.page - 1); setExpandedDestinationId(null); }}>Previous</button>
+              <span className="text-xs text-content-secondary">Page {destinationWindow.page + 1} of {destinationWindow.pageCount} · {DESTINATIONS_PER_PAGE} destinations per page</span>
+              <button type="button" className="btn-secondary btn-sm" disabled={destinationWindow.page + 1 >= destinationWindow.pageCount} onClick={() => { setDestinationPageIndex(destinationWindow.page + 1); setExpandedDestinationId(null); }}>Next</button>
+            </nav>
+          )}
           <div className="card p-5">
-            <div className="rounded-card border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-900">
-              <div className="font-semibold">Safe defaults</div>
-              <div className="mt-1 text-xs leading-5">
-                Existing dashboards are never overwritten. Same-name copies receive a deterministic suffix, and required model content is prepared automatically.
-              </div>
-              <div className="mt-1 text-xs leading-5">{DESTINATION_ACCESS_NOTICE}</div>
-            </div>
+            <p className="text-xs leading-5 text-content-secondary">Copies receive distinct names when needed. {DESTINATION_ACCESS_NOTICE}</p>
             <div className="mt-4 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <button type="button" onClick={() => goToStep(0)} className="btn-secondary justify-center">
-                <ArrowLeft size={15} aria-hidden="true" /> Back
-              </button>
-              <button type="button" onClick={() => goToStep(2)} disabled={!destinationsReady} className="btn-primary justify-center">
-                Review dependencies <ArrowRight size={15} aria-hidden="true" />
-              </button>
+              <button type="button" onClick={() => goToStep(0)} className="btn-secondary justify-center"><ArrowLeft size={15} aria-hidden="true" />Back</button>
+              <button type="button" onClick={() => { goToStep(2); if (!currentPlan) void checkReadiness(); }} disabled={!destinationsReady || !sourceReady} className="btn-primary justify-center">Review readiness<ArrowRight size={15} aria-hidden="true" /></button>
             </div>
           </div>
         </section>
       )}
 
       {draft.step === 2 && !draft.jobId && (
-        <section className="space-y-5" aria-labelledby="safe-copy-dependencies-heading">
+        <section className="space-y-5" aria-labelledby="safe-copy-readiness-heading">
           <div className="card p-5">
-            <h2 ref={headingRef} tabIndex={-1} id="safe-copy-dependencies-heading" className="text-lg font-semibold text-content-primary">
-              Review dependencies
-            </h2>
-            <p className="mt-1 text-sm text-content-secondary">
-              If selected dashboards reference topics or query views in the source model, map them to existing targets or copy them to the destination.
-            </p>
-
-            {draft.destinations.map((destination) => {
-              const instance = instances.find((row) => row.id === destination.instanceId);
-              const topicMappings = destination.topicMappings || [];
-              const queryViewMappings = destination.queryViewMappings || [];
-              const hasDependencies = topicMappings.length > 0 || queryViewMappings.length > 0;
-              return (
-                <article key={destination.targetId} className="mt-5 rounded-card border border-border p-4">
-                  <h3 className="text-sm font-semibold text-content-primary">
-                    {instance?.label || destination.instanceId}
-                  </h3>
-                  {!hasDependencies && (
-                    <p className="mt-2 text-xs text-content-secondary">
-                      No topic or query view dependencies detected. The dashboards can be moved without additional mapping.
-                    </p>
-                  )}
-                  {topicMappings.length > 0 && (
-                    <div className="mt-3">
-                      <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">Topic mappings</div>
-                      <div className="mt-2 space-y-2">
-                        {topicMappings.map((mapping, index) => (
-                          <div key={mapping.sourceTopicName} className="flex items-center gap-3 rounded-card border border-border bg-surface-secondary p-3">
-                            <span className="min-w-0 flex-1 truncate text-sm text-content-primary">{mapping.sourceTopicName}</span>
-                            <select
-                              value={mapping.action}
-                              onChange={(event) => {
-                                const updated = [...topicMappings];
-                                updated[index] = { ...mapping, action: event.target.value as typeof mapping.action, targetTopicName: event.target.value === 'copy_source' ? mapping.sourceTopicName : mapping.targetTopicName };
-                                dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, topicMappings: updated } : d) }, requestId: draft.requestId });
-                              }}
-                              className="rounded border border-border bg-white px-2 py-1 text-xs"
-                            >
-                              <option value="copy_source">Copy from source</option>
-                              <option value="map_existing">Map to existing</option>
-                            </select>
-                            {mapping.action === 'map_existing' && (
-                              <input
-                                type="text"
-                                value={mapping.targetTopicName}
-                                onChange={(event) => {
-                                  const updated = [...topicMappings];
-                                  updated[index] = { ...mapping, targetTopicName: event.target.value };
-                                  dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, topicMappings: updated } : d) }, requestId: draft.requestId });
-                                }}
-                                placeholder="Target topic name"
-                                className="w-40 rounded border border-border px-2 py-1 text-xs"
-                              />
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {queryViewMappings.length > 0 && (
-                    <div className="mt-3">
-                      <div className="text-xs font-semibold uppercase tracking-wider text-content-secondary">Query view mappings</div>
-                      <div className="mt-2 space-y-2">
-                        {queryViewMappings.map((mapping, index) => (
-                          <div key={mapping.sourceQueryViewName} className="flex items-center gap-3 rounded-card border border-border bg-surface-secondary p-3">
-                            <span className="min-w-0 flex-1 truncate text-sm text-content-primary">{mapping.sourceQueryViewName}</span>
-                            <select
-                              value={mapping.action}
-                              onChange={(event) => {
-                                const updated = [...queryViewMappings];
-                                updated[index] = { ...mapping, action: event.target.value as typeof mapping.action, targetQueryViewName: event.target.value === 'copy_source' ? mapping.sourceQueryViewName : mapping.targetQueryViewName };
-                                dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, queryViewMappings: updated } : d) }, requestId: draft.requestId });
-                              }}
-                              className="rounded border border-border bg-white px-2 py-1 text-xs"
-                            >
-                              <option value="copy_source">Copy from source</option>
-                              <option value="map_existing">Map to existing</option>
-                            </select>
-                            {mapping.action === 'map_existing' && (
-                              <input
-                                type="text"
-                                value={mapping.targetQueryViewName}
-                                onChange={(event) => {
-                                  const updated = [...queryViewMappings];
-                                  updated[index] = { ...mapping, targetQueryViewName: event.target.value };
-                                  dispatchDraft({ type: 'patch_plan', patch: { destinations: draft.destinations.map((d) => d.targetId === destination.targetId ? { ...d, queryViewMappings: updated } : d) }, requestId: draft.requestId });
-                                }}
-                                placeholder="Target query view name"
-                                className="w-40 rounded border border-border px-2 py-1 text-xs"
-                              />
-                            )}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </article>
-              );
-            })}
-          </div>
-
-          <div className="card p-5">
-            <div className="flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
-              <button type="button" onClick={() => goToStep(1)} className="btn-secondary justify-center">
-                <ArrowLeft size={15} aria-hidden="true" /> Back
-              </button>
-              <button type="button" onClick={() => goToStep(3)} className="btn-primary justify-center">
-                Confirm &amp; deploy <ArrowRight size={15} aria-hidden="true" />
-              </button>
+            <h2 ref={headingRef} tabIndex={-1} id="safe-copy-readiness-heading" className="text-lg font-semibold text-content-primary">Review readiness</h2>
+            <p className="mt-1 text-sm leading-6 text-content-secondary">Review source definitions, any destination topic choices, and remaining evidence gaps. Workbook-local definitions stay local; copying them is unavailable until workbook-copy capability is verified. Model Migrator reviews shared-model repairs only.</p>
+            <div className="mt-5">
+              <DashboardReadinessReview
+                plan={currentPlan}
+                checking={checkingReadiness}
+                progress={readinessProgress}
+                startedAt={readinessStartedAt}
+                onCancel={readinessStartedAt !== null ? cancelReadiness : undefined}
+                savingTargetId={savingPlanTargetId}
+                selectedTargetIds={selectedReadyTargetIds}
+                destinationLabels={Object.fromEntries(draft.destinations.map((destination) => {
+                  const catalog = destinationCatalogs[destination.instanceId];
+                  const model = catalog?.models.find((row) => row.id === destination.modelId);
+                  return [destination.targetId, { instance: instanceById.get(destination.instanceId)?.label || destination.instanceId, connection: catalog?.connections.find((row) => row.id === destination.connectionId)?.name || destination.connectionId, model: model ? modelDisplayLabel(model) : destination.modelId, folder: destinationFolderLabel(destination.folderPath, destination.folderId) }];
+                }))}
+                folderCatalogs={Object.fromEntries(draft.destinations.map((destination) => {
+                  const instance = instanceById.get(destination.instanceId);
+                  return [destination.targetId, instance ? destinationFolders.catalogs[destinationFolderCacheKey(instance)] || EMPTY_FOLDER_CATALOG : EMPTY_FOLDER_CATALOG];
+                }))}
+                onLoadFolders={(targetId, forceRefresh) => {
+                  const destination = draft.destinations.find((row) => row.targetId === targetId);
+                  const instance = destination && instanceById.get(destination.instanceId);
+                  if (instance) void destinationFolders.load(instance, forceRefresh);
+                }}
+                onUpdate={(update) => void savePlanTargetChoices(update)}
+                onCheck={() => void checkReadiness()}
+                onSelect={(targetIds) => dispatchDraft({ type: 'select_targets', targetIds, deploymentRequestId: newDashboardSafeCopyRequestId() })}
+                onResolve={resolveInModelMigrator}
+                onPlanChange={(plan) => {
+                  const current = latestDeploymentPlan.current;
+                  if (!current || current.id !== plan.id || current.revision >= plan.revision) return;
+                  latestDeploymentPlan.current = plan;
+                  setDeploymentPlan(plan);
+                  dispatchDraft({ type: 'restore_plan', plan });
+                  dispatchDraft({ type: 'select_targets', targetIds: [], deploymentRequestId: newDashboardSafeCopyRequestId() });
+                }}
+                topicRepairBusy={topicRepairBusy}
+                onTopicRepairBusyChange={setTopicRepairBusy}
+              />
             </div>
+          </div>
+          <div className="card flex flex-col-reverse gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
+            <button type="button" onClick={() => goToStep(1)} disabled={checkingReadiness || topicRepairBusy || Boolean(savingPlanTargetId)} className="btn-secondary justify-center"><ArrowLeft size={15} aria-hidden="true" />Back to destinations</button>
+            <button type="button" onClick={() => goToStep(3)} disabled={checkingReadiness || topicRepairBusy || Boolean(savingPlanTargetId) || selectedReadyTargetIds.length === 0} className="btn-primary justify-center">Review deployment ({selectedReadyTargetIds.length})<ArrowRight size={15} aria-hidden="true" /></button>
           </div>
         </section>
       )}
@@ -1577,10 +1753,10 @@ export function DashboardSafeCopyFlow() {
             <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <div>
                 <h2 ref={headingRef} tabIndex={-1} id="safe-copy-track-heading" className="text-lg font-semibold text-content-primary">
-                  Move &amp; track
+                  Deploy and track
                 </h2>
                 <p className="mt-1 text-sm text-content-secondary">
-                  {job ? 'This progress is backed by the durable migration job.' : 'Confirm the simple A-to-every-destination move below.'}
+                  {job ? 'Follow dashboard creation and verification for each deployed destination.' : 'Confirm the destinations included in this deployment.'}
                 </p>
               </div>
               {job && displayedJobStatus && (
@@ -1598,40 +1774,41 @@ export function DashboardSafeCopyFlow() {
                   </div>
                   <div className="rounded-card bg-surface-secondary p-4">
                     <Database size={17} className="text-omni-700" aria-hidden="true" />
-                    <div className="mt-2 text-2xl font-semibold text-content-primary">{draft.destinations.length}</div>
-                    <div className="text-xs text-content-secondary">Destinations</div>
+                    <div className="mt-2 text-2xl font-semibold text-content-primary">{selectedReadyTargetIds.length}</div>
+                    <div className="text-xs text-content-secondary">Included destinations</div>
                   </div>
                   <div className="rounded-card bg-surface-secondary p-4">
                     <Copy size={17} className="text-omni-700" aria-hidden="true" />
-                    <div className="mt-2 text-2xl font-semibold text-content-primary">{draft.selectedDocumentIds.length * draft.destinations.length}</div>
+                    <div className="mt-2 text-2xl font-semibold text-content-primary">{draft.selectedDocumentIds.length * selectedReadyTargetIds.length}</div>
                     <div className="text-xs text-content-secondary">Planned copies</div>
                   </div>
                 </div>
                 <div className="mt-5 rounded-card border border-border p-4">
                   <div className="text-sm font-semibold text-content-primary">
-                    {sourceInstance?.label || draft.sourceId} → {draft.destinations.map((row) => instances.find((instance) => instance.id === row.instanceId)?.label || row.instanceId).join(', ')}
+                    {sourceInstance?.label || draft.sourceId} → {selectedReadyTargetIds.length} selected destinations
                   </div>
                   <ul className="mt-2 space-y-1 text-xs text-content-secondary" aria-label="Destination folders">
-                    {draft.destinations.map((destination) => (
+                    {draft.destinations.filter((row) => selectedReadyTargetIds.includes(row.targetId)).map((destination) => (
                       <li key={destination.targetId}>
                         {instances.find((instance) => instance.id === destination.instanceId)?.label || destination.instanceId}: Folder {destinationFolderLabel(
-                          instances.find((instance) => instance.id === destination.instanceId)?.defaultFolderPath,
-                          instances.find((instance) => instance.id === destination.instanceId)?.defaultFolderId,
+                          destination.folderPath,
+                          destination.folderId,
                         )}
                       </li>
                     ))}
                   </ul>
+                  {heldTargetCount > 0 && <p className="mt-3 rounded-card border border-amber-200 bg-amber-50 p-3 text-xs leading-5 text-amber-950">{heldTargetCount} destination{heldTargetCount === 1 ? ' is' : 's are'} held and will not be deployed. Return to the plan to resolve or select them.</p>}
                   <div className="mt-2 text-xs leading-5 text-content-secondary">
                     Existing content is not replaced or deleted. {DESTINATION_ACCESS_NOTICE}
                   </div>
                 </div>
                 <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <button type="button" onClick={() => goToStep(1)} className="btn-secondary justify-center">
+                  <button type="button" onClick={() => goToStep(2)} disabled={submitting} className="btn-secondary justify-center">
                     <ArrowLeft size={15} aria-hidden="true" /> Back
                   </button>
-                  <button type="button" onClick={() => void startMove()} disabled={submitting} className="btn-primary justify-center">
+                  <button type="button" onClick={() => void startMove()} disabled={submitting || checkingReadiness || Boolean(savingPlanTargetId) || !currentPlan || selectedReadyTargetIds.length === 0} className="btn-primary justify-center">
                     {submitting ? <Loader2 size={15} className="motion-safe:animate-spin" aria-hidden="true" /> : <FolderInput size={15} aria-hidden="true" />}
-                    {submitting ? 'Starting move...' : 'Move dashboards'}
+                    {submitting ? 'Starting deployment…' : `Deploy to ${selectedReadyTargetIds.length} destination${selectedReadyTargetIds.length === 1 ? '' : 's'}`}
                   </button>
                 </div>
               </>
@@ -1862,7 +2039,7 @@ export function DashboardSafeCopyFlow() {
                   </h3>
                   <p className="mt-1 text-sm text-content-secondary">
                     {strictlyVerifiedMove
-                      ? `Every destination passed content, query, and direct-access verification. ${DESTINATION_ACCESS_NOTICE}`
+                      ? `The deployed dashboards passed content, query, and direct-access verification. ${DESTINATION_ACCESS_NOTICE}`
                       : 'Successful destinations are preserved. Only destinations shown above as needing attention should be retried or opened in Model Migrator.'}
                   </p>
                 </div>
@@ -1872,6 +2049,7 @@ export function DashboardSafeCopyFlow() {
                   Start another move
                 </button>
               )}
+              {canStartAnotherMove && currentPlan && <button type="button" onClick={() => void returnToPlan()} disabled={checkingReadiness} className="btn-secondary mt-4 sm:ml-3">{checkingReadiness ? 'Restoring plan…' : 'Return to deployment plan'}</button>}
             </div>
           )}
         </section>

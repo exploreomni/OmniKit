@@ -3,6 +3,8 @@ import type { DashboardDownloadDetails } from './dashboardDownloads';
 import { getConnectionCacheKey } from './connectionGuards';
 import { emitVaultChanged, emitVaultLocked } from './vaultEvents';
 import { normalizeConnectionDiagnosticCode } from '../../shared/instanceConnectionErrors';
+import { readInstanceDocumentsStream, type InstanceDocumentsProgress } from './instanceDocumentsStream';
+export type { InstanceDocumentsProgress } from './instanceDocumentsStream';
 
 const defaultHeaders = {
   'Content-Type': 'application/json',
@@ -180,7 +182,7 @@ export type InstanceDocumentInventoryCacheStatus = 'hit' | 'miss' | 'shared';
 
 export interface InstanceDocumentInventory {
   complete: boolean;
-  scope: 'credential';
+  scope: 'credential' | 'explicit_documents';
   folderScoped?: boolean;
   cache: {
     status: InstanceDocumentInventoryCacheStatus;
@@ -292,6 +294,9 @@ export interface ModelMigratorInventoryRow {
 
 export interface ModelMigratorTranslatedFile {
   fileName: string;
+  targetOriginal?: string | null;
+  additiveStatus?: 'new' | 'additive' | 'unchanged' | 'conflict';
+  reviewToken?: string;
   original: string;
   deterministic: string;
   translated: string;
@@ -319,6 +324,7 @@ export interface ModelMigratorWorkbookPreflight {
 }
 
 export interface ModelMigratorAcceptedFile {
+  reviewToken?: string;
   fileName: string;
   yaml: string;
   previousChecksum?: string;
@@ -380,6 +386,19 @@ export interface InstanceFolder {
   path?: string;
   parentId?: string;
   children?: InstanceFolder[];
+}
+
+export interface InstanceFolderInventoryResponse {
+  folders: InstanceFolder[];
+  pagination: {
+    complete: true;
+    pages: number;
+    pageSize: number;
+    returnedRecords: number;
+    reportedTotalRecords?: number;
+    responseBytes?: number;
+  };
+  cache: InstanceDocumentInventory['cache'];
 }
 
 export interface InstanceLabel {
@@ -860,6 +879,7 @@ export interface DashboardSafeCopyIntentInput {
     modelId: string;
     folderId?: string;
     folderPath?: string;
+    workbookCopy?: { stagingFolderId: string };
     topicMappings?: Array<{
       sourceTopicName: string;
       action: 'map_existing' | 'copy_source';
@@ -958,7 +978,7 @@ export interface DashboardPatchValidationResult {
   results: DashboardPatchValidationModelResult[];
 }
 
-async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+export async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(path, {
     ...options,
     headers: {
@@ -1151,19 +1171,18 @@ export async function connectSavedInstance(id: string, signal?: AbortSignal) {
   );
 }
 
-export async function listInstanceDocuments(
-  id: string,
-  options: {
-    folderId?: string;
-    folderPath?: string;
-    connectionId?: string;
-    allFolders?: boolean;
-    includeModelDetails?: boolean;
-    documentIds?: string[];
-    forceRefresh?: boolean;
-    signal?: AbortSignal;
-  } = {},
-) {
+export interface InstanceDocumentsOptions {
+  folderId?: string;
+  folderPath?: string;
+  connectionId?: string;
+  allFolders?: boolean;
+  includeModelDetails?: boolean;
+  documentIds?: string[];
+  forceRefresh?: boolean;
+  signal?: AbortSignal;
+}
+
+function instanceDocumentsPath(id: string, options: InstanceDocumentsOptions, stream = false): string {
   const params = new URLSearchParams();
   if (options.folderId) params.set('folderId', options.folderId);
   if (options.folderPath) params.set('folderPath', options.folderPath);
@@ -1172,11 +1191,36 @@ export async function listInstanceDocuments(
   if (options.includeModelDetails) params.set('includeModelDetails', 'true');
   if (options.documentIds?.length) params.set('documentIds', options.documentIds.join(','));
   if (options.forceRefresh) params.set('forceRefresh', 'true');
+  if (stream) params.set('stream', 'true');
   const query = params.toString();
+  return `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`;
+}
+
+export async function listInstanceDocuments(id: string, options: InstanceDocumentsOptions = {}) {
   return apiFetch<InstanceDocumentsResponse>(
-    `/api/instances/${encodeURIComponent(id)}/documents${query ? `?${query}` : ''}`,
+    instanceDocumentsPath(id, options),
     { signal: options.signal },
   );
+}
+
+export async function streamInstanceDocuments(
+  id: string,
+  options: InstanceDocumentsOptions & { onProgress?: (progress: InstanceDocumentsProgress) => void } = {},
+) {
+  const response = await fetch(instanceDocumentsPath(id, options, true), {
+    signal: options.signal,
+    headers: { Accept: 'application/x-ndjson' },
+  });
+  return readInstanceDocumentsStream(response, options.onProgress, options.signal);
+}
+
+export async function lookupInstanceDocument(id: string, options: { connectionId: string; reference: string; signal?: AbortSignal }) {
+  const params = new URLSearchParams({ connectionId: options.connectionId, reference: options.reference });
+  const response = await apiFetch<{ document: InstanceDocument }>(`/api/instances/${encodeURIComponent(id)}/document-lookup?${params}`, { signal: options.signal });
+  if (!response.document?.id || !response.document.identifier || response.document.connectionId !== options.connectionId) {
+    throw new Error('The dashboard lookup did not match the selected source connection. Nothing was added.');
+  }
+  return response;
 }
 
 export async function listInstanceModels(id: string, options: { connectionId?: string } = {}) {
@@ -1261,6 +1305,7 @@ export async function loadModelMigratorReadiness(input: {
 }
 
 export async function translateModelMigratorYaml(input: {
+  dashboardRepair?: { planId: string; targetId: string; revision: number };
   sourceInstanceId: string;
   targetInstanceId?: string;
   modelId: string;
@@ -1295,6 +1340,7 @@ export async function preflightModelMigratorWorkbooks(input: {
 }
 
 export async function createModelMigratorJob(input: {
+  dashboardRepair?: { planId: string; targetId: string; revision: number };
   sourceId: string;
   targetId: string;
   targetLabel?: string;
@@ -1321,6 +1367,19 @@ export async function mergeModelMigratorJob(jobId: string, input: { publishDraft
 
 export async function listInstanceFolders(id: string) {
   return apiFetch<{ folders: InstanceFolder[] }>(`/api/instances/${encodeURIComponent(id)}/folders`);
+}
+
+export async function listInstanceFolderInventory(
+  id: string,
+  options: { signal?: AbortSignal; forceRefresh?: boolean } = {},
+) {
+  const params = new URLSearchParams();
+  if (options.forceRefresh) params.set('forceRefresh', 'true');
+  const query = params.toString();
+  return apiFetch<InstanceFolderInventoryResponse>(
+    `/api/instances/${encodeURIComponent(id)}/folder-inventory${query ? `?${query}` : ''}`,
+    { signal: options.signal },
+  );
 }
 
 export async function listInstanceLabels(id: string) {

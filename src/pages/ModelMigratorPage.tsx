@@ -16,6 +16,8 @@ import {
   Workflow,
 } from 'lucide-react';
 import { PageHeader } from '@/components/layout/PageHeader';
+import { DashboardDependencyReviewPanel } from '@/components/dashboardMigration/DashboardDependencyReviewPanel';
+import { DashboardRepairFileDiff } from '@/components/dashboardMigration/DashboardTopicRepairReview';
 import { SavedInstanceRequiredEmptyState } from '@/components/layout/RequireConnection';
 import { Blobby } from '@/components/ui/Blobby';
 import { useConnection } from '@/hooks/useConnection';
@@ -28,6 +30,7 @@ import {
   listModelMigratorConnections,
   listModelMigratorModels,
   listSavedInstances,
+  listInstanceDocuments,
   loadModelMigratorInventory,
   loadModelMigratorReadiness,
   mergeModelMigratorJob,
@@ -36,6 +39,7 @@ import {
   subscribeMigrationJob,
   translateModelMigratorYaml,
   type InstanceModel,
+  type InstanceDocument,
   type ModelMigratorConnection,
   type ModelMigratorContentRepairAction,
   type ModelMigratorInventoryDocument,
@@ -56,11 +60,17 @@ import {
   sanitizeModelMigratorDraftForStorage,
 } from '@/services/modelMigratorDraft';
 import {
+  dashboardDeploymentModelMigratorHandoffFromSearch,
   dashboardSafeCopyModelMigratorHandoffMatchesJob,
+  parseDashboardDeploymentModelMigratorHandoff,
   parseDashboardSafeCopyModelMigratorHandoff,
+  resolveDashboardDeploymentModelMigratorHandoff,
   resolveDashboardSafeCopyModelMigratorHandoff,
+  scopeDashboardModelRepairTranslation,
+  type DashboardModelRepairScope,
   type DashboardSafeCopyModelMigratorHandoff,
 } from '@/services/modelMigratorHandoff';
+import { getDashboardDeploymentPlan, linkDashboardModelRepair } from '@/services/dashboardDeploymentPlans';
 import {
   parseSchemaMappingRows,
   recommendModelMigrationStrategy,
@@ -369,6 +379,7 @@ export function ModelMigratorPage() {
   const [fastPathConfirmedByModelId, setFastPathConfirmedByModelId] = useState<Record<string, boolean>>({});
   const [translationsByModelId, setTranslationsByModelId] = useState<Record<string, TranslationState>>({});
   const [acceptedFilesByModelId, setAcceptedFilesByModelId] = useState<Record<string, Record<string, string>>>({});
+  const [viewedDashboardFiles, setViewedDashboardFiles] = useState<string[]>([]);
   const [skippedFilesByModelId, setSkippedFilesByModelId] = useState<Record<string, string[]>>({});
   const [approvedRepairDecisionIds, setApprovedRepairDecisionIds] = useState<string[]>([]);
   const [workbookPreflights, setWorkbookPreflights] = useState<ModelMigratorWorkbookPreflight[]>([]);
@@ -380,6 +391,18 @@ export function ModelMigratorPage() {
   const [refreshSchemaAfterMigration, setRefreshSchemaAfterMigration] = useState(false);
   const [selectedPostActionIndexes, setSelectedPostActionIndexes] = useState<number[]>([]);
   const [job, setJob] = useState<MigrationJob | null>(null);
+  const dashboardRepairHandoff = useRef(
+    dashboardDeploymentModelMigratorHandoffFromSearch(location.search)
+    || parseDashboardDeploymentModelMigratorHandoff(location.state),
+  );
+  const dashboardRepairRequested = useRef(Boolean(
+    new URLSearchParams(location.search).has('planId')
+    || new URLSearchParams(location.search).has('targetId')
+    || (location.state && typeof location.state === 'object' && location.state.source === 'dashboard_deployment_plan'),
+  )).current;
+  const [dashboardRepairScope, setDashboardRepairScope] = useState<DashboardModelRepairScope | null>(null);
+  const [loadingDashboardRepair, setLoadingDashboardRepair] = useState(dashboardRepairRequested);
+  const [dashboardReviewDocuments, setDashboardReviewDocuments] = useState<{ scopeKey: string; documents: InstanceDocument[]; unavailable: boolean }>({ scopeKey: '', documents: [], unavailable: false });
   const loggedTerminalJobs = useRef(new Set<string>());
   const loggedItemEvents = useRef(new Set<string>());
   const pendingSafeCopyHandoff = useRef<DashboardSafeCopyModelMigratorHandoff | null>(
@@ -418,6 +441,7 @@ export function ModelMigratorPage() {
   });
   const handledReadinessRefresh = useRef(0);
   const jobActive = job?.status === 'pending' || job?.status === 'running';
+  const scopeControlsLocked = jobActive || dashboardRepairRequested;
 
   const sourceInstances = useMemo(() => instances.filter(canUseAsSource), [instances]);
   const targetInstances = useMemo(() => instances.filter(canUseAsTarget), [instances]);
@@ -442,7 +466,7 @@ export function ModelMigratorPage() {
     row.documents.map((document) => ({ ...document, sourceModelId: row.modelId }))
   )), [inventory]);
   const visibleDocuments = useMemo(() => allDocuments.filter((document) => documentMatchesSearch(document, contentSearch)), [allDocuments, contentSearch]);
-  const selectedDocuments = useMemo(() => allDocuments.filter((document) => selectedContentKeys.includes(contentKey(document))), [allDocuments, selectedContentKeys]);
+  const selectedDocuments = useMemo(() => dashboardRepairRequested ? [] : allDocuments.filter((document) => selectedContentKeys.includes(contentKey(document))), [allDocuments, dashboardRepairRequested, selectedContentKeys]);
   const selectedWorkbookDocs = selectedDocuments.filter((document) => document.kind === 'workbook');
   const selectedDashboardDocs = selectedDocuments.filter((document) => document.kind === 'dashboard');
   const translateReviewComplete = selectedSourceModels.every((model) => {
@@ -450,11 +474,16 @@ export function ModelMigratorPage() {
     if ((pathByModelId[model.id] || 'translate') === 'impact_report') return true;
     const translation = translationsByModelId[model.id];
     if (!translation?.files.length) return false;
+    if (dashboardRepairRequested && translation.files.some((file) => file.blocked || file.additiveStatus === 'conflict' || file.targetOriginal === undefined || (file.additiveStatus !== 'unchanged' && !file.reviewToken))) return false;
     const accepted = acceptedFilesByModelId[model.id] || {};
+    if (dashboardRepairRequested) {
+      return translation.files.every((file) => file.additiveStatus === 'unchanged'
+        || accepted[file.fileName] === (file.deterministic || file.translated));
+    }
     const skipped = new Set(skippedFilesByModelId[model.id] || []);
     return Object.keys(accepted).length > 0
       && translation.files.every((file) => file.blocked === true || accepted[file.fileName] !== undefined || skipped.has(file.fileName));
-  });
+  }) && (!dashboardRepairRequested || selectedSourceModels.some((model) => acceptedFilesForModel(model.id).length > 0));
   const targetInstance = targetInstances.find((instance) => instance.id === targetInstanceId);
   const selectedSourceConnection = sourceConnections.find((row) => row.id === sourceConnectionId);
   const selectedTargetConnection = targetConnections.find((row) => row.id === targetConnectionId);
@@ -532,6 +561,7 @@ export function ModelMigratorPage() {
   }, [approvedRepairDecisionIds, pathByModelId, selectedSourceModels, targetModelBySourceId, targetModels, translationsByModelId]);
   const selectedPostMigrationActions = useMemo(() => {
     const actions: PostMigrationAction[] = [];
+    if (dashboardRepairRequested) return actions;
     if (refreshSchemaAfterMigration) {
       for (const sourceModel of selectedSourceModels) {
         const targetModelId = targetModelBySourceId[sourceModel.id];
@@ -562,9 +592,16 @@ export function ModelMigratorPage() {
       }
     }
     return actions;
-  }, [refreshSchemaAfterMigration, selectedPostActionIndexes, selectedSourceModels, targetInstance, targetModelBySourceId, targetModels]);
+  }, [dashboardRepairRequested, refreshSchemaAfterMigration, selectedPostActionIndexes, selectedSourceModels, targetInstance, targetModelBySourceId, targetModels]);
   const workbookBlockerCount = workbookPreflights.reduce((sum, row) => sum + row.blockerCount, 0);
   const canStartJob = selectedSourceModels.length > 0
+    && (!dashboardRepairRequested || Boolean(dashboardRepairScope && !dashboardRepairScope.scopeReviewRequired && !loadingDashboardRepair
+      && !dashboardRepairScope.readiness.repairJobId
+      && sourceInstanceId === dashboardRepairScope.sourceInstanceId && sourceConnectionId === dashboardRepairScope.sourceConnectionId
+      && targetInstanceId === dashboardRepairScope.targetInstanceId && targetConnectionId === dashboardRepairScope.targetConnectionId
+      && sameStringArray([...selectedSourceModelIds].sort(), [...dashboardRepairScope.sourceModelIds].sort())
+      && selectedSourceModels.every((model) => pathByModelId[model.id] === 'translate'
+        && targetModelBySourceId[model.id] === dashboardRepairScope.targetModelId)))
     && selectedSourceModels.every((model) => targetModelBySourceId[model.id])
     && selectedSourceModels.every((model) => branchNameByModelId[model.id]?.trim())
     && selectedSourceModels.every((model) => pathByModelId[model.id] !== 'fast' || (modelSupportsFastPath(model) && fastPathConfirmedByModelId[model.id] === true))
@@ -622,6 +659,7 @@ export function ModelMigratorPage() {
     setFastPathConfirmedByModelId((current) => Object.keys(current).length === 0 ? current : {});
     setTranslationsByModelId((current) => Object.keys(current).length === 0 ? current : {});
     setAcceptedFilesByModelId((current) => Object.keys(current).length === 0 ? current : {});
+    setViewedDashboardFiles([]);
     setSkippedFilesByModelId((current) => Object.keys(current).length === 0 ? current : {});
     setApprovedRepairDecisionIds((current) => current.length === 0 ? current : []);
     setWorkbookPreflights((current) => current.length === 0 ? current : []);
@@ -646,7 +684,7 @@ export function ModelMigratorPage() {
   }, [activeVaultInstanceId]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || dashboardRepairRequested) return;
     try {
       const raw = window.sessionStorage.getItem(MODEL_MIGRATOR_DRAFT_KEY);
       if (!raw) return;
@@ -670,9 +708,77 @@ export function ModelMigratorPage() {
     } catch {
       // Draft restore is convenience only.
     }
-  }, []);
+  }, [dashboardRepairRequested]);
 
   useEffect(() => {
+    if (!dashboardRepairRequested || loadingInstances || instances.length === 0) return;
+    const handoff = dashboardRepairHandoff.current;
+    if (!handoff) {
+      setLoadingDashboardRepair(false);
+      setError('The dashboard dependency repair handoff is invalid. Return to dashboard deployment to choose its target.');
+      return;
+    }
+    const controller = new AbortController();
+    setLoadingDashboardRepair(true);
+    void (async () => {
+      try {
+        const { plan } = await getDashboardDeploymentPlan(handoff.planId, controller.signal);
+        if (controller.signal.aborted) return;
+        const scope = resolveDashboardDeploymentModelMigratorHandoff(handoff, plan, instances);
+        clearModelScopedWorkflowState();
+        setDashboardRepairScope(scope);
+        setSourceInstanceId(scope.sourceInstanceId);
+        setTargetInstanceId(scope.targetInstanceId);
+        setReplaceSameNamed(false);
+        setPublishDrafts(false);
+        setDeleteBranch(false);
+        setRefreshSchemaAfterMigration(false);
+        setSelectedPostActionIndexes([]);
+        setSchemaMapText('');
+        setError('');
+        navigate(`/models/migrate?${new URLSearchParams({ planId: handoff.planId, targetId: handoff.targetId })}`, { replace: true, state: null });
+        if (scope.readiness.repairJobId) {
+          try {
+            const result = await getMigrationJob(scope.readiness.repairJobId);
+            if (!controller.signal.aborted) setJob(result.job);
+          } catch {
+            if (!controller.signal.aborted) setError('The saved repair job could not be loaded. Recheck the deployment plan before starting another repair.');
+          }
+        }
+      } catch (repairError) {
+        if (!controller.signal.aborted) {
+          setDashboardRepairScope(null);
+          setError(errorText(repairError, 'The dashboard dependency repair plan could not be loaded.'));
+        }
+      } finally {
+        if (!controller.signal.aborted) setLoadingDashboardRepair(false);
+      }
+    })();
+    return () => controller.abort();
+  }, [clearModelScopedWorkflowState, dashboardRepairRequested, instances, loadingInstances, navigate]);
+
+  // Names are display context only; they never authorize or change the plan.
+  const repairDocumentScopeKey = dashboardRepairScope && dashboardRepairScope.documentIds.length === 1
+    ? JSON.stringify([dashboardRepairScope.sourceInstanceId, dashboardRepairScope.sourceConnectionId, dashboardRepairScope.documentIds[0]])
+    : '';
+  useEffect(() => {
+    if (!repairDocumentScopeKey) return;
+    const controller = new AbortController();
+    const [instanceId, connectionId, documentId] = JSON.parse(repairDocumentScopeKey) as [string, string, string];
+    void listInstanceDocuments(instanceId, { connectionId, allFolders: true, documentIds: [documentId], signal: controller.signal })
+      .then((result) => {
+        if (controller.signal.aborted) return;
+        const matches = result.documents.filter((doc) => (doc.identifier || doc.id) === documentId && doc.connectionId === connectionId);
+        setDashboardReviewDocuments({ scopeKey: repairDocumentScopeKey, documents: matches.length === 1 ? matches : [], unavailable: matches.length !== 1 });
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) setDashboardReviewDocuments({ scopeKey: repairDocumentScopeKey, documents: [], unavailable: true });
+      });
+    return () => controller.abort();
+  }, [repairDocumentScopeKey]);
+
+  useEffect(() => {
+    if (dashboardRepairRequested) return;
     if (safeCopyHandoffHandled.current || safeCopyHandoffApplying.current || loadingInstances) return;
     if (!safeCopyHandoffWasPresent.current) return;
     const handoff = pendingSafeCopyHandoff.current;
@@ -718,10 +824,10 @@ export function ModelMigratorPage() {
         navigate('/models/migrate', { replace: true, state: null });
       }
     })();
-  }, [instances, loadingInstances, navigate]);
+  }, [dashboardRepairRequested, instances, loadingInstances, navigate]);
 
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (typeof window === 'undefined' || dashboardRepairRequested) return;
     const draft = {
       schemaMapText,
       selectedContentKeys,
@@ -746,9 +852,10 @@ export function ModelMigratorPage() {
     } catch {
       // Draft persistence is best-effort.
     }
-  }, [schemaMapText, selectedContentKeys, pathByModelId, branchNameByModelId, gitRefByModelId, fastPathConfirmedByModelId, translationsByModelId, acceptedFilesByModelId, skippedFilesByModelId, approvedRepairDecisionIds, replaceSameNamed, runAiDialectPass, publishDrafts, deleteBranch, refreshSchemaAfterMigration]);
+  }, [dashboardRepairRequested, schemaMapText, selectedContentKeys, pathByModelId, branchNameByModelId, gitRefByModelId, fastPathConfirmedByModelId, translationsByModelId, acceptedFilesByModelId, skippedFilesByModelId, approvedRepairDecisionIds, replaceSameNamed, runAiDialectPass, publishDrafts, deleteBranch, refreshSchemaAfterMigration]);
 
   useEffect(() => {
+    if (dashboardRepairRequested) return;
     const preferredSource = sourceInstances.find((instance) => instance.id === activeVaultInstanceId) || sourceInstances[0];
     const nextSourceInstanceId = sourceInstances.some((instance) => instance.id === sourceInstanceId)
       ? sourceInstanceId
@@ -759,7 +866,7 @@ export function ModelMigratorPage() {
       ? targetInstanceId
       : targetInstances.find((instance) => instance.id !== nextSourceInstanceId)?.id || targetInstances[0]?.id || '';
     if (nextTargetInstanceId !== targetInstanceId) setTargetInstanceId(nextTargetInstanceId);
-  }, [activeVaultInstanceId, sourceInstanceId, sourceInstances, targetInstanceId, targetInstances]);
+  }, [activeVaultInstanceId, dashboardRepairRequested, sourceInstanceId, sourceInstances, targetInstanceId, targetInstances]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -791,7 +898,10 @@ export function ModelMigratorPage() {
         if (!isLatestScope()) return;
         setSourceConnections(result.connections);
         setSourceConnectionId((current) => (
-          pendingSafeCopyHandoff.current?.sourceInstanceId === sourceInstanceId
+          dashboardRepairScope
+            ? result.connections.some((connection) => connection.id === dashboardRepairScope.sourceConnectionId)
+              ? dashboardRepairScope.sourceConnectionId : ''
+            : pendingSafeCopyHandoff.current?.sourceInstanceId === sourceInstanceId
             && safeCopyHandoffAppliedRevision.current === safeCopyHandoffManualRevision.current
             ? result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.sourceConnectionId)
               ? pendingSafeCopyHandoff.current.sourceConnectionId
@@ -801,8 +911,8 @@ export function ModelMigratorPage() {
             : result.connections[0]?.id || ''
         ));
         if (
-          pendingSafeCopyHandoff.current?.sourceInstanceId === sourceInstanceId
-          && !result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.sourceConnectionId)
+          (dashboardRepairScope || pendingSafeCopyHandoff.current?.sourceInstanceId === sourceInstanceId)
+          && !result.connections.some((connection) => connection.id === (dashboardRepairScope?.sourceConnectionId || pendingSafeCopyHandoff.current?.sourceConnectionId))
         ) setError('The dashboard repair source connection is no longer available.');
       })
       .catch((err) => {
@@ -814,7 +924,7 @@ export function ModelMigratorPage() {
     return () => {
       controller.abort();
     };
-  }, [catalogRefreshToken, clearModelScopedWorkflowState, sourceInstanceId]);
+  }, [catalogRefreshToken, clearModelScopedWorkflowState, dashboardRepairScope, sourceInstanceId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -846,7 +956,10 @@ export function ModelMigratorPage() {
         if (!isLatestScope()) return;
         setTargetConnections(result.connections);
         setTargetConnectionId((current) => (
-          pendingSafeCopyHandoff.current?.targetInstanceId === targetInstanceId
+          dashboardRepairScope
+            ? result.connections.some((connection) => connection.id === dashboardRepairScope.targetConnectionId)
+              ? dashboardRepairScope.targetConnectionId : ''
+            : pendingSafeCopyHandoff.current?.targetInstanceId === targetInstanceId
             && safeCopyHandoffAppliedRevision.current === safeCopyHandoffManualRevision.current
             ? result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.targetConnectionId)
               ? pendingSafeCopyHandoff.current.targetConnectionId
@@ -856,8 +969,8 @@ export function ModelMigratorPage() {
             : result.connections[0]?.id || ''
         ));
         if (
-          pendingSafeCopyHandoff.current?.targetInstanceId === targetInstanceId
-          && !result.connections.some((connection) => connection.id === pendingSafeCopyHandoff.current?.targetConnectionId)
+          (dashboardRepairScope || pendingSafeCopyHandoff.current?.targetInstanceId === targetInstanceId)
+          && !result.connections.some((connection) => connection.id === (dashboardRepairScope?.targetConnectionId || pendingSafeCopyHandoff.current?.targetConnectionId))
         ) setError('The dashboard repair target connection is no longer available.');
       })
       .catch((err) => {
@@ -869,7 +982,7 @@ export function ModelMigratorPage() {
     return () => {
       controller.abort();
     };
-  }, [catalogRefreshToken, clearTargetScopedWorkflowState, targetInstanceId]);
+  }, [catalogRefreshToken, clearTargetScopedWorkflowState, dashboardRepairScope, targetInstanceId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -900,7 +1013,11 @@ export function ModelMigratorPage() {
       signal: controller.signal,
     })
       .then((result) => {
-        if (isLatestScope()) setSourceModels(result.models);
+        if (!isLatestScope()) return;
+        setSourceModels(result.models);
+        if (dashboardRepairScope && dashboardRepairScope.sourceModelIds.some((id) => (
+          !result.models.some((model) => model.id === id && model.connectionId === sourceConnectionId)
+        ))) setError('A required source model is no longer available on the deployment plan source connection.');
       })
       .catch((err) => {
         if (isLatestScope() && !isAbortFailure(err)) setError(errorText(err, 'Failed to load source models.'));
@@ -911,7 +1028,7 @@ export function ModelMigratorPage() {
     return () => {
       controller.abort();
     };
-  }, [catalogRefreshToken, clearModelScopedWorkflowState, sourceConnectionId, sourceInstanceId]);
+  }, [catalogRefreshToken, clearModelScopedWorkflowState, dashboardRepairScope, sourceConnectionId, sourceInstanceId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -943,7 +1060,7 @@ export function ModelMigratorPage() {
       .then((result) => {
         if (!isLatestScope()) return;
         setTargetModels(result.models);
-        const handoff = pendingSafeCopyHandoff.current;
+        const handoff = dashboardRepairScope || pendingSafeCopyHandoff.current;
         if (
           handoff
           && handoff.targetInstanceId === targetInstanceId
@@ -960,18 +1077,23 @@ export function ModelMigratorPage() {
     return () => {
       controller.abort();
     };
-  }, [catalogRefreshToken, clearTargetScopedWorkflowState, targetConnectionId, targetInstanceId]);
+  }, [catalogRefreshToken, clearTargetScopedWorkflowState, dashboardRepairScope, targetConnectionId, targetInstanceId]);
 
   useEffect(() => {
     setSelectedSourceModelIds((current) => {
-      const next = current.filter((id) => sourceModels.some((model) => model.id === id));
+      const next = (dashboardRepairScope?.sourceModelIds || current).filter((id) => sourceModels.some((model) => model.id === id));
       return sameStringArray(current, next) ? current : next;
     });
-  }, [sourceModels]);
+  }, [dashboardRepairScope, sourceModels]);
 
   useEffect(() => {
     const next: Record<string, string> = {};
     for (const sourceModel of selectedSourceModels) {
+      if (dashboardRepairScope) {
+        next[sourceModel.id] = targetModels.some((model) => model.id === dashboardRepairScope.targetModelId && model.connectionId === dashboardRepairScope.targetConnectionId)
+          ? dashboardRepairScope.targetModelId : '';
+        continue;
+      }
       const existing = targetModelBySourceId[sourceModel.id];
       if (existing && targetModels.some((model) => model.id === existing)) {
         next[sourceModel.id] = existing;
@@ -999,12 +1121,12 @@ export function ModelMigratorPage() {
     if (sameStringRecord(targetModelBySourceId, next)) return;
     setSelectedPostActionIndexes([]);
     setTargetModelBySourceId(next);
-  }, [selectedSourceModels, selectedSourceConnection, selectedTargetConnection, targetModelBySourceId, targetModels]);
+  }, [dashboardRepairScope, selectedSourceModels, selectedSourceConnection, selectedTargetConnection, targetModelBySourceId, targetModels]);
 
   useEffect(() => {
     setPathByModelId((current) => {
       const next: Record<string, ModelPath> = {};
-      for (const model of selectedSourceModels) next[model.id] = current[model.id] || 'translate';
+      for (const model of selectedSourceModels) next[model.id] = dashboardRepairRequested ? 'translate' : current[model.id] || 'translate';
       return sameStringRecord(current, next) ? current : next;
     });
     setBranchNameByModelId((current) => {
@@ -1012,7 +1134,7 @@ export function ModelMigratorPage() {
       for (const model of selectedSourceModels) next[model.id] = current[model.id] || defaultBranchName(model);
       return sameStringRecord(current, next) ? current : next;
     });
-  }, [selectedSourceModels]);
+  }, [dashboardRepairRequested, selectedSourceModels]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1020,7 +1142,7 @@ export function ModelMigratorPage() {
     const isLatestScope = () => sequence === requestSequences.current.inventory && !controller.signal.aborted;
     const modelIds = [...new Set(selectedSourceModelIds.map((modelId) => modelId.trim()).filter(Boolean))].sort();
 
-    if (!sourceInstanceId || modelIds.length === 0) {
+    if (dashboardRepairRequested || !sourceInstanceId || modelIds.length === 0) {
       setInventory((current) => current.length === 0 ? current : []);
       setLoadingInventory(false);
       return () => {
@@ -1050,7 +1172,7 @@ export function ModelMigratorPage() {
       clearTimeout(timer);
       controller.abort();
     };
-  }, [catalogRefreshToken, selectedSourceModelIds, sourceInstanceId]);
+  }, [catalogRefreshToken, dashboardRepairRequested, selectedSourceModelIds, sourceInstanceId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1129,14 +1251,14 @@ export function ModelMigratorPage() {
   }
 
   function chooseSourceInstance(instanceId: string) {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualModelMigratorScopeChange();
     setSourceConnectionId('');
     setSourceInstanceId(instanceId);
   }
 
   function chooseTargetInstance(instanceId: string) {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualModelMigratorScopeChange();
     setSelectedPostActionIndexes([]);
     setTargetConnectionId('');
@@ -1144,27 +1266,27 @@ export function ModelMigratorPage() {
   }
 
   function chooseSourceConnection(connectionId: string) {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualModelMigratorScopeChange();
     setSourceConnectionId(connectionId);
   }
 
   function chooseTargetConnection(connectionId: string) {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualModelMigratorScopeChange();
     setSelectedPostActionIndexes([]);
     setTargetConnectionId(connectionId);
   }
 
   function chooseTargetModel(sourceModelId: string, targetModelId: string) {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualModelMigratorScopeChange();
     setSelectedPostActionIndexes([]);
     setTargetModelBySourceId((current) => ({ ...current, [sourceModelId]: targetModelId }));
   }
 
   function toggleSourceModel(modelId: string) {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualBeforeSafeCopyHandoff();
     setSelectedSourceModelIds((current) => (
       current.includes(modelId) ? current.filter((id) => id !== modelId) : [...current, modelId]
@@ -1172,7 +1294,7 @@ export function ModelMigratorPage() {
   }
 
   function selectAllSourceModels() {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualBeforeSafeCopyHandoff();
     setSelectedSourceModelIds((current) => {
       const next = sourceModels.map((model) => model.id);
@@ -1181,7 +1303,7 @@ export function ModelMigratorPage() {
   }
 
   function clearSourceModels() {
-    if (jobActive) return;
+    if (scopeControlsLocked) return;
     markManualBeforeSafeCopyHandoff();
     setSelectedSourceModelIds((current) => current.length === 0 ? current : []);
   }
@@ -1241,7 +1363,7 @@ export function ModelMigratorPage() {
   }
 
   async function translateSelectedModels() {
-    if (jobActive) return;
+    if (jobActive || (dashboardRepairRequested && (!dashboardRepairScope || dashboardRepairScope.scopeReviewRequired || loadingDashboardRepair))) return;
     setTranslating(true);
     setError('');
     setMessage('');
@@ -1263,16 +1385,22 @@ export function ModelMigratorPage() {
           schemaMapText,
           sourceDialect,
           targetDialect,
-          runAi: runAiDialectPass,
+          runAi: dashboardRepairRequested ? false : runAiDialectPass,
+          ...(dashboardRepairScope ? { dashboardRepair: {
+            planId: dashboardRepairScope.handoff.planId,
+            targetId: dashboardRepairScope.handoff.targetId,
+            revision: dashboardRepairScope.revision,
+          } } : {}),
         });
-        nextTranslations[model.id] = result;
+        nextTranslations[model.id] = dashboardRepairScope ? scopeDashboardModelRepairTranslation(result, dashboardRepairScope, model.id) : result;
         nextAccepted[model.id] = {};
         nextSkipped[model.id] = [];
       }
       setTranslationsByModelId(nextTranslations);
+      setViewedDashboardFiles([]);
       setAcceptedFilesByModelId(nextAccepted);
       setSkippedFilesByModelId(nextSkipped);
-      setMessage('Model YAML translated. Accept, edit, or skip each file before running.');
+      setMessage(dashboardRepairRequested ? 'Additive-only changes prepared. Review the current destination and exact proposed additions, then explicitly accept each changed file. YAML and AI edits are unavailable for this reviewed repair.' : 'Model YAML translated. Accept, edit, or skip each file before running.');
     } catch (err) {
       setError(errorText(err, 'Failed to translate selected models.'));
     } finally {
@@ -1312,14 +1440,21 @@ export function ModelMigratorPage() {
   function acceptedFilesForModel(modelId: string) {
     const accepted = acceptedFilesByModelId[modelId] || {};
     const checksums = translationsByModelId[modelId]?.checksums || {};
-    return Object.entries(accepted).map(([fileName, yaml]) => ({
+    const requiredFiles = new Set(dashboardRepairScope?.readiness.requiredFilesByModelId?.[modelId] || []);
+    return Object.entries(accepted).filter(([fileName, yaml]) => {
+      if (!dashboardRepairRequested) return true;
+      const file = translationsByModelId[modelId]?.files.find((row) => row.fileName === fileName);
+      return requiredFiles.has(fileName) && file && !file.blocked && file.targetOriginal !== undefined && file.additiveStatus !== 'conflict' && file.additiveStatus !== 'unchanged' && Boolean(file.reviewToken) && yaml === (file.deterministic || file.translated);
+    }).map(([fileName, yaml]) => ({
       fileName,
       yaml,
       previousChecksum: checksums[fileName],
+      ...(dashboardRepairRequested ? { reviewToken: translationsByModelId[modelId]?.files.find((file) => file.fileName === fileName)?.reviewToken } : {}),
     }));
   }
 
   function contentRepairActionsForModel(modelId: string): ModelMigratorContentRepairAction[] {
+    if (dashboardRepairRequested) return [];
     return (translationsByModelId[modelId]?.semanticDecisions || [])
       .filter((decision) => (
         approvedRepairDecisionIds.includes(decision.id)
@@ -1366,11 +1501,11 @@ export function ModelMigratorPage() {
         sourceId: sourceInstanceId,
         targetId: targetInstanceId,
         targetLabel: targetInstances.find((instance) => instance.id === targetInstanceId)?.label,
-        replaceSameNamed,
+        replaceSameNamed: dashboardRepairRequested ? false : replaceSameNamed,
         mergeAfterValidation: false,
-        publishDrafts,
-        deleteBranch,
-        models: selectedSourceModels.map((model) => {
+        publishDrafts: dashboardRepairRequested ? false : publishDrafts,
+        deleteBranch: dashboardRepairRequested ? false : deleteBranch,
+        models: selectedSourceModels.filter((model) => !dashboardRepairRequested || acceptedFilesForModel(model.id).length > 0).map((model) => {
           const targetModelId = targetModelBySourceId[model.id];
           const targetModel = targetModels.find((row) => row.id === targetModelId);
           const mode = pathByModelId[model.id] || 'translate';
@@ -1393,9 +1528,24 @@ export function ModelMigratorPage() {
         }),
         content: contentInputs(),
         postMigrationActions: selectedSourceModels.every((model) => (pathByModelId[model.id] || 'translate') === 'impact_report') ? [] : selectedPostMigrationActions,
+        ...(dashboardRepairScope ? { dashboardRepair: {
+          planId: dashboardRepairScope.handoff.planId,
+          targetId: dashboardRepairScope.handoff.targetId,
+          revision: dashboardRepairScope.revision,
+        } } : {}),
       });
       setJob(result.job);
-      setMessage('Model migration job started.');
+      if (dashboardRepairScope) {
+        setDashboardRepairScope((current) => current ? { ...current, readiness: { ...current.readiness, repairJobId: result.job.id } } : current);
+        try {
+          await linkDashboardModelRepair(dashboardRepairScope.handoff.planId, dashboardRepairScope.handoff.targetId, result.job.id);
+          setMessage('Dependency repair started. After the reviewed model changes are published, return to dashboard deployment to recheck compatibility.');
+        } catch (linkError) {
+          setError(`Repair job ${result.job.id} was created, but its plan reference could not be saved. ${errorText(linkError, 'Return to dashboard deployment and recheck before starting another repair.')}`);
+        }
+      } else {
+        setMessage('Model migration job started.');
+      }
       logOperation('model_migration', 'Model Migrator job started', {
         itemCount: result.job.items.length,
         successCount: 0,
@@ -1513,6 +1663,7 @@ export function ModelMigratorPage() {
   }
 
   const unlocked = Boolean(vaultStatus?.unlocked);
+  const hideDashboardRepairEditor = dashboardRepairRequested && (loadingDashboardRepair || !dashboardRepairScope || Boolean(dashboardRepairScope.scopeReviewRequired));
 
   if (!unlocked) {
     return (
@@ -1525,7 +1676,7 @@ export function ModelMigratorPage() {
 
   return (
     <div className="space-y-5 pb-12">
-      <PageHeader
+      {!dashboardRepairRequested && <PageHeader
         title="Model Migrator"
         description="Safely move semantic models between saved Omni instances: match a target, resolve differences, check content impact, then publish or hand off review."
         icon={<Blobby mood="migration" size={58} className="animate-float" style={{ animationDuration: '3.4s' }} />}
@@ -1535,10 +1686,34 @@ export function ModelMigratorPage() {
             Refresh
           </button>
         )}
-      />
+      />}
 
       {error && <div role="alert" className="rounded-card border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">{error}</div>}
       {message && <div aria-live="polite" className="rounded-card border border-green-200 bg-green-50 px-4 py-3 text-sm text-green-700">{message}</div>}
+
+      {dashboardRepairRequested && (dashboardRepairScope ? (
+        <DashboardDependencyReviewPanel scope={dashboardRepairScope}
+          source={instances.find((instance) => instance.id === dashboardRepairScope.sourceInstanceId)}
+          target={instances.find((instance) => instance.id === dashboardRepairScope.targetInstanceId)}
+          sourceConnection={selectedSourceConnection} targetConnection={selectedTargetConnection}
+          sourceModels={sourceModels} targetModels={targetModels}
+          documents={dashboardReviewDocuments.scopeKey === repairDocumentScopeKey ? dashboardReviewDocuments.documents : []}
+          namesUnavailable={dashboardReviewDocuments.scopeKey === repairDocumentScopeKey && dashboardReviewDocuments.unavailable}
+          readiness={readiness} hasJob={Boolean(job)}
+          onReturn={() => navigate(`/dashboards/migrate?${new URLSearchParams({ planId: dashboardRepairScope.handoff.planId })}`)}
+        />
+      ) : (
+        <section className="card p-5">
+          <h1 className="text-xl font-semibold">Review dashboard model definitions</h1>
+          <p className="mt-2 text-sm">{loadingDashboardRepair ? 'Loading your saved dashboard plan…' : 'The saved plan could not be opened. Return to Dashboard Migrator to review the selected source and destination.'}</p>
+          <button type="button" className="btn-secondary mt-3" onClick={() => navigate(dashboardRepairHandoff.current
+            ? `/dashboards/migrate?${new URLSearchParams({ planId: dashboardRepairHandoff.current.planId })}`
+            : '/dashboards/migrate')}>Back to dashboard plan</button>
+        </section>
+      ))}
+
+      <div className="space-y-5" hidden={hideDashboardRepairEditor} data-testid="model-repair-editor">
+      {dashboardRepairRequested && <p className="text-sm text-content-secondary">The source and destination below are fixed by your dashboard plan. This repair permits shared-model additions only, not replacements or deletions of existing definitions. Conflicts block staging; unchanged files need no write. Review the current destination against each exact proposal before accepting it. YAML is read-only and AI edits are unavailable for this repair. Dashboard copying happens later in Dashboard Migrator.</p>}
 
       <div className="grid gap-3 lg:grid-cols-7">
         {WIZARD_STEPS.map((step, index) => (
@@ -1554,7 +1729,8 @@ export function ModelMigratorPage() {
           <div>
             <div className="flex items-center gap-2 text-sm font-semibold">
               {loadingReadiness ? <Loader2 size={15} className="animate-spin" /> : <ShieldCheck size={15} />}
-              Migration readiness
+              Model preparation checks
+
             </div>
             <p className="mt-1 text-xs" role={readinessError ? 'alert' : undefined}>
               {loadingReadiness
@@ -1567,7 +1743,7 @@ export function ModelMigratorPage() {
           <div className="flex flex-wrap items-center gap-2">
             <span className="rounded-chip bg-white/70 px-3 py-1 text-xs font-semibold">
               {loadingReadiness ? 'Checking' : readinessError ? 'Needs retry' : readiness ? readinessLabel(readiness.summary.status) : 'Waiting'}
-              {readiness ? ` · ${readiness.summary.blockers} blockers · ${readiness.summary.warnings} review items` : ''}
+              {readiness ? ` · ${readiness.summary.blockers} model-level blocker${readiness.summary.blockers === 1 ? '' : 's'} · ${readiness.summary.warnings} model-level review items` : ''}
             </span>
             <button
               type="button"
@@ -1653,13 +1829,13 @@ export function ModelMigratorPage() {
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <SelectField label="Source instance" value={sourceInstanceId} onChange={chooseSourceInstance} disabled={jobActive}>
+                <SelectField label="Source instance" value={sourceInstanceId} onChange={chooseSourceInstance} disabled={scopeControlsLocked}>
                   <EmptyValue>Choose source instance</EmptyValue>
                   {sourceInstances.map((instance) => (
                     <option key={instance.id} value={instance.id}>{instance.label} · {roleLabel(instance.role)} · {hostLabel(instance.baseUrl)}</option>
                   ))}
                 </SelectField>
-                <SelectField label="Source connection" value={sourceConnectionId} onChange={chooseSourceConnection} disabled={jobActive || !sourceInstanceId || sourceConnections.length === 0}>
+                <SelectField label="Source connection" value={sourceConnectionId} onChange={chooseSourceConnection} disabled={scopeControlsLocked || !sourceInstanceId || sourceConnections.length === 0}>
                   <EmptyValue>{sourceConnections.length === 0 ? 'No connections loaded' : 'Choose connection'}</EmptyValue>
                   {sourceConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>
@@ -1672,8 +1848,8 @@ export function ModelMigratorPage() {
                   Showing {displayedSourceModels.length} of {sourceModels.length} models · {selectedSourceModelIds.length} selected
                 </div>
                 <div className="flex items-center gap-2">
-                  <button type="button" onClick={selectAllSourceModels} disabled={jobActive || sourceModels.length === 0} className="btn-secondary text-xs disabled:opacity-50">Select all</button>
-                  <button type="button" onClick={clearSourceModels} disabled={jobActive || selectedSourceModelIds.length === 0} className="btn-secondary text-xs disabled:opacity-50">Clear</button>
+                  <button type="button" onClick={selectAllSourceModels} disabled={scopeControlsLocked || sourceModels.length === 0} className="btn-secondary text-xs disabled:opacity-50">Select all</button>
+                  <button type="button" onClick={clearSourceModels} disabled={scopeControlsLocked || selectedSourceModelIds.length === 0} className="btn-secondary text-xs disabled:opacity-50">Clear</button>
                 </div>
               </div>
 
@@ -1688,7 +1864,7 @@ export function ModelMigratorPage() {
                       type="button"
                       key={model.id}
                       onClick={() => toggleSourceModel(model.id)}
-                      disabled={jobActive}
+                      disabled={scopeControlsLocked}
                       aria-pressed={selected}
                       className={`block w-full border-l-4 px-4 py-3 text-left transition ${selected ? 'border-l-omni-500 bg-omni-50' : 'border-l-transparent hover:bg-surface-secondary'}`}
                     >
@@ -1744,13 +1920,13 @@ export function ModelMigratorPage() {
               </div>
 
               <div className="grid gap-3 md:grid-cols-2">
-                <SelectField label="Target instance" value={targetInstanceId} onChange={chooseTargetInstance} disabled={jobActive}>
+                <SelectField label="Target instance" value={targetInstanceId} onChange={chooseTargetInstance} disabled={scopeControlsLocked}>
                   <EmptyValue>Choose target instance</EmptyValue>
                   {targetInstances.map((instance) => (
                     <option key={instance.id} value={instance.id}>{instance.label} · {roleLabel(instance.role)} · {hostLabel(instance.baseUrl)}</option>
                   ))}
                 </SelectField>
-                <SelectField label="Target connection" value={targetConnectionId} onChange={chooseTargetConnection} disabled={jobActive || !targetInstanceId || targetConnections.length === 0}>
+                <SelectField label="Target connection" value={targetConnectionId} onChange={chooseTargetConnection} disabled={scopeControlsLocked || !targetInstanceId || targetConnections.length === 0}>
                   <EmptyValue>{targetConnections.length === 0 ? 'No connections loaded' : 'Choose connection'}</EmptyValue>
                   {targetConnections.map((connection) => (
                     <option key={connection.id} value={connection.id}>{connectionLabel(connection)}</option>
@@ -1779,7 +1955,7 @@ export function ModelMigratorPage() {
                     <select
                       value={targetModelBySourceId[sourceModel.id] || ''}
                       onChange={(event) => chooseTargetModel(sourceModel.id, event.target.value)}
-                      disabled={jobActive || targetModels.length === 0}
+                      disabled={scopeControlsLocked || targetModels.length === 0}
                       className="input-field"
                     >
                       <option value="">{targetModels.length === 0 ? 'No target models loaded' : 'Choose target model'}</option>
@@ -1791,7 +1967,8 @@ export function ModelMigratorPage() {
                       <div className="mt-3 grid gap-2 lg:grid-cols-[1fr_1.3fr]">
                         <div className={`rounded-card px-3 py-2 text-xs ${confidenceTone(match.confidence)}`}>
                           <div className="font-semibold">{match.confidence === 'strong' ? 'Strong target match' : match.confidence === 'likely' ? 'Likely target match' : 'Manual match'}</div>
-                          <div className="mt-1">{match.score}/100 · {match.reasons.slice(0, 2).join(', ') || 'Selected manually'}</div>
+                          <div className="mt-1">Model similarity: {match.score}/100 · {match.reasons.slice(0, 2).join(', ') || 'Selected manually'}</div>
+                          <p className="mt-1">Similarity is a matching hint, not a readiness or validation score.</p>
                           {readinessPair?.schemaOverlap && (
                             <div className="mt-1">
                               {readinessPair.schemaOverlap.overlappingSchemas.length} schema overlap
@@ -1812,7 +1989,7 @@ export function ModelMigratorPage() {
                           value={pathByModelId[sourceModel.id] || 'translate'}
                           onChange={(event) => setPathByModelId((current) => ({ ...current, [sourceModel.id]: event.target.value as ModelPath }))}
                           className="input-field"
-                          disabled={jobActive}
+                          disabled={scopeControlsLocked}
                         >
                           <option value="translate">Review and adapt model changes</option>
                           <option value="fast" disabled={!modelSupportsFastPath(sourceModel)}>Copy model automatically {modelSupportsFastPath(sourceModel) ? '' : '(git-backed source required)'}</option>
@@ -1866,7 +2043,7 @@ export function ModelMigratorPage() {
             </section>
           </div>
 
-          <section className="card p-5">
+          {!dashboardRepairRequested && <section className="card p-5">
             <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
               <div>
                 <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
@@ -1965,7 +2142,7 @@ export function ModelMigratorPage() {
                 })}
               </div>
             )}
-          </section>
+          </section>}
 
           <section className="grid gap-5 xl:grid-cols-2">
             <div className="card p-5">
@@ -1977,12 +2154,12 @@ export function ModelMigratorPage() {
                   </div>
                   <p className="mt-1 text-xs text-content-secondary">Map data locations, review semantic YAML changes, and choose which files should be staged on the safe working copy. Main branches are never written by this step.</p>
                 </div>
-	                <button type="button" onClick={translateSelectedModels} disabled={jobActive || translating || selectedSourceModels.length === 0} className="btn-primary inline-flex items-center gap-2 text-xs disabled:opacity-60">
+	                <button type="button" onClick={translateSelectedModels} disabled={jobActive || translating || selectedSourceModels.length === 0 || (dashboardRepairRequested && (!dashboardRepairScope || Boolean(dashboardRepairScope.scopeReviewRequired) || loadingDashboardRepair))} className="btn-primary inline-flex items-center gap-2 text-xs disabled:opacity-60">
 	                  {translating ? <Loader2 size={13} className="animate-spin" /> : <Workflow size={13} />}
 	                  Prepare differences
 	                </button>
 	              </div>
-	              <label className="mb-3 flex items-start gap-2 rounded-card border border-border-subtle bg-surface-secondary p-3 text-xs text-content-secondary">
+	              {!dashboardRepairRequested && <label className="mb-3 flex items-start gap-2 rounded-card border border-border-subtle bg-surface-secondary p-3 text-xs text-content-secondary">
 	                <input
 	                  type="checkbox"
 	                  className="mt-0.5"
@@ -1991,7 +2168,7 @@ export function ModelMigratorPage() {
                     disabled={jobActive}
 	                />
 	                <span>Run Omni AI dialect pass after deterministic schema rewrites. AI output is a reviewed draft and never writes until accepted.</span>
-	              </label>
+	              </label>}
               <div className="rounded-card border border-border-subtle p-3">
                 <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                   <div>
@@ -2048,7 +2225,7 @@ export function ModelMigratorPage() {
                     <div key={model.id} className="rounded-card border border-border-subtle p-3">
                       <div className="mb-2 text-sm font-semibold text-content-primary">{model.name}</div>
                       {!translation ? (
-                        <div className="text-xs text-content-secondary">Run Translate to load YAML and prepare accepted files.</div>
+                        <div className="text-xs text-content-secondary">Choose “Prepare differences” to load model definitions for review. This does not publish changes.</div>
                       ) : (
                         <div className="space-y-2">
                           {translation.semanticDecisions.length > 0 && (
@@ -2111,34 +2288,40 @@ export function ModelMigratorPage() {
                             </div>
                           )}
 	                          {translation.files.map((file) => {
-	                            const accepted = acceptedFilesByModelId[model.id]?.[file.fileName] !== undefined;
 	                            const skipped = (skippedFilesByModelId[model.id] || []).includes(file.fileName);
                               const acceptedValue = acceptedFilesByModelId[model.id]?.[file.fileName];
-                              const activeDraft = fileDraft(file);
-                              const edited = accepted && acceptedValue !== activeDraft;
-	                            const decision = file.blocked ? 'Blocked' : skipped ? 'Skipped' : accepted ? edited ? 'Edited' : 'Accepted' : 'Needs decision';
+                              const activeDraft = dashboardRepairRequested ? file.deterministic || file.translated : fileDraft(file);
+                              const editableValue = dashboardRepairRequested ? activeDraft : acceptedValue ?? activeDraft;
+                              const accepted = dashboardRepairRequested ? acceptedValue === activeDraft : acceptedValue !== undefined;
+                              const edited = editableValue !== activeDraft;
+                              const unchanged = dashboardRepairRequested && file.additiveStatus === 'unchanged';
+                              const blocked = file.blocked || (dashboardRepairRequested && (file.additiveStatus === 'conflict' || file.targetOriginal === undefined || (!unchanged && !file.reviewToken)));
+                              const dashboardReviewKey = JSON.stringify([model.id, file.fileName, file.reviewToken]);
+                              const viewed = !dashboardRepairRequested || viewedDashboardFiles.includes(dashboardReviewKey);
+	                            const decision = blocked ? file.additiveStatus === 'conflict' ? 'Conflict — blocked' : 'Blocked' : unchanged ? 'No change' : skipped ? 'Skipped' : accepted ? edited ? 'Accepted edit' : 'Accepted' : edited ? 'Edited — needs acceptance' : 'Needs decision';
 	                            return (
-	                              <details key={file.fileName} className="rounded-card border border-border-subtle bg-white">
+	                              <details key={file.fileName} className="rounded-card border border-border-subtle bg-white" onToggle={(event) => { if (dashboardRepairRequested && event.currentTarget.open) setViewedDashboardFiles((current) => current.includes(dashboardReviewKey) ? current : [...current, dashboardReviewKey]); }}>
 	                                <summary className="flex cursor-pointer items-center justify-between gap-3 px-3 py-2 text-xs font-semibold text-content-primary">
 	                                  <span>{file.fileName}</span>
                                     <span className="flex flex-wrap items-center justify-end gap-2">
-                                      {file.aiDraft && !skipped && (
+                                      {file.aiDraft && !skipped && !dashboardRepairRequested && (
                                         <span className="rounded-chip bg-amber-50 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-800">
                                           AI draft needs review
                                         </span>
                                       )}
-	                                    <span className={file.blocked ? 'text-red-700' : skipped ? 'text-content-secondary' : accepted ? 'text-green-700' : 'text-amber-700'}>{decision}</span>
+	                                    <span className={blocked ? 'text-red-700' : skipped || unchanged ? 'text-content-secondary' : accepted ? 'text-green-700' : 'text-amber-700'}>{decision}</span>
                                     </span>
 	                                </summary>
 	                                <div className="border-t border-border-subtle p-3">
 	                                  {file.warnings.map((warning) => <div key={warning} className="mb-2 rounded-card bg-amber-50 px-2 py-1 text-xs text-amber-800">{warning}</div>)}
                                     {file.aiJobId && <div className="mb-2 rounded-card bg-blue-50 px-2 py-1 text-xs text-blue-800">Omni AI job: {file.aiJobId}</div>}
                                     {file.aiRefusal && <div className="mb-2 rounded-card bg-red-50 px-2 py-1 text-xs text-red-800">{file.aiRefusal}</div>}
+                                    {dashboardRepairRequested && <p className={`mb-2 text-xs leading-5 ${blocked ? 'text-red-800' : 'text-content-secondary'}`}>{file.targetOriginal === undefined ? 'Current destination evidence was not returned. Prepare differences again before accepting this file.' : file.additiveStatus === 'conflict' ? 'This proposal conflicts with an existing definition. It cannot be accepted or overridden here.' : unchanged ? 'The destination already has this definition. No change or acceptance is needed.' : !file.reviewToken ? 'The server-issued review is unavailable. Prepare differences again; this file cannot be accepted.' : file.additiveStatus === 'new' ? 'New destination file. Review its full contents before accepting.' : 'Additions to the existing destination file. Existing definitions must be preserved.'}</p>}
 	                                  <div className="mb-2 flex flex-wrap gap-2 text-xs">
 	                                    <button
 	                                      type="button"
 	                                      className="btn-secondary text-xs"
-                                        disabled={file.blocked}
+                                        disabled={blocked || unchanged || !viewed || jobActive || startingJob}
 	                                      onClick={() => {
 	                                        setAcceptedFilesByModelId((current) => ({
 	                                          ...current,
@@ -2152,11 +2335,11 @@ export function ModelMigratorPage() {
 	                                    >
 	                                      Accept deterministic
 	                                    </button>
-                                      {file.aiDraft && (
+                                      {file.aiDraft && !dashboardRepairRequested && (
                                         <button
                                           type="button"
                                           className="btn-secondary text-xs"
-                                          disabled={file.blocked}
+                                          disabled={blocked || unchanged || jobActive || startingJob}
                                           onClick={() => {
                                             setAcceptedFilesByModelId((current) => ({
                                               ...current,
@@ -2174,11 +2357,11 @@ export function ModelMigratorPage() {
                                       <button
                                         type="button"
                                         className="btn-secondary text-xs"
-                                        disabled={file.blocked}
+                                        disabled={blocked || unchanged || !viewed || jobActive || startingJob}
                                         onClick={() => {
                                           setAcceptedFilesByModelId((current) => ({
                                             ...current,
-                                            [model.id]: { ...(current[model.id] || {}), [file.fileName]: current[model.id]?.[file.fileName] ?? activeDraft },
+                                            [model.id]: { ...(current[model.id] || {}), [file.fileName]: editableValue },
                                           }));
                                           setSkippedFilesByModelId((current) => ({
                                             ...current,
@@ -2191,7 +2374,7 @@ export function ModelMigratorPage() {
 	                                    <button
 	                                      type="button"
 	                                      className="btn-secondary text-xs"
-                                        disabled={file.blocked}
+                                        disabled={blocked || unchanged || jobActive || startingJob}
 	                                      onClick={() => {
 	                                        setAcceptedFilesByModelId((current) => {
 	                                          const modelFiles = { ...(current[model.id] || {}) };
@@ -2208,6 +2391,7 @@ export function ModelMigratorPage() {
 	                                    </button>
 	                                  </div>
 	                                  <div className="grid gap-3 xl:grid-cols-2">
+                                      {dashboardRepairRequested ? <div className="xl:col-span-2">{file.targetOriginal === undefined ? <pre className="max-h-96 overflow-auto rounded border border-border p-3 text-[11px]">{editableValue}</pre> : <DashboardRepairFileDiff before={file.targetOriginal} after={editableValue} />}</div> : <>
 	                                    <div>
 	                                      <div className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-content-secondary">Original</div>
 	                                      <pre className="max-h-72 overflow-auto rounded-card border border-border-subtle bg-surface-secondary p-3 font-mono text-[11px] leading-5 text-content-secondary">
@@ -2241,20 +2425,23 @@ export function ModelMigratorPage() {
                                           </div>
                                         )}
                                       </div>
+                                      </>}
 	                                    <label className="block">
-	                                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-content-secondary">Accepted output</span>
+	                                      <span className="mb-1 block text-[10px] font-semibold uppercase tracking-wide text-content-secondary">{dashboardRepairRequested ? 'Exact proposed output — read-only' : 'Accepted output'}</span>
 	                                      <textarea
-	                                        value={acceptedFilesByModelId[model.id]?.[file.fileName] ?? activeDraft}
-	                                        onChange={(event) => setAcceptedFilesByModelId((current) => ({
-	                                          ...current,
-	                                          [model.id]: { ...(current[model.id] || {}), [file.fileName]: event.target.value },
-	                                        }))}
+	                                        value={editableValue}
+	                                        readOnly={dashboardRepairRequested}
+	                                        onChange={(event) => {
+                                            if (dashboardRepairRequested) return;
+                                            const value = event.target.value;
+                                            setAcceptedFilesByModelId((current) => ({ ...current, [model.id]: { ...(current[model.id] || {}), [file.fileName]: value } }));
+                                          }}
 	                                        onFocus={() => setSkippedFilesByModelId((current) => ({
 	                                          ...current,
 	                                          [model.id]: (current[model.id] || []).filter((item) => item !== file.fileName),
 	                                        }))}
 	                                        className="input-field min-h-[288px] font-mono text-[11px]"
-	                                        disabled={skipped || file.blocked}
+	                                        disabled={skipped || blocked || unchanged || jobActive || startingJob}
 	                                      />
 	                                    </label>
 	                                  </div>
@@ -2275,16 +2462,16 @@ export function ModelMigratorPage() {
                 <div>
                   <div className="flex items-center gap-2 text-sm font-semibold text-content-primary">
                     <ShieldCheck size={16} />
-                    Content impact and publish
+                    {dashboardRepairRequested ? 'Dependency review and publish' : 'Content impact and publish'}
                   </div>
                   <p className="mt-1 text-xs text-content-secondary">Check affected workbooks and dashboards, then stage the model changes. Apply and validate writes only to safe working copies; publish after validation.</p>
                 </div>
-                <button type="button" onClick={preflightWorkbooks} disabled={jobActive || preflighting || selectedWorkbookDocs.length === 0} className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-60">
+                {!dashboardRepairRequested && <button type="button" onClick={preflightWorkbooks} disabled={jobActive || preflighting || selectedWorkbookDocs.length === 0} className="btn-secondary inline-flex items-center gap-2 text-xs disabled:opacity-60">
                   {preflighting ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
                   Check workbook impact
-                </button>
+                </button>}
               </div>
-              <div className="grid gap-2 text-xs text-content-secondary sm:grid-cols-2">
+              {!dashboardRepairRequested && <div className="grid gap-2 text-xs text-content-secondary sm:grid-cols-2">
 	                <label className="flex items-start gap-2 rounded-card border border-border-subtle p-3">
 	                  <input type="checkbox" checked={replaceSameNamed} onChange={(event) => setReplaceSameNamed(event.target.checked)} disabled={jobActive} />
 	                  <span>Replace same-named workbook documents in the target folder.</span>
@@ -2301,8 +2488,8 @@ export function ModelMigratorPage() {
 	                  <input type="checkbox" checked={refreshSchemaAfterMigration} onChange={(event) => setRefreshSchemaAfterMigration(event.target.checked)} disabled={jobActive} />
 	                  <span>Refresh target schema models after migration completes.</span>
 	                </label>
-	              </div>
-	              {targetInstance?.postMigrationActions.length ? (
+	              </div>}
+	              {!dashboardRepairRequested && targetInstance?.postMigrationActions.length ? (
 	                <div className="mt-4 rounded-card border border-border-subtle p-3">
 	                  <div className="mb-2 text-xs font-semibold uppercase tracking-wide text-content-secondary">Saved post-actions</div>
 	                  <div className="space-y-2">
@@ -2326,8 +2513,8 @@ export function ModelMigratorPage() {
 	              ) : null}
 	              <div className="mt-4 grid grid-cols-3 gap-2 text-center text-xs">
                 <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{selectedSourceModels.length}</div><div className="text-content-secondary">Models</div></div>
-                <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{selectedDashboardDocs.length}</div><div className="text-content-secondary">Dashboards</div></div>
-                <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{selectedWorkbookDocs.length}</div><div className="text-content-secondary">Workbooks</div></div>
+                <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{dashboardRepairScope ? dashboardRepairScope.documentIds.length : selectedDashboardDocs.length}</div><div className="text-content-secondary">{dashboardRepairScope ? 'Dashboards awaiting model review' : 'Dashboards selected for copy'}</div></div>
+                <div className="rounded-card bg-surface-secondary px-3 py-2"><div className="font-semibold text-content-primary">{dashboardRepairScope ? 'Not assessed' : selectedWorkbookDocs.length}</div><div className="text-content-secondary">{dashboardRepairScope ? 'Other workbook impact' : 'Workbooks selected for copy'}</div></div>
               </div>
               <div className="mt-4 rounded-card border border-border-subtle bg-surface-secondary p-3 text-xs">
                 <div className="mb-2 font-semibold text-content-primary">Review before run</div>
@@ -2367,6 +2554,10 @@ export function ModelMigratorPage() {
               </button>
             </div>
           </section>
+
+        </>
+      )}
+      </div>
 
           {job && (
             <section className="card p-5">
@@ -2457,8 +2648,6 @@ export function ModelMigratorPage() {
               </div>
             </section>
           )}
-        </>
-      )}
     </div>
   );
 }

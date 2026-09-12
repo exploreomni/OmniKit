@@ -1,4 +1,5 @@
 import { assertSafeOutboundUrl, validateBaseUrl, validateEndpoint, jsonHeaders } from '../security';
+import { acquireOmniRequestSlot } from '../services/omniClient';
 
 const ALLOWED_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
 
@@ -12,7 +13,16 @@ interface ProxyRequest {
   raw_response?: boolean;
 }
 
-export default async function handler(req: Request): Promise<Response> {
+export interface OmniProxyDependencies {
+  fetch?: typeof fetch;
+  validateOutbound?: (url: string) => Promise<void>;
+  acquireRequestSlot?: (apiKey: string, signal?: AbortSignal) => Promise<void>;
+}
+
+export default async function handler(
+  req: Request,
+  dependencies: OmniProxyDependencies = {},
+): Promise<Response> {
   try {
     const {
       base_url,
@@ -79,13 +89,15 @@ export default async function handler(req: Request): Promise<Response> {
     // outbound surface in the app — arbitrary host, endpoint, method and bearer
     // token — so resolve the host and reject private results before connecting.
     try {
-      await assertSafeOutboundUrl(url, { label: 'base_url' });
+      await (dependencies.validateOutbound
+        || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url);
     } catch (error) {
       return new Response(
         JSON.stringify({ error: error instanceof Error ? error.message : 'base_url is not a safe outbound target.' }),
         { status: 400, headers: jsonHeaders },
       );
     }
+    await (dependencies.acquireRequestSlot || acquireOmniRequestSlot)(api_key, req.signal);
 
     const fetchOptions: RequestInit = {
       method,
@@ -100,7 +112,7 @@ export default async function handler(req: Request): Promise<Response> {
       fetchOptions.body = JSON.stringify(body);
     }
 
-    const response = await fetch(url, fetchOptions);
+    const response = await (dependencies.fetch || globalThis.fetch)(url, fetchOptions);
 
     // Matches the unexpected_redirect handling in services/adminReadiness.ts:
     // an Omni /api/v1 endpoint has no documented reason to redirect, so report

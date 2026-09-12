@@ -113,6 +113,35 @@ const ordersSnapshot = {
   checksums: { 'orders.view': 'checksum-1' },
 };
 
+test('v2 read-only preparation routes semantic changes to repair without scratch validation', async () => {
+  const selected = target('b');
+  const safeIntent = intent(['b']);
+  safeIntent.deployment = {
+    version: 2, planId: 'reviewed-plan',
+    sourceHashes: { 'dashboard-1': 'a'.repeat(64) }, modelHashes: { b: 'b'.repeat(64) },
+  };
+  let scratchCalls = 0;
+  let snapshotCalls = 0;
+  const results = await prepareDashboardSafeCopyTargets(safeIntent, [selected], {
+    async buildPlan(input) {
+      assert.equal(input.targets![0].exactFolder, true, 'v2 targets must not inherit saved destination folder defaults');
+      return planFor(input.targets![0]);
+    },
+    resolveTarget(_plan, current) {
+      return { status: 'resolved', target: { ...current, semanticPatches: [{
+        id: 'missing-field', artifactType: 'field', sourceName: 'orders.amount', targetFileName: 'orders.view',
+        targetModelId: selected.targetModelId, resolution: 'recommended', safetyCategory: 'safe_update', status: 'ready',
+      }] } };
+    },
+    async validatePatches() { scratchCalls += 1; throw new Error('must not mutate scratch branches'); },
+    async loadTargetYamlSnapshot() { snapshotCalls += 1; return ordersSnapshot; },
+  });
+  assert.equal(results[0].status, 'needs_attention');
+  if (results[0].status === 'needs_attention') assert.equal(results[0].exceptions[0].code, 'REPAIR_REQUIRED');
+  assert.equal(scratchCalls, 0);
+  assert.equal(snapshotCalls, 0);
+});
+
 test('automatic preparation converges without exposing dependency decisions for an exact target', async () => {
   const selected = target('b');
   let planCalls = 0;

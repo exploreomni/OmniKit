@@ -218,6 +218,37 @@ function harness(options: {
   };
 }
 
+test('content-only deployment rejects even a checksum-protected model update', async () => {
+  const target = { ...executionTarget(), contentOnly: true as const };
+  const state = harness({ targets: [target], semanticChange: {
+    mode: 'existing_file_update', fileName: 'orders.view', previousChecksum: 'checksum', expectedYamlHash: 'hash',
+  } });
+  const result = await executeDashboardSafeCopy(executionInput([target]), state.dependencies);
+  assert.equal(result.targets[0].exceptions[0].code, 'SEMANTIC_CHANGE_UNSAFE');
+  assert.equal(state.applyCalls.length, 0);
+  assert.equal(state.createCalls.length, 0);
+  assert.equal(state.attempts.length, 0);
+});
+
+test('folder routes on one destination model serialize their writes', async () => {
+  const first = executionTarget('first');
+  const second = { ...first, targetId: 'second', folderId: 'second-folder' };
+  const state = harness({ targets: [first, second] });
+  const create = state.dependencies.createDocument;
+  let active = 0;
+  let peak = 0;
+  state.dependencies.createDocument = async (...args) => {
+    active += 1;
+    peak = Math.max(peak, active);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    try { return await create(...args); } finally { active -= 1; }
+  };
+  const result = await executeDashboardSafeCopy(executionInput([first, second]), state.dependencies);
+  assert.equal(result.status, 'succeeded');
+  assert.equal(state.createCalls.length, 2);
+  assert.equal(peak, 1);
+});
+
 test('a safe copy persists a content-only create attempt before import and verifies one exact candidate', async () => {
   const target = executionTarget();
   const state = harness({ targets: [target] });

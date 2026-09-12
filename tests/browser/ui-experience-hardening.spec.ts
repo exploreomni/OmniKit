@@ -632,13 +632,11 @@ test('Dashboard Migrator keeps long duplicate destination connections readable a
   await page.getByRole('listbox', { name: 'Source connection options' })
     .getByRole('option', { name: new RegExp(firstConnectionId) })
     .click();
-  // The shipping flow (DashboardSafeCopyFlow) loads the inventory as soon as a
-  // source connection is chosen and refreshes through "Refresh"; the explicit
-  // "Load dashboards" / "Refresh from Omni" controls belong to the legacy
-  // wizard, which is only reachable as an internal rollback surface.
+  // Browsing is explicit; a separate refresh bypasses the completed catalog cache.
+  await page.getByRole('button', { name: 'Browse all dashboards', exact: true }).click();
   await expect.poll(() => dashboardInventoryRequests.length).toBe(1);
   expect(dashboardInventoryRequests[0].searchParams.has('forceRefresh')).toBe(false);
-  const refreshDashboards = page.getByRole('button', { name: 'Refresh', exact: true });
+  const refreshDashboards = page.getByRole('button', { name: 'Refresh catalog', exact: true });
   await expect(refreshDashboards).toBeEnabled();
   await refreshDashboards.click();
   await expect.poll(() => dashboardInventoryRequests.length).toBe(2);

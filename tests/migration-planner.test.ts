@@ -45,6 +45,7 @@ import {
 } from '../server/services/nativeVault';
 import { clearReadThroughCache, readThroughCache } from '../server/services/readThroughCache';
 import { clearMigrationDestinationModelReservations } from '../server/services/migrationScopeReservation';
+import { resolveDashboardSafeCopyTarget } from '../server/services/dashboardSafeCopyResolver';
 
 const realRunQuery = OmniClient.prototype.runQuery;
 const realUpdateModelYamlFiles = OmniClient.prototype.updateModelYamlFiles;
@@ -126,6 +127,60 @@ function emptyMetricFilter() {
     embedExternalIdExact: [],
   };
 }
+
+test('readiness prepares authored field patch candidates without choosing writes or resolving missing source evidence', async () => {
+  for (const [id, label, role] of [['source-1', 'Source', 'source'], ['dest-1', 'Destination', 'destination']] as const) {
+    upsertInstance({ id, label, role, baseUrl: `https://${id}.example.omniapp.co`, apiKey: `${id}-fixture-key`,
+      metricFilter: emptyMetricFilter(), postMigrationActions: [] });
+  }
+  const sourceYaml = 'dimensions:\n  id:\n    sql: ${TABLE}.id\n  category_label:\n    sql: ${TABLE}.category\n';
+  const targetYaml = 'label: Keep destination settings\ndimensions:\n  id:\n    sql: ${TABLE}.id\n';
+  const inheritedYaml = sourceYaml + '  inherited_only:\n    sql: ${TABLE}.inherited\n';
+  let authoredReads = 0;
+  const network = mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected external request in isolated regression'); });
+  mock.method(OmniClient.prototype, 'listFolderDocuments', async () => [{
+    id: 'source-doc', identifier: 'source-doc', name: 'Source dashboard', baseModelId: 'source-model',
+  }]);
+  mock.method(OmniClient.prototype, 'listModelQueryViews', async () => []);
+  mock.method(OmniClient.prototype, 'listModelTopics', async () => []);
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function () {
+    return { 'views/orders.view': clientLabel(this) === 'Source' ? inheritedYaml : targetYaml };
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function (modelId: string, options: { fullyResolved?: boolean } = {}) {
+    const source = clientLabel(this) === 'Source';
+    if (source) { assert.equal(options.fullyResolved, false); authoredReads += 1; }
+    return { files: { 'views/orders.view': source ? sourceYaml : targetYaml },
+      checksums: { 'views/orders.view': source ? 'source-checksum' : 'target-checksum' }, raw: { modelId } };
+  });
+  mock.method(OmniClient.prototype, 'exportDocument', async () => ({
+    tiles: [{ fields: ['orders.category_label', 'orders.missing_definition', 'orders.inherited_only'] }],
+  }));
+  const target = { id: 'target-1', destinationInstanceId: 'dest-1', targetModelId: 'target-model' };
+  const input = { sourceId: 'source-1', targets: [target], documentIds: ['source-doc'], emptyFirst: false,
+    replaceSameNamed: false, documentAccessPolicy: 'destination_defaults' as const };
+  const ordinary = await buildMigrationPlan(input);
+  assert.equal(authoredReads, 0, 'legacy planning is unchanged');
+  const plan = await buildMigrationPlan({ ...input, prepareDependencyPatchCandidates: true });
+  const patches = plan.steps.flatMap((step) => step.details?.semanticPatches as Array<Record<string, unknown>> || []);
+  const patch = patches.find((item) => item.sourceName === 'orders.category_label');
+  assert.ok(patch, 'unconfigured source-backed field has a patch before resolution');
+  assert.equal(patch.targetFileName, 'views/orders.view');
+  assert.equal(patch.previousChecksum, 'target-checksum');
+  assert.equal(patch.safetyCategory, 'safe_update');
+  assert.match(String(patch.recommendedYaml), /Keep destination settings/);
+  assert.match(String(patch.recommendedYaml), /category_label/);
+  assert.ok(!patches.some((item) => ['orders.missing_definition', 'orders.inherited_only'].includes(String(item.sourceName))));
+  assert.ok(!ordinary.steps.some((step) => (step.details?.semanticPatches as Array<Record<string, unknown>> || []).some((item) => item.sourceName === 'orders.category_label')));
+  assert.equal(plan.targets[0].fieldMappings?.length || 0, 0, 'proposals never select user decisions');
+  assert.equal(plan.steps.find((step) => step.kind === 'import')?.blocked, true);
+  const resolution = resolveDashboardSafeCopyTarget(plan, plan.targets[0]);
+  assert.equal(resolution.status, 'exception');
+  if (resolution.status !== 'exception') throw new Error('Unknown fields must remain blocked');
+  assert.ok(resolution.exceptions.some((issue) => issue.code === 'MISSING_EVIDENCE' && issue.reference === 'orders.missing_definition'));
+  assert.ok(!resolution.exceptions.some((issue) => issue.reference === 'orders.category_label' && issue.message.includes('lacks an exact validated semantic patch')));
+  assert.equal(authoredReads, 1);
+  assert.equal(network.mock.callCount(), 0, 'all regression reads are mocked; no tenant or credential access');
+});
 
 test('permission discovery remains dormant when selected semantic files contain no security evidence', () => {
   assert.equal(migrationFilesHavePermissionEvidence({

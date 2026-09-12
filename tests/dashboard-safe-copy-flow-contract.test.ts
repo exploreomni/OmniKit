@@ -20,10 +20,10 @@ test('safe-copy is the default experience and legacy Dashboard Migrator is a laz
   assert.doesNotMatch(pageSource, /import\s*\{\s*DashboardMigrationWizard\s*\}/);
 });
 
-test('the default safe-copy experience exposes exactly three accessible screens', () => {
+test('the default safe-copy experience exposes four accessible screens with readiness before deployment', () => {
   assert.match(
     flowSource,
-    /STEP_LABELS\s*=\s*\['Choose dashboards',\s*'Choose destinations',\s*'Move & track'\]\s+as const/,
+    /STEP_LABELS\s*=\s*\['Choose dashboards',\s*'Choose destinations',\s*'Review readiness',\s*'Deploy and track'\]\s+as const/,
   );
   assert.equal((flowSource.match(/draft\.step === [012]/g) || []).length, 3);
   assert.match(flowSource, /aria-label="Dashboard move steps"/);
@@ -35,7 +35,7 @@ test('the default safe-copy experience exposes exactly three accessible screens'
   assert.match(flowSource, /headingRef\.current/);
   assert.match(flowSource, /\.focus\(\)/);
   assert.match(flowSource, /\}, \[draft\.jobId, draft\.step, loading\]\);/);
-  assert.equal((flowSource.match(/ref=\{headingRef\}\s+tabIndex=\{-1\}/g) || []).length, 3);
+  assert.equal((flowSource.match(/ref=\{headingRef\}\s+tabIndex=\{-1\}/g) || []).length, 4);
 });
 
 test('the safe-copy flow does not expose legacy destructive or expert controls', () => {
@@ -63,11 +63,13 @@ test('the safe-copy flow does not expose legacy destructive or expert controls',
   }
 });
 
-test('the default UI can submit only the safe-copy contract and never calls legacy migration surfaces', () => {
-  assert.match(flowSource, /\bcreateDashboardSafeCopyJob\b/);
+test('new starts use reviewed deployment plans and never call legacy migration starts', () => {
+  assert.match(flowSource, /\bcreateDashboardDeploymentPlan\b/);
+  assert.match(flowSource, /\bdeployDashboardDeploymentPlan\b/);
   assert.match(flowSource, /\bretryDashboardSafeCopyTarget\b/);
   for (const legacyCall of [
     /\bcreateMigrationJob\b/,
+    /\bcreateDashboardSafeCopyJob\b/,
     /\bpreviewDashboardMigrationJob\b/,
     /\bvalidateDashboardMigrationPatches\b/,
     /\brunPostMigrationActions\b/,
@@ -91,6 +93,49 @@ test('large inventories are progressively disclosed and asynchronous scope work 
   assert.match(flowSource, /sourceConnectionAbortRef\.current\?\.abort\(\)/);
   assert.match(flowSource, /dashboardAbortRef\.current\?\.abort\(\)/);
   assert.match(flowSource, /Object\.(?:values|entries)\(destinationAbortRef\.current\).*controller\.abort\(\)/s);
+});
+
+test('dashboard selection uses explicit browse or exact lookup with observable cancellable progress', () => {
+  assert.match(flowSource, /Add dashboard by link/);
+  assert.match(flowSource, /Browse all dashboards/);
+  assert.match(flowSource, /lookupInstanceDocument\(draft.sourceId/);
+  assert.match(flowSource, /onClick=\{\(\) => void loadDashboards\(\)\}/);
+  assert.doesNotMatch(flowSource, /void loadDashboards\(false\)|void loadDashboards\(true\)/);
+  assert.match(flowSource, /documentIds: selectedIds/);
+  assert.match(flowSource, /'explicit_documents'/);
+  assert.match(flowSource, /hasVerifiedDashboardSelection\(documents, draft.selectedDocumentIds, draft.sourceConnectionId\)/);
+  assert.match(flowSource, /dashboardScopeRef.current === scope/);
+  assert.match(flowSource, /Cancel browsing/);
+  assert.match(flowSource, /dashboardBrowseProgress.pages/);
+  assert.match(flowSource, /dashboardBrowseProgress.returnedRecords/);
+  assert.match(flowSource, /Elapsed: \{dashboardBrowseElapsed\}s/);
+  assert.match(flowSource, /Reused complete cached inventory/);
+  assert.match(flowSource, /dashboardInventory.cache.fetchedAt/);
+  assert.match(flowSource, /Folder details not supplied/);
+  assert.doesNotMatch(flowSource, /document.folderPath \|\| 'Top level'/);
+});
+
+test('source catalog failures stay instance-scoped in Step 1 and cannot overwrite readiness or a restored source', () => {
+  const sourceCatalog = flowSource.slice(flowSource.indexOf('const loadSourceConnections = useCallback'), flowSource.indexOf('// Changing the source cancels work'));
+  assert.doesNotMatch(sourceCatalog, /setError\(/);
+  assert.match(sourceCatalog, /error: sourceConnectionLoadError\(loadError\)/);
+  assert.match(sourceCatalog, /sourceConnectionContextRef\.current\.instanceId === instanceId/);
+  assert.match(sourceCatalog, /sourceConnectionContextRef\.current\.step === 0/);
+  assert.match(sourceCatalog, /draft\.step !== 0/);
+  assert.match(sourceCatalog, /sourcePlanRestoring/);
+  assert.match(sourceCatalog, /sourceConnectionAbortRef\.current\?\.abort\(\)/);
+  assert.match(sourceCatalog, /sourceConnectionRequestRef\.current \+= 1/);
+  assert.match(sourceCatalog, /if \(!sourceConnectionContextRef\.current\.planId\)/);
+  assert.match(flowSource, /sourceConnectionCatalog\.instanceId === draft\.sourceId/);
+  assert.match(flowSource, /emptyLabel=\{sourceConnectionEmptyLabel\(sourceCatalog\)\}/);
+  const picker = flowSource.slice(flowSource.indexOf('ariaLabel="Source connection"'), flowSource.indexOf('<h3 className="text-base font-semibold text-content-primary">Dashboards'));
+  assert.match(picker, /sourceCatalog\.error/);
+  assert.match(picker, /Retry source connections/);
+  assert.match(picker, /separate from dashboard readiness/);
+  assert.match(flowSource, /currentPlan\.intent\.source\.instanceId === draft\.sourceId/);
+  assert.match(flowSource, /currentPlan\.intent\.source\.connectionId === draft\.sourceConnectionId/);
+  assert.match(flowSource, /sameDocumentScope\(currentPlan\.intent\.source\.documentIds, draft\.selectedDocumentIds\)/);
+  assert.match(flowSource, /savedSourceScopeMatches \|\| \(verifiedDocumentsScopeRef/);
 });
 
 test('active source, submit idempotency, target retry guard, and reduced motion have explicit seams', () => {
@@ -121,8 +166,7 @@ test('exception codes are available only in collapsed technical details', () => 
 
 test('safe-copy access wording distinguishes direct verification from destination-folder governance', () => {
   assert.match(flowSource, /Source sharing is not copied\./);
-  assert.match(flowSource, /Inherited access follows the destination folder shown here/);
-  assert.match(flowSource, /no unexpected non-owner direct grant/);
+  assert.match(flowSource, /Access inherited from the destination folder and business acceptance still require your review/);
   assert.match(flowSource, /Folder \{destinationFolderLabel\(targetScope\?\.targetFolderPath, targetScope\?\.targetFolderId\)\}/);
   assert.doesNotMatch(flowSource, /passed content, access, and query verification/);
 });

@@ -1,4 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { assertAdditiveDashboardRepairDispatch, dashboardRepairInstanceBoundaryHash } from './dashboardRepairRuntime';
+import type { ReviewedReconstructedTopics } from './dashboardTopicRepairEvidence';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import {
   OmniClient,
@@ -51,6 +53,8 @@ import {
   validatePostMigrationActionTargetForRequest,
 } from './postMigrationActions';
 import { clearReadThroughCache, readThroughCache } from './readThroughCache';
+import { dashboardSafeCopyDependencyPatchCandidates } from './dashboardSafeCopyResolver';
+import { readDashboardSourceEvidence, type DashboardSourceEvidence, type DashboardSourceFieldProvenance, type DashboardSourceYamlReadOptions } from './dashboardSourceEvidence';
 import {
   materializeDashboardSafeCopyDocumentContent,
   type DashboardSafeCopyDocumentContent,
@@ -272,6 +276,8 @@ export interface MigrationPlan {
 
 export interface MigrationTarget {
   id: string;
+  /** Reviewed deployment resolves defaults in the UI; absence means top level. */
+  exactFolder?: boolean;
   destinationInstanceId: string;
   destinationLabel?: string;
   targetConnectionId?: string;
@@ -286,6 +292,7 @@ export interface MigrationTarget {
   permissionDecisions?: MigrationPermissionDecision[];
   semanticPatches?: MigrationSemanticPatch[];
   queryValidationWaivers?: MigrationQueryValidationWaiver[];
+  workbookCopy?: { stagingFolderId: string };
 }
 
 export interface MigrationQueryValidationWaiver {
@@ -416,12 +423,21 @@ export interface MigrationFieldDependency {
   sourceViewName: string;
   sourceFieldName: string;
   sourceFileName?: string;
+  sourceProvenance?: DashboardSourceFieldProvenance;
+  sourceDocumentId?: string;
   fieldKind: MigrationFieldDependencyKind;
   sourceYaml?: string;
   targetCandidates: MigrationFieldCandidate[];
   status: MigrationFieldDependencyStatus;
   reason?: string;
   warnings?: string[];
+}
+
+export interface MigrationDependencyProposalWithheld {
+  artifact: 'field' | 'query_view' | 'topic' | 'relationship';
+  reference: string;
+  reason: string;
+  sourceDocumentId: string;
 }
 
 export interface MigrationFieldMapping {
@@ -486,6 +502,7 @@ export interface ModelMigrationAcceptedFile {
   fileName: string;
   yaml: string;
   previousChecksum?: string;
+  reviewToken?: string;
 }
 
 export interface ModelMigrationSemanticDecision {
@@ -538,6 +555,12 @@ export interface ModelMigrationContentInput {
 }
 
 export interface ModelMigrationJobInput {
+  dashboardRepair?: { planId: string; targetId: string; revision: number; additiveOnly?: true;
+    targetModelHash?: string; sourceModelHashes?: Record<string, string>; approvedFilesHash?: string;
+    sourceRelationEvidence?: Record<string, Record<string, string>>; targetRelationEvidence?: Record<string, string>;
+    targetRelationInventoryHash?: string;
+    sourceRelationInventoryHashes?: Record<string, string>;
+    sourceDocumentHashes?: Record<string, string>; sourceWorkbookHashes?: Record<string, string>; instanceBoundaryHash?: string };
   sourceId: string;
   targetId: string;
   targetLabel?: string;
@@ -3569,6 +3592,13 @@ function queryViewsFromModelYamlFiles(files: Record<string, string>): OmniModelQ
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function topicsFromModelYamlFiles(files: Record<string, string>, checksums?: Record<string, string>) {
+  return Object.entries(files).filter(([fileName]) => fileName.endsWith('.topic'))
+    .map(([fileName, yaml]) => ({ name: (fileName.split('/').pop() || fileName).replace(/\.topic$/, ''),
+      fileName, yaml, label: yamlScalar(yaml, 'label'), ...(checksums?.[fileName] ? { checksum: checksums[fileName] } : {}) }))
+    .sort((left, right) => left.name.localeCompare(right.name));
+}
+
 function extractTopicViewReferences(yaml: string): string[] {
   const refs = new Set<string>();
   const fieldPattern = /\$\{([A-Za-z_][\w/]*)(?:\.[A-Za-z_][\w]*)/g;
@@ -4605,7 +4635,7 @@ function normalizeTargets(input: {
       if (!targetModelId) {
         throw new Error(`Choose a target model for ${destination.label}.`);
       }
-      if (explicitFolderId && !explicitFolderPath) {
+      if (explicitFolderId && !explicitFolderPath && !target.exactFolder) {
         throw new Error(`Choose a target folder path for ${destination.label}, or clear the folder to use the default destination.`);
       }
       return {
@@ -4615,8 +4645,9 @@ function normalizeTargets(input: {
         targetConnectionId: target.targetConnectionId?.trim(),
         targetModelId,
         targetModelName: target.targetModelName?.trim() || targetModelId,
-        targetFolderId: explicitFolderId || (explicitFolderPath ? undefined : destination.defaultFolderId),
-        targetFolderPath: explicitFolderPath || destination.defaultFolderPath,
+        ...(target.exactFolder ? { exactFolder: true } : {}),
+        targetFolderId: target.exactFolder ? explicitFolderId : explicitFolderId || (explicitFolderPath ? undefined : destination.defaultFolderId),
+        targetFolderPath: target.exactFolder ? explicitFolderPath : explicitFolderPath || destination.defaultFolderPath,
         sameNamedStrategy: target.sameNamedStrategy === 'replace' ? 'replace' : 'update',
         topicMappings: normalizeTopicMappings(target.topicMappings),
         queryViewMappings: normalizeQueryViewMappings(target.queryViewMappings),
@@ -4624,6 +4655,9 @@ function normalizeTargets(input: {
         permissionDecisions: normalizePermissionDecisions(target.permissionDecisions),
         semanticPatches: normalizeSemanticPatches(target.semanticPatches),
         queryValidationWaivers: normalizeQueryValidationWaivers(target.queryValidationWaivers),
+        ...(target.workbookCopy?.stagingFolderId?.trim()
+          ? { workbookCopy: { stagingFolderId: target.workbookCopy.stagingFolderId.trim() } }
+          : {}),
       };
     });
   }
@@ -4693,6 +4727,18 @@ export function clearJobs(): void {
   clearStoredJobs();
 }
 
+export interface MigrationSourceEvidenceContext {
+  /** Server-only approvals verified against current source and destination snapshots. */
+  reconstructedTopics?: ReviewedReconstructedTopics;
+  /** Trusted server reads only; never populated from a request-body field. */
+  signal?: AbortSignal;
+  sourceDocuments?: ReadonlyMap<string, OmniDocumentRecord>;
+  sourceDocumentStates?: ReadonlyMap<string, Record<string, unknown>>;
+  loadSourceYaml?: (modelId: string, options: DashboardSourceYamlReadOptions) => Promise<Record<string, string>>;
+  /** Authored fullyResolved:false, includeChecksums:true destination snapshot. */
+  loadDestinationYaml?: (instanceId: string, modelId: string) => Promise<OmniModelYamlResponse>;
+}
+
 export async function buildMigrationPlan(input: {
   sourceId: string;
   sourceConnectionId?: string;
@@ -4709,7 +4755,9 @@ export async function buildMigrationPlan(input: {
   sourceAllFolders?: boolean;
   documentAccessPolicy?: 'migrate_explicit' | 'destination_defaults';
   usePreviewCache?: boolean;
-}): Promise<MigrationPlan> {
+  /** Read-only dashboard readiness: prepare proposals without selecting writes. */
+  prepareDependencyPatchCandidates?: boolean;
+}, evidenceContext: MigrationSourceEvidenceContext = {}): Promise<MigrationPlan> {
   const source = requireInstance(input.sourceId);
   const routeGroups = normalizeRouteGroups(input);
   const targetsById = new Map<string, MigrationTarget>();
@@ -4718,7 +4766,8 @@ export async function buildMigrationPlan(input: {
   }
   const targets = [...targetsById.values()];
   const sourceDocumentIds = [...new Set(routeGroups.flatMap((group) => group.documentIds))];
-  const sourceClient = new OmniClient(source);
+  evidenceContext.signal?.throwIfAborted();
+  const sourceClient = new OmniClient(source, { signal: evidenceContext.signal });
   const sourceAllFolders = input.sourceAllFolders === true;
   const sourceFolderId = sourceAllFolders ? undefined : input.sourceFolderId?.trim() || source.defaultFolderId;
   const sourceFolderPath = sourceAllFolders ? undefined : input.sourceFolderPath?.trim() || source.defaultFolderPath;
@@ -4737,7 +4786,13 @@ export async function buildMigrationPlan(input: {
     : [];
   const hintKeys = new Set(sourceDocumentHints.flatMap((document) => [document.id, document.identifier]).filter(Boolean));
   const hintsCoverSelection = sourceDocumentIds.length > 0 && sourceDocumentIds.every((documentId) => hintKeys.has(documentId));
-  const sourceDocs = hintsCoverSelection
+  const trustedDocuments = sourceDocumentIds.map((id) => evidenceContext.sourceDocuments?.get(id)
+    || [...(evidenceContext.sourceDocuments?.values() || [])].find((document) => document.id === id || document.identifier === id));
+  const trustedDocumentsCoverSelection = sourceDocumentIds.length > 0 && trustedDocuments.every((document) => document
+    && (evidenceContext.sourceDocumentStates?.has(document.identifier) || evidenceContext.sourceDocumentStates?.has(document.id)));
+  const sourceDocs = trustedDocumentsCoverSelection
+    ? [...new Map((trustedDocuments as OmniDocumentRecord[]).map((document) => [document.identifier, document])).values()]
+    : hintsCoverSelection
     ? sourceDocumentHints as OmniDocumentRecord[]
     : await cachedPreviewRead(
       `source-documents:${JSON.stringify({ sourceFolderId, sourceFolderPath })}`,
@@ -4762,6 +4817,10 @@ export async function buildMigrationPlan(input: {
   const sourceQueryViewUniverseCache = new Map<string, Promise<QueryViewCatalogResult>>();
   const sourceQueryViewCatalogCache = new Map<string, Promise<OmniModelQueryViewRecord[]>>();
   const sourceModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
+  const sourceAuthoredYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
+  const sourceWorkbookYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
+  const sourceDocumentStateCache = new Map<string, Promise<Record<string, unknown>>>();
+  const sourceEvidenceCache = new Map<string, Promise<DashboardSourceEvidence>>();
   const targetModelYamlFilesCache = new Map<string, Promise<Record<string, string>>>();
   const targetUserAttributeCache = new Map<string, Promise<{
     names: string[];
@@ -4840,13 +4899,12 @@ export async function buildMigrationPlan(input: {
     return next;
   }
 
-  function sourceTopicCatalog(modelId: string) {
+  function originalSourceTopicCatalog(modelId: string) {
     const cached = sourceTopicCatalogCache.get(modelId);
     if (cached) return cached;
-    const next = cachedPreviewRead(
-      `source-topics:${modelId}`,
-      () => sourceClient.listModelTopics(modelId, { includeYaml: true, includeChecksums: true }),
-    );
+    // listModelTopics is a projection of authored model YAML. Reuse that exact
+    // representation; resolved/inherited YAML remains a separate cache.
+    const next = sourceAuthoredYamlFiles(modelId).then((files) => topicsFromModelYamlFiles(files));
     sourceTopicCatalogCache.set(modelId, next);
     return next;
   }
@@ -4867,10 +4925,7 @@ export async function buildMigrationPlan(input: {
     if (cached) return cached;
     const next = (async (): Promise<QueryViewCatalogResult> => {
       try {
-        const files = await cachedPreviewRead(
-          `source-model-yaml-files:${modelId}`,
-          () => sourceClient.getModelYamlFiles(modelId),
-        );
+        const files = await sourceModelYamlFiles(modelId);
         return { queryViews: queryViewsFromModelYamlFiles(files) };
       } catch (error) {
         return {
@@ -4886,10 +4941,7 @@ export async function buildMigrationPlan(input: {
   function sourceQueryViewCatalog(modelId: string) {
     const cached = sourceQueryViewCatalogCache.get(modelId);
     if (cached) return cached;
-    const next = cachedPreviewRead(
-      `source-query-views:${modelId}`,
-      () => sourceClient.listModelQueryViews(modelId, { includeYaml: true, includeChecksums: true }),
-    );
+    const next = sourceAuthoredYamlFiles(modelId).then(queryViewsFromModelYamlFiles);
     sourceQueryViewCatalogCache.set(modelId, next);
     return next;
   }
@@ -4899,6 +4951,38 @@ export async function buildMigrationPlan(input: {
     if (cached) return cached;
     const next = cachedPreviewRead(`source-model-yaml-files:${modelId}`, () => sourceClient.getModelYamlFiles(modelId));
     sourceModelYamlFilesCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceAuthoredYamlFiles(modelId: string) {
+    const cached = sourceAuthoredYamlFilesCache.get(modelId);
+    if (cached) return cached;
+    const next = evidenceContext.loadSourceYaml?.(modelId, { fullyResolved: false }) || cachedPreviewRead(`source-authored-yaml-files:${modelId}`, async () => (
+      await sourceClient.getModelYaml(modelId, { fullyResolved: false, includeChecksums: true })
+    ).files);
+    sourceAuthoredYamlFilesCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceWorkbookYamlFiles(modelId: string) {
+    const cached = sourceWorkbookYamlFilesCache.get(modelId);
+    if (cached) return cached;
+    const next = evidenceContext.loadSourceYaml?.(modelId, { fullyResolved: false, mode: 'extension' }) || cachedPreviewRead(`source-workbook-extension:${modelId}`, async () => (
+      await sourceClient.getModelYaml(modelId, { fullyResolved: false, mode: 'extension', includeChecksums: true })
+    ).files);
+    sourceWorkbookYamlFilesCache.set(modelId, next);
+    return next;
+  }
+
+  function sourceDocumentState(document: OmniDocumentRecord) {
+    const trusted = evidenceContext.sourceDocumentStates?.get(document.identifier)
+      || evidenceContext.sourceDocumentStates?.get(document.id);
+    if (trusted) return Promise.resolve(trusted);
+    const cached = sourceDocumentStateCache.get(document.identifier);
+    if (cached) return cached;
+    // A planner-local read, not preview-cache or request-body provenance.
+    const next = sourceClient.getDocumentStateV2(document.identifier, evidenceContext.signal);
+    sourceDocumentStateCache.set(document.identifier, next);
     return next;
   }
 
@@ -5170,8 +5254,15 @@ export async function buildMigrationPlan(input: {
     const selectedNames = new Set(groupSelected.map((doc) => doc.name).filter(Boolean));
 
     for (const target of routeGroup.targets) {
+    const sourceTopicCatalog = async (modelId: string) => {
+      const original = await originalSourceTopicCatalog(modelId);
+      const reviewed = (evidenceContext.reconstructedTopics?.[target.id] || []).filter((row) => row.sourceModelId === modelId);
+      return [...original, ...reviewed.map((row) => ({ name: row.sourceTopicName,
+        fileName: row.sourceFileName, yaml: row.yaml }))];
+    };
     const destination = requireInstance(target.destinationInstanceId);
-    const destinationClient = new OmniClient(destination);
+    evidenceContext.signal?.throwIfAborted();
+    const destinationClient = new OmniClient(destination, { signal: evidenceContext.signal });
     const cleanupNotices: string[] = [];
     const cleanupFolderPath = target.targetFolderPath || destination.defaultFolderPath;
     const cleanupCanBeScoped = folderScopeAvailable(target.targetFolderId, cleanupFolderPath);
@@ -5207,10 +5298,13 @@ export async function buildMigrationPlan(input: {
       target.targetModelId,
       () => targetModelYamlFiles(destination, destinationClient, target.targetModelId),
     );
-    let targetYamlSnapshot: OmniModelYamlResponse | null = null;
+    let targetYamlSnapshot: Promise<OmniModelYamlResponse> | null = null;
+    const reuseDestinationSnapshot = Boolean(input.prepareDependencyPatchCandidates && evidenceContext.loadDestinationYaml);
     async function loadTargetYamlSnapshot(): Promise<OmniModelYamlResponse> {
       if (targetYamlSnapshot) return targetYamlSnapshot;
-      targetYamlSnapshot = await cachedInstanceRead(
+      targetYamlSnapshot = reuseDestinationSnapshot
+        ? evidenceContext.loadDestinationYaml!(destination.id, target.targetModelId)
+        : cachedInstanceRead(
         destination.id,
         `target-model-yaml:${target.targetModelId}:checksums`,
         () => destinationClient.getModelYaml(target.targetModelId, { includeChecksums: true }),
@@ -5247,6 +5341,11 @@ export async function buildMigrationPlan(input: {
 
 	    async function loadTargetTopicsForPreflight(): Promise<Array<{ name: string; label?: string; yaml?: string; fileName?: string; checksum?: string }>> {
 	      if (targetTopics) return targetTopics;
+	      if (reuseDestinationSnapshot) {
+            const snapshot = await loadTargetYamlSnapshot();
+            targetTopics = topicsFromModelYamlFiles(snapshot.files, snapshot.checksums);
+            return targetTopics;
+          }
 	      targetTopics = await cachedInstanceRead(
 	        destination.id,
 	        `target-topics:${target.targetModelId}`,
@@ -5257,6 +5356,13 @@ export async function buildMigrationPlan(input: {
 
     async function loadTargetQueryViewsForPreflight(): Promise<OmniModelQueryViewRecord[]> {
       if (targetQueryViews) return targetQueryViews;
+      if (reuseDestinationSnapshot) {
+        const snapshot = await loadTargetYamlSnapshot();
+        targetQueryViews = queryViewsFromModelYamlFiles(snapshot.files).map((view) => ({ ...view,
+          ...(view.fileName && snapshot.checksums?.[view.fileName] ? { checksum: snapshot.checksums[view.fileName] } : {}),
+        }));
+        return targetQueryViews;
+      }
       targetQueryViews = await cachedInstanceRead(
         destination.id,
         `target-query-views:${target.targetModelId}`,
@@ -5361,6 +5467,9 @@ export async function buildMigrationPlan(input: {
       let relationshipEdges: RelationshipEdgeReference[] = [];
       let existingRelationshipEdges: RelationshipEdgeReference[] = [];
       let sourceModelId: string | undefined;
+      let sourceEvidence: DashboardSourceEvidence | undefined;
+      let sourceProvenanceUnavailable = false;
+      const dependencyProposalsWithheld: MigrationDependencyProposalWithheld[] = [];
       let unresolvedMissingFields: string[] = [];
       let semanticPatches: MigrationSemanticPatch[] = [];
       let permissionDependencies: MigrationPermissionDependency[] = [];
@@ -5407,6 +5516,32 @@ export async function buildMigrationPlan(input: {
           exportCache.set(doc.identifier, payload);
         }
         sourceModelId = doc.baseModelId || extractDashboardModelId(payload);
+        try {
+          const rawState = await sourceDocumentState(doc);
+          const state = isRecord(rawState.document) ? rawState.document : isRecord(rawState.state) ? rawState.state : rawState;
+          if (typeof state.modelId !== 'string' || !state.modelId.trim()) throw new Error('Shared model binding unavailable.');
+          if (typeof state.workbookModelId !== 'string' || !state.workbookModelId.trim()) throw new Error('Workbook model binding unavailable.');
+          sourceModelId = state.modelId.trim();
+          const workbookModelId = state.workbookModelId.trim();
+          let evidence = sourceEvidenceCache.get(doc.identifier);
+          if (!evidence) {
+            evidence = readDashboardSourceEvidence({
+              sharedModelId: sourceModelId,
+              workbookModelId,
+              references: refs,
+              states: [state],
+              loadYaml: (modelId, options) => options.mode === 'extension'
+                ? sourceWorkbookYamlFiles(modelId)
+                : sourceAuthoredYamlFiles(modelId),
+            });
+            sourceEvidenceCache.set(doc.identifier, evidence);
+          }
+          sourceEvidence = await evidence;
+          refs = [...new Set([...refs, ...sourceEvidence.fields.map((field) => field.reference)])];
+        } catch {
+          sourceProvenanceUnavailable = true;
+          fieldBlockers.push('Published source-model provenance could not be verified; shared-model changes are blocked.');
+        }
         const sameTargetModel = Boolean(sourceModelId && sourceModelId === target.targetModelId);
         let missingFields: string[] = [];
         if (!sameTargetModel && refs.length === 0) {
@@ -5450,10 +5585,20 @@ export async function buildMigrationPlan(input: {
                 queryViewWarnings.push(`Target model ${target.targetModelName || target.targetModelId} is git configured; created query-view YAML may require Omni-side review after import.`);
               }
             }
-            if (sourceModelId && resolvedQueryViewMappings.length > 0) {
+            const queryViewPatchMappings = [...resolvedQueryViewMappings];
+            if (input.prepareDependencyPatchCandidates) {
+              const candidates = dashboardSafeCopyDependencyPatchCandidates({
+                queryViews: requiredQueryViews,
+                configuredQueryViewMappings: target.queryViewMappings || [],
+              });
+              queryViewPatchMappings.push(...candidates.queryViewMappings.filter((mapping) => (
+                !mappingForSourceQueryView({ name: mapping.sourceQueryViewName }, queryViewPatchMappings)
+              )));
+            }
+            if (sourceModelId && queryViewPatchMappings.length > 0) {
               try {
                 sourceQueryViewRows = await sourceQueryViewCatalog(sourceModelId);
-                const queryViewPatches = resolvedQueryViewMappings
+                const queryViewPatches = queryViewPatchMappings
                   .map((mapping) => semanticPatchForQueryViewMapping({
                     mapping,
                     sourceQueryViews: sourceQueryViewRows,
@@ -5545,7 +5690,11 @@ export async function buildMigrationPlan(input: {
             if (!sourceModelId) {
               fieldBlockers.push(`Cannot inspect source field definitions for ${doc.name} because the source model ID could not be detected.`);
             } else {
-              sourceDefinitions = fieldDefinitionIndex(await sourceModelYamlFiles(sourceModelId));
+              // Runtime/inherited definitions can inform compatibility, but
+              // readiness proposals must retain an authored source definition.
+              sourceDefinitions = fieldDefinitionIndex(await (input.prepareDependencyPatchCandidates
+                ? sourceAuthoredYamlFiles(sourceModelId)
+                : sourceModelYamlFiles(sourceModelId)));
               if (sourceQueryViewRows.length === 0) {
                 sourceQueryViewRows = await sourceQueryViewCatalog(sourceModelId);
               }
@@ -5577,10 +5726,18 @@ export async function buildMigrationPlan(input: {
           if (fieldPreflight.ignoredFieldRefs.length > 0) {
             compatibilityWarnings.push(`${fieldPreflight.ignoredFieldRefs.length} referenced field${fieldPreflight.ignoredFieldRefs.length === 1 ? '' : 's'} will be ignored by user choice: ${formatFieldList(fieldPreflight.ignoredFieldRefs)}.`);
           }
-          if (resolvedFieldMappings.length > 0) {
+          const fieldPatchMappings = [...resolvedFieldMappings];
+          if (input.prepareDependencyPatchCandidates) {
+            const candidates = dashboardSafeCopyDependencyPatchCandidates({ fieldDependencies });
+            fieldPatchMappings.push(...candidates.fieldMappings.filter((mapping) => (
+              !mappingForSourceField(mapping.sourceFieldRef, target.fieldMappings || [])
+              && !mappingForSourceField(mapping.sourceFieldRef, fieldPatchMappings)
+            )));
+          }
+          if (fieldPatchMappings.length > 0) {
             try {
               const targetYaml = await loadTargetYamlSnapshot();
-              semanticPatches.push(...resolvedFieldMappings
+              semanticPatches.push(...fieldPatchMappings
                 .map((mapping) => semanticPatchForFieldMapping({
                   mapping,
                   sourceDefinitions,
@@ -5640,6 +5797,33 @@ export async function buildMigrationPlan(input: {
             topicBlockers.push(`Target topic catalog could not be loaded: ${error instanceof Error ? error.message : String(error)}.`);
           }
           for (const topic of sourceTopics) {
+            // Resolve source identity before destination choices. Otherwise an
+            // unmapped topic loses a known authored filename at the early exit.
+            let exactAuthoredTopic = false;
+            if (sourceModelId) {
+              try {
+                const identity = (value: string) => value.normalize('NFKC').trim().toLowerCase();
+                const sourceKeys = new Set([topic.name, topic.id].filter((value): value is string => Boolean(value)).map(identity));
+                const exactTopics = (await sourceTopicCatalog(sourceModelId)).filter((candidate) => {
+                  if (!candidate.fileName?.endsWith('.topic')) return false;
+                  const stem = identity(candidate.fileName.replace(/\.topic$/, ''));
+                  const leaf = stem.split('/').pop()!;
+                  return (sourceKeys.has(stem) || sourceKeys.has(leaf))
+                    && identity(candidate.name) === leaf
+                    && (!topic.fileName || identity(topic.fileName) === identity(candidate.fileName));
+                });
+                if (exactTopics.length === 1) {
+                  topic.fileName = exactTopics[0].fileName;
+                  exactAuthoredTopic = true;
+                }
+              } catch {
+                topicWarnings.push(`Authored source topic identity could not be verified for ${topic.name}.`);
+              }
+            }
+            if (!exactAuthoredTopic) {
+              topicBlockers.push(`One exact authored source topic file is required for ${topic.name}; labels alone cannot establish source identity.`);
+              continue;
+            }
             const explicitMapping = mappingForSourceTopic(topic, target.topicMappings || []);
             const exact = exactTargetTopic(topic, targetTopicRows);
             const mapping = explicitMapping || (exact ? {
@@ -6162,6 +6346,61 @@ export async function buildMigrationPlan(input: {
       } catch (error) {
         compatibilityWarnings.push(`Compatibility preflight could not inspect ${doc.name}: ${error instanceof Error ? error.message : String(error)}.`);
       }
+      const blockedSourceFields = sourceEvidence?.fields.filter((field) => !field.sharedWriteAllowed) || [];
+      if (sourceProvenanceUnavailable || sourceEvidence?.unverified || blockedSourceFields.length > 0) {
+        // No authored workbook definition or override may become a shared-model
+        // field/query-view/alias proposal, even when a target field already exists.
+        const blockedRefs = new Set(blockedSourceFields.map((field) => field.reference.toLowerCase()));
+        fieldDependencies = fieldDependencies.filter((field) => !blockedRefs.has(field.sourceFieldRef.toLowerCase()));
+        for (const field of blockedSourceFields) {
+          const local = field.provenance === 'workbook_local' || field.provenance === 'workbook_override';
+          const reason = local
+            ? 'This workbook-local field or override must be preserved in the workbook; shared-model repair is not authorized.'
+            : sourceEvidence?.findings.find((finding) => finding.reference === field.reference)?.message
+              || 'The full authored source dependency closure could not authorize a shared-model repair.';
+          const parts = fieldRefParts(field.reference);
+          fieldDependencies.push({
+            sourceFieldRef: field.reference,
+            sourceViewName: parts.viewName,
+            sourceFieldName: parts.fieldName,
+            sourceFileName: field.sourceFileName,
+            sourceProvenance: field.provenance,
+            sourceDocumentId: doc.identifier,
+            fieldKind: 'unknown',
+            status: 'blocked',
+            reason,
+            targetCandidates: [],
+          });
+          fieldBlockers.push(`${field.reference}: ${reason}`);
+        }
+        if (sourceEvidence?.unverified) fieldBlockers.push('Workbook/source evidence requires explicit review before shared-model changes.');
+        const unsafeWholeSource = sourceProvenanceUnavailable || sourceEvidence?.findings.some((finding) => (
+          ['shared_model', 'workbook_model', 'source_binding', 'source_references', 'workbook_overlay'].includes(finding.reference)
+        ));
+        const blockedViews = new Set(blockedSourceFields.map((field) => fieldRefParts(field.reference).viewName.toLowerCase()));
+        const withheldReason = unsafeWholeSource
+          ? 'Authored source/workbook prerequisites must be resolved before shared-model proposals can be prepared.'
+          : 'Workbook-local or unverified source dependencies cannot authorize shared-model proposals.';
+        const withhold = (artifact: MigrationDependencyProposalWithheld['artifact'], reference: string) => dependencyProposalsWithheld.push({ artifact, reference, reason: withheldReason, sourceDocumentId: doc.identifier });
+        for (const field of fieldDependencies) if (unsafeWholeSource) withhold('field', field.sourceFieldRef);
+        for (const queryView of requiredQueryViews) if (queryView.status === 'missing_copyable' && (unsafeWholeSource || blockedViews.has(queryView.name.toLowerCase()))) withhold('query_view', queryView.name);
+        if (unsafeWholeSource) {
+          for (const topic of sourceTopics) withhold('topic', topic.name);
+          if (relationshipEdges.length) withhold('relationship', 'relationship');
+        }
+        semanticPatches = unsafeWholeSource ? [] : semanticPatches.filter((patch) => (
+          patch.artifactType === 'field' ? !blockedRefs.has((patch.sourceName || '').toLowerCase())
+            : patch.artifactType === 'query_view' ? !blockedViews.has((patch.sourceName || '').toLowerCase()) : true
+        ));
+        resolvedFieldMappings = unsafeWholeSource ? [] : resolvedFieldMappings.filter((mapping) => !blockedRefs.has(mapping.sourceFieldRef.toLowerCase()));
+        resolvedQueryViewMappings = unsafeWholeSource ? [] : resolvedQueryViewMappings.filter((mapping) => !blockedViews.has(mapping.sourceQueryViewName.toLowerCase()));
+        if (unsafeWholeSource) resolvedTopicMappings = [];
+      }
+      const sourceFieldEvidence = new Map(sourceEvidence?.fields.map((field) => [field.reference.toLowerCase(), field]));
+      fieldDependencies = fieldDependencies.map((field) => {
+        const provenance = sourceFieldEvidence.get(field.sourceFieldRef.toLowerCase())?.provenance;
+        return { ...field, sourceDocumentId: doc.identifier, ...(provenance ? { sourceProvenance: provenance } : {}) };
+      });
       compatibilityWarnings = [...new Set(compatibilityWarnings)];
       compatibilityNotices = [...new Set(compatibilityNotices)];
       queryViewWarnings = [...new Set(queryViewWarnings)];
@@ -6181,6 +6420,7 @@ export async function buildMigrationPlan(input: {
         .filter((patch) => patch.resolution !== 'keep_target' && (patch.status === 'blocked' || patch.safetyCategory === 'blocked'))
         .map((patch) => `${semanticPatchArtifactLabel(patch.artifactType)} ${patch.sourceName || patch.targetFileName} needs resolution before dashboard import.`);
       const semanticDetails: Record<string, unknown> = {};
+      if (dependencyProposalsWithheld.length) semanticDetails.dependencyProposalsWithheld = dependencyProposalsWithheld;
       if (sourceModelId) semanticDetails.sourceModelId = sourceModelId;
       if (requiredQueryViews.length > 0) semanticDetails.requiredQueryViews = requiredQueryViews;
       if (resolvedQueryViewMappings.length > 0) semanticDetails.queryViewMappings = resolvedQueryViewMappings;
@@ -6577,6 +6817,7 @@ export async function buildMigrationPlan(input: {
     }
   }
 
+  evidenceContext.signal?.throwIfAborted();
   return {
     sourceId: input.sourceId,
     sourceLabel: source.label,
@@ -7418,6 +7659,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
       targetId: target.id,
       targetLabel: input.targetLabel || target.label,
       modelCount: input.models.length,
+      ...(input.dashboardRepair ? { dashboardRepair: input.dashboardRepair } : {}),
       dashboardCount: input.content.filter((row) => row.kind === 'dashboard').length,
       workbookCount: input.content.filter((row) => row.kind === 'workbook').length,
       mergeAfterValidation: false,
@@ -7425,6 +7667,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
         sourceId: input.sourceId,
         targetId: input.targetId,
         targetLabel: input.targetLabel,
+        ...(input.dashboardRepair ? { dashboardRepair: input.dashboardRepair } : {}),
         models: input.models,
         content: input.content,
         replaceSameNamed: false,
@@ -7601,6 +7844,8 @@ export async function retryMigrationJob(id: string, options: { destinationId?: s
     }
     return createModelMigrationJob({
       ...input,
+      // Older stored retry inputs may predate this field. Never lose the review guard on retry.
+      ...(parent.details?.dashboardRepair ? { dashboardRepair: parent.details.dashboardRepair as ModelMigrationJobInput['dashboardRepair'] } : {}),
       models: retryModels.length > 0 ? retryModels : input.models.filter((model) => retryContent.some((content) => content.targetModelId === model.targetModelId)),
       content: retryContent,
       parentJobId: parent.id,
@@ -7694,6 +7939,32 @@ function branchNameForModel(job: MigrationJob, model: ModelMigrationModelInput):
   return detailString(branchItem?.details, 'branchName') || model.branchName;
 }
 
+/** Full asynchronous repair proof remains upstream; this closes the final transport wait gap. */
+function modelMigrationTargetClient(job: MigrationJob, target: SavedInstance, targetModelIds: string[]): OmniClient {
+  const repair = job.details?.dashboardRepair as ModelMigrationJobInput['dashboardRepair'];
+  if (!repair) return new OmniClient(target);
+  const expectedBoundary = repair.instanceBoundaryHash;
+  const sourceModelIds = Object.keys(repair.sourceModelHashes || {}).sort();
+  return new OmniClient(target, { writeGuard: { assertCanDispatch() {
+    const current = getJob(job.id);
+    const currentRepair = current?.details?.dashboardRepair as ModelMigrationJobInput['dashboardRepair'];
+    if (!current || current.status !== 'running' || canceledJobs.has(job.id)) {
+      throw new Error('The dashboard repair is no longer running; no further write is authorized.');
+    }
+    if (!expectedBoundary || !sourceModelIds.length || !targetModelIds.length
+      || current.sourceId !== job.sourceId || current.destinationIds.length !== 1 || current.destinationIds[0] !== target.id
+      || !currentRepair || currentRepair.instanceBoundaryHash !== expectedBoundary
+      || JSON.stringify(Object.keys(currentRepair.sourceModelHashes || {}).sort()) !== JSON.stringify(sourceModelIds)) {
+      throw new Error('The saved dashboard repair authority is missing or changed. Prepare a fresh review.');
+    }
+    for (const modelId of targetModelIds) {
+      if (dashboardRepairInstanceBoundaryHash(job.sourceId, target.id, modelId, sourceModelIds) !== expectedBoundary) {
+        throw new Error('A saved instance changed after repair approval. No further write is authorized.');
+      }
+    }
+  } } });
+}
+
 export async function mergeModelMigrationJob(id: string, options: { publishDrafts?: boolean; deleteBranch?: boolean } = {}): Promise<MigrationJob> {
   const job = getJob(id);
   if (!job) throw new Error('Job not found.');
@@ -7728,7 +7999,7 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
   let mutationLeaseIds: ReadonlySet<string> = new Set();
   try {
   mutationLeaseIds = beginDestinationModelMutation(job, mergeScopes, 'model_merge');
-  const targetClient = new OmniClient(target);
+  const targetClient = modelMigrationTargetClient(job, target, input.models.map((model) => model.targetModelId));
   job.status = 'running';
   job.endedAt = undefined;
   persistJobStatus(job);
@@ -7760,6 +8031,14 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
     job.items.push(item);
     persistItem(item);
     try {
+      if (job.details?.dashboardRepair) {
+        if (options.publishDrafts === true || options.deleteBranch === true) throw new Error('Additive dashboard repair does not publish dashboards or delete branches.');
+        const reviewedBranch = await targetClient.findModelBranch(model.targetModelId, branchName);
+        if (!reviewedBranch?.id) throw new Error('The approved working branch is unavailable.');
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId,
+          new OmniClient(requireModelMigrationInstance(input.sourceId, 'source')), targetClient,
+          { branchId: reviewedBranch.id, beforeMerge: true });
+      }
       if (requiresPr) {
         const branch = await targetClient.findModelBranch(model.targetModelId, branchName);
         if (!branch?.id) throw new Error('Target branch was not found for pull request creation.');
@@ -7777,7 +8056,7 @@ export async function mergeModelMigrationJob(id: string, options: { publishDraft
       dispatchDestinationModelMutationForItem(item);
       await targetClient.mergeModelBranch(model.targetModelId, branchName, {
         publishDrafts: options.publishDrafts === true,
-        deleteBranch: options.deleteBranch !== false,
+        deleteBranch: job.details?.dashboardRepair ? false : options.deleteBranch !== false,
         forceOverrideGitSettings: false,
       });
       if (options.publishDrafts === true) invalidateDocumentInventory(target.id);
@@ -7955,7 +8234,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
   const input = modelMigrationInputFromJob(job);
   assertNoUnresolvedSafeCopyModelOverlap(target.id, input.models.map((model) => model.targetModelId));
   const sourceClient = new OmniClient(source);
-  const targetClient = new OmniClient(target);
+  const targetClient = modelMigrationTargetClient(job, target, input.models.map((model) => model.targetModelId));
   const branchByTargetModel = new Map<string, { branchId: string; branchName: string }>();
   const targetYamlByModel = new Map<string, Record<string, string>>();
   const workbookQueries = new Map<string, Array<{ id: string; name: string; query: Record<string, unknown>; visConfig?: Record<string, unknown>; description?: string }>>();
@@ -8085,6 +8364,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
           markAndPersistItem(item, 'succeeded');
         }
       } else if (item.kind === 'model_branch_create') {
+        await assertAdditiveDashboardRepairDispatch(job, targetModelId, sourceClient, targetClient);
         dispatchDestinationModelMutationForItem(item);
         const branch = await targetClient.createModelBranch({
           connectionId: detailString(details, 'targetConnectionId'),
@@ -8097,6 +8377,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         const branch = branchByTargetModel.get(targetModelId);
         if (!branch?.branchId) throw new Error('Target branch was not created before YAML write.');
         const files = detailFiles(details);
+        await assertAdditiveDashboardRepairDispatch(job, targetModelId, sourceClient, targetClient, { branchId: branch.branchId });
         dispatchDestinationModelMutationForItem(item);
         await targetClient.updateModelYamlFiles({
           modelId: targetModelId,

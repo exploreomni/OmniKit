@@ -386,7 +386,7 @@ test('reload resumes a server-owned job without restoring migration scope from b
     destinations: [{ instanceId: 'must-not-return' }],
   }));
 
-  assert.equal(recovered.step, 2);
+  assert.equal(recovered.step, 3);
   assert.equal(recovered.jobId, JOB_ID);
   assert.equal(recovered.sourceId, '');
   assert.equal(recovered.sourceConnectionId, '');
@@ -554,6 +554,8 @@ test('Choose another model replans only one failed target and never recopies suc
     instanceId: 'destination-c',
     connectionId: 'connection-c',
     modelId: '',
+    folderId: '',
+    folderPath: '',
     requiresModelChoice: true,
   }]);
 

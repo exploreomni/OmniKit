@@ -5,6 +5,8 @@ import {
   DashboardSafeCopyError,
   dashboardSafeCopyCanonicalJson,
   parseDashboardSafeCopyIntent,
+  parseDashboardDeploymentPlanIntent,
+  scopeDashboardSafeCopyIntent,
 } from '../shared/dashboardSafeCopyContract';
 import { dashboardSafeCopyIntentHash } from '../server/services/dashboardSafeCopyJobs';
 
@@ -177,4 +179,39 @@ test('safe-copy contract accepts 1,000 copy cells and rejects the exact 1,001-ce
 
   assert.equal(parseDashboardSafeCopyIntent(matrixIntent(500, 2)).source.documentIds.length, 500);
   expectCode(() => parseDashboardSafeCopyIntent(matrixIntent(143, 7)), 'SAFE_COPY_LIMIT_EXCEEDED');
+});
+
+test('v2 deployment permits distinct folders on one model and requires exact immutable evidence', () => {
+  const input = intent();
+  input.destinations = [
+    { ...input.destinations[0], targetId: 'folder-a', folderPath: 'Shared/A' },
+    { ...input.destinations[0], targetId: 'folder-b', folderPath: 'Shared/B' },
+  ];
+  const deployment = {
+    version: 2,
+    planId: 'approved-plan',
+    sourceHashes: { 'dashboard-a': 'a'.repeat(64), 'dashboard-b': 'b'.repeat(64) },
+    modelHashes: { 'folder-a': 'c'.repeat(64), 'folder-b': 'c'.repeat(64) },
+  };
+  assert.equal(parseDashboardDeploymentPlanIntent(input).destinations.length, 2);
+  expectCode(() => parseDashboardDeploymentPlanIntent({ ...input, deployment }), 'SAFE_COPY_INVALID_DEPLOYMENT');
+  const parsed = parseDashboardSafeCopyIntent({ ...input, deployment });
+  assert.equal(parsed.destinations.length, 2);
+  assert.deepEqual(parsed.deployment, deployment);
+  assert.equal(parseDashboardSafeCopyIntent(scopeDashboardSafeCopyIntent(parsed, new Set(['folder-b']))).destinations.length, 1);
+  expectCode(() => parseDashboardSafeCopyIntent({
+    ...input, deployment: { ...deployment, sourceHashes: {} },
+  }), 'SAFE_COPY_INVALID_DEPLOYMENT');
+  expectCode(() => parseDashboardSafeCopyIntent({
+    ...input, deployment, options: { deleteSourceOnSuccess: true },
+  }), 'SAFE_COPY_UNSUPPORTED_OPTIONS');
+  expectCode(() => parseDashboardSafeCopyIntent({
+    ...input, deployment, options: { unexpected: false },
+  }), 'SAFE_COPY_UNSUPPORTED_OPTIONS');
+  assert.notEqual(dashboardSafeCopyIntentHash(parsed), dashboardSafeCopyIntentHash({
+    ...parsed, deployment: { ...parsed.deployment!, planId: 'different-plan' },
+  }));
+  assert.notEqual(dashboardSafeCopyCanonicalJson(parsed), dashboardSafeCopyCanonicalJson({
+    ...parsed, deployment: { ...parsed.deployment!, modelHashes: { ...deployment.modelHashes, 'folder-b': 'd'.repeat(64) } },
+  }));
 });

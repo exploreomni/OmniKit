@@ -31,6 +31,7 @@ import {
 import {
   createDashboardSafeCopyRuntimeAdapterForTests,
   dashboardSafeCopyIntentFromJob,
+  dashboardSafeCopyStateHash,
   retryDashboardSafeCopyJobTarget,
   runDashboardSafeCopyJob,
   withDashboardSafeCopyClientEvidence,
@@ -58,6 +59,9 @@ import {
 } from '../server/services/migrationJobs';
 import {
   OmniClientError,
+  OmniClient,
+  acquireOmniRequestSlot,
+  resetOmniClientRateLimitStateForTests,
   type OmniDocumentAccessPrincipal,
   type OmniDocumentRecord,
   type OmniFolderRecord,
@@ -138,6 +142,9 @@ function migrationTarget(row: DashboardSafeCopyIntent['destinations'][number]): 
     targetModelId: row.modelId,
     ...(row.folderId ? { targetFolderId: row.folderId } : {}),
     ...(row.folderPath ? { targetFolderPath: row.folderPath } : {}),
+    ...(row.topicMappings ? { topicMappings: row.topicMappings } : {}),
+    ...(row.queryViewMappings ? { queryViewMappings: row.queryViewMappings } : {}),
+    ...(row.workbookCopy ? { workbookCopy: { ...row.workbookCopy } } : {}),
   };
 }
 
@@ -233,6 +240,7 @@ function safeCopyJob(safeIntent: DashboardSafeCopyIntent): MigrationJob {
       safeCopyRequestId: safeIntent.requestId,
       safeCopyIntentHash: dashboardSafeCopyIntentHash(safeIntent),
       safeCopyPreparationState: 'prepared',
+      ...(safeIntent.deployment ? { safeCopyDeployment: safeIntent.deployment } : {}),
     },
     items: targets.map((target) => {
       const prepared = preparedTarget(safeIntent, target);
@@ -308,6 +316,7 @@ function sourceDashboard(): Record<string, unknown> {
     name: 'Safe copy example',
     description: 'Content-only dashboard copy.',
     modelId: 'source-model',
+    workbookModelId: 'source-workbook-model',
     queryPresentations: {
       data: {
         '1': {
@@ -357,6 +366,10 @@ interface ClientHarness {
   legacyQueries?: unknown;
   runQueryCalls?: Array<Record<string, unknown>>;
   runQuerySummary?: unknown;
+  modelFiles?: Record<string, string>;
+  sourceModelFiles?: Record<string, string>;
+  sourceWorkbookFiles?: Record<string, string>;
+  sourceWorkbookReadError?: Error;
 }
 
 function runtimeServices(
@@ -420,8 +433,14 @@ function runtimeServices(
         rowCount: 1,
       }) as OmniQueryExecutionSummary;
     },
-    async getModelYaml() {
-      return { files: {}, checksums: {}, raw: {} };
+    async getModelYaml(_modelId, options) {
+      if (instance.id === SOURCE_ID && options?.mode === 'extension') {
+        if (harness.sourceWorkbookReadError) throw harness.sourceWorkbookReadError;
+        assert.equal(options.fullyResolved, false);
+        assert.ok(options.signal, 'workbook evidence reads must have a bounded abort signal');
+        return { files: harness.sourceWorkbookFiles || {}, checksums: {}, raw: {} };
+      }
+      return { files: (instance.id === SOURCE_ID ? harness.sourceModelFiles : harness.modelFiles) || {}, checksums: {}, raw: {} };
     },
     async updateModelYamlFile() {
       harness.semanticWriteCalls = (harness.semanticWriteCalls || 0) + 1;
@@ -457,6 +476,64 @@ function runtimeServices(
     ...overrides,
   };
 }
+
+test('frozen jobs cannot bypass workbook safety through missing evidence, missing identity, or unreadable extension', async () => {
+  for (const scenario of ['authored', 'missing-identity', 'unreadable'] as const) {
+    const safeIntent = intent();
+    const job = safeCopyJob(safeIntent);
+    insertJob(job);
+    const sourceState = sourceDashboard();
+    if (scenario === 'missing-identity') delete sourceState.workbookModelId;
+    const harness: ClientHarness = {
+      candidateVisible: false, createCalls: 0, sourceDashboard: sourceState,
+      ...(scenario === 'authored' ? { sourceWorkbookFiles: { 'example.view': 'dimensions:\n  local_field:\n    sql: 1' } } : {}),
+      ...(scenario === 'unreadable' ? { sourceWorkbookReadError: new Error('Unavailable authored evidence') } : {}),
+    };
+    let preparationCalls = 0;
+    const result = await runDashboardSafeCopyJob(job.id, safeIntent, runtimeServices(safeIntent, harness, {
+      async prepareJob() { preparationCalls += 1; },
+    }));
+    assert.equal(result.execution?.targets[0].exceptions[0]?.code, 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED');
+    assert.equal(preparationCalls, 0, 'block before any legacy scratch/shared preparation');
+    assert.equal(harness.createCalls, 0);
+    assert.equal(harness.semanticWriteCalls || 0, 0);
+    assert.equal(harness.runQueryCalls?.length || 0, 0, 'do not query local fields against shared model');
+  }
+});
+
+test('content-only fast path remains available when the identified workbook has only empty authored roots', async () => {
+  const safeIntent = intent();
+  const job = safeCopyJob(safeIntent);
+  insertJob(job);
+  const harness: ClientHarness = { candidateVisible: false, createCalls: 0, showCreatedDocumentAfterCreate: true,
+    sourceWorkbookFiles: { model: '# nothing authored', relationships: '{}', 'empty.view': '' } };
+  const result = await runDashboardSafeCopyJob(job.id, safeIntent, runtimeServices(safeIntent, harness));
+  assert.equal(result.execution?.status, 'succeeded');
+  assert.equal(harness.createCalls, 1);
+});
+
+test('workbook routing and extension hashes survive durable job reconstruction without authorizing production copying', async () => {
+  const safeIntent = intent();
+  safeIntent.destinations[0].folderId = 'delivery-folder';
+  safeIntent.destinations[0].workbookCopy = { stagingFolderId: 'staging-folder' };
+  safeIntent.deployment = { version: 2, planId: 'reviewed-workbook-plan',
+    sourceHashes: { [SOURCE_DOCUMENT]: dashboardSafeCopyStateHash(sourceDashboard()) },
+    modelHashes: { B: dashboardSafeCopyStateHash({}) },
+    workbookCopies: { [SOURCE_DOCUMENT]: {
+      sourceSharedModelId: 'source-model', sourceWorkbookModelId: 'source-workbook-model',
+      authoredModelHash: '1'.repeat(64), authoredFileHashes: { 'example.view': '2'.repeat(64) },
+    } },
+  };
+  const job = safeCopyJob(safeIntent);
+  insertJob(job);
+  const reconstructed = dashboardSafeCopyIntentFromJob(getJob(job.id)!);
+  assert.deepEqual(reconstructed.deployment?.workbookCopies, safeIntent.deployment.workbookCopies);
+  assert.deepEqual(reconstructed.destinations[0].workbookCopy, safeIntent.destinations[0].workbookCopy);
+  const harness: ClientHarness = { candidateVisible: false, createCalls: 0 };
+  const result = await runDashboardSafeCopyJob(job.id, safeIntent, runtimeServices(safeIntent, harness));
+  assert.equal(result.execution?.targets[0].exceptions[0]?.code, 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED');
+  assert.equal(harness.createCalls, 0);
+});
 
 async function persistExactVerifiedDocument(
   adapter: Awaited<ReturnType<typeof createDashboardSafeCopyRuntimeAdapterForTests>>,
@@ -935,6 +1012,85 @@ test('runtime re-proves the exact target immediately before each document create
   assert.equal(harness.createCalls, 1);
 });
 
+test('approved deployment evidence and explicit mappings survive persisted request reconstruction', () => {
+  const safeIntent = intent();
+  safeIntent.destinations[0].topicMappings = [{ sourceTopicName: 'source_topic', action: 'map_existing', targetTopicName: 'target_topic' }];
+  safeIntent.destinations[0].queryViewMappings = [{ sourceQueryViewName: 'source_view', action: 'map_existing', targetQueryViewName: 'target_view' }];
+  safeIntent.deployment = {
+    version: 2, planId: 'reviewed-plan',
+    sourceHashes: { [SOURCE_DOCUMENT]: 'a'.repeat(64) }, modelHashes: { B: 'b'.repeat(64) },
+  };
+  const created = createDashboardSafeCopyJob(safeIntent);
+  assert.deepEqual(dashboardSafeCopyIntentFromJob(getJob(created.job.id)!), safeIntent);
+  assert.equal(createDashboardSafeCopyJob(safeIntent).replayed, true);
+  assert.throws(() => createDashboardSafeCopyJob({
+    ...safeIntent, deployment: { ...safeIntent.deployment!, planId: 'different-plan' },
+  }), (error) => error instanceof DashboardSafeCopyError && error.code === 'SAFE_COPY_IDEMPOTENCY_CONFLICT');
+});
+
+test('snapshot hashing ignores object key order but includes nested content and array order', () => {
+  assert.equal(dashboardSafeCopyStateHash({ b: [{ z: 1, a: 2 }], a: 'x' }), dashboardSafeCopyStateHash({ a: 'x', b: [{ a: 2, z: 1 }] }));
+  assert.notEqual(dashboardSafeCopyStateHash({ data: [1, 2] }), dashboardSafeCopyStateHash({ data: [2, 1] }));
+});
+
+for (const drift of ['source', 'source-model', 'model', 'none'] as const) {
+  test(`v2 deployment rechecks approved source and model snapshots at dispatch: ${drift}`, async () => {
+    const safeIntent = intent();
+    safeIntent.deployment = {
+      version: 2, planId: 'reviewed-plan',
+      sourceHashes: { [SOURCE_DOCUMENT]: dashboardSafeCopyStateHash(sourceDashboard()) },
+      modelHashes: { B: dashboardSafeCopyStateHash({}) },
+      sourceModelHashes: { 'source-model': dashboardSafeCopyStateHash({}) },
+    };
+    const job = safeCopyJob(safeIntent);
+    insertJob(job);
+    const harness: ClientHarness = { candidateVisible: false, showCreatedDocumentAfterCreate: true, createCalls: 0 };
+    let proofCalls = 0;
+    const services = runtimeServices(safeIntent, harness, {
+      async prepareTargets(_scopedIntent, targets) {
+        proofCalls += 1;
+        if (proofCalls === 2) {
+          if (drift === 'source') harness.sourceDashboard = { ...sourceDashboard(), name: 'Changed after approval' };
+          if (drift === 'model') harness.modelFiles = { 'changed.view': 'dimensions: {}' };
+          if (drift === 'source-model') harness.sourceModelFiles = { 'changed.view': 'dimensions: {}' };
+        }
+        return targets.map((target) => preparedTarget(safeIntent, target));
+      },
+    });
+    const result = await runDashboardSafeCopyJob(job.id, safeIntent, services);
+    assert.equal(proofCalls, 2, 'the deployment must reach final pre-dispatch reproof');
+    assert.equal(harness.createCalls, drift === 'none' ? 1 : 0);
+    assert.equal(harness.semanticWriteCalls || 0, 0);
+    if (drift === 'none') assert.equal(result.execution?.status, 'succeeded');
+    else {
+      const expectedCode = drift === 'source' ? 'SOURCE_SNAPSHOT_CHANGED'
+        : drift === 'source-model' ? 'SOURCE_MODEL_SNAPSHOT_CHANGED' : 'MODEL_SNAPSHOT_CHANGED';
+      assert.equal(result.execution?.targets[0].exceptions[0]?.code, expectedCode);
+      assert.equal(result.execution?.targets[0].exceptions[0]?.retryable, false);
+    }
+  });
+}
+
+test('runtime refuses a late create after asynchronous reproof exhausts the dispatch deadline', async () => {
+  const safeIntent = intent();
+  const job = safeCopyJob(safeIntent);
+  insertJob(job);
+  let clock = FIXED_NOW;
+  let proofCalls = 0;
+  const harness: ClientHarness = { candidateVisible: false, createCalls: 0 };
+  await runDashboardSafeCopyJob(job.id, safeIntent, runtimeServices(safeIntent, harness, {
+    now: () => clock,
+    targetDeadlineMs: 1_000,
+    async prepareTargets(_scopedIntent, targets) {
+      proofCalls += 1;
+      if (proofCalls === 2) clock += 1_001;
+      return targets.map((target) => preparedTarget(safeIntent, target));
+    },
+  }));
+  assert.equal(proofCalls, 2);
+  assert.equal(harness.createCalls, 0);
+});
+
 test('bounded pre-write Documents V2 rejection remains safely retryable', async () => {
   const safeIntent = intent();
   const job = safeCopyJob(safeIntent);
@@ -1125,6 +1281,55 @@ test('source and destination role drift fail closed at the actual document write
   );
   assert.equal(harness.createCalls, 0);
 });
+
+for (const mutation of ['deadline', 'canceled', 'credential'] as const) {
+  test(`queued transport rechecks runtime ${mutation} authority before the actual document POST`, async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'], now: FIXED_NOW + 10 });
+    resetOmniClientRateLimitStateForTests();
+    t.after(resetOmniClientRateLimitStateForTests);
+    const safeIntent = intent();
+    const job = safeCopyJob(safeIntent);
+    insertJob(job);
+    const harness: ClientHarness = { candidateVisible: false, createCalls: 0 };
+    const services = runtimeServices(safeIntent, harness, { now: () => Date.now() });
+    let entered = false;
+    const adapter = await createDashboardSafeCopyRuntimeAdapterForTests(job.id, {
+      ...services,
+      createClient(instance) {
+        const base = services.createClient!(instance);
+        const transport = new OmniClient({ ...instance, baseUrl: 'https://93.184.216.34' }, {
+          maxReadRetries: 5, fetchImpl: async () => { harness.createCalls++; return new Response(JSON.stringify({ identifier: 'example-copy' })); },
+        });
+        return { ...base, async createDashboardSafeCopyDocument(input, guard) {
+          assert.ok(guard, 'runtime must forward its fresh authority check to the transport');
+          entered = true;
+          return transport.createDashboardSafeCopyDocument(input, guard);
+        } };
+      },
+    });
+    const target = await adapter.dependencies.reproveTarget(adapter.input.targets[0]);
+    const prepared = await adapter.dependencies.prepareDocument(target, SOURCE_DOCUMENT);
+    const attempt = attemptFor(job.id, 'B', 'dispatched', prepared);
+    await adapter.dependencies.persistAttempt(attempt);
+    await Promise.all(Array.from({ length: 55 }, () => acquireOmniRequestSlot(`${destination('B').instanceId}-credential`)));
+    let expired = false;
+    const pending = assert.rejects(adapter.dependencies.createDocument(target, prepared, attempt.chosenName!, attempt, {
+      assertCanDispatch() { if (expired) throw new Error('Example deadline expired'); },
+    }), (error) => {
+      assert.equal(adapter.dependencies.classifyWriteFailure?.(error), 'definitely_not_committed');
+      return true;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(entered, true);
+    assert.equal(harness.createCalls, 0);
+    if (mutation === 'deadline') expired = true;
+    else if (mutation === 'canceled') updateJobAtomically(job.id, (current) => ({ ...current, status: 'canceled' }));
+    else saveInstance(destination('B').instanceId, 'both', 'example-rotated-credential');
+    t.mock.timers.tick(60_000);
+    await pending;
+    assert.equal(harness.createCalls, 0);
+  });
+}
 
 for (const mutation of [
   {
@@ -1965,7 +2170,8 @@ test('production runtime restart reuses a verified semantic update and creates o
         async runQuery() {
           return { status: 'COMPLETE', rowCount: 1 } as OmniQueryExecutionSummary;
         },
-        async getModelYaml() {
+        async getModelYaml(_modelId, options) {
+          if (instance.id === SOURCE_ID && options?.mode === 'extension') return { files: {}, checksums: {}, raw: {} };
           return {
             files: { 'orders.view': currentYaml },
             checksums: { 'orders.view': currentChecksum },

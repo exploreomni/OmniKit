@@ -6,6 +6,7 @@ import type {
   SavedInstancePublic,
 } from '@/services/opsConsole';
 import { DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS } from '../../../shared/dashboardSafeCopyContract';
+import type { DashboardDeploymentPlan } from '../../../shared/dashboardDeploymentPlan';
 
 export { DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS };
 
@@ -54,9 +55,13 @@ export interface DashboardSafeCopyDestinationDraft {
   instanceId: string;
   connectionId: string;
   modelId: string;
+  folderId?: string;
+  folderPath?: string;
+  folderInputMode?: 'path' | 'id';
   requiresModelChoice?: boolean;
   topicMappings?: DashboardSafeCopyTopicMappingDraft[];
   queryViewMappings?: DashboardSafeCopyQueryViewMappingDraft[];
+  workbookCopy?: { stagingFolderId: string };
 }
 
 export interface DashboardSafeCopyDraft {
@@ -64,6 +69,9 @@ export interface DashboardSafeCopyDraft {
   step: DashboardSafeCopyStep;
   requestId: string;
   jobId?: string;
+  planId?: string;
+  deploymentRequestId?: string;
+  selectedTargetIds?: string[];
   sourceId: string;
   sourceConnectionId: string;
   selectedDocumentIds: string[];
@@ -194,11 +202,19 @@ export function readDashboardSafeCopyDraft(
     }
     const jobId = typeof value.jobId === 'string' ? value.jobId : '';
     if (jobId && !CANONICAL_REQUEST_ID.test(jobId)) return createDashboardSafeCopyDraft();
+    const planId = typeof value.planId === 'string' && CANONICAL_REQUEST_ID.test(value.planId) ? value.planId : '';
+    const deploymentRequestId = typeof value.deploymentRequestId === 'string' && CANONICAL_REQUEST_ID.test(value.deploymentRequestId)
+      ? value.deploymentRequestId : undefined;
     return {
       version: 1,
-      step: jobId ? 3 : 0,
+      step: jobId ? 3 : planId ? 2 : 0,
       requestId: restoredRequestId,
       ...(jobId ? { jobId } : {}),
+      ...(planId ? { planId } : {}),
+      ...(deploymentRequestId ? { deploymentRequestId } : {}),
+      ...(planId && Array.isArray(value.selectedTargetIds) ? {
+        selectedTargetIds: value.selectedTargetIds.filter((id): id is string => typeof id === 'string' && CANONICAL_REQUEST_ID.test(id)).slice(0, 100),
+      } : {}),
       sourceId: '',
       sourceConnectionId: '',
       selectedDocumentIds: [],
@@ -219,6 +235,9 @@ export function writeDashboardSafeCopyDraft(
       version: 1,
       requestId: draft.requestId,
       ...(draft.jobId ? { jobId: draft.jobId } : {}),
+      ...(draft.planId ? { planId: draft.planId } : {}),
+      ...(draft.deploymentRequestId ? { deploymentRequestId: draft.deploymentRequestId } : {}),
+      ...(draft.planId && draft.selectedTargetIds ? { selectedTargetIds: draft.selectedTargetIds } : {}),
     }));
   } catch {
     // Session recovery is a convenience. The server job remains authoritative.
@@ -961,7 +980,7 @@ export function dashboardSafeCopyJobProgress(
   });
 }
 
-type DashboardSafeCopyPlanningPatch = Omit<Partial<DashboardSafeCopyDraft>, 'version' | 'requestId' | 'jobId'>;
+type DashboardSafeCopyPlanningPatch = Omit<Partial<DashboardSafeCopyDraft>, 'version' | 'requestId' | 'jobId' | 'planId' | 'deploymentRequestId' | 'selectedTargetIds'>;
 
 export type DashboardSafeCopyDraftAction =
   | { type: 'choose_source'; sourceId: string; requestId: string }
@@ -977,6 +996,12 @@ export type DashboardSafeCopyDraftAction =
   | { type: 'toggle_document'; documentId: string; limit: number; requestId: string }
   | { type: 'patch_plan'; patch: DashboardSafeCopyPlanningPatch; requestId: string }
   | { type: 'toggle_destination'; instanceId: string; limit: number; requestId: string }
+  | { type: 'add_destination'; destination: DashboardSafeCopyDestinationDraft; limit: number; requestId: string }
+  | { type: 'remove_destination'; targetId: string; requestId: string }
+  | { type: 'update_destination'; targetId: string; patch: Partial<Omit<DashboardSafeCopyDestinationDraft, 'targetId'>>; requestId: string }
+  | { type: 'restore_plan'; plan: DashboardDeploymentPlan }
+  | { type: 'select_targets'; targetIds: string[]; deploymentRequestId: string }
+  | { type: 'prepare_deployment'; deploymentRequestId: string }
   | {
     type: 'resolve_destination';
     instanceId: string;
@@ -986,7 +1011,7 @@ export type DashboardSafeCopyDraftAction =
     manual?: boolean;
   }
   | { type: 'set_step'; step: DashboardSafeCopyStep }
-  | { type: 'attach_job'; jobId: string }
+  | { type: 'attach_job'; jobId: string; requestId?: string }
   | { type: 'reset'; draft: DashboardSafeCopyDraft }
   | { type: 'reject_restored_job'; draft: DashboardSafeCopyDraft }
   | { type: 'replan_target'; job: MigrationJob; targetId: string; requestId: string };
@@ -1001,6 +1026,9 @@ function planningUpdate(
     ...patch,
     requestId,
     jobId: undefined,
+    planId: undefined,
+    deploymentRequestId: undefined,
+    selectedTargetIds: undefined,
   };
 }
 
@@ -1070,6 +1098,49 @@ export function dashboardSafeCopyDraftReducer(
         }].sort((left, right) => left.instanceId.localeCompare(right.instanceId));
       return planningUpdate(state, action.requestId, { destinations });
     }
+    case 'add_destination':
+      if (state.jobId || state.destinations.length >= action.limit || state.destinations.some((row) => row.targetId === action.destination.targetId)) return state;
+      return planningUpdate(state, action.requestId, { destinations: [...state.destinations, action.destination] });
+    case 'remove_destination':
+      if (state.jobId) return state;
+      return planningUpdate(state, action.requestId, { destinations: state.destinations.filter((row) => row.targetId !== action.targetId) });
+    case 'update_destination':
+      if (state.jobId || !state.destinations.some((row) => row.targetId === action.targetId)) return state;
+      return planningUpdate(state, action.requestId, {
+        destinations: state.destinations.map((row) => {
+          if (row.targetId !== action.targetId) return row;
+          const instanceChanged = action.patch.instanceId !== undefined && action.patch.instanceId !== row.instanceId;
+          const modelScopeChanged = instanceChanged
+            || (action.patch.connectionId !== undefined && action.patch.connectionId !== row.connectionId)
+            || (action.patch.modelId !== undefined && action.patch.modelId !== row.modelId);
+          return { ...row, ...action.patch,
+            ...(modelScopeChanged ? { topicMappings: undefined, queryViewMappings: undefined } : {}),
+            ...(instanceChanged ? { workbookCopy: undefined } : {}),
+          };
+        }),
+      });
+    case 'restore_plan': {
+      const readyIds = action.plan.targets.filter((row) => row.status === 'ready' && !row.deploymentJobId).map((row) => row.targetId);
+      const continuingJob = state.planId === action.plan.id ? state.jobId : undefined;
+      return {
+        ...state,
+        planId: action.plan.id,
+        jobId: continuingJob,
+        step: continuingJob ? 3 : 2,
+        requestId: continuingJob ? state.requestId : action.plan.intent.requestId,
+        sourceId: action.plan.intent.source.instanceId,
+        sourceConnectionId: action.plan.intent.source.connectionId,
+        selectedDocumentIds: [...action.plan.intent.source.documentIds],
+        destinations: action.plan.intent.destinations.map((row) => ({ ...row, folderId: row.folderId || '', folderPath: row.folderPath || '', folderInputMode: row.folderPath ? 'path' : row.folderId ? 'id' : 'path' })),
+        selectedTargetIds: state.selectedTargetIds === undefined
+          ? readyIds.length === action.plan.targets.length ? readyIds : []
+          : state.selectedTargetIds.filter((id) => readyIds.includes(id)),
+      };
+    }
+    case 'select_targets':
+      return state.jobId ? state : { ...state, selectedTargetIds: [...action.targetIds], deploymentRequestId: action.deploymentRequestId };
+    case 'prepare_deployment':
+      return state.jobId ? state : { ...state, deploymentRequestId: action.deploymentRequestId };
     case 'resolve_destination': {
       if (state.jobId) return state;
       const destination = state.destinations.find((row) => row.instanceId === action.instanceId);
@@ -1094,7 +1165,7 @@ export function dashboardSafeCopyDraftReducer(
     case 'set_step':
       return state.jobId || state.step === action.step ? state : { ...state, step: action.step };
     case 'attach_job':
-      return { ...state, step: 3, jobId: action.jobId };
+      return { ...state, step: 3, jobId: action.jobId, requestId: action.requestId || state.requestId };
     case 'reset':
     case 'reject_restored_job':
       return action.draft;
@@ -1118,6 +1189,8 @@ export function dashboardSafeCopyDraftReducer(
           instanceId: target.destinationInstanceId,
           connectionId: target.targetConnectionId || '',
           modelId: '',
+          folderId: target.targetFolderId || '',
+          folderPath: target.targetFolderPath || '',
           requiresModelChoice: true,
         }],
       };
@@ -1146,8 +1219,8 @@ export function dashboardSafeCopyIntentFromDraft(
         instanceId: row.instanceId,
         connectionId: row.connectionId,
         modelId: row.modelId,
-        ...(instance?.defaultFolderId ? { folderId: instance.defaultFolderId } : {}),
-        ...(instance?.defaultFolderPath ? { folderPath: instance.defaultFolderPath } : {}),
+        ...((row.folderId ?? instance?.defaultFolderId) ? { folderId: row.folderId ?? instance?.defaultFolderId } : {}),
+        ...((row.folderPath ?? instance?.defaultFolderPath) ? { folderPath: row.folderPath ?? instance?.defaultFolderPath } : {}),
         ...(row.topicMappings?.length ? {
           topicMappings: row.topicMappings
             .filter(isExecutableTopicMapping)
@@ -1158,6 +1231,7 @@ export function dashboardSafeCopyIntentFromDraft(
             .filter(isExecutableQueryViewMapping)
             .map((m) => ({ sourceQueryViewName: m.sourceQueryViewName, action: m.action, targetQueryViewName: m.targetQueryViewName })),
         } : {}),
+        ...(row.workbookCopy ? { workbookCopy: { stagingFolderId: row.workbookCopy.stagingFolderId } } : {}),
       };
     }),
     ...(draft.emptyFirst || draft.deleteSourceOnSuccess || draft.refreshSchemaOnComplete ? {
