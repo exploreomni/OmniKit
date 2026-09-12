@@ -23,10 +23,11 @@ const TIMEOUT_MS = 60_000;
 const MAX_RETRIES = 5;
 const RATE_LIMIT_STATE_TTL_MS = 5 * 60_000;
 const RATE_LIMIT_WINDOW_MS = 60_000;
-// Omni documents 60 requests per minute per API key. Keep five requests of
-// headroom for other interactive work while allowing a healthy catalog crawl
-// to use the remaining budget without an unconditional delay between pages.
+// Preserve the existing overall budget and its upstream headroom. Reserve five
+// of these starts for interactive work so a background crawl cannot consume the
+// whole rolling window before a user opens a picker.
 const RATE_LIMIT_REQUEST_BUDGET = 55;
+const RATE_LIMIT_BACKGROUND_BUDGET = RATE_LIMIT_REQUEST_BUDGET - 5;
 const MAX_CURSOR_PAGES = 1_000;
 const MAX_SCIM_PAGES = 1_000;
 const SCIM_USER_PAGE_MAX_BYTES = 2 * 1024 * 1024;
@@ -40,19 +41,58 @@ const ERROR_RESPONSE_MAX_BYTES = 64 * 1024;
 const AI_EVAL_RESPONSE_MAX_BYTES = 2 * 1024 * 1024;
 
 export interface OmniRequestPolicy {
+  /** Overall caller lifecycle, inherited even by methods without a signal argument. */
+  signal?: AbortSignal;
   requestTimeoutMs?: number;
   maxReadRetries?: number;
   fetchImpl?: typeof fetch;
   documentInventoryInitialDeadlineMs?: number;
+  requestPriority?: 'interactive' | 'background';
+  /** Server-owned authority applied to every write, in addition to any per-call guard. */
+  writeGuard?: OmniWriteDispatchGuard;
 }
 
-const keyChains = new Map<string, Promise<void>>();
+/** Server-owned per-write authority, evaluated after every asynchronous dispatch prerequisite. */
+export interface OmniWriteDispatchGuard {
+  signal?: AbortSignal;
+  assertCanDispatch(): void;
+}
+
+/** Only emitted before fetch is invoked; a response lost after dispatch stays ambiguous. */
+export class OmniWriteNotDispatchedError extends Error {
+  readonly code = 'OMNI_WRITE_NOT_DISPATCHED';
+  constructor(readonly reason: unknown) {
+    super('The guarded Omni write stopped before network dispatch.');
+    this.name = 'OmniWriteNotDispatchedError';
+  }
+}
+
+interface PendingRequestSlot {
+  resolve: () => void;
+  reject: (reason: Error) => void;
+  removeAbortListener: () => void;
+}
+
+interface RequestSlotQueue {
+  interactive: PendingRequestSlot[];
+  background: PendingRequestSlot[];
+  wakeTimer?: NodeJS.Timeout;
+}
+
+const requestSlotQueues = new Map<string, RequestSlotQueue>();
 const requestStartsByKey = new Map<string, number[]>();
 const rateLimitCleanupTimers = new Map<string, NodeJS.Timeout>();
 
 /** Test-only lifecycle seam; production request paths never call this. */
 export function resetOmniClientRateLimitStateForTests(): void {
-  keyChains.clear();
+  for (const queue of requestSlotQueues.values()) {
+    if (queue.wakeTimer) clearTimeout(queue.wakeTimer);
+    for (const pending of [...queue.interactive, ...queue.background]) {
+      pending.removeAbortListener();
+      pending.reject(abortError());
+    }
+  }
+  requestSlotQueues.clear();
   requestStartsByKey.clear();
   for (const timer of rateLimitCleanupTimers.values()) clearTimeout(timer);
   rateLimitCleanupTimers.clear();
@@ -158,6 +198,12 @@ export interface OmniDocumentInventoryPagination {
   returnedRecords: number;
   reportedTotalRecords?: number;
   responseBytes?: number;
+}
+
+export interface OmniDocumentInventoryProgress {
+  pages: number;
+  returnedRecords: number;
+  reportedTotalRecords?: number;
 }
 
 export interface OmniDocumentInventoryResult {
@@ -525,6 +571,53 @@ async function raceWithAbortSignal<T>(operation: Promise<T>, signal: AbortSignal
   });
 }
 
+/** Abort the body as well as the headers, including non-cooperative injected transports. */
+function responseWithAbortSignal(response: Response, signal: AbortSignal): Response {
+  throwIfAborted(signal);
+  if (!response.body) return response;
+  const reader = response.body.getReader();
+  let closed = false;
+  let onAbort: () => void;
+  const cleanup = () => {
+    signal.removeEventListener('abort', onAbort);
+    try { reader.releaseLock(); } catch { /* A pending read releases when cancellation settles. */ }
+  };
+  const body = new ReadableStream<Uint8Array>({
+    start(output) {
+      onAbort = () => {
+        if (closed) return;
+        closed = true;
+        const error = signal.reason instanceof Error ? signal.reason : abortError();
+        output.error(error);
+        void reader.cancel(error).catch(() => undefined).finally(cleanup);
+        cleanup();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    },
+    async pull(output) {
+      try {
+        const item = await raceWithAbortSignal(reader.read(), signal);
+        if (closed) return;
+        if (item.done) { closed = true; cleanup(); output.close(); }
+        else output.enqueue(item.value);
+      } catch (error) {
+        if (!closed) { closed = true; cleanup(); output.error(error); }
+      }
+    },
+    cancel(reason) {
+      if (closed) return;
+      closed = true;
+      void reader.cancel(reason).catch(() => undefined).finally(cleanup);
+      cleanup();
+    },
+  });
+  const wrapped = new Response(body, { status: response.status, statusText: response.statusText, headers: response.headers });
+  // Preserve fetch metadata for existing diagnostics without exposing another unbound body.
+  for (const key of ['url', 'redirected', 'type'] as const) Object.defineProperty(wrapped, key, { value: response[key] });
+  return wrapped;
+}
+
 function credentialRateKey(apiKey: string): string {
   return createHash('sha256').update(apiKey).digest('hex');
 }
@@ -540,42 +633,72 @@ function scheduleRateLimitStateCleanup(key: string): void {
   rateLimitCleanupTimers.set(key, timer);
 }
 
-async function acquireSlot(apiKey: string, signal?: AbortSignal): Promise<void> {
+function drainRequestSlots(key: string, queue: RequestSlotQueue): void {
+  if (queue.wakeTimer) clearTimeout(queue.wakeTimer);
+  queue.wakeTimer = undefined;
+  while (queue.interactive.length || queue.background.length) {
+    const now = Date.now();
+    const starts = (requestStartsByKey.get(key) ?? [])
+      .filter((startedAt) => startedAt > now - RATE_LIMIT_WINDOW_MS);
+    // Background admission counts every start, including interactive work; this
+    // reserves capacity within the existing limit rather than adding a quota.
+    const budget = queue.interactive.length ? RATE_LIMIT_REQUEST_BUDGET : RATE_LIMIT_BACKGROUND_BUDGET;
+    if (starts.length >= budget) {
+      requestStartsByKey.set(key, starts);
+      queue.wakeTimer = setTimeout(
+        () => drainRequestSlots(key, queue),
+        Math.max(1, starts[starts.length - budget] + RATE_LIMIT_WINDOW_MS - now),
+      );
+      return;
+    }
+    // Pick priority only when a slot is available: a background request waiting
+    // on the rolling window must not reserve the next slot ahead of the UI.
+    const pending = queue.interactive.shift() ?? queue.background.shift()!;
+    pending.removeAbortListener();
+    starts.push(now);
+    requestStartsByKey.set(key, starts);
+    pending.resolve();
+  }
+  requestSlotQueues.delete(key);
+  scheduleRateLimitStateCleanup(key);
+}
+
+export async function acquireOmniRequestSlot(
+  apiKey: string,
+  signal?: AbortSignal,
+  priority: NonNullable<OmniRequestPolicy['requestPriority']> = 'interactive',
+): Promise<void> {
   throwIfAborted(signal);
   const key = credentialRateKey(apiKey);
-  const previous = keyChains.get(key) ?? Promise.resolve();
-  const next = previous.then(async () => {
-    throwIfAborted(signal);
-    let now = Date.now();
-    let starts = (requestStartsByKey.get(key) ?? [])
-      .filter((startedAt) => startedAt > now - RATE_LIMIT_WINDOW_MS);
-    if (starts.length >= RATE_LIMIT_REQUEST_BUDGET) {
-      const waitMs = Math.max(0, starts[0] + RATE_LIMIT_WINDOW_MS - now);
-      if (waitMs > 0) await sleep(waitMs, signal);
-      now = Date.now();
-      starts = starts.filter((startedAt) => startedAt > now - RATE_LIMIT_WINDOW_MS);
-    }
-    throwIfAborted(signal);
-    starts.push(Date.now());
-    requestStartsByKey.set(key, starts);
-  });
-  const settled = next.catch(() => undefined);
-  keyChains.set(key, settled);
-  // Chain cleanup follows the underlying queue entry, not this subscriber's
-  // caller-facing wait. A cancelled queued caller can return promptly without
-  // letting a later request jump ahead of the predecessor that still owns the
-  // rate-limit slot ordering.
-  void settled.then(() => {
-    if (keyChains.get(key) === settled) {
-      keyChains.delete(key);
-      scheduleRateLimitStateCleanup(key);
-    }
-  });
-  if (signal) {
-    await raceWithAbortSignal(next, signal);
-    return;
+  const cleanup = rateLimitCleanupTimers.get(key);
+  if (cleanup) clearTimeout(cleanup);
+  rateLimitCleanupTimers.delete(key);
+  let queue = requestSlotQueues.get(key);
+  if (!queue) {
+    queue = { interactive: [], background: [] };
+    requestSlotQueues.set(key, queue);
   }
-  await next;
+  const activeQueue = queue;
+  await new Promise<void>((resolve, reject) => {
+    const pending: PendingRequestSlot = {
+      resolve,
+      reject,
+      removeAbortListener: () => signal?.removeEventListener('abort', onAbort),
+    };
+    const onAbort = () => {
+      const entries = activeQueue[priority];
+      const index = entries.indexOf(pending);
+      if (index < 0) return;
+      entries.splice(index, 1);
+      pending.removeAbortListener();
+      reject(signal?.reason instanceof Error ? signal.reason : abortError());
+      drainRequestSlots(key, activeQueue);
+    };
+    activeQueue[priority].push(pending);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    else drainRequestSlots(key, activeQueue);
+  });
 }
 
 function retryAfterMs(header: string | null, attempt: number): number {
@@ -1191,9 +1314,12 @@ function normalizeOmniDocumentRecords(all: unknown[]): OmniDocumentRecord[] {
 export class OmniClient {
   private readonly requestTimeoutMs: number;
   private readonly maxReadRetries: number;
+  private readonly requestPriority: NonNullable<OmniRequestPolicy['requestPriority']>;
   private readonly fetchImpl: typeof fetch;
   private readonly documentInventoryInitialDeadlineMs: number;
   private readonly vaultSessionSignal?: AbortSignal;
+  private readonly operationSignal?: AbortSignal;
+  private readonly defaultWriteGuard?: OmniWriteDispatchGuard;
 
   constructor(
     private readonly instance: Pick<SavedInstance, 'baseUrl' | 'apiKey' | 'label'> & VaultSessionBoundInstance,
@@ -1208,7 +1334,10 @@ export class OmniClient {
       ? Math.max(0, Math.floor(requestPolicy.maxReadRetries!))
       : MAX_RETRIES;
     this.fetchImpl = requestPolicy.fetchImpl ?? globalThis.fetch;
+    this.requestPriority = requestPolicy.requestPriority ?? 'interactive';
     this.vaultSessionSignal = instance[VAULT_SESSION_ABORT_SIGNAL];
+    this.operationSignal = requestPolicy.signal;
+    this.defaultWriteGuard = requestPolicy.writeGuard;
     this.documentInventoryInitialDeadlineMs = Number.isFinite(requestPolicy.documentInventoryInitialDeadlineMs)
       ? Math.max(1, Math.floor(requestPolicy.documentInventoryInitialDeadlineMs!))
       : DOCUMENT_INVENTORY_INITIAL_DEADLINE_MS;
@@ -1223,12 +1352,31 @@ export class OmniClient {
     return url.toString();
   }
 
+  private combinedSignal(...requestSignals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+    const signals = [...new Set([...requestSignals, this.operationSignal, this.vaultSessionSignal]
+      .filter((candidate): candidate is AbortSignal => Boolean(candidate)))];
+    return signals.length > 1 ? AbortSignal.any(signals) : signals[0];
+  }
+
+  private async readJsonOrFallback(response: Response, fallback: unknown): Promise<unknown> {
+    try {
+      const value: unknown = await response.json();
+      throwIfAborted(this.combinedSignal());
+      return value;
+    } catch {
+      // Malformed optional JSON may use its existing fallback, but cancellation never does.
+      throwIfAborted(this.combinedSignal());
+      return fallback;
+    }
+  }
+
   private async request(method: string, path: string, options: {
     query?: Record<string, string | number | boolean | undefined>;
     body?: unknown;
     accept?: string;
     allowStatuses?: number[];
     signal?: AbortSignal;
+    writeGuard?: OmniWriteDispatchGuard;
   } = {}): Promise<Response> {
     const url = this.buildUrl(path, options.query);
     const headers: Record<string, string> = {
@@ -1237,17 +1385,21 @@ export class OmniClient {
     };
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
 
-    const externalSignals = [options.signal, this.vaultSessionSignal]
-      .filter((signal): signal is AbortSignal => Boolean(signal));
-    const externalSignal = externalSignals.length > 1
-      ? AbortSignal.any(externalSignals)
-      : externalSignals[0];
+    const externalSignal = this.combinedSignal(options.signal, options.writeGuard?.signal, this.defaultWriteGuard?.signal);
     const normalizedMethod = method.toUpperCase();
     const maxRetries = ['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod) ? this.maxReadRetries : 0;
+    const writeGuards = ['GET', 'HEAD', 'OPTIONS'].includes(normalizedMethod) ? []
+      : [...new Set([this.defaultWriteGuard, options.writeGuard].filter((guard): guard is OmniWriteDispatchGuard => Boolean(guard)))];
     let lastError: unknown;
     for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
-      throwIfAborted(externalSignal);
-      await acquireSlot(this.instance.apiKey, externalSignal);
+      try {
+        throwIfAborted(externalSignal);
+        await acquireOmniRequestSlot(this.instance.apiKey, externalSignal, this.requestPriority);
+      } catch (error) {
+        if (writeGuards.length) throw new OmniWriteNotDispatchedError(error);
+        throw error;
+      }
+      let dispatched = false;
       const timeoutController = new AbortController();
       const requestSignal = externalSignal
         ? AbortSignal.any([externalSignal, timeoutController.signal])
@@ -1259,7 +1411,13 @@ export class OmniClient {
           assertSafeOutboundUrl(url, { label: 'base_url' }),
           requestSignal,
         );
-        const response = await raceWithAbortSignal(
+        throwIfAborted(requestSignal);
+        // No await may separate this fresh authority check from fetch. Slot
+        // waiting and outbound validation can outlive a job, deadline, or credential.
+        for (const guard of writeGuards) guard.assertCanDispatch();
+        throwIfAborted(requestSignal);
+        dispatched = true;
+        const fetchedResponse = await raceWithAbortSignal(
           this.fetchImpl(url, {
             method,
             headers,
@@ -1269,6 +1427,7 @@ export class OmniClient {
           }),
           requestSignal,
         );
+        const response = responseWithAbortSignal(fetchedResponse, requestSignal);
         if (response.status === 429 && attempt < maxRetries) {
           await response.body?.cancel().catch(() => undefined);
           // Retry-After is server-controlled. Keep it inside the active request
@@ -1284,6 +1443,7 @@ export class OmniClient {
         }
         return response;
       } catch (error) {
+        if (writeGuards.length && !dispatched) throw new OmniWriteNotDispatchedError(error);
         const effectiveError = timeoutController.signal.reason === timeoutError ? timeoutError : error;
         lastError = effectiveError;
         if (externalSignal?.aborted) throw externalSignal.reason instanceof Error ? externalSignal.reason : error;
@@ -1314,7 +1474,9 @@ export class OmniClient {
     maxTotalBytes?: number;
     requireRecordKeys?: boolean;
     requireArrayKey?: boolean;
+    onProgress?: (progress: OmniDocumentInventoryProgress) => void;
   }): Promise<{ records: unknown[]; pagination: OmniDocumentInventoryPagination }> {
+    const signal = this.combinedSignal(options.signal);
     const pageSize = options.pageSize ?? 100;
     const records: unknown[] = [];
     const recordKeys = new Set<string>();
@@ -1323,10 +1485,24 @@ export class OmniClient {
     let expectedTotal: number | undefined;
     let exactTotalMode: 'stable' | 'remaining' | undefined;
     let responseBytes = 0;
+    const reportProgress = (pages: number) => {
+      throwIfAborted(signal);
+      try {
+        options.onProgress?.({
+          pages,
+          returnedRecords: records.length,
+          ...(expectedTotal !== undefined ? { reportedTotalRecords: expectedTotal } : {}),
+        });
+      } catch {
+        // Progress is advisory; an observer failure must not change inventory
+        // validation or make a completed page trigger another upstream read.
+      }
+      throwIfAborted(signal);
+    };
     const deadlineController = new AbortController();
-    const forwardAbort = () => deadlineController.abort(options.signal?.reason);
-    if (options.signal?.aborted) deadlineController.abort(options.signal.reason);
-    else options.signal?.addEventListener('abort', forwardAbort, { once: true });
+    const forwardAbort = () => deadlineController.abort(signal?.reason);
+    if (signal?.aborted) deadlineController.abort(signal.reason);
+    else signal?.addEventListener('abort', forwardAbort, { once: true });
     let deadlineTimer: NodeJS.Timeout | undefined;
     let deadlineError: OmniDocumentInventoryDeadlineError | undefined;
     const operationStartedAt = Date.now();
@@ -1362,8 +1538,9 @@ export class OmniClient {
           }
           data = bounded.data;
         } else {
-          data = await response.json().catch(() => ({})) as unknown;
+          data = await this.readJsonOrFallback(response, {}) as unknown;
         }
+        throwIfAborted(deadlineController.signal);
         const recordsBeforePage = records.length;
         const explicitRecords = options.requireArrayKey
           ? extractExplicitArray(data, options.arrayKeys)
@@ -1417,6 +1594,7 @@ export class OmniClient {
           if (!nextCursor || nextCursor === cursor || cursors.has(nextCursor)) throw new OmniPaginationError();
           cursors.add(nextCursor);
           cursor = nextCursor;
+          reportProgress(page + 1);
           continue;
         }
 
@@ -1427,6 +1605,7 @@ export class OmniClient {
             ? records.length !== expectedTotal
             : records.length < expectedTotal
         )) throw new OmniPaginationError();
+        reportProgress(page + 1);
         return {
           records,
           pagination: {
@@ -1446,7 +1625,7 @@ export class OmniClient {
       throw error;
     } finally {
       if (deadlineTimer) clearTimeout(deadlineTimer);
-      options.signal?.removeEventListener('abort', forwardAbort);
+      signal?.removeEventListener('abort', forwardAbort);
     }
   }
 
@@ -1462,6 +1641,7 @@ export class OmniClient {
   }
 
   private async listScimResources(path: string, signal?: AbortSignal): Promise<unknown[]> {
+    signal = this.combinedSignal(signal);
     const count = 100;
     const resources: unknown[] = [];
     const resourceKeys = new Set<string>();
@@ -1478,7 +1658,8 @@ export class OmniClient {
         query: { count, startIndex },
         signal,
       });
-      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const data = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
+      throwIfAborted(signal);
       const pageResources = Array.isArray(data.Resources) ? data.Resources : [];
       const returnedStartIndex = firstNumber(data.startIndex) ?? startIndex;
       if (returnedStartIndex !== startIndex) throw new OmniPaginationError();
@@ -1517,8 +1698,8 @@ export class OmniClient {
     throw new OmniPaginationError();
   }
 
-  private documentsV2(): DocumentsV2Adapter {
-    return new DocumentsV2Adapter((method, path, options) => this.request(method, path, options));
+  private documentsV2(signal?: AbortSignal, writeGuard?: OmniWriteDispatchGuard): DocumentsV2Adapter {
+    return new DocumentsV2Adapter((method, path, options) => this.request(method, path, { ...options, signal, writeGuard }));
   }
 
   async test(signal?: AbortSignal): Promise<void> {
@@ -1546,7 +1727,7 @@ export class OmniClient {
       query: { pageSize: 1 },
       signal,
     });
-    const data = await response.json().catch(() => ({})) as unknown;
+    const data = await this.readJsonOrFallback(response, {}) as unknown;
     const totalRecords = extractPageInfo(data)?.totalRecords;
     if (typeof totalRecords !== 'number' || !Number.isSafeInteger(totalRecords) || totalRecords < 0) {
       throw new OmniPaginationError();
@@ -1593,7 +1774,7 @@ export class OmniClient {
       query: branchId ? { branchId } : undefined,
       signal,
     });
-    const data = await response.json().catch(() => ({})) as unknown;
+    const data = await this.readJsonOrFallback(response, {}) as unknown;
     return [...new Set(extractArray(data, ['schemas', 'records', 'data', 'items'])
       .map((raw) => {
         if (typeof raw === 'string') return raw;
@@ -1822,7 +2003,11 @@ export class OmniClient {
   }
 
   async listDocumentInventory(
-    options: { includeLabels?: boolean; folderId?: string } = {},
+    options: {
+      includeLabels?: boolean;
+      folderId?: string;
+      onProgress?: (progress: OmniDocumentInventoryProgress) => void;
+    } = {},
     signal?: AbortSignal,
   ): Promise<OmniDocumentInventoryResult> {
     const result = await this.listCursorRecordsWithTelemetry({
@@ -1838,6 +2023,7 @@ export class OmniClient {
         ? firstString(raw.identifier, raw.id, raw.slug, raw.documentId, raw.document_id)
         : undefined,
       signal,
+      onProgress: options.onProgress,
       requireExactTotal: true,
       // Omni List Documents is observed in two cursor-total variants. Some
       // tenants repeat the collection total on every page; others report the
@@ -2045,7 +2231,7 @@ export class OmniClient {
       const response = await this.request('GET', '/api/scim/v2/groups', {
         query: { count, startIndex },
       });
-      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const data = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
       const resources = Array.isArray(data.Resources) ? data.Resources : [];
       groups.push(...resources
         .map(parseUserGroupRecord)
@@ -2061,7 +2247,7 @@ export class OmniClient {
 
   async getUserGroup(userGroupId: string): Promise<OmniUserGroupRecord> {
     const response = await this.request('GET', `/api/scim/v2/groups/${encodeURIComponent(userGroupId)}`);
-    const group = parseUserGroupRecord(await response.json().catch(() => ({})));
+    const group = parseUserGroupRecord(await this.readJsonOrFallback(response, {}));
     if (!group) throw new Error(`Omni returned an invalid user group response for ${userGroupId}.`);
     return group;
   }
@@ -2076,7 +2262,7 @@ export class OmniClient {
         connectionId: options.connectionId,
       },
     });
-    return parseModelRoleRecords(await response.json().catch(() => ({})));
+    return parseModelRoleRecords(await this.readJsonOrFallback(response, {}));
   }
 
   async assignUserModelRole(
@@ -2090,7 +2276,7 @@ export class OmniClient {
         connectionId: input.connectionId,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async listUserGroupModelRoles(
@@ -2103,7 +2289,7 @@ export class OmniClient {
         connectionId: options.connectionId,
       },
     });
-    return parseModelRoleRecords(await response.json().catch(() => ({})));
+    return parseModelRoleRecords(await this.readJsonOrFallback(response, {}));
   }
 
   async assignUserGroupModelRole(
@@ -2117,7 +2303,7 @@ export class OmniClient {
         connectionId: input.connectionId,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async listDocumentAccess(
@@ -2142,7 +2328,7 @@ export class OmniClient {
           },
         },
       );
-      const data = await response.json().catch(() => ({})) as Record<string, unknown>;
+      const data = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
       const rows = Array.isArray(data.principals) ? data.principals : [];
       principals.push(...rows
         .map((raw): OmniDocumentAccessPrincipal | null => {
@@ -2308,7 +2494,7 @@ export class OmniClient {
 
   async listModelTopicSummaries(modelId: string, signal?: AbortSignal): Promise<OmniModelTopicRecord[]> {
     const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/topic`, { signal });
-    const data = await response.json().catch(() => ({})) as unknown;
+    const data = await this.readJsonOrFallback(response, {}) as unknown;
     return extractArray(data, ['topics', 'records', 'data', 'items'])
       .map((raw): OmniModelTopicRecord | null => {
         if (!isRecord(raw)) return null;
@@ -2397,7 +2583,7 @@ export class OmniClient {
         baseModelId: input.baseModelId,
       },
     });
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const raw = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
     const responseUrl = response.url || this.buildUrl(path);
     if (omniBodyIndicatesFailure(raw)) {
       const detail = omniErrorDetail(JSON.stringify(raw), 'Omni reported that model creation failed.');
@@ -2489,8 +2675,9 @@ export class OmniClient {
     branchId?: string;
     previousChecksum?: string;
     commitMessage?: string;
-  }): Promise<unknown> {
+  }, writeGuard?: OmniWriteDispatchGuard): Promise<unknown> {
     const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
+      writeGuard,
       body: {
         fileName: input.fileName,
         yaml: input.yaml,
@@ -2500,7 +2687,7 @@ export class OmniClient {
         commitMessage: input.commitMessage,
       },
     });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async updateModelYamlFiles(input: {
@@ -2539,7 +2726,7 @@ export class OmniClient {
         commitMessage: input.commitMessage,
       },
     });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async deleteView(input: {
@@ -2554,14 +2741,14 @@ export class OmniClient {
         branchId: input.branchId,
       },
     });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async validateModel(modelId: string, branchId?: string): Promise<OmniValidationIssue[]> {
     const response = await this.request('GET', `/api/v1/models/${encodeURIComponent(modelId)}/validate`, {
       query: branchId ? { branchId } : undefined,
     });
-    const data = await response.json().catch(() => []) as unknown;
+    const data = await this.readJsonOrFallback(response, []) as unknown;
     return extractArray(data, ['issues', 'errors', 'warnings', 'data']).map((issue) => issue as OmniValidationIssue);
   }
 
@@ -2587,7 +2774,7 @@ export class OmniClient {
         find_type: options?.findType,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async planQueryAsUser(
@@ -2602,7 +2789,7 @@ export class OmniClient {
         planOnly: true,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async findAndReplaceModelContent(input: {
@@ -2622,7 +2809,7 @@ export class OmniClient {
         include_personal_folders: input.includePersonalFolders === true,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async createOrUpdateModelBranchPullRequest(input: {
@@ -2640,7 +2827,7 @@ export class OmniClient {
         require_branch_exists: input.requireBranchExists === true,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async deleteModelBranch(modelId: string, branchName: string): Promise<Record<string, unknown>> {
@@ -2648,7 +2835,7 @@ export class OmniClient {
       'DELETE',
       `/api/v1/models/${encodeURIComponent(modelId)}/branch/${encodeURIComponent(branchName)}`,
     );
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async migrateModel(input: {
@@ -2666,7 +2853,7 @@ export class OmniClient {
         commitMessage: input.commitMessage,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async mergeModelBranch(modelId: string, branchName: string, options: {
@@ -2681,12 +2868,12 @@ export class OmniClient {
         force_override_git_settings: options.forceOverrideGitSettings === true,
       },
     });
-    return await response.json().catch(() => ({})) as Record<string, unknown>;
+    return await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
   }
 
   async getDocumentQueries(documentId: string, signal?: AbortSignal): Promise<OmniDocumentQueryRecord[]> {
     const response = await this.request('GET', `/api/v1/documents/${encodeURIComponent(documentId)}/queries`, { signal });
-    const data = await response.json().catch(() => []) as unknown;
+    const data = await this.readJsonOrFallback(response, []) as unknown;
     return extractArray(data, ['queries', 'queryPresentations', 'records', 'data', 'items']).map((raw) => {
       const row = raw as Record<string, unknown>;
       const query = row.query && typeof row.query === 'object' && !Array.isArray(row.query)
@@ -2726,7 +2913,7 @@ export class OmniClient {
       },
       allowStatuses: [408],
     });
-    let payload = await response.json().catch(() => ({})) as Record<string, unknown>;
+    let payload = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
     let remainingJobIds = Array.isArray(payload.remaining_job_ids)
       ? payload.remaining_job_ids.filter((value): value is string => typeof value === 'string' && Boolean(value))
       : [];
@@ -2743,7 +2930,7 @@ export class OmniClient {
       const waitResponse = await this.request('GET', '/api/v1/query/wait', {
         query: { job_ids: JSON.stringify(remainingJobIds) },
       });
-      payload = await waitResponse.json().catch(() => ({})) as Record<string, unknown>;
+      payload = await this.readJsonOrFallback(waitResponse, {}) as Record<string, unknown>;
       remainingJobIds = Array.isArray(payload.remaining_job_ids)
         ? payload.remaining_job_ids.filter((value): value is string => typeof value === 'string' && Boolean(value))
         : [];
@@ -2784,9 +2971,9 @@ export class OmniClient {
     name: string;
     folderId?: string;
     content: DashboardSafeCopyDocumentContent;
-  }): Promise<OmniCreateWorkbookResult> {
+  }, writeGuard?: OmniWriteDispatchGuard): Promise<OmniCreateWorkbookResult> {
     const content = materializeDashboardSafeCopyDocumentContent(input.content);
-    return this.documentsV2().create({
+    return this.documentsV2(undefined, writeGuard).create({
       modelId: input.modelId,
       name: input.name,
       ...(content.description !== undefined ? { description: content.description } : {}),
@@ -2813,24 +3000,24 @@ export class OmniClient {
       },
       signal,
     });
-    const raw = await response.json().catch(() => ({}));
+    const raw = await this.readJsonOrFallback(response, {});
     return normalizeOmniAiJobResult(raw);
   }
 
   async getAiJob(jobId: string, signal?: AbortSignal): Promise<OmniAiJobResult> {
     const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}`, { signal });
-    const raw = await response.json().catch(() => ({}));
+    const raw = await this.readJsonOrFallback(response, {});
     return normalizeOmniAiJobResult(raw, jobId);
   }
 
   async getAiJobResult(jobId: string, signal?: AbortSignal): Promise<unknown> {
     const response = await this.request('GET', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/result`, { signal });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async getAiCreditControls(signal?: AbortSignal): Promise<unknown> {
     const response = await this.request('GET', '/api/v1/ai/credit-controls', { signal });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async listAiEvalPromptSets(signal?: AbortSignal): Promise<unknown> {
@@ -2866,17 +3053,17 @@ export class OmniClient {
 
   async getSchedule(scheduleId: string, signal?: AbortSignal): Promise<unknown> {
     const response = await this.request('GET', `/api/v1/schedules/${encodeURIComponent(scheduleId)}`, { signal });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async listScheduleRecipients(scheduleId: string, signal?: AbortSignal): Promise<unknown> {
     const response = await this.request('GET', `/api/v1/schedules/${encodeURIComponent(scheduleId)}/recipients`, { signal });
-    return response.json().catch(() => ({}));
+    return this.readJsonOrFallback(response, {});
   }
 
   async cancelAiJob(jobId: string): Promise<OmniAiJobResult> {
     const response = await this.request('POST', `/api/v1/ai/jobs/${encodeURIComponent(jobId)}/cancel`);
-    const raw = await response.json().catch(() => ({}));
+    const raw = await this.readJsonOrFallback(response, {});
     return normalizeOmniAiJobResult(raw, jobId);
   }
 
@@ -2890,10 +3077,17 @@ export class OmniClient {
     });
   }
 
-  async setDocumentLabels(identifier: string, add: string[]): Promise<void> {
-    if (add.length === 0) return;
+  async setDocumentLabels(identifier: string, add: string[], remove: string[] = []): Promise<void> {
+    if (add.length === 0 && remove.length === 0) return;
     await this.request('PATCH', `/api/v1/documents/${encodeURIComponent(identifier)}/labels`, {
-      body: { add, remove: [] },
+      body: { add, remove },
+    });
+  }
+
+  async setFolderLabels(folderId: string, add: string[], remove: string[] = []): Promise<void> {
+    if (add.length === 0 && remove.length === 0) return;
+    await this.request('PATCH', `/api/v1/folders/${encodeURIComponent(folderId)}/labels`, {
+      body: { add, remove },
     });
   }
 
@@ -2902,8 +3096,17 @@ export class OmniClient {
     await this.documentsV2().updateDescription(identifier, body.description);
   }
 
-  async getDocumentStateV2(documentId: string): Promise<Record<string, unknown>> {
-    return this.documentsV2().getState(documentId);
+  async getDocumentStateV2(documentId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const state = await this.documentsV2(signal).getState(documentId);
+    throwIfAborted(this.combinedSignal(signal));
+    return state;
+  }
+
+  /** Returns the named draft's workbookModelId, never an inferred shared-model ID. */
+  async getDocumentDraftStateV2(documentId: string, draftId: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
+    const state = await this.documentsV2(signal).getDraftState(documentId, draftId);
+    throwIfAborted(this.combinedSignal(signal));
+    return state;
   }
 
   async createDocumentDraft(documentId: string, patch: DocumentV2Patch): Promise<OmniDocumentDraftResult> {
@@ -2963,7 +3166,7 @@ export class OmniClient {
     const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/refresh`, {
       query: branchId ? { branch_id: branchId } : undefined,
     });
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const raw = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
     return {
       jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')),
       status: firstString(raw.status, nested(raw, 'job', 'status')),
@@ -2973,7 +3176,7 @@ export class OmniClient {
 
   async getJobStatus(jobId: string): Promise<OmniJobStatusResult> {
     const response = await this.request('GET', `/api/v1/jobs/${encodeURIComponent(jobId)}/status`);
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+    const raw = await this.readJsonOrFallback(response, {}) as Record<string, unknown>;
     return {
       jobId: firstString(raw.jobId, raw.job_id, raw.id, nested(raw, 'job', 'id')) ?? jobId,
       status: (firstString(

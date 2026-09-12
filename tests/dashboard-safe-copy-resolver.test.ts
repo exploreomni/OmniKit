@@ -3,6 +3,7 @@ import { test } from 'node:test';
 
 import {
   resolveDashboardSafeCopyTarget,
+  dashboardSafeCopyDependencyPatchCandidates,
   type DashboardSafeCopyResolverResult,
 } from '../server/services/dashboardSafeCopyResolver';
 import type {
@@ -90,6 +91,137 @@ function assertException(result: DashboardSafeCopyResolverResult) {
   return result.exceptions;
 }
 
+test('field exceptions preserve exact per-document provenance and reasons', () => {
+  const target = migrationTarget();
+  const plan = migrationPlan({ fieldDependencies: [
+    fieldDependency({ sourceDocumentId: 'workbook-document', sourceProvenance: 'workbook_local', status: 'blocked', reason: 'Preserve this workbook-local definition.' }),
+    fieldDependency({ sourceDocumentId: 'shared-document', sourceProvenance: 'inherited_unverified', status: 'blocked', reason: 'Authored shared evidence is missing.' }),
+  ] }, target);
+  const issues = assertException(resolveDashboardSafeCopyTarget(plan, target));
+  assert.equal(issues.length, 2);
+  assert.deepEqual(issues.map((issue) => [issue.sourceProvenance, issue.sourceDocumentIds, issue.message]).sort(), [
+    ['inherited_unverified', ['shared-document'], 'Authored shared evidence is missing.'],
+    ['workbook_local', ['workbook-document'], 'Preserve this workbook-local definition.'],
+  ]);
+});
+
+test('readiness omits only explicitly withheld executable coverage and never resolves a withheld plan', () => {
+  const target = migrationTarget();
+  const plan = migrationPlan({ requiredQueryViews: [
+    { name: 'withheld_view', sourceFileName: 'withheld_view.query.view', status: 'missing_copyable' },
+    { name: 'independent_view', sourceFileName: 'independent_view.query.view', status: 'missing_copyable' },
+  ], relationshipEdges: [{ joinFromView: 'withheld_view', joinToView: 'independent_view' }], dependencyProposalsWithheld: [
+    { artifact: 'query_view', reference: 'withheld_view', reason: 'Source prerequisite requires review.', sourceDocumentId: 'dashboard-1' },
+    { artifact: 'relationship', reference: 'relationship', reason: 'Source prerequisite requires review.', sourceDocumentId: 'dashboard-1' },
+  ] }, target);
+  const readiness = assertException(resolveDashboardSafeCopyTarget(plan, target, { mode: 'readiness' }));
+  assert.equal(readiness.filter((issue) => issue.message.includes('lacks an exact')).length, 1);
+  assert.ok(readiness.some((issue) => issue.reference === 'independent_view'));
+  assert.ok(readiness.some((issue) => issue.reference === 'source_evidence' && issue.sourceDocumentIds?.[0] === 'dashboard-1'));
+  const execution = assertException(resolveDashboardSafeCopyTarget(plan, target));
+  assert.equal(execution.filter((issue) => issue.message.includes('lacks an exact')).length, 3);
+  const noWithheldProof = migrationPlan({ requiredQueryViews: [{ name: 'withheld_view', sourceFileName: 'withheld_view.query.view', status: 'missing_copyable' }] }, target);
+  assert.ok(assertException(resolveDashboardSafeCopyTarget(noWithheldProof, target, { mode: 'readiness' })).some((issue) => issue.message.includes('lacks an exact')));
+});
+
+test('per-document provenance never permits conflicting shared field mappings', () => {
+  const target = migrationTarget();
+  const plan = migrationPlan({ fieldDependencies: [
+    fieldDependency({ sourceDocumentId: 'first-document', targetCandidates: [{ fieldRef: 'orders.net_sales', matchType: 'exact' }] }),
+    fieldDependency({ sourceDocumentId: 'second-document' }),
+  ] }, target);
+  const issues = assertException(resolveDashboardSafeCopyTarget(plan, target));
+  const conflict = issues.find((issue) => issue.code === 'AMBIGUOUS_MAPPING');
+  assert.deepEqual(conflict?.sourceDocumentIds, ['first-document', 'second-document']);
+});
+
+test('readiness patch candidates preserve exact names and reject unknown or ambiguous evidence', () => {
+  const candidates = dashboardSafeCopyDependencyPatchCandidates({
+    fieldDependencies: [fieldDependency(), fieldDependency({ sourceFieldRef: 'other.net_sales', sourceViewName: 'other', sourceYaml: undefined, sourceFileName: undefined })],
+    queryViews: [{ name: 'summary', sourceFileName: 'reports/summary.query.view', status: 'missing_copyable' }],
+  });
+  assert.deepEqual(candidates.fieldMappings.map((mapping) => mapping.sourceFieldRef), ['orders.net_sales']);
+  assert.equal(candidates.queryViewMappings[0].targetFileName, 'reports/summary.query.view');
+  assert.equal(candidates.queryViewMappings[0].targetQueryViewName, 'summary');
+  const conflict = dashboardSafeCopyDependencyPatchCandidates({
+    fieldDependencies: [fieldDependency(), fieldDependency({ sourceYaml: '  net_sales:\n    sql: ${TABLE}.different\n' })],
+    queryViews: [{ name: 'summary', sourceFileName: 'reports/summary.query.view', status: 'missing_copyable' }],
+    configuredQueryViewMappings: [{ sourceQueryViewName: 'summary', action: 'copy_source', targetQueryViewName: 'different_summary' }],
+  });
+  assert.deepEqual(conflict, { fieldMappings: [], queryViewMappings: [] });
+});
+
+test('topic mappings require authored source identity even when the destination is explicitly selected', () => {
+  const mapping = { sourceTopicName: 'ExampleSource', sourceTopicId: 'example-topic-id', action: 'map_existing' as const, targetTopicName: 'ExampleSource' };
+  const target = { ...migrationTarget(), topicMappings: [mapping] };
+  const result = resolveDashboardSafeCopyTarget(migrationPlan({
+    sourceTopics: [{ name: 'ExampleSource', id: 'example-topic-id' }],
+    topicMappings: [mapping],
+  }, target), target);
+  assert.ok(assertException(result).some((issue) => issue.artifact === 'topic' && issue.code === 'MISSING_EVIDENCE'));
+});
+
+test('topic mappings reject ambiguous authored files and conflicting cross-name file identity', () => {
+  for (const topics of [
+    [
+      { name: 'ExampleSource', id: 'example-topic-id', fileName: 'first/ExampleSource.topic' },
+      { name: 'ExampleSource', id: 'example-topic-id', fileName: 'second/ExampleSource.topic' },
+    ],
+    [
+      { name: 'ExampleSource', id: 'example-topic-id', fileName: 'ExampleSource.topic' },
+      { name: 'RenamedSource', id: 'example-topic-id', fileName: 'RenamedSource.topic' },
+    ],
+  ]) {
+    const mapping = { sourceTopicName: 'ExampleSource', sourceTopicId: 'example-topic-id', action: 'map_existing' as const, targetTopicName: 'ExampleSource' };
+    const target = { ...migrationTarget(), topicMappings: [mapping] };
+    const result = resolveDashboardSafeCopyTarget(migrationPlan({ sourceTopics: topics, topicMappings: [mapping] }, target), target);
+    assert.ok(assertException(result).some((issue) => issue.artifact === 'topic' && issue.code === 'AMBIGUOUS_MAPPING'));
+  }
+});
+
+test('an explicit differently named destination is permitted only with exact original source evidence', () => {
+  const mapping = { sourceTopicName: 'ExampleSource', sourceTopicId: 'example-topic-id', action: 'map_existing' as const, targetTopicName: 'ExampleDestination' };
+  const target = { ...migrationTarget(), topicMappings: [mapping] };
+  const result = resolveDashboardSafeCopyTarget(migrationPlan({
+    sourceTopics: [{ name: 'ExampleSource', id: 'example-topic-id', fileName: 'nested/ExampleSource.topic' }],
+    topicMappings: [mapping],
+  }, target), target);
+  assert.equal(result.status, 'resolved');
+  if (result.status !== 'resolved') return;
+  assert.deepEqual(result.target.topicMappings, [mapping]);
+});
+
+test('a label-only or stale renamed source filename cannot prove source identity', () => {
+  for (const fileName of ['unrelated.topic', 'ExampleDestination.topic']) {
+    const mapping = { sourceTopicName: 'ExampleSource', sourceTopicId: 'example-topic-id', action: 'map_existing' as const, targetTopicName: 'ExampleDestination' };
+    const target = { ...migrationTarget(), topicMappings: [mapping] };
+    const result = resolveDashboardSafeCopyTarget(migrationPlan({
+      sourceTopics: [{ name: 'ExampleSource', id: 'example-topic-id', fileName }],
+      topicMappings: [mapping],
+    }, target), target);
+    assert.ok(assertException(result).some((issue) => issue.artifact === 'topic' && issue.code === 'MISSING_EVIDENCE'));
+  }
+});
+
+test('an automatically inferred differently named topic remains blocked without an explicit choice', () => {
+  const target = migrationTarget();
+  const result = resolveDashboardSafeCopyTarget(migrationPlan({
+    sourceTopics: [{ name: 'ExampleSource', id: 'example-topic-id', fileName: 'ExampleSource.topic' }],
+    topicMappings: [{ sourceTopicName: 'ExampleSource', sourceTopicId: 'example-topic-id', action: 'map_existing', targetTopicName: 'ExampleDestination' }],
+  }, target), target);
+  assert.ok(assertException(result).some((issue) => issue.artifact === 'topic' && issue.code === 'AMBIGUOUS_MAPPING'));
+});
+
+test('an explicit topic choice cannot replace a conflicting source identifier', () => {
+  const mapping = { sourceTopicName: 'ExampleSource', sourceTopicId: 'different-topic-id', action: 'map_existing' as const, targetTopicName: 'ExampleDestination' };
+  const target = { ...migrationTarget(), topicMappings: [mapping] };
+  const result = resolveDashboardSafeCopyTarget(migrationPlan({
+    sourceTopics: [{ name: 'ExampleSource', id: 'example-topic-id', fileName: 'ExampleSource.topic' }],
+    topicMappings: [mapping],
+  }, target), target);
+  assert.ok(assertException(result).some((issue) => issue.artifact === 'topic' && issue.code === 'AMBIGUOUS_MAPPING'));
+});
+
 test('safe-copy resolver builds one deterministic target from exact, strong, and source-copy evidence', () => {
   const target = migrationTarget();
   const result = resolveDashboardSafeCopyTarget(migrationPlan({
@@ -129,7 +261,7 @@ test('safe-copy resolver builds one deterministic target from exact, strong, and
       targetFileName: 'orders_summary.query.view',
     }],
     sourceTopics: [
-      { name: 'Orders', id: 'topic-orders' },
+      { name: 'Orders', id: 'topic-orders', fileName: 'Orders.topic' },
       { name: 'Daily Operations', id: 'topic-daily', fileName: 'Daily Operations.topic' },
     ],
     topicMappings: [{

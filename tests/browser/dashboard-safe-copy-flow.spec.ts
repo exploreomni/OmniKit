@@ -1,11 +1,14 @@
 import { expect, test, type Page, type Route } from '@playwright/test';
 import { sha256Text } from '../../src/services/contentHash';
 import type { MigrationJob } from '../../src/services/opsConsole';
+import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
+import type { DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
 
 const DRAFT_KEY = 'omnikit:dashboardSafeCopyDraft:v1';
 const CONNECTION_KEY = 'omnikit:activeConnection:v1';
 const REQUEST_ID = '11111111-1111-4111-8111-111111111111';
 const JOB_ID = '22222222-2222-4222-8222-222222222222';
+const PLAN_ID = '44444444-4444-4444-8444-444444444444';
 const SOURCE_HASH = 'a'.repeat(64);
 const PAYLOAD_HASH = 'b'.repeat(64);
 const ATTEMPT_CREATED_AT = 1;
@@ -77,14 +80,14 @@ function documents(count = 220) {
   });
 }
 
-function inventory(documentCount: number) {
+function inventory(documentCount: number, scope: 'credential' | 'explicit_documents' = 'credential') {
   return {
     complete: true,
-    scope: 'credential',
+    scope,
     cache: {
       status: 'miss',
       fetchedAt: '2026-08-16T00:00:00.000Z',
-      expiresAt: '2026-08-16T00:05:00.000Z',
+      expiresAt: '2026-08-16T00:15:00.000Z',
       ageMs: 0,
       fresh: true,
     },
@@ -487,6 +490,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
   const retriedTargets: Array<{ jobId: string; targetId: string; requestId: string }> = [];
   const migrationPostPaths: string[] = [];
   let currentJob = options.restoredJob;
+  let currentPlan: DashboardDeploymentPlan | undefined;
   let jobReadCount = 0;
   let handoffJobReadGateArmed = false;
 
@@ -501,6 +505,11 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
       return json(route, { unlocked: true, exists: true, path: '/isolated/test-vault', instanceCount: instances.length });
     }
     if (path === '/api/instances' && method === 'GET') return json(route, { instances });
+    const folderInventory = path.match(/^\/api\/instances\/([^/]+)\/folder-inventory$/);
+    if (folderInventory) return json(route, {
+      folders: [{ id: `folder-${folderInventory[1].toLowerCase()}`, name: `Safe copies ${folderInventory[1]}`, path: `/Safe copies/${folderInventory[1]}` }],
+      pagination: { complete: true }, cache: { status: 'miss', fresh: true },
+    });
 
     const catalogMatch = path.match(/^\/api\/model-migrator\/([^/]+)\/(connections|models)$/);
     if (catalogMatch) {
@@ -511,12 +520,20 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
     }
 
     if (path === '/api/instances/A/documents') {
-      const rows = documents();
-      return json(route, { documents: rows, inventory: inventory(rows.length) });
+      const selectedIds = url.searchParams.get('documentIds')?.split(',');
+      const rows = documents().filter((document) => !selectedIds || selectedIds.includes(document.identifier) || selectedIds.includes(document.id));
+      return json(route, { documents: rows, inventory: inventory(rows.length, selectedIds ? 'explicit_documents' : 'credential') });
     }
 
-    if (path === '/api/migration-jobs/safe-copy' && method === 'POST') {
-      const payload = request.postDataJSON() as SafeCopyPayload;
+    if (path === '/api/migration-jobs/deployment-plans' && method === 'POST') {
+      const intent = request.postDataJSON() as DashboardSafeCopyIntent;
+      currentPlan = { version: 2, id: PLAN_ID, revision: 1, createdAt: 1, updatedAt: 1, intent, sourceHashes: {}, sourceModelHashes: {}, targets: intent.destinations.map((row) => ({ targetId: row.targetId, status: 'ready', findings: [], sourceModelIds: [], requiredFiles: [], requiredFilesByModelId: {}, checkedAt: VERIFIED_AT })) };
+      return json(route, { plan: currentPlan });
+    }
+    if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}` || path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/recheck`) return json(route, { plan: currentPlan });
+    if (path === `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy` && method === 'POST') {
+      const body = request.postDataJSON() as { requestId: string; targetIds: string[] };
+      const payload: SafeCopyPayload = { ...currentPlan!.intent, requestId: body.requestId, destinations: currentPlan!.intent.destinations.filter((row) => body.targetIds.includes(row.targetId)) };
       createdPayloads.push(payload);
       currentJob = safeCopyJob(payload);
       if (options.createJobId) currentJob.id = options.createJobId;
@@ -524,7 +541,7 @@ async function installApiMocks(page: Page, options: MockOptions = {}) {
         await new Promise((resolve) => setTimeout(resolve, 80));
         return json(route, { error: 'The server accepted the request but the response was lost.' }, 503);
       }
-      return json(route, { job: currentJob, replayed: createdPayloads.length > 1, resumed: false });
+      return json(route, { job: currentJob, plan: currentPlan });
     }
 
     if (path === '/api/migration-jobs' && method === 'GET') {
@@ -592,6 +609,7 @@ async function chooseDashboardsAndDestinations(page: Page, destinationIds: strin
   // Connection pickers show "name — database" once selected so two connections
   // that share a name stay distinguishable. See buildConnectionComboBoxOptions.
   await expect(page.getByRole('combobox', { name: 'Source connection' })).toHaveValue('A connection — A');
+  if (await page.getByRole('checkbox', { name: /Dashboard 001/ }).count() === 0) await page.getByRole('button', { name: 'Browse all dashboards', exact: true }).click();
   await page.getByRole('checkbox', { name: /Dashboard 001/ }).check();
   await page.getByRole('button', { name: 'Choose destinations', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Choose destinations', exact: true })).toBeFocused();
@@ -600,24 +618,37 @@ async function chooseDashboardsAndDestinations(page: Page, destinationIds: strin
   await expect(stepNavigation.locator('button[aria-current="step"]')).toHaveCount(1);
   await expect(steps.nth(1)).toHaveAttribute('aria-current', 'step');
   for (const destinationId of destinationIds) {
-    await page.getByRole('checkbox', { name: new RegExp(`Destination ${destinationId}`) }).check();
+    await addDestination(page, destinationId);
   }
-  await expect(page.getByRole('button', { name: 'Review move' })).toBeEnabled();
-  await page.getByRole('button', { name: 'Review move' }).click();
-  await expect(page.getByRole('heading', { name: 'Move & track', exact: true })).toBeFocused();
+  await expect(page.getByRole('button', { name: 'Review readiness', exact: true })).toBeEnabled();
+  await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
+  await page.getByRole('button', { name: `Review deployment (${destinationIds.length})`, exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeFocused();
   await expect(stepNavigation.locator('button[aria-current="step"]')).toHaveCount(1);
-  await expect(steps.nth(2)).toHaveAttribute('aria-current', 'step');
+  await expect(steps.nth(3)).toHaveAttribute('aria-current', 'step');
 }
 
-test('three-screen A→B,C,D move is progressive, accessible, idempotent after a lost response, and storage-minimal', async ({ page }) => {
+async function addDestination(page: Page, destinationId: string) {
+  await page.getByRole('combobox', { name: 'Instance to add as a destination', exact: true }).click();
+  await page.getByRole('option', { name: new RegExp(`^Destination ${destinationId}`) }).click();
+  await page.getByRole('button', { name: 'Add destination', exact: true }).click();
+}
+
+async function editDestination(page: Page, index: number) {
+  const edit = page.getByRole('button', { name: `Edit destination ${index}`, exact: true });
+  if (await edit.getAttribute('aria-expanded') !== 'true') await edit.click();
+}
+
+test('four-screen A→B,C,D deployment is progressive, accessible, idempotent after a lost response, and storage-minimal', async ({ page }) => {
   await seedActiveConnection(page);
   const mock = await installApiMocks(page, { createFirstResponseLost: true });
   await openFlow(page);
 
   const steps = page.getByRole('navigation', { name: 'Dashboard move steps' }).getByRole('button');
-  await expect(steps).toHaveCount(3);
+  await expect(steps).toHaveCount(4);
   await expect(steps.nth(0)).toHaveAttribute('aria-current', 'step');
   await expect(page.getByRole('heading', { name: 'Choose dashboards', exact: true })).toBeFocused();
+  await page.getByRole('button', { name: 'Browse all dashboards', exact: true }).click();
   await expect(page.getByRole('checkbox', { name: /Dashboard \d{3}/ })).toHaveCount(100);
   await page.getByRole('button', { name: 'Show 100 more' }).click();
   await expect(page.getByRole('checkbox', { name: /Dashboard \d{3}/ })).toHaveCount(200);
@@ -635,14 +666,15 @@ test('three-screen A→B,C,D move is progressive, accessible, idempotent after a
     await expect(page.getByText(forbidden, { exact: false })).toHaveCount(0);
   }
 
-  await page.getByRole('button', { name: 'Move dashboards' }).dblclick();
+  await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).dblclick();
   await expect.poll(() => mock.createdPayloads.length).toBe(1);
   await expect(page.getByRole('alert')).toContainText('response was lost');
-  await page.getByRole('button', { name: 'Move dashboards' }).click();
+  await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).click();
   await expect.poll(() => mock.createdPayloads.length).toBe(2);
   expect(mock.migrationPostPaths).toEqual([
-    '/api/migration-jobs/safe-copy',
-    '/api/migration-jobs/safe-copy',
+    '/api/migration-jobs/deployment-plans',
+    `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy`,
+    `/api/migration-jobs/deployment-plans/${PLAN_ID}/deploy`,
   ]);
 
   expect(mock.createdPayloads[0].requestId).toBe(mock.createdPayloads[1].requestId);
@@ -650,8 +682,8 @@ test('three-screen A→B,C,D move is progressive, accessible, idempotent after a
     profile: 'safe_copy_v1',
     requestId: mock.createdPayloads[1].requestId,
     source: { instanceId: 'A', connectionId: 'connection-a', documentIds: ['dashboard-001'] },
-    destinations: ['B', 'C', 'D'].map((id) => ({
-      targetId: id,
+    destinations: ['B', 'C', 'D'].map((id, index) => ({
+      targetId: mock.createdPayloads[1].destinations[index].targetId,
       instanceId: id,
       connectionId: `connection-${id.toLowerCase()}`,
       modelId: `model-${id.toLowerCase()}`,
@@ -663,13 +695,13 @@ test('three-screen A→B,C,D move is progressive, accessible, idempotent after a
     JSON.parse(window.sessionStorage.getItem(key) || '{}') as { jobId?: string }
   ).jobId, DRAFT_KEY)).toBe(JOB_ID);
   const storedDraft = await page.evaluate((key) => JSON.parse(window.sessionStorage.getItem(key) || '{}'), DRAFT_KEY);
-  expect(Object.keys(storedDraft).sort()).toEqual(['jobId', 'requestId', 'version']);
+  expect(Object.keys(storedDraft).sort()).toEqual(['deploymentRequestId', 'jobId', 'planId', 'requestId', 'selectedTargetIds', 'version']);
   expect(JSON.stringify(storedDraft)).not.toMatch(/source|dashboard|destination|connection|model|folder|credential|secret/i);
 
   await page.reload();
   const close = page.getByRole('button', { name: 'Close walkthrough' });
   if (await close.isVisible().catch(() => false)) await close.click();
-  await expect(page.getByRole('heading', { name: 'Move & track', exact: true })).toBeFocused();
+  await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeFocused();
   await expect(page.getByText(`Job ${JOB_ID}`, { exact: true })).not.toBeVisible();
   await page.locator('details').filter({ hasText: `Job ${JOB_ID}` }).getByText('Technical details').click();
   await expect(page.getByText(`Job ${JOB_ID}`, { exact: true })).toBeVisible();
@@ -681,14 +713,14 @@ test('a minimal A→B move projects only the safe-copy intent contract', async (
   await openFlow(page);
   await chooseDashboardsAndDestinations(page, ['B']);
   await expect(page.getByRole('list', { name: 'Destination folders' })).toContainText('Destination B: Folder /Safe copies/B');
-  await expect(page.getByText(/Source sharing is not copied\. Inherited access follows the destination folder shown here/)).toBeVisible();
-  await page.getByRole('button', { name: 'Move dashboards' }).click();
+  await expect(page.getByText(/Source sharing is not copied\. Access inherited from the destination folder/)).toBeVisible();
+  await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).click();
   await expect.poll(() => mock.createdPayloads.length).toBe(1);
   expect(mock.createdPayloads[0].destinations.map((row) => row.instanceId)).toEqual(['B']);
   expect(Object.keys(mock.createdPayloads[0]).sort()).toEqual(['destinations', 'profile', 'requestId', 'source']);
 });
 
-test('destination defaults render prompts only for choices the catalog cannot resolve', async ({ page }) => {
+test('destination defaults stay editable and unresolved choices block readiness', async ({ page }) => {
   const bModels = [
     { ...model('B-one'), connectionId: 'connection-b', connectionName: 'B connection' },
     { ...model('B-two'), connectionId: 'connection-b', connectionName: 'B connection' },
@@ -705,45 +737,37 @@ test('destination defaults render prompts only for choices the catalog cannot re
   });
   await openFlow(page);
 
+  await page.getByRole('button', { name: 'Browse all dashboards', exact: true }).click();
   await page.getByRole('checkbox', { name: /Dashboard 001/ }).check();
   await page.getByRole('button', { name: 'Choose destinations', exact: true }).click();
   for (const destinationId of ['B', 'C', 'D']) {
-    await page.getByRole('checkbox', { name: new RegExp(`Destination ${destinationId}`) }).check();
+    await addDestination(page, destinationId);
   }
-
-  const destinationB = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination B' }) });
-  const destinationC = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination C' }) });
-  const destinationD = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination D' }) });
-  const reviewMove = page.getByRole('button', { name: 'Review move' });
-
-  await expect(destinationB.getByText('B connection', { exact: true })).toBeVisible();
-  await expect(destinationB.getByRole('combobox', { name: /Destination B destination \d+ connection/ })).toHaveCount(0);
-  const destinationBModel = destinationB.getByRole('combobox', { name: 'Destination model for Destination B' });
+  const destinationB = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 1', exact: true }) });
+  const destinationC = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 2', exact: true }) });
+  const destinationD = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 3', exact: true }) });
+  const reviewMove = page.getByRole('button', { name: 'Review readiness', exact: true });
+  await editDestination(page, 1);
+  await expect(destinationB.getByRole('combobox', { name: /Destination B destination 1 connection/ })).toHaveValue('B connection — B');
+  const destinationBModel = destinationB.getByRole('combobox', { name: 'Destination 1 model', exact: true });
   await expect(destinationBModel).toBeVisible();
-  await expect(destinationB.getByText('Choice needed', { exact: true })).toBeVisible();
-
-  const destinationCConnection = destinationC.getByRole('combobox', { name: /Destination C destination \d+ connection/ });
+  await editDestination(page, 2);
+  const destinationCConnection = destinationC.getByRole('combobox', { name: /Destination C destination 2 connection/ });
   await expect(destinationCConnection).toBeVisible();
-  await expect(destinationC.getByRole('combobox', { name: 'Destination model for Destination C' })).toBeDisabled();
-  await expect(destinationC.getByText('Choice needed', { exact: true })).toBeVisible();
-
-  await expect(destinationD.getByText('D connection', { exact: true })).toBeVisible();
-  await expect(destinationD.getByText('D connection - D shared model', { exact: true })).toBeVisible();
-  await expect(destinationD.getByRole('combobox')).toHaveCount(0);
-  await expect(destinationD.getByText('Ready', { exact: true })).toBeVisible();
+  await expect(destinationC.getByRole('combobox', { name: 'Destination 2 model', exact: true })).toBeDisabled();
+  await editDestination(page, 3);
+  await expect(destinationD.getByRole('combobox', { name: /Destination D destination 3 connection/ })).toHaveValue('D connection — D');
+  await expect(destinationD.getByRole('combobox', { name: 'Destination 3 model', exact: true })).toHaveValue('D connection - D shared model');
   await expect(reviewMove).toBeDisabled();
-
+  await editDestination(page, 1);
   await destinationBModel.click();
   await page.getByRole('option', { name: /B-one shared model/ }).click();
-  await expect(destinationB.getByRole('combobox')).toHaveCount(0);
-  await expect(destinationB.getByText('Ready', { exact: true })).toBeVisible();
+  await expect(destinationBModel).toBeVisible();
   await expect(reviewMove).toBeDisabled();
-
+  await editDestination(page, 2);
   await destinationCConnection.click();
   await page.getByRole('option', { name: /C-one connection/ }).click();
-  await expect(destinationC.getByRole('combobox')).toHaveCount(0);
-  await expect(destinationC.getByText('C-one connection - C-one shared model', { exact: true })).toBeVisible();
-  await expect(destinationC.getByText('Ready', { exact: true })).toBeVisible();
+  await expect(destinationC.getByRole('combobox', { name: 'Destination 2 model', exact: true })).toHaveValue('C-one connection - C-one shared model');
   await expect(reviewMove).toBeEnabled();
 });
 
@@ -753,7 +777,7 @@ test('full-success A→B completion exposes exactly one attested artifact and ve
   await openFlow(page);
 
   await expect(page.getByRole('heading', { name: 'Move complete', exact: true })).toBeVisible();
-  await expect(page.getByText(/Every destination passed content, query, and direct-access verification\./)).toBeVisible();
+  await expect(page.getByText(/The deployed dashboards passed content, query, and direct-access verification\./)).toBeVisible();
   const destinationB = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Destination B' }) });
   await expect(destinationB).toHaveCount(1);
   await expect(destinationB.getByText('Folder /Safe copies/B', { exact: true })).toBeVisible();
@@ -806,7 +830,7 @@ test('Screen 3 projects exact per-dashboard proof with isolated B, C, and D stag
   await installApiMocks(page, { restoredJob: mixedScreen3Job() });
   await openFlow(page);
 
-  await expect(page.getByRole('heading', { name: 'Move & track', exact: true })).toBeFocused();
+  await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeFocused();
   const targets = Object.fromEntries(['B', 'C', 'D'].map((targetId) => [
     targetId,
     page.getByRole('article').filter({ has: page.getByRole('heading', { name: `Destination ${targetId}` }) }),
@@ -857,14 +881,14 @@ test('an accepted create whose response is lost is recovered by its exact reques
   const mock = await installApiMocks(page, { createFirstResponseLost: true });
   await openFlow(page);
   await chooseDashboardsAndDestinations(page, ['B']);
-  await page.getByRole('button', { name: 'Move dashboards' }).click();
+  await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).click();
   await expect(page.getByRole('alert')).toContainText('response was lost');
   await expect.poll(() => mock.createdPayloads.length).toBe(1);
 
   await page.reload();
   const close = page.getByRole('button', { name: 'Close walkthrough' });
   if (await close.isVisible().catch(() => false)) await close.click();
-  await expect(page.getByRole('heading', { name: 'Move & track', exact: true })).toBeFocused();
+  await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeFocused();
   const stored = await page.evaluate((key) => JSON.parse(window.sessionStorage.getItem(key) || '{}'), DRAFT_KEY);
   expect(stored.requestId).toBe(mock.createdPayloads[0].requestId);
   expect(stored.jobId).toBe(JOB_ID);
@@ -900,10 +924,10 @@ test('a malformed create-job identifier is rejected and never attached to browse
   await installApiMocks(page, { createJobId: 'malformed-job-id' });
   await openFlow(page);
   await chooseDashboardsAndDestinations(page, ['B']);
-  await page.getByRole('button', { name: 'Move dashboards' }).click();
+  await page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ }).click();
 
   await expect(page.getByRole('alert')).toContainText('did not match this safe dashboard move');
-  await expect(page.getByRole('button', { name: 'Move dashboards' })).toBeVisible();
+  await expect(page.getByRole('button', { name: /^Deploy to \d+ destinations?$/ })).toBeVisible();
   const stored = await page.evaluate((key) => JSON.parse(window.sessionStorage.getItem(key) || '{}'), DRAFT_KEY);
   expect(stored.jobId).toBeUndefined();
 });
@@ -1144,7 +1168,7 @@ test('Screen 3 fits 320px and reduced motion disables the active reconciliation 
   await installApiMocks(page, { restoredJob: mixedScreen3Job(), retryDelayMs: 500 });
   await openFlow(page);
 
-  await expect(page.getByRole('heading', { name: 'Move & track', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: 'Deploy and track', exact: true })).toBeVisible();
   await expect(page.getByRole('article')).toHaveCount(3);
   await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
 

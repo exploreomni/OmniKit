@@ -17,6 +17,7 @@ export interface OmniFolder {
   name: string;
   identifier?: string;
   path?: string;
+  url?: string;
   labels?: Array<string | { name?: string }>;
   children?: OmniFolder[];
 }
@@ -25,6 +26,7 @@ export interface OmniDocument {
   id: string;
   name: string;
   identifier?: string;
+  url?: string;
   baseModelId?: string;
   baseModelName?: string;
   topicNames?: string[];

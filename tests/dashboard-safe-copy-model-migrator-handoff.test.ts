@@ -2,12 +2,17 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  dashboardDeploymentModelMigratorHandoffFromSearch,
   dashboardSafeCopyModelMigratorHandoffMatchesJob,
   createDashboardSafeCopyModelMigratorHandoff,
   parseDashboardSafeCopyModelMigratorHandoff,
+  parseDashboardDeploymentModelMigratorHandoff,
+  resolveDashboardDeploymentModelMigratorHandoff,
   resolveDashboardSafeCopyModelMigratorHandoff,
+  scopeDashboardModelRepairTranslation,
 } from '../src/services/modelMigratorHandoff';
 import type { MigrationJob } from '../src/services/opsConsole';
+import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
 
 const JOB_ID = '22222222-2222-4222-8222-222222222222';
 
@@ -102,7 +107,7 @@ test('malformed, expanded, or whitespace-altered repair route state fails closed
   }
 });
 
-test('repair route state resolves only for distinct saved instances with eligible roles', () => {
+test('repair route state resolves for eligible roles including same-instance different connections', () => {
   const value = handoff();
   assert.deepEqual(resolveDashboardSafeCopyModelMigratorHandoff(value, [
     instance('source-a', 'source'),
@@ -123,8 +128,90 @@ test('repair route state resolves only for distinct saved instances with eligibl
   const sameInstanceResolution = resolveDashboardSafeCopyModelMigratorHandoff(sameInstance, [
     instance('source-a', 'both'),
   ]);
-  assert.equal(sameInstanceResolution.status, 'invalid');
-  assert.equal(sameInstanceResolution.handoff, undefined);
+  assert.equal(sameInstanceResolution.status, 'ready');
+  assert.deepEqual(sameInstanceResolution.handoff, sameInstance);
+});
+
+function deploymentPlan(): DashboardDeploymentPlan {
+  return {
+    version: 2, id: JOB_ID, revision: 1, createdAt: 1, updatedAt: 1,
+    intent: {
+      profile: 'safe_copy_v1', requestId: JOB_ID,
+      source: { instanceId: 'source-a', connectionId: 'source-connection', documentIds: ['dashboard-1'] },
+      destinations: [{ targetId: 'target-c', instanceId: 'destination-c', connectionId: 'target-connection', modelId: 'target-model' }],
+    },
+    sourceHashes: {}, sourceModelHashes: {},
+    targets: [{
+      targetId: 'target-c', status: 'model_changes_required', checkedAt: 1,
+      findings: [{ id: 'finding-1', kind: 'view', reference: 'required', message: 'A required view is missing.', documentIds: ['dashboard-1'], sourceFileName: 'required.view' }],
+      sourceModelIds: ['source-model'], requiredFiles: ['required.view'],
+      requiredFilesByModelId: { 'source-model': ['required.view'] },
+    }],
+  };
+}
+
+const deploymentHandoff = { version: 2, source: 'dashboard_deployment_plan', planId: JOB_ID, targetId: 'target-c' } as const;
+const repairInstances = [instance('source-a', 'source'), instance('destination-c', 'destination')];
+
+test('deployment handoff carries identifiers only and reload query recovers the same exact plan target', () => {
+  assert.deepEqual(parseDashboardDeploymentModelMigratorHandoff(deploymentHandoff), deploymentHandoff);
+  assert.deepEqual(dashboardDeploymentModelMigratorHandoffFromSearch(`?planId=${JOB_ID}&targetId=target-c`), deploymentHandoff);
+  assert.equal(parseDashboardDeploymentModelMigratorHandoff({ ...deploymentHandoff, targetModelId: 'spoofed-model' }), null);
+  assert.equal(dashboardDeploymentModelMigratorHandoffFromSearch(`?planId=${JOB_ID}&targetId=target-c&targetId=other`), null);
+  assert.equal(parseDashboardDeploymentModelMigratorHandoff({ ...deploymentHandoff, planId: 'not-a-plan-id' }), null);
+});
+
+test('deployment repair gets all model and connection identities from the reread plan', () => {
+  const plan = deploymentPlan();
+  const scope = resolveDashboardDeploymentModelMigratorHandoff(deploymentHandoff, plan, repairInstances);
+  assert.deepEqual(scope.sourceModelIds, ['source-model']);
+  assert.equal(scope.targetModelId, 'target-model');
+  assert.equal(scope.sourceConnectionId, 'source-connection');
+  assert.equal(scope.targetConnectionId, 'target-connection');
+  assert.equal(scope.scopeReviewRequired, undefined);
+  assert.throws(() => resolveDashboardDeploymentModelMigratorHandoff(deploymentHandoff, { ...plan, id: 'other-plan' }, repairInstances));
+  assert.throws(() => resolveDashboardDeploymentModelMigratorHandoff(deploymentHandoff, plan, [instance('source-a', 'destination'), instance('destination-c', 'destination')]));
+  plan.intent.destinations[0].instanceId = 'source-a';
+  assert.equal(resolveDashboardDeploymentModelMigratorHandoff(deploymentHandoff, plan, [instance('source-a', 'both')]).scopeReviewRequired, undefined);
+});
+
+test('empty, unowned, conflicting, or unverified dependency scope never defaults to whole-model repair', () => {
+  for (const change of [
+    { requiredFiles: [], requiredFilesByModelId: {} },
+    { sourceModelIds: [] },
+    { requiredFilesByModelId: {} },
+    { requiredFiles: ['required.view', 'unowned.view'] },
+    { sourceModelIds: ['source-model', 'other-model'], requiredFilesByModelId: { 'source-model': ['required.view'], 'other-model': ['required.view'] } },
+    { status: 'unverified' as const },
+    { status: 'needs_recheck' as const },
+  ]) {
+    const plan = deploymentPlan();
+    Object.assign(plan.targets[0], change);
+    const scope = resolveDashboardDeploymentModelMigratorHandoff(deploymentHandoff, plan, repairInstances);
+    assert.ok(scope.scopeReviewRequired);
+  }
+});
+
+test('repair translation includes only required files and their source-backed decisions', () => {
+  const scope = resolveDashboardDeploymentModelMigratorHandoff(deploymentHandoff, deploymentPlan(), repairInstances);
+  const translation = {
+    files: [{ fileName: 'required.view' }, { fileName: 'unrelated.view' }],
+    checksums: { 'required.view': 'required-checksum', 'unrelated.view': 'other-checksum' },
+    semanticDecisions: [
+      { sourceFileName: 'required.view', targetFileName: 'required.view' },
+      { sourceFileName: 'unrelated.view', targetFileName: 'unrelated.view' },
+      { targetFileName: 'target-only.view' },
+      { sourceFileName: 'required.view', targetFileName: 'target-only.view' },
+    ],
+    prompts: [{ fileName: 'required.view', prompt: 'Required review' }, { fileName: 'unrelated.view', prompt: 'Other review' }],
+  };
+  const filtered = scopeDashboardModelRepairTranslation(translation, scope, 'source-model');
+  assert.deepEqual(filtered.files, [{ fileName: 'required.view' }]);
+  assert.deepEqual(filtered.checksums, { 'required.view': 'required-checksum' });
+  assert.deepEqual(filtered.semanticDecisions, [{ sourceFileName: 'required.view', targetFileName: 'required.view' }]);
+  assert.equal(filtered.prompts.length, 1);
+  assert.throws(() => scopeDashboardModelRepairTranslation({ ...translation, files: [] }, scope, 'source-model'), /Dependency scope needs review/);
+  assert.throws(() => scopeDashboardModelRepairTranslation(translation, scope, 'other-model'), /Dependency scope needs review/);
 });
 
 test('repair scope must still match the exact safe-copy job and one actionable target', () => {

@@ -1,4 +1,5 @@
-import { validateBaseUrl, jsonHeaders } from '../security';
+import { assertSafeOutboundUrl, validateBaseUrl, jsonHeaders } from '../security';
+import { acquireOmniRequestSlot } from '../services/omniClient';
 
 function extractSlug(folder: Record<string, unknown>): string {
   for (const key of ["identifier", "slug", "filePath", "file_path", "path"]) {
@@ -28,6 +29,7 @@ function normalizeFolders(folders: unknown[]): unknown[] {
       name: (folder.name as string).trim(),
       ...(identifier ? { identifier } : {}),
       ...(typeof folder.path === "string" && folder.path.trim() ? { path: folder.path.trim() } : {}),
+      ...(typeof folder.url === "string" && folder.url.trim() ? { url: folder.url.trim() } : {}),
       ...(labels ? { labels } : {}),
       ...(children ? { children } : {}),
     };
@@ -56,6 +58,7 @@ function collectFolderIds(records: unknown[], seen: Set<string>): boolean {
       || ['identifier', 'slug', 'filePath', 'file_path', 'path'].some((key) => (
         folder[key] !== undefined && typeof folder[key] !== "string"
       ))
+      || (folder.url !== undefined && typeof folder.url !== "string")
       || (folder.labels !== undefined && (!Array.isArray(folder.labels) || !folder.labels.every(isSafeFolderLabel)))
     ) return false;
     seen.add(id);
@@ -79,6 +82,46 @@ interface FolderPage {
 }
 
 const MAX_PAGES = 50;
+const PAGE_TIMEOUT_MS = 15_000;
+
+export interface ListFoldersDependencies {
+  fetch?: typeof fetch;
+  validateOutbound?: (url: string) => Promise<void>;
+  acquireRequestSlot?: (apiKey: string, signal?: AbortSignal) => Promise<void>;
+  pageTimeoutMs?: number;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The operation was aborted.', 'AbortError');
+}
+
+async function raceWithAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortReason(signal);
+  void operation.catch(() => undefined);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
@@ -117,7 +160,10 @@ function parseFolderPage(data: unknown): FolderPage | null {
   };
 }
 
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(
+  req: Request,
+  dependencies: ListFoldersDependencies = {},
+): Promise<Response> {
   try {
     const { base_url, api_key, page_size, cursor, all_pages } = await req.json();
 
@@ -143,6 +189,7 @@ export default async function handler(req: Request): Promise<Response> {
     let nextCursor = initialCursor;
     let lastPageInfo: PageInfo | null = null;
     let totalRecords: number | null = null;
+    let totalMode: 'stable' | 'remaining' | null = null;
     let pagesFetched = 0;
     let reachedSafetyLimit = false;
     const seenCursors = new Set<string>();
@@ -157,29 +204,63 @@ export default async function handler(req: Request): Promise<Response> {
       params.set("include", "labels");
       if (nextCursor) params.set("cursor", nextCursor);
 
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-
-      const response = await fetch(`${cleanUrl}/api/v1/folders?${params.toString()}`, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${api_key}`,
-          "Content-Type": "application/json",
-        },
-        signal: controller.signal,
-      });
-      clearTimeout(timeout);
-
-      if (!response.ok) {
+      const url = `${cleanUrl}/api/v1/folders?${params.toString()}`;
+      try {
+        await raceWithAbortSignal(
+          (dependencies.validateOutbound
+            || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url),
+          req.signal,
+        );
+      } catch (error) {
+        if (req.signal.aborted) throw error;
         return new Response(
-          JSON.stringify({
-            error: `Omni folder read failed with HTTP ${response.status}.`,
-          }),
-          { status: response.status, headers: jsonHeaders }
+          JSON.stringify({ error: 'The Omni folder destination could not be validated safely.' }),
+          { status: 400, headers: jsonHeaders },
         );
       }
+      await (dependencies.acquireRequestSlot || acquireOmniRequestSlot)(api_key, req.signal);
+      const controller = new AbortController();
+      const requestSignal = AbortSignal.any([req.signal, controller.signal]);
+      const timeout = setTimeout(
+        () => controller.abort(new DOMException('The folder inventory page timed out.', 'TimeoutError')),
+        dependencies.pageTimeoutMs ?? PAGE_TIMEOUT_MS,
+      );
+      let response: Response;
+      let responseData: unknown;
+      try {
+        response = await raceWithAbortSignal(
+          (dependencies.fetch || globalThis.fetch)(url, {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${api_key}`,
+              "Content-Type": "application/json",
+            },
+            redirect: 'manual',
+            signal: requestSignal,
+          }),
+          requestSignal,
+        );
+        if (response.status >= 300 && response.status < 400) {
+          return new Response(
+            JSON.stringify({ error: 'Omni redirected the folder inventory request unexpectedly.' }),
+            { status: 502, headers: jsonHeaders },
+          );
+        }
 
-      const page = parseFolderPage(await response.json());
+        if (!response.ok) {
+          return new Response(
+            JSON.stringify({
+              error: `Omni folder read failed with HTTP ${response.status}.`,
+            }),
+            { status: response.status, headers: jsonHeaders }
+          );
+        }
+        responseData = await raceWithAbortSignal(response.json(), requestSignal);
+      } finally {
+        clearTimeout(timeout);
+      }
+
+      const page = parseFolderPage(responseData);
       if (page === null) {
         return new Response(
           JSON.stringify({
@@ -189,12 +270,30 @@ export default async function handler(req: Request): Promise<Response> {
         );
       }
 
-      if (totalRecords === null) totalRecords = page.pageInfo.totalRecords;
-      if (page.pageInfo.totalRecords !== totalRecords) {
-        return new Response(
-          JSON.stringify({ error: "Omni returned inconsistent folder pagination evidence." }),
-          { status: 502, headers: jsonHeaders }
-        );
+      const recordsBeforePage = allRaw.length;
+      if (totalRecords === null) {
+        totalRecords = page.pageInfo.totalRecords;
+      } else {
+        const stableTotal = page.pageInfo.totalRecords === totalRecords;
+        const remainingTotal = page.pageInfo.totalRecords === totalRecords - recordsBeforePage;
+        if (totalMode === null) {
+          if (stableTotal) totalMode = 'stable';
+          else if (remainingTotal) totalMode = 'remaining';
+          else {
+            return new Response(
+              JSON.stringify({ error: "Omni returned inconsistent folder pagination evidence." }),
+              { status: 502, headers: jsonHeaders }
+            );
+          }
+        } else if (
+          (totalMode === 'stable' && !stableTotal)
+          || (totalMode === 'remaining' && !remainingTotal)
+        ) {
+          return new Response(
+            JSON.stringify({ error: "Omni returned inconsistent folder pagination evidence." }),
+            { status: 502, headers: jsonHeaders }
+          );
+        }
       }
       if (!collectFolderIds(page.records, seenFolderIds)) {
         return new Response(

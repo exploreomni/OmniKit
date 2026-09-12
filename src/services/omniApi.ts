@@ -418,15 +418,22 @@ export async function testConnection(baseUrl: string, apiKey: string) {
 export async function listFolders(
   baseUrl: string,
   apiKey: string,
-  options?: { allPages?: boolean; pageSize?: number; cursor?: string }
+  options?: { allPages?: boolean; pageSize?: number; cursor?: string; forceRefresh?: boolean; signal?: AbortSignal }
 ) {
-  const cacheKey = `${cacheScope(baseUrl, apiKey)}|folders|${JSON.stringify(options || {})}`;
+  const cachePrefix = `${cacheScope(baseUrl, apiKey)}|folders|`;
+  const cacheKey = `${cachePrefix}${JSON.stringify({
+    allPages: options?.allPages,
+    pageSize: options?.pageSize,
+    cursor: options?.cursor,
+  })}`;
+  if (options?.forceRefresh) clearMetadataCache(cachePrefix);
   return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('list-folders'),
       {
         method: 'POST',
         headers: defaultHeaders,
+        signal: options?.signal,
         body: JSON.stringify({
           base_url: baseUrl,
           api_key: apiKey,
@@ -446,15 +453,30 @@ export async function listDocuments(
   baseUrl: string,
   apiKey: string,
   folderId?: string,
-  options?: { allPages?: boolean; pageSize?: number; cursor?: string }
+  options?: {
+    allPages?: boolean;
+    pageSize?: number;
+    cursor?: string;
+    forceRefresh?: boolean;
+    signal?: AbortSignal;
+    includeAllDocuments?: boolean;
+  }
 ) {
-  const cacheKey = `${cacheScope(baseUrl, apiKey)}|documents|${folderId || 'root'}|${JSON.stringify(options || {})}`;
+  const cachePrefix = `${cacheScope(baseUrl, apiKey)}|documents|`;
+  const cacheKey = `${cachePrefix}${folderId || 'root'}|${JSON.stringify({
+    allPages: options?.allPages,
+    pageSize: options?.pageSize,
+    cursor: options?.cursor,
+    includeAllDocuments: options?.includeAllDocuments,
+  })}`;
+  if (options?.forceRefresh) clearMetadataCache(cachePrefix);
   return withMetadataCache(cacheKey, async ({ deduplicationScope }) => {
     const res = await safeFetch(
       edgeFunctionUrl('list-documents'),
       {
         method: 'POST',
         headers: defaultHeaders,
+        signal: options?.signal,
         body: JSON.stringify({
           base_url: baseUrl,
           api_key: apiKey,
@@ -462,6 +484,7 @@ export async function listDocuments(
           all_pages: options?.allPages,
           page_size: options?.pageSize,
           cursor: options?.cursor,
+          include_all_documents: options?.includeAllDocuments,
         }),
       },
       'List documents',
@@ -2602,7 +2625,12 @@ async function omniProxyRequest<T = unknown>(
   apiKey: string,
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   endpoint: string,
-  options: { body?: unknown; queryParams?: Record<string, string>; rawResponse?: boolean } | undefined,
+  options: {
+    body?: unknown;
+    queryParams?: Record<string, string>;
+    rawResponse?: boolean;
+    signal?: AbortSignal;
+  } | undefined,
   requestPolicy: SafeFetchPolicy,
 ): Promise<T> {
   const res = await safeFetch(
@@ -2610,6 +2638,7 @@ async function omniProxyRequest<T = unknown>(
     {
       method: 'POST',
       headers: defaultHeaders,
+      signal: options?.signal,
       body: JSON.stringify({
         base_url: baseUrl,
         api_key: apiKey,
@@ -2632,7 +2661,12 @@ export async function omniProxy<T = unknown>(
   apiKey: string,
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE',
   endpoint: string,
-  options?: { body?: unknown; queryParams?: Record<string, string>; rawResponse?: boolean }
+  options?: {
+    body?: unknown;
+    queryParams?: Record<string, string>;
+    rawResponse?: boolean;
+    signal?: AbortSignal;
+  }
 ): Promise<T> {
   return omniProxyRequest(baseUrl, apiKey, method, endpoint, options, {});
 }

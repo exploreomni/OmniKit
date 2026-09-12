@@ -257,7 +257,7 @@ function bridgeNodeCancellation(req: IncomingMessage, res: ServerResponse): {
   };
 }
 
-async function sendWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
+export async function sendWebResponse(webRes: Response, nodeRes: ServerResponse): Promise<void> {
   nodeRes.statusCode = webRes.status;
   webRes.headers.forEach((value, key) => {
     if (key.toLowerCase() === 'content-encoding') return;
@@ -268,8 +268,21 @@ async function sendWebResponse(webRes: Response, nodeRes: ServerResponse): Promi
     return;
   }
   const nodeStream = Readable.fromWeb(webRes.body as unknown as import('node:stream/web').ReadableStream);
-  nodeStream.pipe(nodeRes);
-  nodeStream.on('error', () => nodeRes.end());
+  // Keep the request cancellation bridge alive until a streamed body finishes,
+  // not merely until its headers are available.
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      nodeRes.off('finish', finish);
+      nodeRes.off('close', close);
+    };
+    const finish = () => { cleanup(); resolve(); };
+    const close = () => { cleanup(); nodeStream.destroy(); resolve(); };
+    nodeRes.once('finish', finish);
+    nodeRes.once('close', close);
+    nodeStream.once('error', (error) => { cleanup(); reject(error); });
+    if (nodeRes.destroyed) close();
+    else nodeStream.pipe(nodeRes);
+  });
 }
 
 export function apiMiddleware() {
@@ -330,6 +343,7 @@ export function apiMiddleware() {
       await sendWebResponse(webRes, res);
     } catch (err) {
       if (res.destroyed || res.writableEnded) return;
+      if (res.headersSent) { res.end(); return; }
       res.statusCode = typeof (err as { statusCode?: unknown }).statusCode === 'number'
         ? (err as { statusCode: number }).statusCode
         : 500;

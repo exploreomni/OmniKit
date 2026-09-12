@@ -313,6 +313,7 @@ function configuredCount(name: string, fallback: number): number {
 
 function portfolioRequestPolicy(): OmniRequestPolicy {
   return {
+    requestPriority: 'background',
     requestTimeoutMs: Math.min(
       DEFAULT_REQUEST_TIMEOUT_MS,
       Math.max(1, configuredDuration('OMNIKIT_PORTFOLIO_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS)),

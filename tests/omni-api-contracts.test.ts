@@ -175,8 +175,19 @@ test('current registry corrections preserve read-versus-write semantics', () => 
   }
 });
 
+test('folder label bulk updates are documented controlled writes', () => {
+  const contract = findOmniApiContract('PATCH', '/api/v1/folders/folder-1/labels');
+
+  assert.equal(contract?.id, 'folder-labels-bulk');
+  assert.equal(contract?.status, 'documented_current');
+  assert.equal(contract?.probeMode, 'controlled_write');
+  assert.equal(contract?.docsUrl, 'https://docs.omni.co/api/folder-labels/bulk-update-folder-labels');
+  assert.deepEqual(contract?.workflows, ['label_manager']);
+});
+
 test('method-specific documentation links retain documented operation status', () => {
   const documentedOperations = [
+    ['PATCH', '/api/v1/documents/document-1/labels', 'https://docs.omni.co/api/document-labels/bulk-update-document-labels'],
     ['POST', '/api/v1/models/model-1/yaml', 'https://docs.omni.co/api/models/create-or-update-yaml-files'],
     ['DELETE', '/api/v1/models/model-1/yaml', 'https://docs.omni.co/api/models/delete-a-yaml-file'],
     ['GET', '/api/v2/documents/document-1/draft/draft-1', 'https://docs.omni.co/api/documents-v2/get-draft-state'],

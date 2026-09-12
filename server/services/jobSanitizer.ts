@@ -1,5 +1,6 @@
 import type { PostMigrationAction } from './nativeVault';
 import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget } from './migrationJobs';
+import { parseDashboardSafeCopyDeploymentEvidence } from '../../shared/dashboardSafeCopyContract';
 
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9]|$)/gi;
@@ -186,6 +187,10 @@ export function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarge
     destinationLabel: target.destinationLabel ? redactSensitiveText(target.destinationLabel) : target.destinationLabel,
     targetModelName: target.targetModelName ? redactSensitiveText(target.targetModelName) : target.targetModelName,
     targetFolderPath: target.targetFolderPath ? redactSensitiveText(target.targetFolderPath) : target.targetFolderPath,
+    ...(target.workbookCopy ? { workbookCopy: {
+      stagingFolderId: isBoundedSafeCopyStructuredIdentity(target.workbookCopy.stagingFolderId)
+        ? target.workbookCopy.stagingFolderId : redactSensitiveText(target.workbookCopy.stagingFolderId),
+    } } : {}),
     topicMappings: target.topicMappings?.map((mapping) => ({
       ...mapping,
       sourceTopicName: redactSensitiveText(mapping.sourceTopicName),
@@ -238,7 +243,29 @@ export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
 
 function sanitizeDetails(value: Record<string, unknown> | undefined): Record<string, unknown> | undefined {
   if (!value) return value;
-  return sanitizeUnknown(value) as Record<string, unknown>;
+  const sanitized = sanitizeUnknown(value) as Record<string, unknown>;
+  const deployment = value.safeCopyDeployment;
+  if (deployment && typeof deployment === 'object' && !Array.isArray(deployment)) {
+    const evidence = deployment as Record<string, unknown>;
+    const hashMap = (candidate: unknown, limit: number): candidate is Record<string, string> => candidate !== null
+      && typeof candidate === 'object' && !Array.isArray(candidate)
+      && Object.keys(candidate).length > 0 && Object.keys(candidate).length <= limit
+      && Object.entries(candidate).every(([key, hash]) => /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(key)
+        && typeof hash === 'string' && CANONICAL_SAFE_COPY_DIGEST_PATTERN.test(hash));
+    if (evidence.version === 2 && typeof evidence.planId === 'string' && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(evidence.planId)
+      && hashMap(evidence.sourceHashes, 500) && hashMap(evidence.modelHashes, 100)
+      && (evidence.sourceModelHashes === undefined || hashMap(evidence.sourceModelHashes, 500))) {
+      // Digests are not human text; redaction must not corrupt authorization.
+      try {
+        sanitized.safeCopyDeployment = parseDashboardSafeCopyDeploymentEvidence(evidence,
+          { documentIds: Object.keys(evidence.sourceHashes) },
+          Object.keys(evidence.modelHashes).map((targetId) => ({ targetId })));
+      } catch {
+        delete sanitized.safeCopyDeployment;
+      }
+    } else delete sanitized.safeCopyDeployment;
+  }
+  return sanitized;
 }
 
 function sanitizeJobItemDetails(

@@ -1,5 +1,6 @@
 import type {
   MigrationFieldCandidate,
+  MigrationDependencyProposalWithheld,
   MigrationFieldDependency,
   MigrationFieldMapping,
   MigrationPermissionDecision,
@@ -53,6 +54,9 @@ export interface DashboardSafeCopyTargetException {
   artifact: DashboardSafeCopyTargetExceptionArtifact;
   reference: string;
   message: string;
+  sourceProvenance?: MigrationFieldDependency['sourceProvenance'];
+  sourceFileName?: string;
+  sourceDocumentIds?: string[];
 }
 
 export type DashboardSafeCopyResolverResult =
@@ -90,6 +94,7 @@ interface CollectedPlanEvidence {
   topicMappings: MigrationTopicMapping[];
   permissionDependencies: MigrationPermissionDependency[];
   semanticPatches: MigrationSemanticPatch[];
+  proposalsWithheld: MigrationDependencyProposalWithheld[];
   relationshipBlocked: boolean;
   relationshipRequired: boolean;
   topicCompatibilityBlocked: boolean;
@@ -194,7 +199,16 @@ function isFieldDependency(value: unknown): value is MigrationFieldDependency {
     && typeof value.sourceFieldRef === 'string'
     && typeof value.sourceViewName === 'string'
     && typeof value.sourceFieldName === 'string'
-    && Array.isArray(value.targetCandidates);
+    && Array.isArray(value.targetCandidates)
+    && (value.sourceDocumentId === undefined || typeof value.sourceDocumentId === 'string')
+    && (value.sourceProvenance === undefined || ['shared_authored', 'workbook_local', 'workbook_override', 'inherited_unverified', 'unverified'].includes(String(value.sourceProvenance)));
+}
+
+function isWithheldProposal(value: unknown): value is MigrationDependencyProposalWithheld {
+  return isRecord(value) && ['field', 'query_view', 'topic', 'relationship'].includes(String(value.artifact))
+    && typeof value.reference === 'string' && Boolean(value.reference.trim())
+    && typeof value.reason === 'string' && Boolean(value.reason.trim())
+    && typeof value.sourceDocumentId === 'string' && Boolean(value.sourceDocumentId.trim());
 }
 
 function isQueryViewEvidence(value: unknown): value is RequiredQueryViewEvidence {
@@ -223,12 +237,14 @@ function isQueryViewMapping(value: unknown): value is MigrationQueryViewMapping 
 function isSourceTopic(value: unknown): value is SourceTopicEvidence {
   return isRecord(value)
     && typeof value.name === 'string'
+    && (value.id === undefined || typeof value.id === 'string')
     && (value.fileName === undefined || typeof value.fileName === 'string');
 }
 
 function isTopicMapping(value: unknown): value is MigrationTopicMapping {
   return isRecord(value)
     && typeof value.sourceTopicName === 'string'
+    && (value.sourceTopicId === undefined || typeof value.sourceTopicId === 'string')
     && typeof value.targetTopicName === 'string'
     && (value.action === 'map_existing' || value.action === 'copy_source');
 }
@@ -283,6 +299,7 @@ function collectPlanEvidence(plan: MigrationPlan, target: MigrationTarget): Coll
     topicMappings: [],
     permissionDependencies: [],
     semanticPatches: [],
+    proposalsWithheld: [],
     relationshipBlocked: false,
     relationshipRequired: false,
     topicCompatibilityBlocked: false,
@@ -305,17 +322,23 @@ function collectPlanEvidence(plan: MigrationPlan, target: MigrationTarget): Coll
       'relationshipEdges',
       'relationshipBlockers',
       'topicCompatibilityBlockers',
+      'dependencyProposalsWithheld',
     ];
     if (
       step.blocked
       && !structuredEvidenceKeys.some((key) => Array.isArray(details[key]) && details[key].length > 0)
     ) evidence.unexplainedBlockedStep = true;
+    const previousFieldCount = evidence.fieldDependencies.length;
     evidence.invalidEvidenceFound = pushArrayEvidence(
       details,
       'fieldDependencies',
       isFieldDependency,
       evidence.fieldDependencies,
     ) || evidence.invalidEvidenceFound;
+    evidence.fieldDependencies = evidence.fieldDependencies.map((field, index) => index < previousFieldCount ? field : {
+      ...field, sourceDocumentId: field.sourceDocumentId || step.documentId,
+    });
+    evidence.invalidEvidenceFound = pushArrayEvidence(details, 'dependencyProposalsWithheld', isWithheldProposal, evidence.proposalsWithheld) || evidence.invalidEvidenceFound;
     evidence.invalidEvidenceFound = pushArrayEvidence(
       details,
       'requiredQueryViews',
@@ -373,6 +396,7 @@ function requireWritePatchCoverage(
   relationshipRequired: boolean,
   patches: readonly MigrationSemanticPatch[],
   exceptions: DashboardSafeCopyTargetException[],
+  proposalsWithheld: readonly MigrationDependencyProposalWithheld[] = [],
 ): void {
   const expected = [
     ...fieldMappings
@@ -436,6 +460,7 @@ function requireWritePatchCoverage(
     .map((patch) => ({ patch }));
   const remainingActual = [...actual];
   for (const decision of expected) {
+    if (proposalsWithheld.some((withheld) => withheld.artifact === decision.artifact && normalizedName(withheld.reference) === normalizedName(decision.reference))) continue;
     const index = remainingActual.findIndex((candidate) => decision.matches(candidate.patch));
     if (index >= 0) {
       remainingActual.splice(index, 1);
@@ -475,10 +500,14 @@ function resultExceptions(
   targetId: string,
   values: DashboardSafeCopyTargetException[],
 ): DashboardSafeCopyResolverResult {
-  const deduplicated = [...new Map(values.map((value) => [
-    `${value.artifact}:${value.reference}:${value.code}`,
-    value,
-  ])).values()].sort(exceptionSorter);
+  const byIdentity = new Map<string, DashboardSafeCopyTargetException>();
+  for (const value of values) {
+    const key = `${value.artifact}:${value.reference}:${value.code}:${value.sourceProvenance || ''}:${value.sourceFileName || ''}:${value.message}`;
+    const previous = byIdentity.get(key);
+    const sourceDocumentIds = uniqueStrings([...(previous?.sourceDocumentIds || []), ...(value.sourceDocumentIds || [])]);
+    byIdentity.set(key, { ...value, ...(sourceDocumentIds.length ? { sourceDocumentIds } : {}) });
+  }
+  const deduplicated = [...byIdentity.values()].sort(exceptionSorter);
   return { status: 'exception', targetId, exceptions: deduplicated };
 }
 
@@ -489,6 +518,7 @@ function addException(
   artifact: DashboardSafeCopyTargetExceptionArtifact,
   reference: unknown,
   message: string,
+  source?: Pick<DashboardSafeCopyTargetException, 'sourceProvenance' | 'sourceFileName' | 'sourceDocumentIds'>,
 ): void {
   exceptions.push({
     targetId,
@@ -496,6 +526,7 @@ function addException(
     artifact,
     reference: cleanReference(reference, artifact),
     message,
+    ...source,
   });
 }
 
@@ -518,7 +549,12 @@ function resolveFields(
   exceptions: DashboardSafeCopyTargetException[],
 ): MigrationFieldMapping[] {
   const mappings: MigrationFieldMapping[] = [];
-  const groups = groupBy(dependencies, (dependency) => normalizedName(dependency.sourceFieldRef));
+  for (const [reference, rows] of groupBy(dependencies.filter((dependency) => dependency.status !== 'blocked'), (dependency) => normalizedName(dependency.sourceFieldRef))) {
+    if (uniqueStrings(rows.map((row) => row.sourceYaml)).length > 1 || uniqueStrings(rows.map((row) => row.sourceFileName)).length > 1) {
+      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'field', reference, 'Field evidence conflicts across source documents.', { sourceDocumentIds: uniqueStrings(rows.map((row) => row.sourceDocumentId)) });
+    }
+  }
+  const groups = groupBy(dependencies, (dependency) => `${normalizedName(dependency.sourceFieldRef)}:${dependency.sourceDocumentId || ''}`);
   for (const [key, rows] of [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
     const reference = rows[0]?.sourceFieldRef || key;
     const statuses = uniqueStrings(rows.map((row) => row.status));
@@ -527,6 +563,12 @@ function resolveFields(
     const sourceViews = uniqueStrings(rows.map((row) => row.sourceViewName));
     const sourceFields = uniqueStrings(rows.map((row) => row.sourceFieldName));
     const fieldKinds = uniqueStrings(rows.map((row) => row.fieldKind));
+    const provenances = uniqueStrings(rows.map((row) => row.sourceProvenance));
+    const source = {
+      sourceDocumentIds: uniqueStrings(rows.map((row) => row.sourceDocumentId)),
+      ...(provenances.length === 1 ? { sourceProvenance: provenances[0] as MigrationFieldDependency['sourceProvenance'] } : {}),
+      ...(sourceFiles.length === 1 ? { sourceFileName: sourceFiles[0] } : {}),
+    };
     if (
       statuses.length !== 1
       || sourceFiles.length > 1
@@ -534,16 +576,20 @@ function resolveFields(
       || sourceViews.length !== 1
       || sourceFields.length !== 1
       || fieldKinds.length !== 1
+      || provenances.length > 1
     ) {
-      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'field', reference, 'Field evidence conflicts across the migration plan.');
+      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'field', reference, 'Field evidence conflicts across the migration plan.', source);
       continue;
     }
     if (statuses[0] === 'blocked') {
-      addException(exceptions, targetId, 'BLOCKED_DEPENDENCY', 'field', reference, 'The field dependency is blocked.');
+      const reasons = uniqueStrings(rows.map((row) => row.reason));
+      for (const reason of reasons.length ? reasons : ['The field dependency is blocked.']) {
+        addException(exceptions, targetId, 'BLOCKED_DEPENDENCY', 'field', reference, cleanReference(reason, 'The field dependency is blocked.'), source);
+      }
       continue;
     }
     if (statuses[0] === 'warning') {
-      addException(exceptions, targetId, 'MANUAL_REVIEW_REQUIRED', 'field', reference, 'The field dependency requires manual review.');
+      addException(exceptions, targetId, 'MANUAL_REVIEW_REQUIRED', 'field', reference, cleanReference(rows[0].reason, 'The field dependency requires manual review.'), source);
       continue;
     }
     const candidates = [...new Map(rows.flatMap((row) => row.targetCandidates)
@@ -564,15 +610,15 @@ function resolveFields(
       continue;
     }
     if (preferred.length > 1) {
-      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'field', reference, 'More than one strong field match is available.');
+      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'field', reference, 'More than one strong field match is available.', source);
       continue;
     }
     if (!sourceFiles[0] || !sourceYaml[0]) {
-      addException(exceptions, targetId, 'MISSING_EVIDENCE', 'field', reference, 'Verified source YAML is required to create this field.');
+      addException(exceptions, targetId, 'MISSING_EVIDENCE', 'field', reference, 'Verified source YAML is required to create this field.', source);
       continue;
     }
     if (sourceYaml[0].length > MAX_PATCH_YAML_CHARACTERS) {
-      addException(exceptions, targetId, 'YAML_LIMIT_EXCEEDED', 'field', reference, 'The source field YAML exceeds the safe-copy limit.');
+      addException(exceptions, targetId, 'YAML_LIMIT_EXCEEDED', 'field', reference, 'The source field YAML exceeds the safe-copy limit.', source);
       continue;
     }
     mappings.push({
@@ -582,7 +628,17 @@ function resolveFields(
       action: 'create_from_source',
     });
   }
-  return mappings.sort((left, right) => left.sourceFieldRef.localeCompare(right.sourceFieldRef));
+  const uniqueMappings = [...new Map(mappings.map((mapping) => [stableJson(mapping), mapping])).values()];
+  const conflictingReferences = new Set<string>();
+  for (const [reference, rows] of groupBy(uniqueMappings, (mapping) => normalizedName(mapping.sourceFieldRef))) {
+    if (rows.length > 1) {
+      conflictingReferences.add(reference);
+      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'field', reference, 'Field mappings conflict across source documents.', {
+        sourceDocumentIds: uniqueStrings(dependencies.filter((dependency) => normalizedName(dependency.sourceFieldRef) === reference).map((dependency) => dependency.sourceDocumentId)),
+      });
+    }
+  }
+  return uniqueMappings.filter((mapping) => !conflictingReferences.has(normalizedName(mapping.sourceFieldRef))).sort((left, right) => left.sourceFieldRef.localeCompare(right.sourceFieldRef));
 }
 
 function resolveQueryViews(
@@ -659,29 +715,85 @@ function resolveQueryViews(
   return mappings.sort((left, right) => left.sourceQueryViewName.localeCompare(right.sourceQueryViewName));
 }
 
+/** Read-only candidates, not accepted decisions. Final resolution still checks
+ * all evidence, patch coverage, permissions, checksums and destination scope. */
+export function dashboardSafeCopyDependencyPatchCandidates(input: {
+  fieldDependencies?: MigrationFieldDependency[];
+  queryViews?: RequiredQueryViewEvidence[];
+  configuredQueryViewMappings?: MigrationQueryViewMapping[];
+}): { fieldMappings: MigrationFieldMapping[]; queryViewMappings: MigrationQueryViewMapping[] } {
+  const exceptions: DashboardSafeCopyTargetException[] = [];
+  return {
+    fieldMappings: resolveFields('candidate', input.fieldDependencies || [], exceptions)
+      .filter((mapping) => mapping.action === 'create_from_source'),
+    queryViewMappings: resolveQueryViews('candidate', input.queryViews || [], input.configuredQueryViewMappings || [], exceptions)
+      .filter((mapping) => mapping.action === 'copy_source'),
+  };
+}
+
 function resolveTopics(
   targetId: string,
   topics: SourceTopicEvidence[],
   configured: MigrationTopicMapping[],
+  explicitlyRequested: MigrationTopicMapping[],
   exceptions: DashboardSafeCopyTargetException[],
 ): MigrationTopicMapping[] {
   const mappings: MigrationTopicMapping[] = [];
   const mappingGroups = groupBy(configured, (mapping) => normalizedName(mapping.sourceTopicName));
   const groups = groupBy(topics, (topic) => normalizedName(topic.name));
+  const filesByIdentity = new Map<string, Set<string>>();
+  for (const topic of topics) {
+    if (!topic.id?.trim() || !topic.fileName?.trim()) continue;
+    const identity = normalizedName(topic.id);
+    const files = filesByIdentity.get(identity) || new Set<string>();
+    files.add(topic.fileName.trim());
+    filesByIdentity.set(identity, files);
+  }
   for (const [key, rows] of [...groups.entries()].sort(([left], [right]) => left.localeCompare(right))) {
     const reference = rows[0]?.name || key;
     const sourceFiles = uniqueStrings(rows.map((row) => row.fileName));
-    if (uniqueStrings(rows.map((row) => row.id)).length > 1) {
+    const sourceIds = uniqueStrings(rows.map((row) => row.id));
+    if (sourceIds.length > 1 || sourceIds.some((id) => (filesByIdentity.get(normalizedName(id))?.size || 0) > 1)) {
       addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'topic', reference, 'Topic identity evidence conflicts across the migration plan.');
       continue;
     }
-    const existing = [...new Map((mappingGroups.get(key) || []).map((mapping) => [
+    if (sourceFiles.length > 1) {
+      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'topic', reference, 'Topic file identity evidence conflicts across the migration plan.');
+      continue;
+    }
+    const sourceFile = sourceFiles[0] || '';
+    const sourceStem = sourceFile.endsWith('.topic') ? sourceFile.slice(0, -'.topic'.length) : '';
+    const sourceNames = new Set([reference, ...sourceIds].map(normalizedName));
+    if (!sourceStem || ![sourceStem, sourceStem.split('/').pop() || ''].some((name) => sourceNames.has(normalizedName(name)))) {
+      // An exact destination match cannot establish the missing source identity.
+      // Keep the original source name: a display label or renamed candidate is
+      // not evidence that an unrelated authored file belongs to this topic.
+      addException(exceptions, targetId, 'MISSING_EVIDENCE', 'topic', reference, 'One exact source topic file is required for an automatic topic copy.');
+      continue;
+    }
+    const requested = [...new Map(explicitlyRequested
+      .filter((mapping) => normalizedName(mapping.sourceTopicName) === key)
+      .map((mapping) => [stableJson(mapping), mapping])).values()];
+    const observed = mappingGroups.get(key) || [];
+    const existing = [...new Map((observed.length ? observed : requested).map((mapping) => [
       stableJson(mapping),
       mapping,
     ])).values()];
-    const exact = existing.filter((mapping) => (
-      mapping.action === 'map_existing'
-      && normalizedName(mapping.targetTopicName) === normalizedName(reference)
+    const sameChoice = (left: MigrationTopicMapping, right: MigrationTopicMapping) => (
+      left.action === right.action
+      && normalizedName(left.sourceTopicName) === normalizedName(right.sourceTopicName)
+      && normalizedName(left.targetTopicName) === normalizedName(right.targetTopicName)
+    );
+    if (requested.length > 1
+      || (requested.length === 1 && existing.some((mapping) => !sameChoice(mapping, requested[0])))
+      || [...existing, ...requested].some((mapping) => mapping.sourceTopicId
+        && !sourceIds.some((id) => normalizedName(id) === normalizedName(mapping.sourceTopicId!)))) {
+      addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'topic', reference, 'The configured topic mapping conflicts with exact source identity evidence.');
+      continue;
+    }
+    const exact = existing.filter((mapping) => mapping.action === 'map_existing' && (
+      normalizedName(mapping.targetTopicName) === normalizedName(reference)
+      || (requested.length === 1 && requested[0].action === 'map_existing' && sameChoice(mapping, requested[0]))
     ));
     const copies = existing.filter((mapping) => (
       mapping.action === 'copy_source'
@@ -692,19 +804,11 @@ function resolveTopics(
       continue;
     }
     if (copies.length === 1 && existing.length === 1) {
-      if (sourceFiles.length !== 1) {
-        addException(exceptions, targetId, 'MISSING_EVIDENCE', 'topic', reference, 'One exact source topic file is required for an automatic topic copy.');
-        continue;
-      }
       mappings.push(copies[0]);
       continue;
     }
     if (existing.length > 0) {
       addException(exceptions, targetId, 'AMBIGUOUS_MAPPING', 'topic', reference, 'Topics can only be mapped exactly or copied under the source name.');
-      continue;
-    }
-    if (sourceFiles.length !== 1) {
-      addException(exceptions, targetId, 'MISSING_EVIDENCE', 'topic', reference, 'One exact source topic file is required for an automatic topic copy.');
       continue;
     }
     mappings.push({
@@ -947,6 +1051,7 @@ function targetScopeMatches(planTarget: MigrationTarget, target: MigrationTarget
 export function resolveDashboardSafeCopyTarget(
   plan: MigrationPlan,
   target: MigrationTarget,
+  options: { mode?: 'execution' | 'readiness' } = {},
 ): DashboardSafeCopyResolverResult {
   const exceptions: DashboardSafeCopyTargetException[] = [];
   const matchingTargets = plan.targets.filter((candidate) => candidate.id === target.id);
@@ -994,6 +1099,11 @@ export function resolveDashboardSafeCopyTarget(
   }
 
   const evidence = collectPlanEvidence(plan, target);
+  for (const [documentId, withheld] of groupBy(evidence.proposalsWithheld, (proposal) => proposal.sourceDocumentId)) {
+    addException(exceptions, target.id, 'MANUAL_REVIEW_REQUIRED', 'target', 'source_evidence',
+      uniqueStrings(withheld.map((proposal) => proposal.reason)).map((reason) => cleanReference(reason, 'Source prerequisites require review.')).join(' '),
+      { sourceDocumentIds: [documentId] });
+  }
   if (evidence.invalidEvidenceFound) {
     addException(exceptions, target.id, 'MISSING_EVIDENCE', 'target', target.id, 'The migration plan contains malformed target evidence.');
   }
@@ -1017,7 +1127,7 @@ export function resolveDashboardSafeCopyTarget(
     evidence.queryViewMappings,
     exceptions,
   );
-  const topicMappings = resolveTopics(target.id, evidence.topics, evidence.topicMappings, exceptions);
+  const topicMappings = resolveTopics(target.id, evidence.topics, evidence.topicMappings, target.topicMappings || [], exceptions);
   const permissionDecisions = resolvePermissions(
     target.id,
     evidence.permissionDependencies,
@@ -1044,9 +1154,14 @@ export function resolveDashboardSafeCopyTarget(
     evidence.relationshipRequired,
     semanticPatches,
     exceptions,
+    options.mode === 'readiness' ? evidence.proposalsWithheld : [],
   );
 
-  if (exceptions.length > 0) return resultExceptions(target.id, exceptions);
+  if (exceptions.length > 0) return resultExceptions(target.id, exceptions.map((exception) => {
+    if (exception.artifact !== 'field' || exception.sourceDocumentIds?.length) return exception;
+    const fields = evidence.fieldDependencies.filter((field) => normalizedName(field.sourceFieldRef) === normalizedName(exception.reference));
+    return { ...exception, sourceDocumentIds: uniqueStrings(fields.map((field) => field.sourceDocumentId)) };
+  }));
   return {
     status: 'resolved',
     target: {

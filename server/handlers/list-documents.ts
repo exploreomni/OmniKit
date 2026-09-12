@@ -1,4 +1,5 @@
-import { validateBaseUrl, jsonHeaders } from '../security';
+import { assertSafeOutboundUrl, validateBaseUrl, jsonHeaders } from '../security';
+import { acquireOmniRequestSlot } from '../services/omniClient';
 
 interface PageInfo {
   hasNextPage: boolean;
@@ -13,6 +14,46 @@ interface DocumentPage {
 }
 
 const MAX_PAGES = 50;
+const PAGE_TIMEOUT_MS = 15_000;
+
+export interface ListDocumentsDependencies {
+  fetch?: typeof fetch;
+  validateOutbound?: (url: string) => Promise<void>;
+  acquireRequestSlot?: (apiKey: string, signal?: AbortSignal) => Promise<void>;
+  pageTimeoutMs?: number;
+}
+
+function abortReason(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new DOMException('The operation was aborted.', 'AbortError');
+}
+
+async function raceWithAbortSignal<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) throw abortReason(signal);
+  void operation.catch(() => undefined);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      reject(abortReason(signal));
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      },
+    );
+  });
+}
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isSafeInteger(value) && Number(value) >= 0;
@@ -51,6 +92,15 @@ function parseDocumentPage(data: unknown): DocumentPage | null {
   };
 }
 
+function isSafeDocumentLabel(value: unknown): boolean {
+  if (typeof value === 'string') return value.trim().length > 0;
+  return Boolean(value)
+    && typeof value === 'object'
+    && !Array.isArray(value)
+    && typeof (value as Record<string, unknown>).name === 'string'
+    && String((value as Record<string, unknown>).name).trim().length > 0;
+}
+
 function collectDocumentIds(records: unknown[], seen: Set<string>): boolean {
   for (const value of records) {
     if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -61,9 +111,13 @@ function collectDocumentIds(records: unknown[], seen: Set<string>): boolean {
       || seen.has(id)
       || typeof record.name !== "string"
       || record.name.trim().length === 0
+      || (record.url !== undefined && typeof record.url !== "string")
       || (record.hasDashboard !== undefined && typeof record.hasDashboard !== "boolean")
       || (record.type !== undefined && typeof record.type !== "string")
       || (record.kind !== undefined && typeof record.kind !== "string")
+      || (record.labels !== undefined && (
+        !Array.isArray(record.labels) || !record.labels.every(isSafeDocumentLabel)
+      ))
     ) return false;
     seen.add(id);
   }
@@ -112,6 +166,7 @@ function normalizeDocument(raw: Record<string, unknown>) {
     id: docId,
     name: String(raw.name ?? ""),
     identifier: docId,
+    url: firstString(raw.url),
     hasDashboard: typeof raw.hasDashboard === "boolean" ? raw.hasDashboard : undefined,
     connectionId: firstString(raw.connectionId),
     baseModelId,
@@ -132,9 +187,20 @@ function normalizeDocument(raw: Record<string, unknown>) {
   };
 }
 
-export default async function handler(req: Request): Promise<Response> {
+export default async function handler(
+  req: Request,
+  dependencies: ListDocumentsDependencies = {},
+): Promise<Response> {
   try {
-    const { base_url, api_key, folder_id, page_size, cursor, all_pages } = await req.json();
+    const {
+      base_url,
+      api_key,
+      folder_id,
+      page_size,
+      cursor,
+      all_pages,
+      include_all_documents,
+    } = await req.json();
 
     const urlError = validateBaseUrl(base_url);
     if (urlError) {
@@ -158,6 +224,7 @@ export default async function handler(req: Request): Promise<Response> {
     let nextCursor = initialCursor;
     let lastPageInfo: PageInfo | null = null;
     let totalRecords: number | null = null;
+    let totalMode: 'stable' | 'remaining' | null = null;
     let pagesFetched = 0;
     let reachedSafetyLimit = false;
     const seenCursors = new Set<string>();
@@ -173,31 +240,63 @@ export default async function handler(req: Request): Promise<Response> {
       if (folder_id) params.set("folderId", folder_id);
       if (nextCursor) params.set("cursor", nextCursor);
 
+      const url = `${cleanUrl}/api/v1/documents?${params.toString()}`;
+      try {
+        await raceWithAbortSignal(
+          (dependencies.validateOutbound
+            || ((candidate: string) => assertSafeOutboundUrl(candidate, { label: 'base_url' })))(url),
+          req.signal,
+        );
+      } catch (error) {
+        if (req.signal.aborted) throw error;
+        return new Response(
+          JSON.stringify({ error: 'The Omni document destination could not be validated safely.' }),
+          { status: 400, headers: jsonHeaders },
+        );
+      }
+      await (dependencies.acquireRequestSlot || acquireOmniRequestSlot)(api_key, req.signal);
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
-      const response = await fetch(
-        `${cleanUrl}/api/v1/documents?${params.toString()}`,
-        {
+      const requestSignal = AbortSignal.any([req.signal, controller.signal]);
+      const timeout = setTimeout(
+        () => controller.abort(new DOMException('The document inventory page timed out.', 'TimeoutError')),
+        dependencies.pageTimeoutMs ?? PAGE_TIMEOUT_MS,
+      );
+      let response: Response;
+      let responseData: unknown;
+      try {
+        response = await raceWithAbortSignal(
+          (dependencies.fetch || globalThis.fetch)(url, {
           method: "GET",
           headers: {
             Authorization: `Bearer ${api_key}`,
             "Content-Type": "application/json",
           },
-          signal: controller.signal,
-        }
-      );
-      clearTimeout(timeout);
-
-      if (!response.ok) {
-        return new Response(
-          JSON.stringify({
-            error: `Omni document read failed with HTTP ${response.status}.`,
+          redirect: 'manual',
+          signal: requestSignal,
           }),
-          { status: response.status, headers: jsonHeaders }
+          requestSignal,
         );
+        if (response.status >= 300 && response.status < 400) {
+          return new Response(
+            JSON.stringify({ error: 'Omni redirected the document inventory request unexpectedly.' }),
+            { status: 502, headers: jsonHeaders },
+          );
+        }
+
+        if (!response.ok) {
+          return new Response(
+            JSON.stringify({
+              error: `Omni document read failed with HTTP ${response.status}.`,
+            }),
+            { status: response.status, headers: jsonHeaders }
+          );
+        }
+        responseData = await raceWithAbortSignal(response.json(), requestSignal);
+      } finally {
+        clearTimeout(timeout);
       }
 
-      const page = parseDocumentPage(await response.json());
+      const page = parseDocumentPage(responseData);
       if (page === null) {
         return new Response(
           JSON.stringify({
@@ -207,12 +306,30 @@ export default async function handler(req: Request): Promise<Response> {
         );
       }
 
-      if (totalRecords === null) totalRecords = page.pageInfo.totalRecords;
-      if (page.pageInfo.totalRecords !== totalRecords) {
-        return new Response(
-          JSON.stringify({ error: "Omni returned inconsistent document pagination evidence." }),
-          { status: 502, headers: jsonHeaders }
-        );
+      const recordsBeforePage = allRaw.length;
+      if (totalRecords === null) {
+        totalRecords = page.pageInfo.totalRecords;
+      } else {
+        const stableTotal = page.pageInfo.totalRecords === totalRecords;
+        const remainingTotal = page.pageInfo.totalRecords === totalRecords - recordsBeforePage;
+        if (totalMode === null) {
+          if (stableTotal) totalMode = 'stable';
+          else if (remainingTotal) totalMode = 'remaining';
+          else {
+            return new Response(
+              JSON.stringify({ error: "Omni returned inconsistent document pagination evidence." }),
+              { status: 502, headers: jsonHeaders }
+            );
+          }
+        } else if (
+          (totalMode === 'stable' && !stableTotal)
+          || (totalMode === 'remaining' && !remainingTotal)
+        ) {
+          return new Response(
+            JSON.stringify({ error: "Omni returned inconsistent document pagination evidence." }),
+            { status: 502, headers: jsonHeaders }
+          );
+        }
       }
       if (!collectDocumentIds(page.records, seenDocumentIds)) {
         return new Response(
@@ -254,7 +371,8 @@ export default async function handler(req: Request): Promise<Response> {
 
     const documents = allRaw
       .map((item) => normalizeDocument(item as Record<string, unknown>))
-      .filter((d) => d.hasDashboard !== false && (!d.type || d.type === "dashboard" || d.type === "document"));
+      .filter((d) => include_all_documents === true
+        || (d.hasDashboard !== false && (!d.type || d.type === "dashboard" || d.type === "document")));
 
     return new Response(JSON.stringify({
       documents,

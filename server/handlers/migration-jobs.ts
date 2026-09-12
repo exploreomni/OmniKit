@@ -1,4 +1,8 @@
 import { jsonHeaders, sseHeaders } from '../security';
+import { previewDashboardTopicRepair, approveDashboardTopicRepair } from '../services/dashboardTopicRepair';
+import { createDashboardDeploymentPlan, getDashboardDeploymentPlan, recheckDashboardDeploymentPlan, deployDashboardDeploymentPlan, linkDashboardModelRepair, updateDashboardDeploymentPlan } from '../services/dashboardDeploymentPlans';
+import { createDashboardReadinessContext, dashboardReadinessStream, type DashboardReadinessRunContext } from '../services/dashboardReadinessControl';
+import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
 import {
   adjudicateDestinationModelMutation,
   buildMigrationPlan,
@@ -553,6 +557,52 @@ export async function migrationJobsHandler(
     const path = url.pathname.replace(/^\/api\/migration-jobs\/?/, '');
     const parts = path.split('/').filter(Boolean);
 
+    if (parts[0] === 'deployment-plans') {
+      const locked = requireUnlocked();
+      if (locked) return locked;
+      if (!isDashboardSafeCopyV1Enabled()) return json({ error: 'Dashboard deployment is not enabled.' }, 404);
+      const id = parts[1];
+      const readinessResponse = async (work: (run: DashboardReadinessRunContext) => Promise<DashboardDeploymentPlan>) => {
+        if (url.searchParams.get('stream') === '1') return dashboardReadinessStream(req.signal, work);
+        const run = createDashboardReadinessContext({ signal: req.signal });
+        try {
+          const plan = await work(run);
+          run.throwIfAborted();
+          return json({ plan });
+        }
+        finally { run.dispose(); }
+      };
+      if (req.method === 'POST' && parts.length === 1) {
+        const body = await safeCopyBodyJson(req);
+        return await readinessResponse((run) => createDashboardDeploymentPlan(body, run));
+      }
+      if (req.method === 'GET' && parts.length === 2) return json({ plan: getDashboardDeploymentPlan(id) });
+      if (req.method === 'PATCH' && parts.length === 2) return json({ plan: await updateDashboardDeploymentPlan(id, await safeCopyBodyJson(req)) });
+      if (req.method === 'POST' && parts.length === 3 && parts[2] === 'recheck') {
+        return await readinessResponse((run) => recheckDashboardDeploymentPlan(id, run));
+      }
+      if (req.method === 'POST' && parts.length === 3 && parts[2] === 'deploy') {
+        const body = await bodyJson(req);
+        const result = await deployDashboardDeploymentPlan(id, {
+          revision: Number(body.revision), targetIds: body.targetIds as string[], requestId: String(body.requestId || ''),
+        }, dependencies.safeCopyPreparation === undefined ? prepareAndRunDashboardSafeCopyJob : dependencies.safeCopyPreparation, req.signal);
+        return json({ ...result, job: clientJob(result.job) });
+      }
+      if (req.method === 'POST' && parts.length === 3 && parts[2] === 'repair') {
+        const body = await bodyJson(req);
+        return json({ plan: linkDashboardModelRepair(id, String(body.targetId || ''), String(body.jobId || '')) });
+      }
+      if (req.method === 'POST' && parts.length === 4 && parts[2] === 'topic-repair') {
+        const body = await safeCopyBodyJson(req);
+        if (parts[3] === 'preview') return json(await previewDashboardTopicRepair(id, body, req.signal));
+        if (parts[3] === 'approve') {
+          const { plan, job } = await approveDashboardTopicRepair(id, body);
+          return json({ plan, job });
+        }
+      }
+      return json({ error: 'Unknown deployment plan route.' }, 404);
+    }
+
     if (req.method === 'GET' && parts.length === 0) {
       // History recovery needs identity only; exact UI proof is derived on the
       // detail/SSE surfaces to avoid revalidating every large ledger at once.
@@ -675,6 +725,7 @@ export async function migrationJobsHandler(
     if (req.method === 'POST' && parts.length === 1 && parts[0] === 'safe-copy') {
       try {
         const intent = parseDashboardSafeCopyIntent(await safeCopyBodyJson(req));
+        if (intent.deployment) return json({ error: 'Reviewed deployment must be submitted through its saved plan.', code: 'SAFE_COPY_INVALID_DEPLOYMENT' }, 400);
         const prepare = dependencies.safeCopyPreparation === undefined
           ? prepareAndRunDashboardSafeCopyJob
           : dependencies.safeCopyPreparation || undefined;

@@ -7,6 +7,8 @@ import {
   type DashboardSafeCopyDestination,
   type DashboardSafeCopyIntent,
   canonicalDashboardSafeCopyIntent,
+  parseDashboardSafeCopyIntent,
+  scopeDashboardSafeCopyIntent,
 } from '../../shared/dashboardSafeCopyContract';
 import {
   executeDashboardSafeCopy,
@@ -14,6 +16,7 @@ import {
   type DashboardSafeCopyAttemptEvidence,
   type DashboardSafeCopyAttemptReconciliation,
   type DashboardSafeCopyDocumentResult,
+  type DashboardSafeCopyDispatchGuard,
   type DashboardSafeCopyExecutionInput,
   type DashboardSafeCopyExecutionResult,
   type DashboardSafeCopyExecutionException,
@@ -72,11 +75,13 @@ import {
 import {
   OmniClient,
   OmniClientError,
+  OmniWriteNotDispatchedError,
   type OmniDocumentAccessInventoryResult,
   type OmniDocumentInventoryResult,
   type OmniQueryExecutionSummary,
 } from './omniClient';
 import { getInstance, type SavedInstance } from './nativeVault';
+import { dashboardWorkbookHasAuthoredDefinitions, getDashboardWorkbookCopyCapability } from './dashboardWorkbookCopy';
 
 const SAFE_COPY_RUNTIME_VERSION = 1;
 const SAFE_COPY_VERIFIER_VERSION = 1;
@@ -236,6 +241,11 @@ function sha256(value: unknown): string {
   return createHash('sha256').update(JSON.stringify(stableValue(value))).digest('hex');
 }
 
+/** Hash the complete JSON snapshot, sorting object keys and preserving array order. */
+export function dashboardSafeCopyStateHash(value: unknown): string {
+  return sha256(value);
+}
+
 function contentFingerprint(value: unknown): string {
   const content = materializeDashboardSafeCopyDocumentContent(value);
   const contentWithoutName = Object.fromEntries(
@@ -298,6 +308,11 @@ const SAFE_COPY_EXCEPTION_MESSAGES: Record<DashboardSafeCopyExecutionExceptionCo
   DUPLICATE_DESTINATION_SCOPE: 'The destination was selected more than once.',
   TARGET_REPROOF_FAILED: 'The destination could not be revalidated against its saved scope.',
   TARGET_EXECUTION_FAILED: 'The destination stopped before its next write could be safely dispatched.',
+  SOURCE_SNAPSHOT_CHANGED: 'The source dashboard changed after approval. Rerun compatibility checks.',
+  SOURCE_MODEL_SNAPSHOT_CHANGED: 'A source model changed after approval. Rerun compatibility checks.',
+  MODEL_SNAPSHOT_CHANGED: 'The destination model changed after approval. Rerun compatibility checks.',
+  REPAIR_REQUIRED: 'Repair dependencies in Model Migrator, then rerun compatibility checks.',
+  WORKBOOK_COPY_CAPABILITY_UNVERIFIED: 'Workbook-local copying is blocked until complete staging-folder access and a production adapter are verified. Keep local definitions in their source workbook; do not promote them to the shared model.',
   SEMANTIC_CHANGE_UNSAFE: 'The destination model requires a change outside the automatic safe-copy policy.',
   SEMANTIC_APPLY_FAILED: 'The checksum-protected model update could not be completed safely.',
   SEMANTIC_OUTCOME_UNCERTAIN: 'A previous model update still requires exact reconciliation.',
@@ -486,6 +501,8 @@ async function canonicalDestination(
     ...(folderId ? { folderId } : {}),
     ...(folderPath ? { folderPath } : {}),
     sourceDocumentIds: [...context.intent.source.documentIds],
+    ...(context.intent.deployment ? { contentOnly: true as const } : {}),
+    ...(destination.workbookCopy ? { workbookCopy: { ...destination.workbookCopy } } : {}),
   };
 }
 
@@ -508,7 +525,7 @@ function intentForTarget(
   if (!destination) {
     throw new SafeCopyRuntimeError('SAFE_COPY_TARGET_MISSING', 'The destination is outside the canonical safe-copy request.');
   }
-  return { ...intent, destinations: [destination] };
+  return scopeDashboardSafeCopyIntent(intent, new Set([targetId]));
 }
 
 function preparedTargetScopeMatches(
@@ -677,6 +694,43 @@ function documentModelBinding(state: Record<string, unknown>): string | undefine
   return undefined;
 }
 
+export const dashboardSafeCopyDocumentModelBinding = documentModelBinding;
+
+/** Legacy/frozen jobs must not bypass workbook scope just because they lack new evidence. */
+async function assertWorkbookCopyRuntimeBoundary(
+  context: RuntimeContext,
+  target: DashboardSafeCopyExecutionTarget,
+  documentIds: readonly string[] = target.sourceDocumentIds,
+): Promise<void> {
+  function unavailable(): never {
+    const capability = getDashboardWorkbookCopyCapability();
+    throw new SafeCopyRuntimeError(capability.code, capability.message, 'definitely_not_committed');
+  }
+  if (target.workbookCopy || Object.keys(context.intent.deployment?.workbookCopies || {}).length) {
+    unavailable();
+  }
+  const sourceClient = clientFor(context, requiredInstance(context, context.intent.source.instanceId));
+  const signal = AbortSignal.timeout(Math.max(1, Math.min(DEFAULT_RUNTIME_TARGET_DEADLINE_MS,
+    (target.deadlineAt ?? context.services.now() + DEFAULT_RUNTIME_TARGET_DEADLINE_MS) - context.services.now())));
+  await mapWithConcurrency([...documentIds], DOCUMENT_STATE_CONCURRENCY, async (documentId) => {
+    const state = await sourceClient.getDocumentStateV2(documentId, signal).catch(() => unavailable());
+    const workbookModelId = clean(state.workbookModelId) || clean(state.workbook_model_id);
+    if (!workbookModelId) unavailable(); // Missing identity is not evidence of an empty workbook layer.
+    const sharedModelId = clean(state.modelId) || clean(state.baseModelId);
+    if (!sharedModelId || workbookModelId === sharedModelId) unavailable();
+    try {
+      const snapshot = await sourceClient.getModelYaml(workbookModelId, {
+        mode: 'extension', fullyResolved: false, includeChecksums: true, signal,
+      });
+      if (dashboardWorkbookHasAuthoredDefinitions(snapshot.files)) unavailable();
+    } catch (error) {
+      if (error && typeof error === 'object' && 'code' in error && error.code === 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED') throw error;
+      // An unreadable extension is not proof that no local definitions exist.
+      unavailable();
+    }
+  });
+}
+
 function exactFolderDocument(
   target: DashboardSafeCopyExecutionTarget,
   document: { folderId?: string; folderPath?: string },
@@ -836,7 +890,11 @@ async function applySemanticChange(
   context: RuntimeContext,
   target: DashboardSafeCopyReprovedTarget,
   attempt: DashboardSafeCopyAttemptEvidence,
+  guard?: DashboardSafeCopyDispatchGuard,
 ): Promise<void> {
+  if (context.intent.deployment) {
+    throw new SafeCopyRuntimeError('SAFE_COPY_REPAIR_REQUIRED', 'Content-only dashboard deployment cannot change model dependencies.', 'definitely_not_committed');
+  }
   const auth = runtimeAuthorization(target);
   const fresh = await freshPreparedTarget(context, auth.targetInput);
   if (!sameSemanticProof(auth.prepared, fresh)) {
@@ -859,6 +917,7 @@ async function applySemanticChange(
   }
   const dispatchDestination = assertCurrentWriteAuthority(context, auth);
   const client = clientFor(context, dispatchDestination);
+  assertDispatchIsCurrent(context, auth, guard);
   try {
     await client.updateModelYamlFile({
       modelId: auth.targetInput.modelId,
@@ -866,15 +925,62 @@ async function applySemanticChange(
       yaml: patch.acceptedYaml!,
       previousChecksum: patch.previousChecksum,
       commitMessage: 'Apply verified additive dashboard safe-copy dependency',
-    });
+    }, { signal: guard?.signal, assertCanDispatch: () => assertDispatchIsCurrent(context, auth, guard) });
   } catch (error) {
-    const definitelyNotCommitted = error instanceof OmniClientError
+    if (error instanceof OmniWriteNotDispatchedError && error.reason instanceof SafeCopyRuntimeError) throw error.reason;
+    const definitelyNotCommitted = error instanceof OmniWriteNotDispatchedError || error instanceof OmniClientError
       && [400, 401, 403, 404, 409, 412, 422].includes(error.httpStatus);
     throw new SafeCopyRuntimeError(
       'SAFE_COPY_SEMANTIC_WRITE_FAILED',
       'The checksum-protected model write did not return a verified response.',
       definitelyNotCommitted ? 'definitely_not_committed' : 'uncertain',
     );
+  }
+}
+
+function assertDispatchIsCurrent(
+  context: RuntimeContext,
+  auth: RuntimeAuthorization,
+  guard?: DashboardSafeCopyDispatchGuard,
+): void {
+  assertCurrentWriteAuthority(context, auth);
+  const current = context.services.getJob(context.jobId);
+  if (!current || current.status === 'canceled') {
+    throw new SafeCopyRuntimeError('SAFE_COPY_JOB_NOT_WRITABLE', 'This deployment no longer permits writes.', 'definitely_not_committed');
+  }
+  try {
+    guard?.assertCanDispatch();
+    if (auth.targetInput.deadlineAt !== undefined && context.services.now() >= auth.targetInput.deadlineAt) {
+      throw new Error('deadline expired');
+    }
+  } catch {
+    throw new SafeCopyRuntimeError('SAFE_COPY_TARGET_DEADLINE', 'The deployment deadline expired before dispatch.', 'definitely_not_committed');
+  }
+}
+
+async function recheckDeploymentSnapshots(
+  context: RuntimeContext,
+  auth: RuntimeAuthorization,
+  sourceDocumentId: string,
+): Promise<void> {
+  const deployment = context.intent.deployment;
+  await assertWorkbookCopyRuntimeBoundary(context, auth.targetInput, [sourceDocumentId]);
+  if (!deployment) return;
+  const [sourceState, targetModel] = await Promise.all([
+    clientFor(context, auth.sourceInstance).getDocumentStateV2(sourceDocumentId),
+    clientFor(context, auth.destinationInstance).getModelYaml(auth.targetInput.modelId, { includeChecksums: true }),
+    mapWithConcurrency(Object.entries(deployment.sourceModelHashes || {}), DOCUMENT_STATE_CONCURRENCY, async ([modelId, expectedHash]) => {
+      const snapshot = await clientFor(context, auth.sourceInstance).getModelYaml(modelId, { includeChecksums: true });
+      if (dashboardSafeCopyStateHash(snapshot.files) !== expectedHash) {
+        throw new SafeCopyRuntimeError('SAFE_COPY_SOURCE_MODEL_DRIFT', 'A source model changed after preflight. Rerun compatibility checks.', 'definitely_not_committed');
+      }
+    }),
+  ]);
+  if (dashboardSafeCopyStateHash(sourceState) !== deployment.sourceHashes[sourceDocumentId]) {
+    throw new SafeCopyRuntimeError('SAFE_COPY_SOURCE_DRIFT', 'The source dashboard changed after preflight. Rerun compatibility checks.', 'definitely_not_committed');
+  }
+  if (dashboardSafeCopyStateHash(targetModel.files) !== deployment.modelHashes[auth.targetInput.targetId]) {
+    throw new SafeCopyRuntimeError('SAFE_COPY_MODEL_DRIFT', 'The destination model changed after preflight. Rerun compatibility checks.', 'definitely_not_committed');
   }
 }
 
@@ -908,9 +1014,13 @@ async function prepareDocument(
   sourceDocumentId: string,
 ): Promise<DashboardSafeCopyPreparedDocument> {
   const auth = runtimeAuthorization(target);
+  await assertWorkbookCopyRuntimeBoundary(context, auth.targetInput, [sourceDocumentId]);
   const sourceClient = clientFor(context, auth.sourceInstance);
   const destinationClient = clientFor(context, auth.destinationInstance);
   const state = await sourceClient.getDocumentStateV2(sourceDocumentId);
+  if (context.intent.deployment && dashboardSafeCopyStateHash(state) !== context.intent.deployment.sourceHashes[sourceDocumentId]) {
+    throw new SafeCopyRuntimeError('SAFE_COPY_SOURCE_DRIFT', 'The source dashboard changed after preflight. Rerun compatibility checks.', 'definitely_not_committed');
+  }
   const sourceModelId = documentModelBinding(state);
   if (!sourceModelId) {
     throw new SafeCopyRuntimeError('SAFE_COPY_SOURCE_MODEL_MISSING', 'The source dashboard model binding is unavailable.');
@@ -2152,8 +2262,13 @@ function executorDependencies(
 ): DashboardSafeCopyExecutorDependencies {
   return {
     reproveTarget: async (targetInput) => {
+      // Gate before preparation (which can validate shared-model patches) or local queries.
+      await assertWorkbookCopyRuntimeBoundary(context, targetInput);
       const semanticRecovery = verifiedSemanticRecoveryForExecution(context, targetInput);
       const prepared = await freshPreparedTarget(context, targetInput, Boolean(semanticRecovery));
+      if (context.intent.deployment && (semanticRecovery || writePatches(prepared.target).length > 0)) {
+        throw new SafeCopyRuntimeError('SAFE_COPY_REPAIR_REQUIRED', 'Model dependencies require a new Model Migrator repair and compatibility check.', 'definitely_not_committed');
+      }
       const reproved: DashboardSafeCopyReprovedTarget = {
         targetId: targetInput.targetId,
         scope: {
@@ -2180,16 +2295,18 @@ function executorDependencies(
       }
       return reproved;
     },
-    applySemanticChange: (target, attempt) => applySemanticChange(context, target, attempt),
+    applySemanticChange: (target, attempt, guard) => applySemanticChange(context, target, attempt, guard),
     reconcileSemanticChange: (target, attempt) => reconcileSemanticChange(context, target, attempt),
     prepareDocument: (target, sourceDocumentId) => prepareDocument(context, target, sourceDocumentId),
     readDestinationScope: (target) => readScopeInventory(context, target),
-    createDocument: async (target, document, chosenName) => {
+    createDocument: async (target, document, chosenName, _attempt, guard) => {
       const auth = runtimeAuthorization(target);
       const content = materializeDashboardSafeCopyDocumentContent(document.content);
       let dispatchDestination: SavedInstance;
       try {
         dispatchDestination = await reproveImmediatelyBeforeDocumentWrite(context, target);
+        await recheckDeploymentSnapshots(context, auth, document.sourceDocumentId);
+        assertDispatchIsCurrent(context, auth, guard);
       } catch (error) {
         if (error instanceof SafeCopyRuntimeError) throw error;
         throw new SafeCopyRuntimeError(
@@ -2205,9 +2322,10 @@ function executorDependencies(
           name: chosenName,
           ...(auth.targetInput.folderId ? { folderId: auth.targetInput.folderId } : {}),
           content,
-        });
+        }, { signal: guard?.signal, assertCanDispatch: () => assertDispatchIsCurrent(context, auth, guard) });
       } catch (error) {
-        const definitelyNotCommitted = error instanceof OmniClientError
+        if (error instanceof OmniWriteNotDispatchedError && error.reason instanceof SafeCopyRuntimeError) throw error.reason;
+        const definitelyNotCommitted = error instanceof OmniWriteNotDispatchedError || error instanceof OmniClientError
           && [400, 401, 403, 404, 409, 412, 422].includes(error.httpStatus);
         throw new SafeCopyRuntimeError(
           'SAFE_COPY_DOCUMENT_CREATE_FAILED',
@@ -2242,7 +2360,7 @@ export function dashboardSafeCopyIntentFromJob(job: MigrationJob): DashboardSafe
   if (!requestId || job.targets.length === 0) {
     throw new SafeCopyRuntimeError('SAFE_COPY_JOB_INVALID', 'The stored safe-copy request is incomplete.');
   }
-  const intent = canonicalDashboardSafeCopyIntent({
+  const intent = parseDashboardSafeCopyIntent({
     profile: DASHBOARD_SAFE_COPY_PROFILE,
     requestId,
     source: {
@@ -2257,7 +2375,15 @@ export function dashboardSafeCopyIntentFromJob(job: MigrationJob): DashboardSafe
       modelId: target.targetModelId,
       ...(target.targetFolderId ? { folderId: target.targetFolderId } : {}),
       ...(target.targetFolderPath ? { folderPath: target.targetFolderPath } : {}),
+      ...(target.workbookCopy ? { workbookCopy: { ...target.workbookCopy } } : {}),
+      ...(target.topicMappings?.length ? { topicMappings: target.topicMappings.map((mapping) => ({
+        sourceTopicName: mapping.sourceTopicName, action: mapping.action, targetTopicName: mapping.targetTopicName,
+      })) } : {}),
+      ...(target.queryViewMappings?.length ? { queryViewMappings: target.queryViewMappings.map((mapping) => ({
+        sourceQueryViewName: mapping.sourceQueryViewName, action: mapping.action, targetQueryViewName: mapping.targetQueryViewName,
+      })) } : {}),
     })),
+    ...(job.details?.safeCopyDeployment ? { deployment: job.details.safeCopyDeployment } : {}),
   });
   if (detailsString(job.details, 'safeCopyIntentHash') !== dashboardSafeCopyIntentHash(intent)) {
     throw new SafeCopyRuntimeError('SAFE_COPY_JOB_INVALID', 'The stored safe-copy request fingerprint does not match its canonical scope.');
@@ -2599,6 +2725,37 @@ export async function runDashboardSafeCopyJob(
   activeRuntimeJobs.add(jobId);
   try {
     const intent = canonicalDashboardSafeCopyIntent(rawIntent);
+    const beforePreparation = (services.getJob || getJob)(jobId);
+    if (beforePreparation && isDashboardSafeCopyJob(beforePreparation)
+      && !['canceled', 'succeeded', 'partial'].includes(beforePreparation.status)
+      && beforePreparation.details?.safeCopyExecutionState !== 'reconciliation_required') {
+      const boundaryContext = createContext(beforePreparation, intent, services);
+      try {
+        // Legacy preparation can use scratch branches. Inspect workbook scope before it.
+        // Source extension evidence is target-independent; do not reread it once per instance here.
+        const destination = intent.destinations.find((candidate) => candidate.workbookCopy) || intent.destinations[0];
+        await assertWorkbookCopyRuntimeBoundary(boundaryContext, {
+          targetId: destination.targetId, sourceInstanceId: intent.source.instanceId,
+          sourceConnectionId: intent.source.connectionId, destinationInstanceId: destination.instanceId,
+          connectionId: destination.connectionId, modelId: destination.modelId,
+          sourceDocumentIds: intent.source.documentIds,
+          ...(destination.workbookCopy ? { workbookCopy: destination.workbookCopy } : {}),
+        });
+      } catch (error) {
+        if (!(error instanceof SafeCopyRuntimeError) || error.code !== 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED') throw error;
+        const execution: DashboardSafeCopyExecutionResult = {
+          jobId, status: 'needs_attention', targets: intent.destinations.map((destination) => ({
+            targetId: destination.targetId, status: 'needs_attention', documents: [],
+            exceptions: [{ code: 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED', targetId: destination.targetId,
+              retryable: false, message: SAFE_COPY_EXCEPTION_MESSAGES.WORKBOOK_COPY_CAPABILITY_UNVERIFIED }],
+          })),
+        };
+        if (!persistTargetResultsIndependently(boundaryContext, execution.targets)) {
+          return { job: recordRuntimeFailure(jobId, services) || beforePreparation, execution };
+        }
+        return { job: finalizeJob(boundaryContext), execution };
+      }
+    }
     await (services.prepareJob || prepareDashboardSafeCopyJob)(jobId, intent);
     const job = (services.getJob || getJob)(jobId);
     if (!job || !isDashboardSafeCopyJob(job)) {

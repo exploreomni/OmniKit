@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
+import { getDashboardDeploymentPlan } from './dashboardDeploymentPlans';
+import { readReviewedReconstructedTopics } from './dashboardTopicRepairEvidence';
 
 import {
   DASHBOARD_SAFE_COPY_RESOLVER_VERSION,
   type DashboardSafeCopyDestination,
   type DashboardSafeCopyIntent,
+  scopeDashboardSafeCopyIntent,
 } from '../../shared/dashboardSafeCopyContract';
 import { publishMigrationJobEvent } from './jobEvents';
 import { getJob, updateJobAtomically, updateJobStatus } from './jobStore';
@@ -68,6 +71,7 @@ export type DashboardSafeCopyPreparationExceptionCode =
   | 'PLAN_BLOCKED'
   | 'SCRATCH_VALIDATION_FAILED'
   | 'TARGET_SCOPE_MISMATCH'
+  | 'REPAIR_REQUIRED'
   | 'PREPARATION_FAILED';
 
 export interface DashboardSafeCopyPreparationException {
@@ -226,7 +230,7 @@ function inputForTarget(
   return {
     sourceId: intent.source.instanceId,
     sourceConnectionId: intent.source.connectionId,
-    targets: [target],
+    targets: [{ ...target, ...(intent.deployment ? { exactFolder: true } : {}) }],
     documentIds: [...intent.source.documentIds],
     emptyFirst: false,
     replaceSameNamed: false,
@@ -410,7 +414,39 @@ async function resolveOneTarget(
   const validatePatchSafety = dependencies.validatePatchSafety || validateAdditiveDashboardSafeCopyPatches;
   const loadTargetYamlSnapshot = dependencies.loadTargetYamlSnapshot || loadFreshTargetYamlSnapshot;
   let target = { ...persistedTarget };
-  let plan = await buildPlan(inputForTarget(intent, target));
+  const repairRequired = (candidate: MigrationTarget) => intent.deployment && writeBearingPatches(candidate).length > 0
+    ? fixedException(
+      candidate.id,
+      'REPAIR_REQUIRED',
+      'semantic_patch',
+      'Repair model dependencies in Model Migrator, then rerun compatibility checks before deploying dashboards.',
+      candidate.id,
+    )
+    : undefined;
+  const initialRepair = repairRequired(target);
+  if (initialRepair) return initialRepair;
+  const evidenceContext: Parameters<typeof buildMigrationPlan>[1] = {};
+  if (intent.deployment) {
+    const reviewedPlan = getDashboardDeploymentPlan(intent.deployment.planId);
+    if (reviewedPlan.intent.source.instanceId !== intent.source.instanceId
+      || !reviewedPlan.intent.destinations.some((row) => row.targetId === destination.targetId && row.instanceId === destination.instanceId && row.modelId === destination.modelId)) {
+      throw new Error('The reconstructed-topic review does not match this deployment.');
+    }
+    if (reviewedPlan.topicRepairReceipts?.length) {
+      const snapshots = new Map<string, ReturnType<OmniClient['getModelYaml']>>();
+      const snapshot = (instanceId: string, modelId: string, mode?: 'extension') => {
+        const key = JSON.stringify([instanceId, modelId, mode]);
+        if (!snapshots.has(key)) snapshots.set(key, new OmniClient(getInstance(instanceId)!).getModelYaml(modelId, { fullyResolved: false, ...(mode ? { mode } : {}) }));
+        return snapshots.get(key)!;
+      };
+      evidenceContext.reconstructedTopics = await readReviewedReconstructedTopics(reviewedPlan,
+        async (modelId) => (await snapshot(intent.source.instanceId, modelId)).files,
+        async (instanceId, modelId) => (await snapshot(instanceId, modelId)).files,
+        async (modelId) => (await snapshot(intent.source.instanceId, modelId, 'extension')).files,
+        async (instanceId, modelId) => (await snapshot(instanceId, modelId)).raw);
+    }
+  }
+  let plan = await buildPlan(inputForTarget(intent, target), evidenceContext);
   let converged = false;
 
   for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass += 1) {
@@ -423,6 +459,8 @@ async function resolveOneTarget(
       };
     }
     const nextTarget = resolved.target;
+    const requiredRepair = repairRequired(nextTarget);
+    if (requiredRepair) return requiredRepair;
     if (!targetMatchesDestination(nextTarget, destination)) {
       return fixedException(
         target.id,
@@ -439,7 +477,7 @@ async function resolveOneTarget(
       converged = true;
       break;
     }
-    plan = await buildPlan(inputForTarget(intent, target));
+    plan = await buildPlan(inputForTarget(intent, target), evidenceContext);
   }
 
   if (!converged) {
@@ -759,8 +797,8 @@ export async function prepareDashboardSafeCopyJob(
     if (pendingDestinations.length > 0) {
       // Creation-time role checks are not authority for later queued reads.
       assertDashboardSafeCopyInstanceRoles(intent);
-      const pendingIntent: DashboardSafeCopyIntent = { ...intent, destinations: pendingDestinations };
       const pendingTargetIds = new Set(pendingDestinations.map((destination) => destination.targetId));
+      const pendingIntent = scopeDashboardSafeCopyIntent(intent, pendingTargetIds);
       const pendingTargets = resolvingJob.targets.filter((target) => pendingTargetIds.has(target.id));
       const results = await prepareDashboardSafeCopyTargets(
         pendingIntent,

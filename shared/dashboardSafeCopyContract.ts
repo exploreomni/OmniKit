@@ -32,6 +32,28 @@ export interface DashboardSafeCopyOptions {
   refreshSchemaOnComplete?: boolean;
 }
 
+export interface DashboardSafeCopyWorkbookCopy {
+  stagingFolderId: string;
+}
+
+/** Hashes of authored extension YAML only; never resolved or shared model definitions. */
+export interface DashboardSafeCopyWorkbookEvidence {
+  sourceWorkbookModelId: string;
+  sourceSharedModelId: string;
+  authoredFileHashes: Record<string, string>;
+  authoredModelHash: string;
+}
+
+/** Immutable read-only preflight evidence approved for deployment. */
+export interface DashboardSafeCopyDeployment {
+  version: 2;
+  planId: string;
+  sourceHashes: Record<string, string>;
+  modelHashes: Record<string, string>;
+  sourceModelHashes?: Record<string, string>;
+  workbookCopies?: Record<string, DashboardSafeCopyWorkbookEvidence>;
+}
+
 export interface DashboardSafeCopyDestination {
   targetId: string;
   instanceId: string;
@@ -41,6 +63,7 @@ export interface DashboardSafeCopyDestination {
   folderPath?: string;
   topicMappings?: DashboardSafeCopyTopicMapping[];
   queryViewMappings?: DashboardSafeCopyQueryViewMapping[];
+  workbookCopy?: DashboardSafeCopyWorkbookCopy;
 }
 
 export interface DashboardSafeCopyIntent {
@@ -49,6 +72,7 @@ export interface DashboardSafeCopyIntent {
   source: DashboardSafeCopySource;
   destinations: DashboardSafeCopyDestination[];
   options?: DashboardSafeCopyOptions;
+  deployment?: DashboardSafeCopyDeployment;
 }
 
 export type DashboardSafeCopyErrorCode =
@@ -58,6 +82,8 @@ export type DashboardSafeCopyErrorCode =
   | 'SAFE_COPY_INVALID_REQUEST_ID'
   | 'SAFE_COPY_INVALID_SOURCE'
   | 'SAFE_COPY_INVALID_DESTINATION'
+  | 'SAFE_COPY_INVALID_DEPLOYMENT'
+  | 'SAFE_COPY_UNSUPPORTED_OPTIONS'
   | 'SAFE_COPY_DUPLICATE_TARGET'
   | 'SAFE_COPY_LIMIT_EXCEEDED'
   | 'SAFE_COPY_IDEMPOTENCY_CONFLICT'
@@ -166,13 +192,13 @@ function parseSource(value: unknown): DashboardSafeCopySource {
   };
 }
 
-function parseDestination(value: unknown, index: number): DashboardSafeCopyDestination {
+function parseDestination(value: unknown, index: number, contentOnly = false): DashboardSafeCopyDestination {
   if (!isRecord(value)) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', `destinations[${index}] must be an object.`);
   }
   assertOnlyKeys(
     value,
-    ['targetId', 'instanceId', 'connectionId', 'modelId', 'folderId', 'folderPath', 'topicMappings', 'queryViewMappings'],
+    ['targetId', 'instanceId', 'connectionId', 'modelId', 'folderId', 'folderPath', 'topicMappings', 'queryViewMappings', 'workbookCopy'],
     `destinations[${index}]`,
   );
   const destination: DashboardSafeCopyDestination = {
@@ -185,6 +211,40 @@ function parseDestination(value: unknown, index: number): DashboardSafeCopyDesti
   const folderPath = optionalFolderPath(value.folderPath);
   if (folderId) destination.folderId = folderId;
   if (folderPath) destination.folderPath = folderPath;
+  if (value.workbookCopy !== undefined) {
+    if (!contentOnly || !isRecord(value.workbookCopy)) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'Workbook-local copy requires a reviewed deployment plan and an explicit staging folder.');
+    }
+    assertOnlyKeys(value.workbookCopy, ['stagingFolderId'], 'workbookCopy');
+    const stagingFolderId = requiredIdentifier(value.workbookCopy.stagingFolderId, 'workbookCopy.stagingFolderId', 'SAFE_COPY_INVALID_DESTINATION');
+    if (stagingFolderId === folderId) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'The staging folder must differ from the final delivery folder.');
+    }
+    destination.workbookCopy = { stagingFolderId };
+  }
+  if (contentOnly) {
+    for (const [key, sourceKey, targetKey] of [
+      ['topicMappings', 'sourceTopicName', 'targetTopicName'],
+      ['queryViewMappings', 'sourceQueryViewName', 'targetQueryViewName'],
+    ]) {
+      const mappings = value[key];
+      if (mappings === undefined) continue;
+      if (!Array.isArray(mappings) || mappings.length > DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS) {
+        throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', `${key} must be a bounded mapping list.`);
+      }
+      const sources = new Set<string>();
+      for (const mapping of mappings) {
+        if (!isRecord(mapping)) throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', `${key} entries must be objects.`);
+        assertOnlyKeys(mapping, [sourceKey, targetKey, 'action'], key);
+        const sourceName = requiredIdentifier(mapping[sourceKey], sourceKey, 'SAFE_COPY_INVALID_DESTINATION');
+        requiredIdentifier(mapping[targetKey], targetKey, 'SAFE_COPY_INVALID_DESTINATION');
+        if (!['map_existing', 'copy_source'].includes(String(mapping.action)) || sources.has(sourceName)) {
+          throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', `${key} contains an unsupported or duplicate mapping.`);
+        }
+        sources.add(sourceName);
+      }
+    }
+  }
   if (Array.isArray(value.topicMappings) && value.topicMappings.length > 0) {
     destination.topicMappings = value.topicMappings.map((item: unknown) => {
       if (!isRecord(item)) throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'topicMappings entries must be objects.');
@@ -216,10 +276,13 @@ function destinationCanonicalKey(destination: DashboardSafeCopyDestination): str
     modelId: destination.modelId,
     folderId: destination.folderId || '',
     folderPath: destination.folderPath || '',
+    ...(destination.topicMappings ? { topicMappings: destination.topicMappings } : {}),
+    ...(destination.queryViewMappings ? { queryViewMappings: destination.queryViewMappings } : {}),
+    ...(destination.workbookCopy ? { workbookCopy: destination.workbookCopy } : {}),
   });
 }
 
-function parseDestinations(value: unknown): DashboardSafeCopyDestination[] {
+function parseDestinations(value: unknown, contentOnly = false): DashboardSafeCopyDestination[] {
   if (!Array.isArray(value) || value.length === 0) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'Select at least one destination.');
   }
@@ -228,7 +291,7 @@ function parseDestinations(value: unknown): DashboardSafeCopyDestination[] {
   }
   const byTargetId = new Map<string, DashboardSafeCopyDestination>();
   for (const [index, item] of value.entries()) {
-    const destination = parseDestination(item, index);
+    const destination = parseDestination(item, index, contentOnly);
     const existing = byTargetId.get(destination.targetId);
     if (!existing) {
       byTargetId.set(destination.targetId, destination);
@@ -244,11 +307,19 @@ function parseDestinations(value: unknown): DashboardSafeCopyDestination[] {
   const destinations = [...byTargetId.values()];
   const destinationModelScopes = new Set<string>();
   for (const destination of destinations) {
-    const scope = JSON.stringify({ instanceId: destination.instanceId, modelId: destination.modelId });
+    const scope = JSON.stringify({
+      instanceId: destination.instanceId,
+      modelId: destination.modelId,
+      ...(contentOnly ? {
+        folder: destination.folderId || destination.folderPath?.normalize('NFKC').trim().toLocaleLowerCase('en-US') || '',
+      } : {}),
+    });
     if (destinationModelScopes.has(scope)) {
       throw new DashboardSafeCopyError(
         'SAFE_COPY_DUPLICATE_TARGET',
-        'A safe-copy request supports only one destination target per destination model.',
+        contentOnly
+          ? 'Select distinct folders for repeated destination models.'
+          : 'A safe-copy request supports only one destination target per destination model.',
       );
     }
     destinationModelScopes.add(scope);
@@ -261,11 +332,89 @@ function parseDestinations(value: unknown): DashboardSafeCopyDestination[] {
   ));
 }
 
-export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyIntent {
+export function parseDashboardSafeCopyDeploymentEvidence(
+  value: unknown,
+  source: Pick<DashboardSafeCopySource, 'documentIds'>,
+  destinations: Array<Pick<DashboardSafeCopyDestination, 'targetId' | 'workbookCopy'>>,
+): DashboardSafeCopyDeployment {
+  if (!isRecord(value) || value.version !== 2) {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Deployment must contain version 2 preflight evidence.');
+  }
+  assertOnlyKeys(value, ['version', 'planId', 'sourceHashes', 'modelHashes', 'sourceModelHashes', 'workbookCopies'], 'deployment');
+  const hashes = (input: unknown, expectedIds: string[], label: string): Record<string, string> => {
+    if (!isRecord(input) || Object.keys(input).length !== expectedIds.length) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', `${label} must cover the exact approved scope.`);
+    }
+    return Object.fromEntries([...expectedIds].sort(compareCanonicalStrings).map((id) => {
+      const hash = Object.prototype.hasOwnProperty.call(input, id) ? input[id] : undefined;
+      if (typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) {
+        throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', `${label} contains missing or invalid snapshot evidence.`);
+      }
+      return [id, hash];
+    }));
+  };
+  let sourceModelHashes: Record<string, string> | undefined;
+  if (value.sourceModelHashes !== undefined) {
+    if (!isRecord(value.sourceModelHashes) || !Object.keys(value.sourceModelHashes).length || Object.keys(value.sourceModelHashes).length > MAX_DOCUMENTS) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'sourceModelHashes must contain bounded source model evidence.');
+    }
+    const ids = Object.keys(value.sourceModelHashes);
+    for (const id of ids) {
+      if (requiredIdentifier(id, 'sourceModelHashes model ID', 'SAFE_COPY_INVALID_DEPLOYMENT') !== id) {
+        throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Source model evidence must use canonical model identifiers.');
+      }
+    }
+    sourceModelHashes = hashes(value.sourceModelHashes, ids, 'sourceModelHashes');
+  }
+  let workbookCopies: Record<string, DashboardSafeCopyWorkbookEvidence> | undefined;
+  if (value.workbookCopies !== undefined) {
+    if (!isRecord(value.workbookCopies) || Object.keys(value.workbookCopies).length > source.documentIds.length) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'workbookCopies must contain bounded selected-document evidence.');
+    }
+    workbookCopies = Object.fromEntries(Object.entries(value.workbookCopies).sort(([a], [b]) => compareCanonicalStrings(a, b)).map(([documentId, evidence]) => {
+      if (!source.documentIds.includes(documentId) || !isRecord(evidence)) {
+        throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Workbook evidence is outside the selected source scope.');
+      }
+      assertOnlyKeys(evidence, ['sourceWorkbookModelId', 'sourceSharedModelId', 'authoredFileHashes', 'authoredModelHash'], 'workbookCopies evidence');
+      const sourceWorkbookModelId = requiredIdentifier(evidence.sourceWorkbookModelId, 'sourceWorkbookModelId', 'SAFE_COPY_INVALID_DEPLOYMENT');
+      const sourceSharedModelId = requiredIdentifier(evidence.sourceSharedModelId, 'sourceSharedModelId', 'SAFE_COPY_INVALID_DEPLOYMENT');
+      if (sourceWorkbookModelId === sourceSharedModelId || !isRecord(evidence.authoredFileHashes)) {
+        throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Workbook evidence must identify a separate workbook model and authored file hashes.');
+      }
+      const fileNames = Object.keys(evidence.authoredFileHashes);
+      if (fileNames.length > 2_000 || fileNames.some((fileName) => (
+        !fileName || fileName.length > MAX_FOLDER_PATH_LENGTH || hasAsciiControl(fileName)
+        || fileName !== fileName.trim() || fileName.includes('\\') || fileName.startsWith('/')
+        || fileName.split('/').some((part) => ['', '.', '..'].includes(part))
+      ))) {
+        throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Workbook evidence contains an unsafe or unbounded authored file path.');
+      }
+      return [documentId, {
+        sourceWorkbookModelId,
+        sourceSharedModelId,
+        authoredFileHashes: hashes(evidence.authoredFileHashes, fileNames, 'authoredFileHashes'),
+        authoredModelHash: hashes({ model: evidence.authoredModelHash }, ['model'], 'authoredModelHash').model,
+      }];
+    }));
+  }
+  if (destinations.some((destination) => destination.workbookCopy) && !Object.keys(workbookCopies || {}).length) {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Workbook-local copy requires immutable authored workbook evidence.');
+  }
+  return {
+    version: 2,
+    planId: requiredIdentifier(value.planId, 'deployment.planId', 'SAFE_COPY_INVALID_DEPLOYMENT'),
+    sourceHashes: hashes(value.sourceHashes, source.documentIds, 'sourceHashes'),
+    modelHashes: hashes(value.modelHashes, destinations.map((destination) => destination.targetId), 'modelHashes'),
+    ...(sourceModelHashes ? { sourceModelHashes } : {}),
+    ...(workbookCopies ? { workbookCopies } : {}),
+  };
+}
+
+function parseIntent(value: unknown, contentOnlyPreflight = false): DashboardSafeCopyIntent {
   if (!isRecord(value)) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_BODY', 'Safe-copy request body must be a JSON object.');
   }
-  assertOnlyKeys(value, ['profile', 'requestId', 'source', 'destinations', 'options'], 'request');
+  assertOnlyKeys(value, ['profile', 'requestId', 'source', 'destinations', 'options', 'deployment'], 'request');
   if (value.profile !== DASHBOARD_SAFE_COPY_PROFILE) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_PROFILE', `profile must be ${DASHBOARD_SAFE_COPY_PROFILE}.`);
   }
@@ -274,7 +423,15 @@ export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyI
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_REQUEST_ID', 'requestId must be a canonical UUID.');
   }
   const source = parseSource(value.source);
-  const destinations = parseDestinations(value.destinations);
+  const destinations = parseDestinations(value.destinations, contentOnlyPreflight || value.deployment !== undefined);
+  const deployment = value.deployment === undefined ? undefined : parseDashboardSafeCopyDeploymentEvidence(value.deployment, source, destinations);
+  if ((deployment || contentOnlyPreflight) && value.options !== undefined) {
+    if (!isRecord(value.options) || Object.entries(value.options).some(([key, option]) => (
+      !['emptyFirst', 'deleteSourceOnSuccess', 'refreshSchemaOnComplete'].includes(key) || option !== false
+    ))) {
+      throw new DashboardSafeCopyError('SAFE_COPY_UNSUPPORTED_OPTIONS', 'Content-only deployment does not support destructive or schema-refresh options.');
+    }
+  }
   if (source.documentIds.length * destinations.length > DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS) {
     throw new DashboardSafeCopyError(
       'SAFE_COPY_LIMIT_EXCEEDED',
@@ -286,7 +443,8 @@ export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyI
     requestId,
     source,
     destinations,
-    ...(isRecord(value.options) ? {
+    ...(deployment ? { deployment } : {}),
+    ...(!deployment && !contentOnlyPreflight && isRecord(value.options) ? {
       options: {
         ...(value.options.emptyFirst === true ? { emptyFirst: true } : {}),
         ...(value.options.deleteSourceOnSuccess === true ? { deleteSourceOnSuccess: true } : {}),
@@ -296,8 +454,38 @@ export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyI
   };
 }
 
+export function parseDashboardSafeCopyIntent(value: unknown): DashboardSafeCopyIntent {
+  return parseIntent(value);
+}
+
+/** Read-only plan input supports v2 routes before server-owned snapshot evidence exists. */
+export function parseDashboardDeploymentPlanIntent(value: unknown): DashboardSafeCopyIntent {
+  if (isRecord(value) && value.deployment !== undefined) {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Deployment evidence is generated by the server after preflight.');
+  }
+  return parseIntent(value, true);
+}
+
 export function canonicalDashboardSafeCopyIntent(intent: DashboardSafeCopyIntent): DashboardSafeCopyIntent {
   return parseDashboardSafeCopyIntent(intent);
+}
+
+/** Narrow a preflight/deployment without retaining evidence for unrelated destinations. */
+export function scopeDashboardSafeCopyIntent(
+  intent: DashboardSafeCopyIntent,
+  targetIds: ReadonlySet<string>,
+): DashboardSafeCopyIntent {
+  const destinations = intent.destinations.filter((destination) => targetIds.has(destination.targetId));
+  return {
+    ...intent,
+    destinations,
+    ...(intent.deployment ? { deployment: {
+      ...intent.deployment,
+      modelHashes: Object.fromEntries(destinations.map((destination) => [
+        destination.targetId, intent.deployment!.modelHashes[destination.targetId],
+      ])),
+    } } : {}),
+  };
 }
 
 export function dashboardSafeCopyCanonicalJson(intent: DashboardSafeCopyIntent): string {
@@ -307,6 +495,7 @@ export function dashboardSafeCopyCanonicalJson(intent: DashboardSafeCopyIntent):
     requestId: canonical.requestId,
     source: canonical.source,
     destinations: canonical.destinations,
+    ...(canonical.deployment ? { deployment: canonical.deployment } : {}),
   });
 }
 
