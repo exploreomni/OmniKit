@@ -275,6 +275,36 @@ test('controlled-write approval is bound to the exact current form scope', () =>
   }
 });
 
+test('late topic inventory preserves approval when the selected scope is unchanged', () => {
+  for (const mode of ['review', 'report', 'dashboard', 'app'] as const) {
+    let form = initialAIContentStudioForm(mode);
+    form = aiContentStudioFormReducer(form, { type: 'change-model', modelId: 'verified-shared-model' });
+    form = aiContentStudioFormReducer(form, { type: 'approve-scope', scope: `approved-${mode}` });
+    for (const availableTopics of [[], ['optional_topic']]) {
+      assert.equal(aiContentStudioFormReducer(form, { type: 'sync-topics', availableTopics }), form);
+    }
+
+    form = aiContentStudioFormReducer(form, { type: 'change-topic', topicName: 'selected_topic' });
+    form = aiContentStudioFormReducer(form, { type: 'approve-scope', scope: `approved-${mode}-topic` });
+    assert.equal(aiContentStudioFormReducer(form, {
+      type: 'sync-topics', availableTopics: ['selected_topic', 'other_topic'],
+    }), form);
+  }
+});
+
+test('topic inventory revokes approval when the selected topic disappears', () => {
+  let form = initialAIContentStudioForm('app');
+  form = aiContentStudioFormReducer(form, { type: 'change-model', modelId: 'verified-shared-model' });
+  form = aiContentStudioFormReducer(form, { type: 'change-topic', topicName: 'removed_topic' });
+  form = aiContentStudioFormReducer(form, { type: 'approve-scope', scope: 'approved-topic-scope' });
+  for (const availableTopics of [[], ['other_topic']]) {
+    const synchronized = aiContentStudioFormReducer(form, { type: 'sync-topics', availableTopics });
+    assert.equal(synchronized.topicName, '');
+    assert.equal(synchronized.approvedScope, '');
+    assert.equal(synchronized.modelId, 'verified-shared-model');
+  }
+});
+
 test('App brief readiness fails closed until data, interaction, and acceptance contracts are present', () => {
   const brief = oneShotBrief();
   assert.deepEqual(aiContentBriefRequiredFields('app'), [

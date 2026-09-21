@@ -90,6 +90,7 @@ interface MockAIContentState {
   createPayload: Record<string, unknown> | null;
   lifecycleRequests: Array<{ action: string; responseContract?: string }>;
   instances: SwitcherInstance[];
+  releaseTopicRead: () => void;
   releaseResultRead: () => void;
 }
 
@@ -143,6 +144,7 @@ async function installMockAIContentStudio(
     actions: MockAIContentAction[];
     holdJobOpen?: boolean;
     includeAlternateInstance?: boolean;
+    holdTopicRead?: boolean;
     holdResultRead?: boolean;
     resultFailuresBeforeSuccess?: number;
     resultFailureStatus?: number;
@@ -237,7 +239,12 @@ async function installMockAIContentStudio(
       }),
     });
   });
+  let releaseTopicRead: () => void = () => undefined;
+  const topicReadGate = options.holdTopicRead
+    ? new Promise<void>((resolve) => { releaseTopicRead = resolve; })
+    : Promise.resolve();
   await page.route('**/api/manage-topics', async (route) => {
+    await topicReadGate;
     await route.fulfill({
       status: 200,
       contentType: 'application/json',
@@ -258,6 +265,7 @@ async function installMockAIContentStudio(
     createPayload: null,
     lifecycleRequests: [],
     instances,
+    releaseTopicRead: () => releaseTopicRead(),
     releaseResultRead: () => releaseResultRead(),
   };
   await page.route('**/api/manage-ai', async (route) => {
@@ -2623,11 +2631,9 @@ test('AI Content Studio preserves a completed App hold and rereads only the exis
   await page.getByRole('button', { name: 'Retry result read' }).click();
   await expect(page.getByRole('heading', { name: 'App request completed — functional verification required' })).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('create_app: fictional-recovered-app-1', { exact: true })).toBeVisible();
-  // Poll: the click above may still be in flight. A bare expect here races the
-  // request and fails under CPU contention (reproduced locally, and the cause of
-  // the CI failure at this assertion).
-  await expect.poll(() => state.createCalls).toBe(1);
-  expect(state.resultCalls).toBe(2);
+  // Wait for the result-only read, then prove that recovery did not create another job.
+  await expect.poll(() => state.resultCalls).toBe(2);
+  expect(state.createCalls).toBe(1);
   expect(state.cancelCalls).toBe(0);
   expect(state.lifecycleRequests.slice(lifecycleCountBeforeRecovery).map((requestEntry) => requestEntry.action)).toEqual([
     'get-content-studio-job-result',
@@ -2674,12 +2680,47 @@ test('AI Content Studio keeps COMPLETE locked when the existing App result fails
 
   await page.getByRole('button', { name: 'Retry result read' }).click();
   await expect(page.getByText(/Its separate structured result is unavailable in OmniKit/).first()).toBeVisible();
-  // Poll: the click above may still be in flight. A bare expect here races the
-  // request and fails under CPU contention (reproduced locally, and the cause of
-  // the CI failure at this assertion).
-  await expect.poll(() => state.createCalls).toBe(1);
-  expect(state.resultCalls).toBe(2);
+  // The same validation message may already be visible while the second read is still in flight.
+  await expect.poll(() => state.resultCalls).toBe(2);
+  expect(state.createCalls).toBe(1);
   expect(state.cancelCalls).toBe(0);
+});
+
+test('AI Content Studio preserves blank-topic approval when the delayed topic inventory arrives', async ({ page, request }) => {
+  const state = await installMockAIContentStudio(page, request, {
+    slug: 'ai-content-delayed-topics',
+    resultMessage: 'Unused fictional report result.',
+    actions: [],
+    holdTopicRead: true,
+  });
+
+  try {
+    await page.goto('/content/ai-studio?mode=report');
+    await closeWalkthrough(page);
+    await page.getByLabel('Base model').selectOption('model-ai-content');
+    await page.getByLabel('Outcome or decision (required)').fill('Create a bounded fictional report using model context only.');
+    const topics = page.getByRole('combobox', { name: 'Topic (optional)', exact: true });
+    const approval = page.getByRole('checkbox', { name: /approve one no-write narrative request/i });
+    const generate = page.getByRole('button', { name: 'Generate report', exact: true });
+    await expect(topics).toBeDisabled();
+    await expect(topics).toContainText('Loading topics');
+    await expect(topics).toHaveValue('');
+    await expect(approval).toBeEnabled();
+    await expect(approval).toHaveAccessibleName(/scoped to model Fictional governed model/i);
+    await approval.check();
+    await expect(approval).toBeChecked();
+    await expect(generate).toBeEnabled();
+
+    state.releaseTopicRead();
+    await expect(topics).toBeEnabled();
+    await expect(topics).toContainText('Fictional example topic');
+    await expect(topics).toHaveValue('');
+    await expect(approval).toBeChecked();
+    await expect(generate).toBeEnabled();
+    expect(state.createCalls).toBe(0);
+  } finally {
+    state.releaseTopicRead();
+  }
 });
 
 test('AI Content Studio preserves COMPLETE without cancellation when the instance changes during the result read', async ({ page, request }) => {
