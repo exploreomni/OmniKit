@@ -173,11 +173,12 @@ function completePagination(count: number) {
   };
 }
 
-function blankDashboardState(name: string, modelId = 'source-model'): Record<string, unknown> {
+function blankDashboardState(name: string, workbookModelId: string): Record<string, unknown> {
   return {
     name,
     description: `${name} content-only copy.`,
-    modelId,
+    modelId: 'source-model',
+    workbookModelId,
     queryPresentations: {
       data: {
         '1': {
@@ -220,7 +221,7 @@ function installProductionSafeCopyOmniHarness(
 ): ProductionSafeCopyHarness {
   const sourceStates = new Map(input.sourceDocumentIds.map((documentId, index) => [
     documentId,
-    blankDashboardState(`Dashboard ${index + 1}`),
+    blankDashboardState(`Dashboard ${index + 1}`, `${documentId}-workbook-model`),
   ]));
   const createdStates = new Map<string, Record<string, unknown>>();
   const createdRows = new Map<string, Array<{
@@ -288,7 +289,19 @@ function installProductionSafeCopyOmniHarness(
   });
   t.mock.method(OmniClient.prototype, 'getDocumentQueries', async () => []);
   t.mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({}));
-  t.mock.method(OmniClient.prototype, 'getModelYaml', async () => ({ files: {}, checksums: {}, raw: {} }));
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options?: {
+    mode?: string;
+    fullyResolved?: boolean;
+    includeChecksums?: boolean;
+  }) {
+    if (instanceId(this) === 'source-instance' && options?.mode === 'extension') {
+      assert.ok(input.sourceDocumentIds.some((documentId) => modelId === `${documentId}-workbook-model`));
+      assert.equal(options.fullyResolved, false);
+      assert.equal(options.includeChecksums, true);
+    }
+    // These content-only fixtures have a verified empty workbook extension, not missing identity/evidence.
+    return { files: {}, checksums: {}, raw: {} };
+  });
   t.mock.method(OmniClient.prototype, 'listModelTopics', async () => []);
   t.mock.method(OmniClient.prototype, 'listModelQueryViews', async () => []);
   t.mock.method(OmniClient.prototype, 'listLabels', async () => []);

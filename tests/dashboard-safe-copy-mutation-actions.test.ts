@@ -530,6 +530,10 @@ test('automatic parent jobs record mutating webhooks as skipped before fetch', a
     fetchCalls += 1;
     return new Response(null, { status: 204 });
   });
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async (documentId: string) => {
+    assert.equal(documentId, 'mutation-source-document');
+    return { modelId: 'mutation-source-model', workbookModelId: 'mutation-source-workbook' };
+  });
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
     const instanceId = (this as unknown as { instance: { id: string } }).instance.id;
     if (instanceId === 'mutation-source') {
@@ -556,11 +560,21 @@ test('automatic parent jobs record mutating webhooks as skipped before fetch', a
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
     'example.view': 'dimensions:\n  id:\n',
   }));
-  mock.method(OmniClient.prototype, 'getModelYaml', async () => ({
-    files: { 'example.view': 'dimensions:\n  id:\n' },
-    checksums: {},
-    raw: {},
-  }));
+  mock.method(OmniClient.prototype, 'getModelYaml', async (
+    modelId: string,
+    options: { fullyResolved?: boolean; mode?: string } = {},
+  ) => {
+    if (modelId === 'mutation-source-workbook') {
+      assert.equal(options.fullyResolved, false);
+      assert.equal(options.mode, 'extension');
+      return { files: {}, checksums: {}, raw: {} };
+    }
+    return {
+      files: { 'example.view': 'dimensions:\n  id:\n' },
+      checksums: {},
+      raw: {},
+    };
+  });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async () => []);
   mock.method(OmniClient.prototype, 'listDocumentAccess', async () => []);
   mock.method(OmniClient.prototype, 'listUserAttributes', async () => []);

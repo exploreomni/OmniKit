@@ -41,6 +41,7 @@ beforeEach(() => {
   process.env.OMNIKIT_JOB_HISTORY_PATH = path.join(temporaryRoot, 'jobs.json');
   process.env.OMNIKIT_JOBS_PATH = path.join(temporaryRoot, 'legacy-jobs.json');
   unlockVault('safe-copy access-policy test passphrase');
+  mock.method(globalThis, 'fetch', async () => { throw new Error('Unexpected network access in access-policy fixture'); });
 
   upsertInstance({
     id: 'source-instance',
@@ -116,13 +117,17 @@ test('destination-default access policy skips source access and identity reads w
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
     'orders.view': 'dimensions:\n  id:\n    sql: ${TABLE}.id\n',
   }));
+  mock.method(OmniClient.prototype, 'getModelYaml', async (_modelId, options) => ({
+    files: options?.mode === 'extension' ? {} : { 'orders.view': 'dimensions:\n  id:\n    sql: ${TABLE}.id\n' },
+    checksums: {}, raw: {},
+  }));
   mock.method(OmniClient.prototype, 'listDocumentAccess', async function listDocumentAccess() {
     calls.documentAccess += 1;
     return clientLabel(this) === 'Source' ? [sourceAccess] : [];
   });
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => {
     calls.documentState += 1;
-    return {};
+    return { modelId: 'source-model', workbookModelId: 'source-workbook' };
   });
   mock.method(OmniClient.prototype, 'listIdentityUsers', async function listIdentityUsers() {
     calls.identityUsers += 1;
@@ -180,7 +185,8 @@ test('destination-default access policy skips source access and identity reads w
 
   assert.deepEqual(calls, {
     documentAccess: 0,
-    documentState: 0,
+    // Source binding is still read for provenance, not to copy access settings.
+    documentState: 1,
     identityUsers: 0,
     userGroups: 0,
     userAttributes: 0,
@@ -197,7 +203,7 @@ test('destination-default access policy skips source access and identity reads w
   assert.equal(calls.userAttributes, 0);
   assert.equal(calls.userModelRoles, 2);
   assert.equal(calls.groupModelRoles, 0);
-  assert.equal(calls.documentState, 0);
+  assert.equal(calls.documentState, 2, 'each plan independently verifies the published source binding');
   assert.equal(legacy.steps.some((step) => step.kind === 'permission_apply'), true);
   const permissionKinds = (legacy.steps
     .find((step) => step.kind === 'permission_prepare')
@@ -208,6 +214,9 @@ test('destination-default access policy skips source access and identity reads w
 });
 
 test('safe-copy planning rejects ambiguous source topic catalog matches instead of choosing the first file', async () => {
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => ({
+    modelId: 'source-model', workbookModelId: 'source-workbook',
+  }));
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
     return clientLabel(this) === 'Source'
       ? [{
@@ -234,20 +243,18 @@ test('safe-copy planning rejects ambiguous source topic catalog matches instead 
   });
   mock.method(OmniClient.prototype, 'listModels', async () => []);
   mock.method(OmniClient.prototype, 'listModelQueryViews', async () => []);
-  mock.method(OmniClient.prototype, 'listModelTopics', async function listModelTopics() {
-    return clientLabel(this) === 'Source'
-      ? [{
-          name: 'daily-operations-a',
-          label: 'Daily Operations',
-          fileName: 'folder-a/daily.topic',
-          yaml: 'label: Daily Operations\nviews:\n  orders: {}\n',
-        }, {
-          name: 'daily-operations-b',
-          label: 'Daily Operations',
-          fileName: 'folder-b/daily.topic',
-          yaml: 'label: Daily Operations\nviews:\n  orders: {}\n',
-        }]
-      : [];
+  // The planner now projects the topic catalog from authored YAML, not a separate list call.
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(_modelId, options) {
+    return {
+      files: options?.mode === 'extension' ? {} : {
+        'orders.view': 'dimensions:\n  id:\n    sql: ${TABLE}.id\n',
+        ...(clientLabel(this) === 'Source' ? {
+          'folder-a/daily.topic': 'label: Daily Operations\nviews:\n  orders: {}\n',
+          'folder-b/daily.topic': 'label: Daily Operations\nviews:\n  orders: {}\n',
+        } : {}),
+      },
+      checksums: {}, raw: {},
+    };
   });
 
   const plan = await buildMigrationPlan({
@@ -274,7 +281,7 @@ test('safe-copy planning rejects ambiguous source topic catalog matches instead 
 
   const topicPreparation = plan.steps.find((step) => step.kind === 'topic_prepare');
   assert.equal(topicPreparation?.blocked, true);
-  assert.match(topicPreparation?.error || '', /source topic yaml was not found/i);
+  assert.match(topicPreparation?.error || '', /one exact authored source topic file is required.*labels alone cannot establish source identity/i);
   const topics = topicPreparation?.details?.sourceTopics as Array<{ fileName?: string }>;
   assert.ok(topics.every((topic) => topic.fileName === undefined));
 });

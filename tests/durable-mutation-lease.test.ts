@@ -275,6 +275,25 @@ function mockLegacyDashboardHappyPath(t: TestContext, input: {
   sourceModelId: string;
   description?: string;
 }): void {
+  const unexpectedUrls: string[] = [];
+  t.mock.method(globalThis, 'fetch', async (request: string | URL | Request) => {
+    unexpectedUrls.push(String(request));
+    throw new Error(`Unexpected fictional tenant request: ${String(request)}`);
+  });
+  t.after(() => assert.deepEqual(unexpectedUrls, []));
+  const workbookModelId = `${input.sourceModelId}-workbook`;
+  t.mock.method(OmniClient.prototype, 'getDocumentStateV2', async (documentId: string) => {
+    assert.equal(documentId, 'fictional-dashboard');
+    return { modelId: input.sourceModelId, workbookModelId };
+  });
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async (
+    modelId: string,
+    options: { fullyResolved?: boolean; mode?: string } = {},
+  ) => {
+    assert.equal(options.fullyResolved, false);
+    assert.equal(modelId, options.mode === 'extension' ? workbookModelId : input.sourceModelId);
+    return { files: {}, raw: {} };
+  });
   t.mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
     const instance = (this as unknown as { instance: { id: string; label: string } }).instance;
     return instance.id === input.sourceId || instance.label === input.sourceLabel
@@ -1044,6 +1063,9 @@ test('a legacy field-preparation YAML write is dispatched before Omni and restar
     throw new Error(`Unexpected fictional tenant request: ${String(input)}`);
   });
   const sourceYaml = [
+    'dimensions:',
+    '  amount:',
+    '    sql: ${TABLE}.amount',
     'measures:',
     '  fictional_total:',
     '    sql: ${fictional_orders.amount}',
@@ -1058,6 +1080,10 @@ test('a legacy field-preparation YAML write is dispatched before Omni and restar
     '    sql: ${fictional_orders.amount}',
     '    aggregate_type: sum',
   ].join('\n');
+  t.mock.method(OmniClient.prototype, 'getDocumentStateV2', async (documentId: string) => {
+    assert.equal(documentId, 'fictional-prep-dashboard');
+    return { modelId: 'fictional-source-model', workbookModelId: 'fictional-source-workbook' };
+  });
   t.mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
     const label = (this as unknown as { instance: { label: string } }).instance.label;
     return label === source.label
@@ -1088,9 +1114,15 @@ test('a legacy field-preparation YAML write is dispatched before Omni and restar
   });
   t.mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(
     modelId: string,
-    options: { includeChecksums?: boolean } = {},
+    options: { includeChecksums?: boolean; fullyResolved?: boolean; mode?: string } = {},
   ) {
     const label = (this as unknown as { instance: { label: string } }).instance.label;
+    if (modelId === 'fictional-source-workbook') {
+      assert.equal(label, source.label);
+      assert.equal(options.fullyResolved, false);
+      assert.equal(options.mode, 'extension');
+      return { files: {}, raw: { modelId } };
+    }
     return label === source.label
       ? {
           files: { 'fictional_orders.view': sourceYaml },
@@ -1173,36 +1205,11 @@ test('a legacy field-preparation YAML write is dispatched before Omni and restar
 test('a legacy dashboard parent refresh polls its external job before completing', async (t) => {
   const { source, destination } = saveInstances();
   const observedStatusJobIds: string[] = [];
-  t.mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
-    const label = (this as unknown as { instance: { label: string } }).instance.label;
-    return label === source.label
-      ? [{
-          id: 'fictional-dashboard-id',
-          identifier: 'fictional-dashboard',
-          name: 'Fictional dashboard',
-          baseModelId: 'fictional-source-model',
-        }]
-      : [];
+  mockLegacyDashboardHappyPath(t, {
+    sourceId: source.id,
+    sourceLabel: source.label,
+    sourceModelId: 'fictional-source-model',
   });
-  t.mock.method(OmniClient.prototype, 'listDocumentAccess', async () => []);
-  t.mock.method(OmniClient.prototype, 'listUserAttributes', async () => []);
-  t.mock.method(OmniClient.prototype, 'listIdentityUsers', async () => []);
-  t.mock.method(OmniClient.prototype, 'listUserGroups', async () => []);
-  t.mock.method(OmniClient.prototype, 'listModelTopics', async () => []);
-  t.mock.method(OmniClient.prototype, 'listModelQueryViews', async () => []);
-  t.mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({}));
-  t.mock.method(OmniClient.prototype, 'getDocumentQueries', async () => []);
-  t.mock.method(OmniClient.prototype, 'validateModel', async () => []);
-  t.mock.method(OmniClient.prototype, 'validateModelContent', async () => ({ issues: [] }));
-  t.mock.method(OmniClient.prototype, 'listLabels', async () => []);
-  t.mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    sharedModelId: 'fictional-source-model',
-    tiles: [],
-  }));
-  t.mock.method(OmniClient.prototype, 'importDocument', async () => ({
-    identifier: 'fictional-imported-dashboard',
-    documentId: 'fictional-imported-dashboard-id',
-  }));
   t.mock.method(OmniClient.prototype, 'refreshModel', async () => ({
     jobId: EXTERNAL_JOB_ID,
     status: 'RUNNING',

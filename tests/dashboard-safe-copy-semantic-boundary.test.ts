@@ -29,6 +29,7 @@ const DESTINATION_INSTANCE_ID = 'semantic-destination-instance';
 const SOURCE_CONNECTION_ID = 'semantic-source-connection';
 const DESTINATION_CONNECTION_ID = 'semantic-destination-connection';
 const SOURCE_MODEL_ID = 'semantic-source-model';
+const SOURCE_WORKBOOK_MODEL_ID = 'semantic-source-workbook-model';
 const DESTINATION_MODEL_ID = 'semantic-destination-model';
 const SOURCE_DOCUMENT_ID = 'fictional-operations-dashboard';
 const TARGET_ID = 'semantic-target';
@@ -202,6 +203,7 @@ function sourceDashboard(): Record<string, unknown> {
   return {
     name: 'Fictional Operations Dashboard',
     modelId: SOURCE_MODEL_ID,
+    workbookModelId: SOURCE_WORKBOOK_MODEL_ID,
     queryPresentations: { data: {}, order: [] },
     controls: [],
     settings: { interactionMode: 'cross-filter' },
@@ -347,7 +349,14 @@ function createHarness(options: {
         async runQuery() {
           return { status: 'COMPLETE', rowCount: 0 };
         },
-        async getModelYaml() {
+        async getModelYaml(modelId, options) {
+          if (saved.id === SOURCE_INSTANCE_ID && options?.mode === 'extension') {
+            assert.equal(modelId, SOURCE_WORKBOOK_MODEL_ID);
+            assert.equal(options.fullyResolved, false);
+            assert.equal(options.includeChecksums, true);
+            // Shared-model semantic cases must establish that no workbook-local definitions need copying.
+            return { files: {}, checksums: {}, raw: {} };
+          }
           return {
             files: { 'fictional_orders.view': currentYaml },
             checksums: { 'fictional_orders.view': currentChecksum },

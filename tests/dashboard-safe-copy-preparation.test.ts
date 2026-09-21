@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
+import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
 
 import {
   prepareDashboardSafeCopyTargets,
@@ -113,9 +117,24 @@ const ordersSnapshot = {
   checksums: { 'orders.view': 'checksum-1' },
 };
 
-test('v2 read-only preparation routes semantic changes to repair without scratch validation', async () => {
+test('v2 read-only preparation routes semantic changes to repair without scratch validation', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'omnikit-preparation-plan-'));
+  const previousHistory = process.env.OMNIKIT_JOB_HISTORY_PATH;
+  const history = join(directory, 'jobs.json');
+  process.env.OMNIKIT_JOB_HISTORY_PATH = history;
+  t.after(() => {
+    if (previousHistory === undefined) delete process.env.OMNIKIT_JOB_HISTORY_PATH;
+    else process.env.OMNIKIT_JOB_HISTORY_PATH = previousHistory;
+    rmSync(directory, { recursive: true, force: true });
+  });
   const selected = target('b');
   const safeIntent = intent(['b']);
+  // V2 preparation verifies the stored review scope before resolving dependencies.
+  const reviewedPlan: DashboardDeploymentPlan = {
+    version: 2, evidenceVersion: 4, id: 'reviewed-plan', revision: 1, createdAt: 1, updatedAt: 1,
+    intent: structuredClone(safeIntent), targets: [], sourceHashes: {}, sourceModelHashes: {},
+  };
+  writeFileSync(`${history}.deployment-plans.json`, JSON.stringify([reviewedPlan]));
   safeIntent.deployment = {
     version: 2, planId: 'reviewed-plan',
     sourceHashes: { 'dashboard-1': 'a'.repeat(64) }, modelHashes: { b: 'b'.repeat(64) },
