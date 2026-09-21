@@ -38,3 +38,16 @@ test('enablement modules reuse existing OmniKit app, walkthrough, or deck routes
   assert.ok(path.modules.some((module) => module.asset.kind === 'walkthrough'));
   assert.ok(path.modules.some((module) => module.asset.kind === 'app'));
 });
+
+test('enablement output preserves public module fields without internal selection metadata', () => {
+  const expectedKeys = ['id', 'title', 'objective', 'minutes', 'exercise', 'proof', 'escalationBoundary', 'goals', 'asset'].sort();
+  for (const role of ENABLEMENT_ROLES) {
+    for (const depth of ['quick_start', 'core', 'deep_dive'] as const) {
+      const path = generateRoleEnablementPath({ role, depth });
+      for (const module of path.modules) {
+        assert.deepEqual(Object.keys(module).sort(), expectedKeys);
+        assert.ok(module.asset.route.startsWith('/'));
+      }
+    }
+  }
+});

@@ -10,6 +10,7 @@ function parameter(url: URL, name: string): string | null {
   const values = url.searchParams.getAll(name);
   if (values.length !== 1) return null;
   const value = values[0]?.trim() ?? '';
+  // eslint-disable-next-line no-control-regex -- Deliberately reject ASCII controls in untrusted query identifiers.
   if (!value || value.length > 500 || /[\u0000-\u001f\u007f]/.test(value)) return null;
   return value;
 }
