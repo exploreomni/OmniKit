@@ -1453,7 +1453,7 @@ test('multi-valued SCIM attributes render explicitly and user edits preserve unt
     '2',
   ]);
   await expect(dialog.getByText('No assigned values', { exact: true })).toBeVisible();
-  await expect(dialog.getByText(/Read-only in OmniKit\. Saving other changes preserves these exact values and their order\./).first()).toBeVisible();
+  await expect(dialog.getByText('Read-only in OmniKit. Saving other changes preserves this value exactly.', { exact: true }).first()).toBeVisible();
   await expect(dialog.getByRole('button', { name: 'Remove regions attribute', exact: true })).toHaveCount(0);
   await dialog.getByLabel('Display Name', { exact: true }).fill('Renamed Attribute Fixture');
   await dialog.getByRole('button', { name: 'Save Changes', exact: true }).click();
@@ -1470,14 +1470,18 @@ test('multi-valued SCIM attributes render explicitly and user edits preserve unt
   await dialog.getByLabel('Attribute key', { exact: true }).fill('department');
   await dialog.getByLabel('Attribute value', { exact: true }).fill('Product');
   await dialog.getByRole('button', { name: 'Add custom attribute', exact: true }).click();
+  await expect(dialog.getByRole('list', { name: 'regions values', exact: true }).getByRole('listitem')).toHaveText([
+    'Central', 'West', 'Central',
+  ]);
+  await expect(dialog.getByRole('list', { name: 'thresholds values', exact: true }).getByRole('listitem')).toHaveText([
+    '2', '1.5', '2',
+  ]);
+  await expect(dialog.getByText('No assigned values', { exact: true })).toBeVisible();
   await dialog.getByRole('button', { name: 'Save Changes', exact: true }).click();
   await expect.poll(() => evidence.userUpdateBodies.length).toBe(2);
+  // An attribute edit patches only the changed value; untouched typed values are not echoed or replaced.
   expect(evidence.userUpdateBodies[1][attributeUrn]).toEqual({
     department: 'Product',
-    quota: 12.5,
-    regions: ['Central', 'West', 'Central'],
-    thresholds: [2, 1.5, 2],
-    unassigned: [],
   });
 
   assertIsolated(evidence, ['POST /api/manage-users', 'POST /api/manage-users']);
@@ -1643,7 +1647,7 @@ test('bulk user and group assignment editors stay immutable while intercepted wr
   const bulkEmail = page.getByPlaceholder('new.user@example.com', { exact: true });
   const bulkName = page.getByPlaceholder('New User', { exact: true });
   const bulkDepartment = page.getByPlaceholder('Sales', { exact: true });
-  const bulkRole = page.getByPlaceholder('viewer', { exact: true });
+  const bulkRole = page.getByPlaceholder('Optional attribute', { exact: true });
   await bulkEmail.fill('pending.user@example.invalid');
   await bulkName.fill('Pending User');
   await bulkDepartment.fill('Architecture');

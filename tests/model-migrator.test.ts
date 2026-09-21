@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
-import { test } from 'node:test';
+import { beforeEach, test } from 'node:test';
+import { mockPublicDns } from './helpers/publicDns';
+
+beforeEach(mockPublicDns);
 
 import {
   buildModelMigratorInventory,

@@ -648,14 +648,17 @@ test('Dashboard Migrator keeps long duplicate destination connections readable a
   await sourceDashboard.check();
   // Exact: the step rail also exposes a "Step 2 Choose destinations" button.
   await page.getByRole('button', { name: 'Choose destinations', exact: true }).click();
-  await page.getByRole('checkbox', { name: /Fictional dashboard migration instance/ }).check();
+  await page.getByRole('combobox', { name: 'Instance to add as a destination', exact: true }).click();
+  await page.getByRole('option', { name: /Fictional dashboard migration instance/ }).click();
+  await page.getByRole('button', { name: 'Add destination', exact: true }).click();
 
-  const destinationC1 = page.getByRole('article').filter({ has: page.getByRole('heading', { name: 'Fictional dashboard migration instance' }) }).first();
-  const destinationConnection = page.getByRole('combobox', { name: 'Destination 1 connection' });
+  const destinationC1 = page.getByRole('article').filter({ has: page.getByRole('button', { name: 'Edit destination 1', exact: true }) });
+  const destinationConnectionLabel = 'Fictional dashboard migration instance destination 1 connection';
+  const destinationConnection = destinationC1.getByRole('combobox', { name: destinationConnectionLabel, exact: true });
   await expect(destinationConnection).toBeEnabled();
   await destinationConnection.focus();
   await destinationConnection.press('ArrowDown');
-  const listbox = page.getByRole('listbox', { name: 'Destination 1 connection options' });
+  const listbox = page.getByRole('listbox', { name: `${destinationConnectionLabel} options`, exact: true });
   await expect(listbox).toBeVisible();
 
   const firstOption = listbox.getByRole('option', { name: new RegExp(firstConnectionId) });
@@ -718,11 +721,9 @@ test('Dashboard Migrator keeps long duplicate destination connections readable a
   await destinationConnection.press('Enter');
   await expect(listbox).toBeHidden();
 
-  // The shipping flow replaces a resolved picker with a summary. That summary
-  // must still identify which of the two identically-named connections was
-  // chosen, so it carries the database and the connection id.
-  const resolvedConnection = destinationC1.getByText(duplicateConnectionMetadata, { exact: true });
-  await expect(resolvedConnection).toBeVisible();
+  // The editable picker must retain the database and unique ID after selecting
+  // one of the two identically named connections.
+  await expect(destinationConnection).toHaveValue(`${duplicateConnectionName} — ${duplicateConnectionMetadata}`);
   await expect(destinationC1.getByText(secondConnectionId, { exact: true })).toBeVisible();
   await expectNoHorizontalPageOverflow(page, 'selected Dashboard Migrator destination connection');
 });
@@ -3221,7 +3222,10 @@ test('Omni instance switcher surfaces one delayed failure and retries only after
   await expect(secondaryOption.locator('svg.animate-spin')).toHaveCount(1);
   releaseFailure();
 
-  await expect(sidebar.getByRole('alert')).toHaveText('The Omni connection check timed out.');
+  const connectionAlert = sidebar.getByRole('alert');
+  await expect(connectionAlert.getByText('The Omni connection check timed out.', { exact: true })).toBeVisible();
+  await expect(connectionAlert).toContainText('INSTANCE_CLIENT_CONNECTION_FAILED');
+  await expect(connectionAlert).toContainText('Retry once, then include the diagnostic code and build identifier if the failure continues.');
   await expect(sidebar.getByRole('button', {
     name: 'Switch Omni instance. Current: Primary retry instance. Connected.',
     exact: true,

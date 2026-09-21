@@ -70,8 +70,8 @@ afterEach(() => {
 });
 
 test('an explicit folder path overrides the saved default folder id', async () => {
-  let inventoryOptions: unknown;
-  mock.method(OmniClient.prototype, 'listDocumentInventory', async (options?: unknown) => {
+  let inventoryOptions: Parameters<OmniClient['listDocumentInventory']>[0];
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async (options?: Parameters<OmniClient['listDocumentInventory']>[0]) => {
     inventoryOptions = options;
     return completeInventory([{
       id: 'explicit-path-dashboard',
@@ -90,7 +90,10 @@ test('an explicit folder path overrides the saved default folder id', async () =
 
   assert.equal(response.status, 200);
   assert.deepEqual(body.documents.map((document) => document.id), ['explicit-path-dashboard']);
-  assert.deepEqual(inventoryOptions, { includeLabels: true, folderId: undefined });
+  assert.ok(inventoryOptions);
+  const { onProgress, ...scopeOptions } = inventoryOptions;
+  assert.equal(typeof onProgress, 'function');
+  assert.deepEqual(scopeOptions, { includeLabels: true, folderId: undefined });
 });
 
 test('model-detail requests reject oversized identifier batches before starting an inventory crawl', async () => {

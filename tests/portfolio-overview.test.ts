@@ -4,6 +4,9 @@ import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, beforeEach, test } from 'node:test';
+import { mockPublicDns } from './helpers/publicDns';
+
+beforeEach(mockPublicDns);
 
 import {
   clearPortfolioOverviewCache,

@@ -3,6 +3,9 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
+import { mockPublicDns } from './helpers/publicDns';
+
+beforeEach(mockPublicDns);
 
 import modelMigratorHandler from '../server/handlers/model-migrator';
 import {
