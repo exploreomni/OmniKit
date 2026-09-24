@@ -51,7 +51,9 @@ export function aiContentStudioFormReducer(
     case 'change-topic':
       return changed(state, { topicName: action.topicName });
     case 'sync-topics':
-      return action.availableTopics.includes(state.topicName)
+      // A late inventory does not change a model-wide (no topic) approval.
+      // Revoke approval only when an actual selected topic has disappeared.
+      return !state.topicName || action.availableTopics.includes(state.topicName)
         ? state
         : changed(state, { topicName: '' });
     case 'set-review-scope':

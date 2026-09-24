@@ -3,7 +3,10 @@ import { once } from 'node:events';
 import { readFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { Readable, Writable } from 'node:stream';
-import test from 'node:test';
+import test, { beforeEach } from 'node:test';
+import { mockPublicDns } from './helpers/publicDns';
+
+beforeEach(mockPublicDns);
 
 import {
   applyLabelPatches,

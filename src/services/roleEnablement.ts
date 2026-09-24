@@ -202,9 +202,16 @@ export function generateRoleEnablementPath(input: {
     && module.depth.includes(input.depth)
     && (requestedGoals.length === 0 || module.goals.some((goal) => requestedGoals.includes(goal)))
   ));
-  const modules = candidates.slice(0, DEPTH_LIMITS[input.depth]).map(({ roles: _roles, depth: _depth, asset, ...module }) => ({
-    ...module,
-    asset: resolveAsset(asset),
+  const modules = candidates.slice(0, DEPTH_LIMITS[input.depth]).map((module): EnablementModule => ({
+    id: module.id,
+    title: module.title,
+    objective: module.objective,
+    minutes: module.minutes,
+    exercise: module.exercise,
+    proof: module.proof,
+    escalationBoundary: module.escalationBoundary,
+    goals: module.goals,
+    asset: resolveAsset(module.asset),
   }));
   return {
     schemaVersion: 1,

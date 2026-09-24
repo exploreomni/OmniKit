@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
+import dns from 'node:dns/promises';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, mock, test } from 'node:test';
@@ -76,6 +78,22 @@ beforeEach(() => {
   clearMigrationDestinationModelReservations();
   resetOmniClientRateLimitStateForTests();
   clearReadThroughCache();
+  mock.method(dns, 'lookup', async () => [{ address: '93.184.216.34', family: 4 }]);
+  syncBuiltinESMExports();
+  mock.method(globalThis, 'fetch', async () => {
+    throw new Error('Every planner tenant request must be explicitly mocked.');
+  });
+  mock.method(OmniClient.prototype, 'listModels', async () => []);
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    return publishedDocumentState(this, documentId);
+  });
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(
+    modelId: string,
+    options: { mode?: string } = {},
+  ) {
+    // These legacy fixtures describe authored shared YAML and no workbook overrides.
+    return { files: options.mode === 'extension' ? {} : await this.getModelYamlFiles(modelId), raw: {} };
+  });
   documentAccessRowsByInstance = new Map();
   identityUsersByInstance = new Map();
   mock.method(OmniClient.prototype, 'listDocumentAccess', async function listDocumentAccess() {
@@ -106,6 +124,7 @@ afterEach(() => {
   resetOmniClientRateLimitStateForTests();
   clearReadThroughCache();
   mock.restoreAll();
+  syncBuiltinESMExports();
   resetVault();
   lockVault();
   rmSync(tempDir, { recursive: true, force: true });
@@ -117,6 +136,14 @@ afterEach(() => {
 
 function clientLabel(client: OmniClient): string {
   return (client as unknown as { instance: { label: string } }).instance.label;
+}
+
+async function publishedDocumentState(client: OmniClient, documentId: string) {
+  const document = (await client.listFolderDocuments()).find((candidate) => (
+    candidate.identifier === documentId || candidate.id === documentId
+  ));
+  assert.ok(document?.baseModelId, `The ${documentId} fixture must declare its published shared model.`);
+  return { modelId: document.baseModelId, workbookModelId: `${documentId}-workbook-model` };
 }
 
 function emptyMetricFilter() {
@@ -147,6 +174,7 @@ test('readiness prepares authored field patch candidates without choosing writes
     return { 'views/orders.view': clientLabel(this) === 'Source' ? inheritedYaml : targetYaml };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function (modelId: string, options: { fullyResolved?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     const source = clientLabel(this) === 'Source';
     if (source) { assert.equal(options.fullyResolved, false); authoredReads += 1; }
     return { files: { 'views/orders.view': source ? sourceYaml : targetYaml },
@@ -159,7 +187,7 @@ test('readiness prepares authored field patch candidates without choosing writes
   const input = { sourceId: 'source-1', targets: [target], documentIds: ['source-doc'], emptyFirst: false,
     replaceSameNamed: false, documentAccessPolicy: 'destination_defaults' as const };
   const ordinary = await buildMigrationPlan(input);
-  assert.equal(authoredReads, 0, 'legacy planning is unchanged');
+  assert.equal(authoredReads, 1, 'legacy planning verifies authored source provenance before preparing shared-model changes');
   const plan = await buildMigrationPlan({ ...input, prepareDependencyPatchCandidates: true });
   const patches = plan.steps.flatMap((step) => step.details?.semanticPatches as Array<Record<string, unknown>> || []);
   const patch = patches.find((item) => item.sourceName === 'orders.category_label');
@@ -176,9 +204,10 @@ test('readiness prepares authored field patch candidates without choosing writes
   const resolution = resolveDashboardSafeCopyTarget(plan, plan.targets[0]);
   assert.equal(resolution.status, 'exception');
   if (resolution.status !== 'exception') throw new Error('Unknown fields must remain blocked');
-  assert.ok(resolution.exceptions.some((issue) => issue.code === 'MISSING_EVIDENCE' && issue.reference === 'orders.missing_definition'));
+  assert.ok(resolution.exceptions.some((issue) => issue.code === 'BLOCKED_DEPENDENCY'
+    && issue.reference === 'orders.missing_definition' && issue.sourceProvenance === 'inherited_unverified'));
   assert.ok(!resolution.exceptions.some((issue) => issue.reference === 'orders.category_label' && issue.message.includes('lacks an exact validated semantic patch')));
-  assert.equal(authoredReads, 1);
+  assert.equal(authoredReads, 2, 'each plan verifies the authored source before proposing shared-model changes');
   assert.equal(network.mock.callCount(), 0, 'all regression reads are mocked; no tenant or credential access');
 });
 
@@ -1534,7 +1563,8 @@ test('planner records copied query-view missing fields as resolved notices inste
       'orders.view': 'dimensions:\n  id:\n',
     };
   });
-  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml() {
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return {
       files: clientLabel(this) === 'Source'
         ? {
@@ -1640,6 +1670,7 @@ test('planner records copied query-view missing fields as resolved notices inste
 });
 
 test('planner resolves only fields proven by updated query-view YAML', async () => {
+  let dashboardFields = ['stale_metric.new_value'];
   upsertInstance({
     id: 'source-1',
     label: 'Source',
@@ -1681,7 +1712,8 @@ test('planner resolves only fields proven by updated query-view YAML', async () 
           'orders.view': 'dimensions:\n  id:\n',
         };
   });
-  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml() {
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return {
       files: clientLabel(this) === 'Source'
         ? {
@@ -1714,10 +1746,10 @@ test('planner resolves only fields proven by updated query-view YAML', async () 
         }];
   });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
-    tiles: [{ fields: ['stale_metric.new_value', 'stale_metric.field_not_in_yaml'] }],
+    tiles: [{ fields: dashboardFields }],
   }));
 
-  const plan = await buildMigrationPlan({
+  const input: Parameters<typeof buildMigrationPlan>[0] = {
     sourceId: 'source-1',
     targets: [{
       id: 'target-1',
@@ -1734,7 +1766,8 @@ test('planner resolves only fields proven by updated query-view YAML', async () 
     documentIds: ['source-doc-1'],
     emptyFirst: false,
     replaceSameNamed: false,
-  });
+  };
+  const plan = await buildMigrationPlan(input);
 
   const prepStep = plan.steps.find((step) => step.kind === 'query_view_prepare');
   const importStep = plan.steps.find((step) => step.kind === 'import');
@@ -1745,9 +1778,20 @@ test('planner resolves only fields proven by updated query-view YAML', async () 
   assert.deepEqual(mappings[0].suppliedFieldRefs, ['stale_metric.new_value']);
   assert.equal((mappings[0].fieldEvidence as Record<string, unknown>).verified, true);
   assert.equal(prepStep?.blocked, false);
-  assert.equal(importStep?.blocked, true);
-  assert.equal(fieldDependencies.some((dependency) => dependency.sourceFieldRef === 'stale_metric.field_not_in_yaml'), true);
+  assert.equal(importStep?.blocked, false);
+  assert.deepEqual(fieldDependencies ?? [], []);
   assert.equal(importStep?.notices?.some((notice) => notice.includes('stale_metric.new_value') && notice.includes('verified in the planned query-view YAML')), true);
+
+  dashboardFields = ['stale_metric.new_value', 'stale_metric.field_not_in_yaml'];
+  clearReadThroughCache();
+  const unverifiedPlan = await buildMigrationPlan(input);
+  const blockedImport = unverifiedPlan.steps.find((step) => step.kind === 'import');
+  const blockedPrep = unverifiedPlan.steps.find((step) => step.kind === 'query_view_prepare');
+  assert.equal(blockedImport?.blocked, true);
+  assert.deepEqual(blockedPrep?.details?.queryViewMappings, []);
+  const blockedFields = blockedImport?.details?.fieldDependencies as Array<Record<string, unknown>>;
+  assert.ok(blockedFields.some((dependency) => dependency.sourceFieldRef === 'stale_metric.field_not_in_yaml'
+    && dependency.status === 'blocked' && dependency.sourceProvenance === 'inherited_unverified'));
 });
 
 test('planner recovers query-view field definitions when the accepted decision keeps target YAML', async () => {
@@ -1948,7 +1992,7 @@ test('planner uses accepted custom query-view YAML to satisfy dashboard field de
     postMigrationActions: [],
   });
 
-  const sourceYaml = 'dimensions:\n  base_value: {}\nquery:\n  base_view: orders\n';
+  const sourceYaml = 'dimensions:\n  base_value: {}\n  compatibility_alias:\n    sql: ${derived_metric.base_value}\nquery:\n  base_view: orders\n';
   const targetYaml = 'dimensions:\n  base_value: {}\n  target_only: {}\nquery:\n  base_view: orders\n';
   const acceptedYaml = 'dimensions:\n  base_value: {}\n  compatibility_alias:\n    sql: ${derived_metric.base_value}\n  target_only: {}\nquery:\n  base_view: orders\n';
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
@@ -2083,10 +2127,11 @@ test('dashboard migration creates a recovered field in query-view YAML without o
         };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return {
       files: clientLabel(this) === 'Destination'
         ? { 'orders.view': 'dimensions:\n  id:\n' }
-        : {},
+        : { 'metrics/derived_metric.query.view': sourceQueryViewYaml },
       checksums: options.includeChecksums ? {} : undefined,
       raw: { modelId },
     };
@@ -2292,6 +2337,8 @@ test('planner detects query views referenced by source topic yaml', async () => 
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
+        'orders.view': 'dimensions:\n  id:\n',
+        'northstar_topic.topic': 'label: Northstar Topic\nbase_view_name: northstar_metrics\n',
         'northstar_metrics.query.view': 'dimensions:\n  revenue:\nquery:\n  base_view: orders\n',
       };
     }
@@ -2697,6 +2744,7 @@ test('planner exposes conflicting relationship YAML for review and accepts an ex
       : [];
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     const source = clientLabel(this) === 'Source';
     return {
       files: {
@@ -2840,13 +2888,13 @@ test('planner blocks mapped existing topics that are missing required source top
       return {
         'NorthstarTopic.topic': sourceTopicYaml,
         'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-        'northstar/northstar__northstar_locations.query.view': 'label: Locations\nsql: select 1\n',
+        'northstar/northstar__northstar_locations.query.view': 'label: Locations\nsql: select 1\ndimensions:\n  texas_city:\n',
       };
     }
     return {
       'NorthstarTopic.topic': targetTopicYaml,
       'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-      'northstar/northstar__northstar_locations.query.view': 'label: Locations\nsql: select 1\n',
+      'northstar/northstar__northstar_locations.query.view': 'label: Locations\nsql: select 1\ndimensions:\n  texas_city:\n',
     };
   });
   mock.method(OmniClient.prototype, 'listModelQueryViews', async () => [
@@ -2984,8 +3032,8 @@ test('planner detects query-view dependencies from source query-view yaml', asyn
   assert.equal(byName.get('main_metric')?.status, 'missing_copyable');
   assert.deepEqual(byName.get('main_metric')?.sources, ['dashboard']);
   assert.equal(byName.get('helper_metric')?.status, 'missing_copyable');
-  assert.deepEqual(byName.get('helper_metric')?.sources, ['query_view_dependency']);
-  assert.deepEqual(byName.get('helper_metric')?.referencedBy, ['main_metric']);
+  assert.deepEqual(byName.get('helper_metric')?.sources, ['dashboard', 'query_view_dependency']);
+  assert.deepEqual(byName.get('helper_metric')?.referencedBy, ['Dependency Dashboard', 'main_metric']);
 });
 
 test('planner classifies query views with missing authored source yaml', async () => {
@@ -3023,7 +3071,7 @@ test('planner classifies query views with missing authored source yaml', async (
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
     if (clientLabel(this) === 'Source') {
       return {
-        'no_yaml.query.view': 'dimensions:\n  value:\nquery:\n  base_view: orders\n',
+        'no_yaml.query.view': '',
       };
     }
     return {
@@ -3036,6 +3084,7 @@ test('planner classifies query views with missing authored source yaml', async (
     }
     return [];
   });
+  mock.method(OmniClient.prototype, 'getModelYaml', async () => ({ files: {}, raw: {} }));
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
     tiles: [{ fields: ['no_yaml.value'] }],
   }));
@@ -3440,7 +3489,10 @@ test('planner updates same-named dashboards in place by default when Documents V
         baseModelId: 'target-model',
       }];
   });
-  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => ({ queryPresentations: { data: {} } }));
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    if (clientLabel(this) === 'Source') return publishedDocumentState(this, documentId);
+    return { queryPresentations: { data: {} } };
+  });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
     'orders.view': 'dimensions:\n  id:\n',
   }));
@@ -3513,7 +3565,8 @@ test('planner falls back to replacement only when Documents V2 is explicitly uns
         baseModelId: 'target-model',
       }];
   });
-  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => {
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    if (clientLabel(this) === 'Source') return publishedDocumentState(this, documentId);
     throw new OmniClientError(501, 'https://dest.example.omniapp.co/api/v2/documents/target-doc', 'not implemented');
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
@@ -3588,7 +3641,8 @@ test('planner fails closed when a same-name Documents V2 probe returns 404', asy
         baseModelId: 'target-model',
       }];
   });
-  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => {
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    if (clientLabel(this) === 'Source') return publishedDocumentState(this, documentId);
     throw new OmniClientError(404, 'https://dest.example.omniapp.co/api/v2/documents/target-doc', 'document not found');
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
@@ -4011,7 +4065,9 @@ test('dashboard migration updates same-named destination document through Docume
       }];
   });
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
-    return clientLabel(this) === 'Source' || documentId === 'source-doc' ? sourceState : destinationState;
+    return clientLabel(this) === 'Source' || documentId === 'source-doc'
+      ? { ...await publishedDocumentState(this, documentId), ...sourceState }
+      : destinationState;
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
     'orders.view': 'dimensions:\n  id:\n',
@@ -4181,6 +4237,7 @@ test('dashboard migration retry does not redispatch an update-in-place write wit
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
       return {
+        ...await publishedDocumentState(this, documentId),
         name: 'NorthstarDashboard',
         queryPresentations: {
           data: {
@@ -4289,6 +4346,7 @@ test('dashboard migration update-in-place reports unpublished draft conflicts cl
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
       return {
+        ...await publishedDocumentState(this, documentId),
         name: 'NorthstarDashboard',
         queryPresentations: {
           data: {
@@ -4382,6 +4440,7 @@ test('dashboard migration update-in-place checks the destination model before op
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
       return {
+        ...await publishedDocumentState(this, documentId),
         name: 'NorthstarDashboard',
         modelId: 'source-model',
         queryPresentations: {
@@ -4475,6 +4534,7 @@ test('dashboard migration update-in-place fails when the published document mode
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     if (clientLabel(this) === 'Source' || documentId === 'source-doc') {
       return {
+        ...await publishedDocumentState(this, documentId),
         name: 'NorthstarDashboard',
         modelId: 'source-model',
         queryPresentations: {
@@ -4783,6 +4843,8 @@ test('planner turns missing model fields into resolvable field dependencies', as
       ? {
           'orders.view': [
             'measures:',
+            '  total_sales:',
+            '    sql: ${TABLE}.total_sales',
             '  semantic_total_sales:',
             '    sql: ${orders.total_sales}',
             '    aggregate_type: sum',
@@ -4853,6 +4915,8 @@ test('planner classifies semantic field patch candidates with dependency metadat
 
   const sourceYaml = [
     'measures:',
+    '  total_sales:',
+    '    sql: ${TABLE}.total_sales',
     '  semantic_total_sales:',
     '    sql: ${orders.total_sales}',
     '    aggregate_type: sum',
@@ -4882,6 +4946,7 @@ test('planner classifies semantic field patch candidates with dependency metadat
       : { 'orders.view': targetYaml };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return clientLabel(this) === 'Source'
       ? {
           files: { 'orders.view': sourceYaml },
@@ -4959,6 +5024,8 @@ test('planner blocks accepted semantic patches when destination checksum is stal
 
   const sourceYaml = [
     'measures:',
+    '  total_sales:',
+    '    sql: ${TABLE}.total_sales',
     '  semantic_total_sales:',
     '    sql: ${orders.total_sales}',
     '    aggregate_type: sum',
@@ -4994,6 +5061,7 @@ test('planner blocks accepted semantic patches when destination checksum is stal
       : { 'orders.view': targetYaml };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return clientLabel(this) === 'Source'
       ? {
           files: { 'orders.view': sourceYaml },
@@ -5094,6 +5162,10 @@ test('planner surfaces missing dependencies inside fields created from source YA
       ? {
           'orders.view': [
             'measures:',
+            '  gross_sales:',
+            '    sql: ${TABLE}.gross_sales',
+            '  discounts:',
+            '    sql: ${TABLE}.discounts',
             '  semantic_total_sales:',
             '    sql: ${orders.net_sales}',
             '    aggregate_type: sum',
@@ -5206,6 +5278,8 @@ test('dashboard migration creates selected source fields before dashboard import
             'dimensions:',
             '  id:',
             'measures:',
+            '  total_sales:',
+            '    sql: ${TABLE}.total_sales',
             '  semantic_total_sales:',
             '    sql: ${orders.total_sales}',
             '    aggregate_type: sum',
@@ -5216,6 +5290,7 @@ test('dashboard migration creates selected source fields before dashboard import
         };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     if (clientLabel(this) === 'Source') {
       return {
         files: {
@@ -5223,6 +5298,8 @@ test('dashboard migration creates selected source fields before dashboard import
             'dimensions:',
             '  id:',
             'measures:',
+            '  total_sales:',
+            '    sql: ${TABLE}.total_sales',
             '  semantic_total_sales:',
             '    sql: ${orders.total_sales}',
             '    aggregate_type: sum',
@@ -5313,6 +5390,8 @@ test('dashboard migration applies accepted semantic field code patches before im
     'dimensions:',
     '  id:',
     'measures:',
+    '  total_sales:',
+    '    sql: ${TABLE}.total_sales',
     '  semantic_total_sales:',
     '    sql: ${orders.total_sales}',
     '    aggregate_type: sum',
@@ -5355,6 +5434,7 @@ test('dashboard migration applies accepted semantic field code patches before im
       : { 'orders.view': targetYaml };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return clientLabel(this) === 'Source'
       ? {
         files: { 'orders.view': sourceYaml },
@@ -5447,7 +5527,7 @@ test('dashboard migration retry does not redispatch field preparation with an un
   });
   const writes: Array<{ fileName: string; yaml: string; previousChecksum?: string }> = [];
   let importedCreated = false;
-  const sourceYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n    aggregate_type: sum\n';
+  const sourceYaml = 'measures:\n  total_sales:\n    sql: ${TABLE}.total_sales\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n    aggregate_type: sum\n';
   const targetYaml = 'measures:\n  total_sales:\n    sql: ${orders.amount}\n';
   const brokenYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.broken_total_sales}\n';
 
@@ -5479,6 +5559,7 @@ test('dashboard migration retry does not redispatch field preparation with an un
       : { 'orders.view': targetYaml };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return clientLabel(this) === 'Source'
       ? {
         files: { 'orders.view': sourceYaml },
@@ -5723,7 +5804,7 @@ test('dashboard migration blocks unsafe accepted semantic field patches before i
   });
   const writes: Array<{ fileName: string; yaml: string }> = [];
   let importCalled = false;
-  const sourceYaml = 'measures:\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n';
+  const sourceYaml = 'measures:\n  total_sales:\n    sql: ${TABLE}.total_sales\n  semantic_total_sales:\n    sql: ${orders.total_sales}\n';
   const targetYaml = 'measures:\n  total_sales:\n    sql: ${orders.amount}\n';
 
   mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
@@ -5745,6 +5826,7 @@ test('dashboard migration blocks unsafe accepted semantic field patches before i
       : { 'orders.view': targetYaml };
   });
   mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+    if (modelId.endsWith('-workbook-model')) return { files: {}, raw: { modelId } };
     return clientLabel(this) === 'Source'
       ? {
           files: { 'orders.view': sourceYaml },
@@ -5849,9 +5931,12 @@ test('planner blocks topic-backed imports when mapped target model is missing re
         }]
       : [];
   });
-  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
-    'orders.view': 'dimensions:\n  id:\n',
-  }));
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return {
+      'orders.view': clientLabel(this) === 'Source' ? 'dimensions:\n  id:\n  missing_field:\n' : 'dimensions:\n  id:\n',
+      'source_topic.topic': 'label: Source Topic\nbase_view: orders\n',
+    };
+  });
   mock.method(OmniClient.prototype, 'exportDocument', async () => ({
     dashboard: { topicName: 'source_topic' },
     tiles: [{ fields: ['orders.missing_field'] }],
@@ -6757,8 +6842,8 @@ test('source delete is skipped when final permission verification finds a new co
       : [];
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => securedYaml);
-  mock.method(OmniClient.prototype, 'getModelYaml', async () => ({
-    files: securedYaml,
+  mock.method(OmniClient.prototype, 'getModelYaml', async (_modelId, options) => ({
+    files: options?.mode === 'extension' ? {} : securedYaml,
     checksums: {},
     raw: {},
   }));
@@ -7054,9 +7139,12 @@ test('dashboard migration maps existing target topics and rewrites dashboard pay
       : [];
   });
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
-  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
-    'orders.view': 'dimensions:\n  id:\n',
-  }));
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return {
+      'orders.view': 'dimensions:\n  id:\n',
+      ...(clientLabel(this) === 'Source' ? { 'source_topic.topic': 'label: Source Topic\nbase_view_name: orders\n' } : {}),
+    };
+  });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'target-model-1',
     name: 'Target Model',
@@ -8036,14 +8124,17 @@ test('query-view preparation blockers prevent sibling update-in-place jobs from 
           checksum: 'target-checksum-1',
         }];
   });
-  mock.method(OmniClient.prototype, 'getDocumentStateV2', async () => ({
-    name: 'NorthstarDashboard',
-    queryPresentations: {
-      data: {
-        tile_1: { query: { modelId: 'source-model', fields: ['northstar_metrics.revenue'] } },
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
+    if (clientLabel(this) === 'Source') return publishedDocumentState(this, documentId);
+    return {
+      name: 'NorthstarDashboard',
+      queryPresentations: {
+        data: {
+          tile_1: { query: { modelId: 'source-model', fields: ['northstar_metrics.revenue'] } },
+        },
       },
-    },
-  }));
+    };
+  });
   mock.method(OmniClient.prototype, 'createDocumentDraft', async () => {
     draftCalls += 1;
     throw new Error('Dashboard update should have been skipped.');
@@ -8190,9 +8281,12 @@ test('dashboard migration copies source topic YAML before dashboard import', asy
       : [];
   });
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
-  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
-    'orders.view': 'dimensions:\n  id:\n',
-  }));
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return {
+      'orders.view': 'dimensions:\n  id:\n',
+      ...(clientLabel(this) === 'Source' ? { 'source_topic.topic': 'label: Source Topic\nbase_view_name: orders\n' } : {}),
+    };
+  });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'target-model-1',
     name: 'Target Model',
@@ -8288,9 +8382,12 @@ test('source delete is skipped when topic preparation fails', async () => {
       : [];
   });
   mock.method(OmniClient.prototype, 'listLabels', async () => []);
-  mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({
-    'orders.view': 'dimensions:\n  id:\n',
-  }));
+  mock.method(OmniClient.prototype, 'getModelYamlFiles', async function getModelYamlFiles() {
+    return {
+      'orders.view': 'dimensions:\n  id:\n',
+      ...(clientLabel(this) === 'Source' ? { 'source_topic.topic': 'label: Source Topic\nbase_view_name: orders\n' } : {}),
+    };
+  });
   mock.method(OmniClient.prototype, 'listModels', async () => [{
     id: 'target-model-1',
     name: 'Target Model',
@@ -8405,10 +8502,11 @@ test('source delete is skipped when relationship preparation fails', async () =>
     id: 'target-model-1',
     name: 'Target Model',
   }]);
-  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean } = {}) {
+  mock.method(OmniClient.prototype, 'getModelYaml', async function getModelYaml(modelId: string, options: { includeChecksums?: boolean; mode?: string } = {}) {
+    if (options.mode === 'extension') return { files: {}, checksums: {}, raw: {} };
     const queryViewFiles = {
-      'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\n',
-      'northstar/northstar__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\n',
+      'northstar/northstar__daily_grill_report.query.view': 'label: Daily Grill Report\nsql: select 1\ndimensions:\n  store_number:\n',
+      'northstar/northstar__menu_item_pnl.query.view': 'label: Menu Item P&L\nsql: select 1\ndimensions:\n  plu_code:\n  estimated_margin_pct:\n',
     };
     if (clientLabel(this) === 'Source') {
       return {
@@ -8736,8 +8834,8 @@ test('saved-instance document listing can load all folders scoped by selected co
     postMigrationActions: [],
   });
 
-  let requestedOptions: unknown;
-  mock.method(OmniClient.prototype, 'listDocumentInventory', async (options?: unknown) => {
+  let requestedOptions: Parameters<OmniClient['listDocumentInventory']>[0];
+  mock.method(OmniClient.prototype, 'listDocumentInventory', async (options?: Parameters<OmniClient['listDocumentInventory']>[0]) => {
     requestedOptions = options;
     return completeDocumentInventory([
       {
@@ -8777,7 +8875,10 @@ test('saved-instance document listing can load all folders scoped by selected co
   assert.equal(response.status, 200);
   const body = await response.json() as { documents: Array<{ id: string; folderPath?: string }> };
 
-  assert.deepEqual(requestedOptions, { folderId: undefined, includeLabels: true });
+  assert.ok(requestedOptions);
+  const { onProgress, ...scopeOptions } = requestedOptions;
+  assert.equal(typeof onProgress, 'function');
+  assert.deepEqual(scopeOptions, { folderId: undefined, includeLabels: true });
   assert.deepEqual(body.documents.map((document) => document.id), ['default-doc', 'team-doc']);
   assert.deepEqual(body.documents.map((document) => document.folderPath), ['Default Only', 'Shared/Team Dashboards']);
 });
@@ -8935,7 +9036,7 @@ test('functional query validation blocks update-in-place before any draft is cre
   });
   mock.method(OmniClient.prototype, 'getDocumentStateV2', async function getDocumentStateV2(documentId: string) {
     return documentId === 'source-doc'
-      ? { name: 'Northstar Dashboard', queryPresentations: { data: { tile_1: { query: { modelId: 'source-model', fields: ['orders.revenue'] } } } } }
+      ? { ...await publishedDocumentState(this, documentId), name: 'Northstar Dashboard', queryPresentations: { data: { tile_1: { query: { modelId: 'source-model', fields: ['orders.revenue'] } } } } }
       : { name: 'Northstar Dashboard', queryPresentations: { data: {} } };
   });
   mock.method(OmniClient.prototype, 'getModelYamlFiles', async () => ({

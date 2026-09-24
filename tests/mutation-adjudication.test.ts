@@ -237,6 +237,19 @@ async function waitForTerminalJob(jobId: string): Promise<MigrationJob> {
 }
 
 function mockLegacyRetryDependencies(t: TestContext): void {
+  const workbookModelId = `${SOURCE_MODEL_ID}-workbook`;
+  t.mock.method(OmniClient.prototype, 'getDocumentStateV2', async (documentId: string) => {
+    assert.equal(documentId, 'synthetic-dashboard');
+    return { modelId: SOURCE_MODEL_ID, workbookModelId };
+  });
+  t.mock.method(OmniClient.prototype, 'getModelYaml', async (
+    modelId: string,
+    options: { fullyResolved?: boolean; mode?: string } = {},
+  ) => {
+    assert.equal(options.fullyResolved, false);
+    assert.equal(modelId, options.mode === 'extension' ? workbookModelId : SOURCE_MODEL_ID);
+    return { files: {}, raw: {} };
+  });
   t.mock.method(OmniClient.prototype, 'listFolderDocuments', async function listFolderDocuments() {
     const instanceId = (this as unknown as { instance: { id: string } }).instance.id;
     return instanceId === SOURCE_ID

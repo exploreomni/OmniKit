@@ -2,6 +2,7 @@ import { expect, test, type Page, type Route } from '@playwright/test';
 import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
 import type { DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
 import type { MigrationJob } from '../../src/services/opsConsole';
+import { WALKTHROUGH_STORAGE_KEY, WALKTHROUGH_VERSION } from '../../src/services/walkthrough';
 
 const planId = '33333333-3333-4333-8333-333333333333';
 const jobId = '22222222-2222-4222-8222-222222222222';
@@ -10,7 +11,7 @@ const instances = ['source', 'target'].map((id) => ({
   id, label: id === 'source' ? 'Source instance' : 'Target instance', role: id === 'source' ? 'source' : 'destination',
   baseUrl: `https://${id}.example.test`, apiKeyMasked: 'omni_••••test', defaultModelId: `${id}-model`,
   defaultFolderPath: '/Default folder', metricFilter: { mode: 'all', values: [] }, postMigrationActions: [],
-  createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+  createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z', lastValidatedAt: '2026-01-01T00:00:00.000Z',
 }));
 
 async function json(route: Route, body: unknown, status = 200) {
@@ -25,10 +26,10 @@ async function setup(page: Page, options: { mixed?: boolean; planGate?: Promise<
   const creates: DashboardSafeCopyIntent[] = [];
   const deployments: Array<{ revision: number; targetIds: string[]; requestId: string }> = [];
   const unexpectedWrites: string[] = [];
-  await page.addInitScript(() => {
+  await page.addInitScript(({ walkthroughKey, walkthroughVersion }) => {
     sessionStorage.setItem('omnikit:activeConnection:v1', JSON.stringify({ baseUrl: 'https://source.example.test', apiKey: '__omnikit_vault_instance__:source', status: 'success', connectionMode: 'vault', instanceId: 'source', instanceLabel: 'Source instance', apiKeyMasked: 'omni_••••test' }));
-    localStorage.setItem('omnikit:walkthrough:dismissed:v1', 'true');
-  });
+    localStorage.setItem(walkthroughKey, JSON.stringify({ version: walkthroughVersion, dismissedAt: '2026-01-01T00:00:00.000Z' }));
+  }, { walkthroughKey: WALKTHROUGH_STORAGE_KEY, walkthroughVersion: WALKTHROUGH_VERSION });
   await page.route('**/api/**', async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -162,13 +163,15 @@ test('reopening a plan restores its exact folders without an automatic recheck',
   expect(fixture.deployments).toHaveLength(0);
 });
 
-test('editing a destination invalidates an in-flight readiness result', async ({ page }) => {
+test('canceling readiness before editing a destination invalidates its late result', async ({ page }) => {
   let release!: () => void;
   const planGate = new Promise<void>((resolve) => { release = resolve; });
   const fixture = await setup(page, { planGate });
   await destinations(page);
   await page.getByRole('button', { name: 'Review readiness', exact: true }).click();
   await expect.poll(() => fixture.creates.length).toBe(1);
+  await expect(page.getByRole('button', { name: 'Back to destinations', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Cancel check', exact: true }).click();
   await page.getByRole('button', { name: 'Back to destinations', exact: true }).click();
   await chooseFolder(page, 1, '/Changed folder');
   release();
