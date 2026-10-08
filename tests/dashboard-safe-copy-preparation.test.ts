@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../shared/dashboardDeploymentPlan';
 
 import {
   prepareDashboardSafeCopyTargets,
@@ -131,7 +132,7 @@ test('v2 read-only preparation routes semantic changes to repair without scratch
   const safeIntent = intent(['b']);
   // V2 preparation verifies the stored review scope before resolving dependencies.
   const reviewedPlan: DashboardDeploymentPlan = {
-    version: 2, evidenceVersion: 4, id: 'reviewed-plan', revision: 1, createdAt: 1, updatedAt: 1,
+    version: 2, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: 'reviewed-plan', revision: 1, createdAt: 1, updatedAt: 1,
     intent: structuredClone(safeIntent), targets: [], sourceHashes: {}, sourceModelHashes: {},
   };
   writeFileSync(`${history}.deployment-plans.json`, JSON.stringify([reviewedPlan]));

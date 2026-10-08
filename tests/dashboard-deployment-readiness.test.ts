@@ -4,12 +4,61 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { inspectDashboardDependencyReadiness } from '../server/services/dashboardDependencyReadiness';
-import { getDashboardDeploymentPlan, resolveDashboardRepairScope, deployDashboardDeploymentPlan, updateDashboardDeploymentPlan, mergeDashboardReadinessFindings } from '../server/services/dashboardDeploymentPlans';
-import { sanitizeJob } from '../server/services/jobSanitizer';
+import { getDashboardDeploymentPlan, resolveDashboardRepairScope, deployDashboardDeploymentPlan, updateDashboardDeploymentPlan, mergeDashboardReadinessFindings, dashboardSourceReadinessFindings } from '../server/services/dashboardDeploymentPlans';
+import { readDashboardSourceEvidence } from '../server/services/dashboardSourceEvidence';
+import { sanitizeJob, sanitizeMigrationTarget } from '../server/services/jobSanitizer';
 import type { MigrationJob } from '../server/services/migrationJobs';
 import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../shared/dashboardDeploymentPlan';
+import { parseDashboardDeploymentPlanIntent, type DashboardSafeCopyDeployment } from '../shared/dashboardSafeCopyContract';
+import { dashboardSafeCopyIntentFromJob } from '../server/services/dashboardSafeCopyRuntime';
+import { dashboardSafeCopyIntentHash } from '../server/services/dashboardSafeCopyJobs';
 
 const view = 'dimensions:\n  id:\n    sql: ${TABLE}.id\n';
+
+test('database/schema plan choices require current evidence, invalidate readiness, and survive job recovery', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'omnikit-binding-choice-'));
+  const oldPath = process.env.OMNIKIT_JOB_HISTORY_PATH;
+  process.env.OMNIKIT_JOB_HISTORY_PATH = join(directory, 'jobs.json');
+  const mapping = { sourceFileName: 'source/records.view', targetFileName: 'target/records.view', source: { catalog: 'EXAMPLE_SOURCE' }, destination: { catalog: 'EXAMPLE_TARGET' } };
+  const digest = 'a'.repeat(64);
+  const plan: DashboardDeploymentPlan = { version: 2, packageVersion: 1, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION,
+    id: '11111111-1111-4111-8111-111111111111', revision: 1, createdAt: 1, updatedAt: 1,
+    intent: { profile: 'safe_copy_v1', requestId: '22222222-2222-4222-8222-222222222222',
+      source: { instanceId: 'source', connectionId: 'source-connection', documentIds: ['document'] },
+      destinations: [{ targetId: 'target', instanceId: 'target', connectionId: 'target-connection', modelId: 'model' }] },
+    sourceHashes: {}, sourceModelHashes: {}, targets: [{ targetId: 'target', status: 'unverified', checkedAt: 1, findings: [],
+      sourceModelIds: [], requiredFiles: [], requiredFilesByModelId: {},
+      package: { version: 1, fingerprint: digest, files: [], documents: [], issues: [], bindingMappings: [mapping] } }] };
+  try {
+    writeFileSync(`${process.env.OMNIKIT_JOB_HISTORY_PATH}.deployment-plans.json`, JSON.stringify([plan]));
+    const update = { revision: 1, targetId: 'target', bindingMappings: [mapping], packageFingerprint: digest };
+    await assert.rejects(updateDashboardDeploymentPlan(plan.id, { ...update, packageFingerprint: 'stale' }), /current package review/);
+    await assert.rejects(updateDashboardDeploymentPlan(plan.id, { ...update, bindingMappings: [{ ...mapping, destination: { catalog: 'UNREVIEWED' } }] }), /current package review/);
+    assert.throws(() => parseDashboardDeploymentPlanIntent({ ...plan.intent, destinations: [{ ...plan.intent.destinations[0], bindingMappings: [mapping, mapping] }] }), /unique/);
+    assert.throws(() => parseDashboardDeploymentPlanIntent({ ...plan.intent, destinations: [{ ...plan.intent.destinations[0], bindingMappings: [{ ...mapping, table_name: 'unreviewed' }] }] }), /unique/);
+    const saved = await updateDashboardDeploymentPlan(plan.id, update);
+    assert.equal(saved.revision, 2); assert.equal(saved.targets[0].status, 'needs_recheck');
+    assert.deepEqual(saved.intent.destinations[0].bindingMappings, [mapping]);
+    await assert.rejects(updateDashboardDeploymentPlan(plan.id, { ...update, revision: 2 }), /Recheck readiness/);
+    const deployment: DashboardSafeCopyDeployment = { version: 2, planId: plan.id, sourceHashes: { document: digest }, modelHashes: { target: digest }, sourceModelHashes: { source: digest },
+      packageCopy: { version: 1, targetFingerprints: { target: digest }, confirmDestinationAudience: true, confirmDependencies: true } };
+    const recovered = dashboardSafeCopyIntentFromJob({ workflow: 'dashboard', sourceId: 'source', sourceConnectionId: 'source-connection', documentIds: ['document'],
+      targets: [{ id: 'target', destinationInstanceId: 'target', targetConnectionId: 'target-connection', targetModelId: 'model', bindingMappings: [mapping] }],
+      details: { safeCopyProfile: 'safe_copy_v1', operationMode: 'safe_copy', safeCopyRequestId: plan.intent.requestId,
+        safeCopyIntentHash: dashboardSafeCopyIntentHash({ ...saved.intent, deployment }), safeCopyDeployment: deployment } } as unknown as MigrationJob);
+    assert.deepEqual(recovered.destinations[0].bindingMappings, [mapping]);
+    const dotted = { ...mapping, sourceFileName: 'omni_example.PUBLIC/records.view', source: { catalog: 'omni_example', schema: 'PUBLIC' } };
+    const migrationTarget = { id: 'target', destinationInstanceId: 'target', targetModelId: 'model', bindingMappings: [dotted] };
+    assert.deepEqual(sanitizeMigrationTarget(migrationTarget).bindingMappings, [dotted]);
+    assert.equal(sanitizeMigrationTarget({ ...migrationTarget, bindingMappings: [{ ...dotted, password: 'never retained' } as typeof dotted] }).bindingMappings, undefined);
+    const cleared = await updateDashboardDeploymentPlan(plan.id, { ...update, revision: 2, bindingMappings: [] });
+    assert.equal(cleared.revision, 3); assert.deepEqual(cleared.intent.destinations[0].bindingMappings, []);
+  } finally {
+    if (oldPath === undefined) delete process.env.OMNIKIT_JOB_HISTORY_PATH; else process.env.OMNIKIT_JOB_HISTORY_PATH = oldPath;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
 const inspect = (targetFiles: Record<string, string>, sourceFiles: Record<string, string> = { 'orders.view': view }) => inspectDashboardDependencyReadiness({ sourceFiles, targetFiles,
   states: [{ fields: ['orders.id'] }], documentIds: ['dashboard-demo'] });
 
@@ -62,6 +111,34 @@ test('diagnostic merging uses cause and scope, not wording, and preserves indepe
     { ...base, id: 'four', causeCode: 'SECURITY_REVIEW_REQUIRED', category: 'cannot_verify' }]);
   assert.equal(result.length, 3);
   assert.deepEqual(result[0].documentIds, ['one', 'two']);
+});
+
+test('source diagnostics retain distinct files and workbook origins through durable readiness findings', async () => {
+  const evidence = await readDashboardSourceEvidence({ sharedModelId: 'example-shared', workbookModelId: 'example-workbook',
+    references: ['orders.id'], loadYaml: async (id) => id === 'example-shared' ? { 'orders.view': view }
+      : { 'first.view': 'dimensions: [', 'second.view': 'dimensions: [', relationships: '# empty extension\n' } });
+  const first = dashboardSourceReadinessFindings(evidence, 'example-dashboard-one', 'example-shared');
+  assert.equal(first.length, 2);
+  assert(first.every((item) => item.kind === 'document' && item.sourceScope === 'workbook'
+    && item.causeCode === 'SOURCE_YAML_MALFORMED' && item.category === 'cannot_verify' && item.targetFileName === undefined));
+  assert.deepEqual(first.map((item) => item.sourceFileName), ['first.view', 'second.view']);
+  assert.equal(new Set(first.map((item) => item.rootCauseId)).size, 2);
+  assert.equal(mergeDashboardReadinessFindings([
+    ...first, ...dashboardSourceReadinessFindings(evidence, 'example-dashboard-two', 'example-shared'),
+  ]).length, 4);
+});
+
+test('source parsing and local preservation prerequisites remain separate from identified fields', async () => {
+  const evidence = await readDashboardSourceEvidence({ sharedModelId: 'example-shared', workbookModelId: 'example-workbook',
+    references: ['orders.local_total'], loadYaml: async (id) => id === 'example-shared' ? { 'orders.view': view }
+      : { 'orders.view': 'dimensions:\n  local_total:\n    sql: ${orders.id} * 2\n', relationships:
+        '- join_from_view: orders\n  join_to_view: customers\n  on_sql: ${orders.id} = ${customers.id}\n' } });
+  const findings = dashboardSourceReadinessFindings(evidence, 'example-dashboard', 'example-shared');
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].causeCode, 'WORKBOOK_OVERLAY_PRESERVATION_REQUIRED');
+  assert.equal(findings[0].sourceFileName, 'relationships');
+  assert.equal(findings[0].sourceScope, 'workbook');
+  assert(!findings.some((item) => item.causeCode === 'SOURCE_YAML_MALFORMED'));
 });
 
 test('ordinary view relationships are checked without pulling in unrelated joins', () => {
@@ -180,7 +257,7 @@ test('saved plan recovery, revision checks and held destination guards need no l
   const directory = mkdtempSync(join(tmpdir(), 'omnikit-deployment-plan-'));
   const oldPath = process.env.OMNIKIT_JOB_HISTORY_PATH;
   process.env.OMNIKIT_JOB_HISTORY_PATH = join(directory, 'jobs.json');
-  const plan: DashboardDeploymentPlan = { version: 2, evidenceVersion: 4, id: 'plan-demo', revision: 3, createdAt: 1, updatedAt: 2,
+  const plan: DashboardDeploymentPlan = { version: 2, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: 'plan-demo', revision: 3, createdAt: 1, updatedAt: 2,
     intent: { profile: 'safe_copy_v1', requestId: '11111111-1111-4111-8111-111111111111',
       source: { instanceId: 'source', connectionId: 'connection-source', documentIds: ['dashboard-demo'] },
       destinations: [{ targetId: 'target-demo', instanceId: 'target', connectionId: 'connection-target', modelId: 'model-target' }] },
@@ -219,6 +296,11 @@ test('saved plan recovery, revision checks and held destination guards need no l
     writeFileSync(`${process.env.OMNIKIT_JOB_HISTORY_PATH}.deployment-plans.json`, JSON.stringify([plan]));
     assert.equal(getDashboardDeploymentPlan(plan.id).targets[0].status, 'needs_recheck');
     assert.throws(() => resolveDashboardRepairScope({ planId: plan.id, targetId: 'target-demo', revision: 3 }), /predates workbook-aware/);
+    plan.evidenceVersion = DASHBOARD_READINESS_EVIDENCE_VERSION - 1;
+    plan.targets[0].status = 'model_changes_required';
+    writeFileSync(`${process.env.OMNIKIT_JOB_HISTORY_PATH}.deployment-plans.json`, JSON.stringify([plan]));
+    assert.equal(getDashboardDeploymentPlan(plan.id).targets[0].status, 'needs_recheck');
+    assert.equal(plan.targets[0].status, 'model_changes_required');
   } finally {
     if (oldPath === undefined) delete process.env.OMNIKIT_JOB_HISTORY_PATH; else process.env.OMNIKIT_JOB_HISTORY_PATH = oldPath;
     rmSync(directory, { recursive: true, force: true });

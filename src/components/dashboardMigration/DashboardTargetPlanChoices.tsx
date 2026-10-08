@@ -26,7 +26,9 @@ export function DashboardTargetPlanChoices({ plan, target, index, disabled, onUp
   const workbookCapability = getDashboardWorkbookCopyCapability();
   const savedCapabilityReasons = capabilityReasons.filter((finding) => finding.message !== workbookCapability.message);
   return <div className="mt-4 space-y-4 rounded-card border border-border bg-surface-secondary p-3">
-    {(workbookIncluded || stagingFolderId) && <div className="rounded-card border border-amber-200 bg-amber-50 p-3">
+    {(workbookIncluded || stagingFolderId) && <details className="rounded-card border border-amber-200 bg-amber-50 p-3">
+      <summary className="cursor-pointer text-xs font-semibold text-amber-950">Workbook copy requirements and supporting API evidence</summary>
+      <div className="mt-3">
       <h4 className="text-xs font-semibold text-amber-950">Workbook-local copy is unavailable</h4>
       <p className="mt-1 text-xs leading-5 text-amber-950">{workbookCapability.message}</p>
       <p className="mt-1 text-xs leading-5 text-amber-950">Choosing a folder or confirming privacy would not remove this block, so staging choices are unavailable.</p>
@@ -49,7 +51,8 @@ export function DashboardTargetPlanChoices({ plan, target, index, disabled, onUp
       </details>
       <p className="mt-2 text-xs leading-5 text-amber-950">{workbookCapability.handoff}</p>
       {stagingFolderId && <p className="mt-1 break-all text-xs text-amber-950">Previously saved staging folder: {stagingFolderId}. This choice is preserved, not verified or used for a copy.</p>}
-    </div>}
+      </div>
+    </details>}
     {topicChoices.length > 0 && <p className="text-xs leading-5 text-content-secondary">Each topic choice saves this plan only and invalidates this destination’s readiness. Finish reviewing your choices, then choose “Recheck readiness.” Nothing is copied or written to a model by these controls.</p>}
     {topicChoices.map((choice) => {
       const current = destination.topicMappings?.find((mapping) => mapping.sourceTopicName === choice.sourceTopicName);

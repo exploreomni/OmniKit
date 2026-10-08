@@ -42,7 +42,7 @@ test('categorized workbook findings are informative and do not enable an unverif
   assert.deepEqual(groups.model_migrator, []);
   const html = render(value);
   assert.match(html, /Workbook-local definitions identified/);
-  assert.match(html, /workbook-copy capability is not verified/);
+  assert.match(html, /Automated workbook-local copy is unavailable in this OmniKit build/);
   assert.match(html, /Effective staging isolation cannot be verified/);
   assert.match(html.match(/<input[^>]*type="checkbox"[^>]*>/)?.[0] || '', /disabled=""/);
   assert.doesNotMatch(html, /(?:Resolve|Review) in Model Migrator<\/button>/);
@@ -66,6 +66,7 @@ test('unavailable workbook-copy capability hides staging actions and preserves a
   const html = render(value);
   assert.doesNotMatch(html, /aria-label="Destination 1 workbook staging folder"|Reload staging folders/);
   assert.match(html, /Workbook-local copy is unavailable/);
+  assert.match(html, /<details[^>]*><summary[^>]*>Workbook copy requirements and supporting API evidence<\/summary>/);
   assert.match(html, /Choosing a folder or confirming privacy would not remove this block/);
   assert.match(html, /Previously saved staging folder: saved-stage-folder/);
   assert.match(html, /preserved, not verified or used for a copy/);

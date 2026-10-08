@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DashboardDeploymentPlan, DashboardDeploymentTargetReadiness, DashboardDependencyFinding } from '../../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../../shared/dashboardDeploymentPlan';
 import { DashboardSafeCopyError, parseDashboardSafeCopyIntent, parseDashboardDeploymentPlanIntent, type DashboardSafeCopyIntent } from '../../shared/dashboardSafeCopyContract';
 import { assertDashboardSafeCopyInstanceRoles, createDashboardSafeCopyJob, type DashboardSafeCopyPreparationRunner } from './dashboardSafeCopyJobs';
 import { dashboardSafeCopyDocumentModelBinding, dashboardSafeCopyStateHash } from './dashboardSafeCopyRuntime';
@@ -13,14 +14,16 @@ import { getInstance } from './nativeVault';
 import { OmniClient, type OmniDocumentRecord, type OmniModelYamlResponse } from './omniClient';
 import { redactSensitiveText } from './jobSanitizer';
 import { parse } from 'yaml';
-import { readDashboardSourceEvidence } from './dashboardSourceEvidence';
+import { readDashboardSourceEvidence, type DashboardSourceEvidence } from './dashboardSourceEvidence';
 import { dashboardWorkbookHasAuthoredDefinitions, getDashboardWorkbookCopyCapability } from './dashboardWorkbookCopy';
 import { createDashboardReadinessContext, type DashboardReadinessRunContext } from './dashboardReadinessControl';
 import { readReviewedReconstructedTopics } from './dashboardTopicRepairEvidence';
+import { collectDashboardPackages, inspectDashboardPackagePlan, prepareDashboardPackageTarget, packageHash } from './dashboardPackagePlan';
+import { isDashboardPackageBindingMapping } from '../../shared/dashboardPackageBindings';
 
 const busy = new Set<string>();
 const MAX_PLANS = 500;
-const EVIDENCE_VERSION = 4;
+const EVIDENCE_VERSION = DASHBOARD_READINESS_EVIDENCE_VERSION;
 const storePath = () => `${getJobsDbPath()}.deployment-plans.json`;
 function readPlans(): DashboardDeploymentPlan[] {
   if (!existsSync(storePath())) return [];
@@ -50,7 +53,7 @@ export function getDashboardDeploymentPlan(id: string): DashboardDeploymentPlan 
   if (plan.readinessRun && plan.readinessRun.status !== 'complete') return { ...plan,
     targets: plan.targets.map((target) => ({ ...target, status: 'needs_recheck' as const })) };
   if (plan.evidenceVersion !== EVIDENCE_VERSION) return { ...plan, targets: plan.targets.map((target) => ({ ...target,
-    status: target.status === 'ready' ? 'needs_recheck' as const : target.status,
+    status: 'needs_recheck' as const,
     findings: mergeFindings([...target.findings, { ...finding('document', 'readiness_version',
       'This saved plan needs a workbook-aware readiness check before repair or deployment.', plan.intent.source.documentIds), category: 'cannot_verify' }]),
   })) };
@@ -134,6 +137,29 @@ function localField(evidence: Awaited<ReturnType<typeof readDashboardSourceEvide
   return evidence?.fields.find((field) => field.reference === reference.toLowerCase()
     && ['workbook_local', 'workbook_override'].includes(field.provenance) && field.definition !== undefined && field.sourceFileName);
 }
+
+/** Preserve file-specific failures and provenance through the durable plan boundary. */
+export function dashboardSourceReadinessFindings(evidence: DashboardSourceEvidence, documentId: string, sharedModelId: string): DashboardDependencyFinding[] {
+  return evidence.findings.flatMap((issue) => {
+    // The dependency closure adds the informational local-field record. Parsing
+    // and preservation failures must never be hidden by an identified field.
+    if (issue.causeCode === 'WORKBOOK_FIELD_IDENTIFIED' && localField(evidence, issue.reference)) return [];
+    const overlay = issue.reference.startsWith('workbook_overlay');
+    const sourceScope = issue.sourceScope ?? (overlay ? 'workbook' : undefined);
+    const causeCode = issue.causeCode ?? (overlay ? 'WORKBOOK_OVERLAY_UNVERIFIED' : 'SOURCE_DEFINITION_UNAVAILABLE');
+    const fileLevel = overlay || causeCode.startsWith('SOURCE_YAML_');
+    const rootCauseId = fileLevel
+      ? `source_file:${dashboardSafeCopyStateHash({ sourceScope, source: sourceScope === 'shared' ? sharedModelId : documentId,
+        file: issue.sourceFileName, causeCode })}`
+      : `source_field_unavailable:${issue.reference}`;
+    const record = finding(fileLevel ? 'document' : 'field', issue.reference, issue.message, [documentId], issue.sourceFileName);
+    // Source evidence has no destination file comparison. Do not imply one by
+    // copying the source filename into targetFileName.
+    delete record.targetFileName;
+    return [{ ...record, id: dashboardSafeCopyStateHash({ id: record.id, rootCauseId, sourceScope }).slice(0, 20),
+      category: 'cannot_verify' as const, sourceScope, causeCode, rootCauseId }];
+  });
+}
 export function mergeDashboardReadinessFindings(findings: DashboardDependencyFinding[]): DashboardDependencyFinding[] {
   const merged = new Map<string, DashboardDependencyFinding>();
   const specificCauses = new Set(['SOURCE_DEFINITION_UNAVAILABLE', 'SOURCE_FILE_UNAVAILABLE', 'DESTINATION_FIELD_DIFFERS',
@@ -153,6 +179,7 @@ const mergeFindings = mergeDashboardReadinessFindings;
 
 /** Read-only: no job, scope reservation, branch, YAML write, or query execution. */
 async function inspectPlan(plan: DashboardDeploymentPlan, run: DashboardReadinessRunContext): Promise<DashboardDeploymentPlan> {
+  if (plan.packageVersion === 1) return inspectDashboardPackagePlan(plan, run);
   run.throwIfAborted();
   run.report('source_dashboard', { completed: 0, total: plan.intent.source.documentIds.length });
   assertDashboardSafeCopyInstanceRoles(plan.intent);
@@ -357,14 +384,10 @@ async function inspectPlan(plan: DashboardDeploymentPlan, run: DashboardReadines
             unverified = true;
             result.findings.push({ ...finding('document', 'source_layers_unavailable', 'The complete shared and workbook source layers could not be verified.', [documentId]), category: 'cannot_verify' });
           }
-          for (const issue of evidence?.findings || []) {
-            if (localField(evidence, issue.reference)) continue;
-            unverified = true;
-            const overlay = issue.reference.startsWith('workbook_overlay');
-            result.findings.push({ ...finding(overlay ? 'document' : 'field', issue.reference, issue.message, [documentId], issue.sourceFileName),
-              category: 'cannot_verify', sourceScope: overlay ? 'workbook' : undefined,
-              causeCode: overlay ? 'WORKBOOK_OVERLAY_UNVERIFIED' : 'SOURCE_DEFINITION_UNAVAILABLE',
-              rootCauseId: overlay ? `workbook_overlay:${documentId}` : `source_field_unavailable:${issue.reference}` });
+          if (evidence) {
+            const sourceFindings = dashboardSourceReadinessFindings(evidence, documentId, modelId);
+            unverified ||= sourceFindings.length > 0;
+            result.findings.push(...sourceFindings);
           }
           if (workbookCopies[documentId]) {
             const capability = getDashboardWorkbookCopyCapability();
@@ -447,7 +470,7 @@ export async function createDashboardDeploymentPlan(value: unknown, context?: Da
     return await exclusive(intent.requestId, async () => {
       run.throwIfAborted();
       const now = Date.now();
-      const result = await inspectPlan({ version: 2, id: randomUUID(), revision: 0, createdAt: now, updatedAt: now, intent, requestIntentHash: dashboardSafeCopyStateHash(intent),
+      const result = await inspectPlan({ version: 2, packageVersion: 1, id: randomUUID(), revision: 0, createdAt: now, updatedAt: now, intent, requestIntentHash: dashboardSafeCopyStateHash(intent),
         targets: [], sourceHashes: {}, sourceModelHashes: {} }, run);
       run.throwIfAborted();
       return savePlan({ ...result, readinessRun: { id: run.runId, status: 'complete', startedAt: now,
@@ -493,13 +516,24 @@ export async function recheckDashboardDeploymentPlan(id: string, context?: Dashb
 export async function updateDashboardDeploymentPlan(id: string, value: unknown): Promise<DashboardDeploymentPlan> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) conflict('A plan update must be an object.');
   const body = value as Record<string, unknown>;
-  if (Object.keys(body).some((key) => !['revision', 'targetId', 'topicMappings', 'workbookCopy'].includes(key))) conflict('The plan update contains unsupported fields.');
+  if (Object.keys(body).some((key) => !['revision', 'targetId', 'topicMappings', 'workbookCopy', 'bindingMappings', 'packageFingerprint'].includes(key))) conflict('The plan update contains unsupported fields.');
   return exclusive(id, async () => {
     const plan = getDashboardDeploymentPlan(id);
     if (body.revision !== plan.revision) conflict('The plan changed. Reload its latest review before saving choices.');
     const target = plan.targets.find((candidate) => candidate.targetId === body.targetId);
     const destination = plan.intent.destinations.find((candidate) => candidate.targetId === body.targetId);
     if (!target || !destination) conflict('Choose a destination in this plan.');
+    if (body.bindingMappings !== undefined) {
+      if (plan.packageVersion !== 1 || !target.package || body.packageFingerprint !== target.package.fingerprint
+        || !Array.isArray(body.bindingMappings) || body.bindingMappings.length > 500
+        || body.bindingMappings.some(mapping => !isDashboardPackageBindingMapping(mapping)
+          || !(target.package?.bindingMappings || []).some(candidate => packageHash(candidate) === packageHash(mapping)))) {
+        conflict('Choose exact database/schema bindings from the current package review. Recheck if those details have changed.');
+      }
+      if (body.bindingMappings.length && (target.status === 'needs_recheck' || plan.evidenceVersion !== EVIDENCE_VERSION)) {
+        conflict('Recheck readiness before approving database/schema choices.');
+      }
+    } else if (body.packageFingerprint !== undefined) conflict('A package fingerprint requires database/schema choices.');
     if (target.deploymentJobId || target.repairJobId || listJobs(Number.MAX_SAFE_INTEGER).some((job) =>
       (job.details?.safeCopyDeployment as { planId?: string } | undefined)?.planId === id
       && job.targets?.some((route) => route.id === target.targetId))) conflict('This destination has a submitted job. Review that job before creating a new plan with different choices.');
@@ -519,6 +553,7 @@ export async function updateDashboardDeploymentPlan(id: string, value: unknown):
       }
     }
     const updated = { ...destination, ...(body.topicMappings !== undefined ? { topicMappings: body.topicMappings } : {}),
+      ...(body.bindingMappings !== undefined ? { bindingMappings: body.bindingMappings } : {}),
       ...(body.workbookCopy !== undefined ? { workbookCopy: body.workbookCopy } : {}) };
     if (body.workbookCopy === null) delete updated.workbookCopy;
     const intent = parseDashboardDeploymentPlanIntent({ ...plan.intent,
@@ -528,7 +563,20 @@ export async function updateDashboardDeploymentPlan(id: string, value: unknown):
       targets: plan.targets.map((candidate) => candidate.targetId === target.targetId ? { ...candidate, status: 'needs_recheck' as const } : candidate) });
   });
 }
-export async function deployDashboardDeploymentPlan(id: string, input: { revision: number; targetIds: string[]; requestId: string }, prepare: DashboardSafeCopyPreparationRunner | null, signal?: AbortSignal) {
+export async function previewDashboardDeploymentPackage(id: string, input: { revision: number; targetId: string }, signal?: AbortSignal) {
+  return exclusive(id, async () => {
+    const plan = getDashboardDeploymentPlan(id);
+    if (plan.packageVersion !== 1 || plan.revision !== input.revision) conflict('Recheck the current plan before reviewing its package.');
+    const target = plan.targets.find(row => row.targetId === input.targetId);
+    const destination = plan.intent.destinations.find(row => row.targetId === input.targetId);
+    if (!target?.package || !destination) conflict('The destination package is unavailable. Recheck the plan.');
+    const collection = await collectDashboardPackages(plan.intent, signal);
+    const { preview } = await prepareDashboardPackageTarget(plan.intent, destination, collection, signal);
+    if (preview.fingerprint !== target.package.fingerprint) conflict('The package changed since review. Recheck the plan before approving it.');
+    return preview;
+  });
+}
+export async function deployDashboardDeploymentPlan(id: string, input: { revision: number; targetIds: string[]; requestId: string; confirmDestinationAudience?: boolean; confirmDependencies?: boolean }, prepare: DashboardSafeCopyPreparationRunner | null, signal?: AbortSignal) {
   const run = createDashboardReadinessContext({ signal });
   try { return await exclusive(id, async () => {
     run.throwIfAborted();
@@ -546,6 +594,7 @@ export async function deployDashboardDeploymentPlan(id: string, input: { revisio
     if (listJobs(Number.MAX_SAFE_INTEGER).some((job) => (job.details?.safeCopyDeployment as { planId?: string } | undefined)?.planId === id
       && job.targets?.some((target) => input.targetIds.includes(target.id)))) conflict('A deployment job already exists for these plan destinations. Resume that job instead of creating another copy.');
     if (plan.revision !== input.revision) conflict('The plan changed. Review its latest readiness before deploying.');
+    if (plan.packageVersion === 1 && (input.confirmDestinationAudience !== true || input.confirmDependencies !== true)) conflict('Confirm the reviewed dependency additions and destination audience before copying.');
     if (plan.evidenceVersion !== EVIDENCE_VERSION) conflict('This plan predates workbook-aware readiness. Recheck it before deployment.');
     if (input.targetIds.some((targetId) => plan.targets.find((target) => target.targetId === targetId)?.status !== 'ready')) conflict('Only ready destinations can be deployed. Repair or recheck the held destinations.');
     if (input.targetIds.some((targetId) => plan.targets.find((target) => target.targetId === targetId)?.deploymentJobId)) conflict('These destinations already have a deployment job. Use that job’s retry or create a new reviewed copy plan.');
@@ -557,7 +606,7 @@ export async function deployDashboardDeploymentPlan(id: string, input: { revisio
       || input.targetIds.some((targetId) => {
         const before = plan.targets.find((target) => target.targetId === targetId)!;
         const after = refreshed.targets.find((target) => target.targetId === targetId)!;
-        return after.status !== 'ready' || before.modelHash !== after.modelHash;
+        return after.status !== 'ready' || before.modelHash !== after.modelHash || before.package?.fingerprint !== after.package?.fingerprint;
       });
     if (changed) {
       for (const target of refreshed.targets) if (input.targetIds.includes(target.targetId) && target.status === 'ready') target.status = 'needs_recheck';
@@ -566,6 +615,8 @@ export async function deployDashboardDeploymentPlan(id: string, input: { revisio
     }
     const intent = parseDashboardSafeCopyIntent({ ...plan.intent, requestId: input.requestId, destinations,
       deployment: { version: 2, planId: id, sourceHashes: refreshed.sourceHashes, sourceModelHashes: refreshed.sourceModelHashes,
+        ...(plan.packageVersion === 1 ? { packageCopy: { version: 1, confirmDestinationAudience: true, confirmDependencies: true,
+          targetFingerprints: Object.fromEntries(refreshed.targets.filter(target => input.targetIds.includes(target.targetId)).map(target => [target.targetId, target.package!.fingerprint])) } } : {}),
         ...(Object.keys(refreshed.workbookCopies || {}).length ? { workbookCopies: refreshed.workbookCopies } : {}),
         modelHashes: Object.fromEntries(refreshed.targets.filter((target) => input.targetIds.includes(target.targetId)).map((target) => [target.targetId, target.modelHash])) } });
     // Cancellation applies to the read-only preflight. Once the durable job is

@@ -11,12 +11,13 @@ import { createDashboardReadinessContext } from '../server/services/dashboardRea
 import { lockVault, resetVault, unlockVault, upsertInstance } from '../server/services/nativeVault';
 import { OmniClient } from '../server/services/omniClient';
 import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../shared/dashboardDeploymentPlan';
 
 let directory = '';
 let historyPath = '';
 const environmentKeys = ['OMNIKIT_JOB_HISTORY_PATH', 'OMNIKIT_VAULT_PATH', 'OMNIKIT_SAFE_COPY_V1_INTERNAL'] as const;
 let previousEnvironment: Array<string | undefined>;
-const plan = (): DashboardDeploymentPlan => ({ version: 2, evidenceVersion: 4, id: 'example-plan', revision: 4, createdAt: 1, updatedAt: 1,
+const plan = (): DashboardDeploymentPlan => ({ version: 2, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: 'example-plan', revision: 4, createdAt: 1, updatedAt: 1,
   intent: { profile: 'safe_copy_v1', requestId: '11111111-1111-4111-8111-111111111111',
     source: { instanceId: 'example-source', connectionId: 'example-source-connection', documentIds: ['example-dashboard'] },
     destinations: [{ targetId: 'example-route', instanceId: 'example-target', connectionId: 'example-target-connection', modelId: 'example-target-model' }] },

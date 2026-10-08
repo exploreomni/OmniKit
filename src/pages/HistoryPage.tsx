@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowRightLeft,
   BookOpen,
@@ -26,9 +26,13 @@ import { PageHeader } from '@/components/layout/PageHeader';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { ConfirmDialog } from '@/components/ui/ConfirmDialog';
 import { Blobby } from '@/components/ui/Blobby';
-import { clearMigrationJobs, listMigrationJobs, type JobStatus, type MigrationJob } from '@/services/opsConsole';
+import { clearMigrationJobs, getMigrationJob, listMigrationJobs, listSavedInstances, retryDashboardSafeCopyTarget, verifyExistingDashboardPackageCopy, type JobStatus, type MigrationJob, type SavedInstancePublic } from '@/services/opsConsole';
 import { sanitizeHistoryExportPayload } from '@/services/historyExport';
 import type { OperationLogEntry, OperationType } from '@/types';
+import { DashboardPackageResults } from '@/components/dashboardMigration/DashboardPackageReview';
+import { DashboardPackageHistoryCounts } from '@/components/dashboardMigration/DashboardPackageHistoryCounts';
+import { dashboardPackageCopyCanVerify, dashboardPackageHistorySummary, readDashboardPackageResults } from '@/components/dashboardMigration/dashboardPackagePresentation';
+import { onVaultChanged, onVaultLocked } from '@/services/vaultEvents';
 
 const TYPE_CONFIG: Record<OperationType, { icon: typeof Clock; label: string; color: string }> = {
   migration: { icon: ArrowRightLeft, label: 'Dashboard Migrator', color: 'text-blue-600 bg-blue-50' },
@@ -120,11 +124,17 @@ function downloadJson(filename: string, payload: unknown) {
   URL.revokeObjectURL(url);
 }
 
-function JobDetail({ job }: { job: MigrationJob }) {
+export function HistoryJobDetail({ job, destinations, onVerifyExisting, verifyingDocumentKeys, onContinue, continuingTargetIds }: {
+  job: MigrationJob; destinations: Record<string, { label: string; baseUrl?: string }>;
+  onVerifyExisting: (targetId: string, sourceDocumentId: string) => void; verifyingDocumentKeys: string[];
+  onContinue: (targetId: string) => void; continuingTargetIds: string[];
+}) {
   const counts = jobCounts(job);
   const isModelJob = job.workflow === 'model';
   const modelCount = numberDetail(job, 'modelCount') || job.targets?.length || 0;
   const workbookCount = numberDetail(job, 'workbookCount');
+  const packageResults = readDashboardPackageResults(job);
+  const packageSummary = dashboardPackageHistorySummary(job);
   return (
     <div className="card p-5">
       <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -135,14 +145,17 @@ function JobDetail({ job }: { job: MigrationJob }) {
           </p>
           {job.parentJobId && <p className="mt-1 text-xs text-content-secondary">Retry of {job.parentJobId}</p>}
         </div>
-        <StatusChip status={statusForChip(job.status)} label={job.status} />
+        <StatusChip status={packageSummary?.pendingVerificationCount ? 'warning' : statusForChip(job.status)} label={packageSummary?.pendingVerificationCount ? 'Created · verification pending' : job.status} />
       </div>
-      <div className="mt-4 grid gap-3 sm:grid-cols-4">
+      {packageResults !== null ? <>
+        <DashboardPackageHistoryCounts job={job} />
+        <div className="mt-4"><DashboardPackageResults key={job.id} results={packageResults} running={job.status === 'running' || job.status === 'pending'} destinations={destinations} onVerifyExisting={onVerifyExisting} verifyingDocumentKeys={verifyingDocumentKeys} onContinue={onContinue} continuingTargetIds={continuingTargetIds} disabled={continuingTargetIds.length > 0} /></div>
+      </> : <div className="mt-4 grid gap-3 sm:grid-cols-4">
         <div className="rounded-card bg-surface-secondary p-3 text-sm"><span className="font-semibold">{job.items.length}</span><br />Total steps</div>
         <div className="rounded-card bg-surface-secondary p-3 text-sm"><span className="font-semibold">{counts.succeeded}</span><br />Succeeded</div>
         <div className="rounded-card bg-surface-secondary p-3 text-sm"><span className="font-semibold">{counts.failed}</span><br />Failed</div>
         <div className="rounded-card bg-surface-secondary p-3 text-sm"><span className="font-semibold">{counts.pending}</span><br />Pending/running</div>
-      </div>
+      </div>}
       <div className="mt-4 max-h-[440px] overflow-auto rounded-card border border-border-subtle">
         {job.items.map((item) => (
           <div key={item.id} className="border-b border-border-subtle px-3 py-2 text-xs last:border-b-0">
@@ -191,6 +204,13 @@ export function HistoryPage() {
   const { entries, clearLog } = useOperationLog();
   const [jobs, setJobs] = useState<MigrationJob[]>([]);
   const [selectedJobId, setSelectedJobId] = useState('');
+  const [selectedJobDetail, setSelectedJobDetail] = useState<MigrationJob | null>(null);
+  const [detailInstances, setDetailInstances] = useState<SavedInstancePublic[]>([]);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [verifyingDocumentKeys, setVerifyingDocumentKeys] = useState<string[]>([]);
+  const [continuingTargetIds, setContinuingTargetIds] = useState<string[]>([]);
+  const detailRequestRef = useRef<AbortController | null>(null);
+  const verifyRequestRef = useRef<AbortController | null>(null);
   const [typeFilter, setTypeFilter] = useState<TimelineFilter>('all');
   const [showClearConfirm, setShowClearConfirm] = useState(false);
   const [loadingJobs, setLoadingJobs] = useState(false);
@@ -212,6 +232,66 @@ export function HistoryPage() {
   useEffect(() => {
     void loadJobs();
   }, []);
+
+  useEffect(() => {
+    const invalidate = () => {
+      detailRequestRef.current?.abort(); verifyRequestRef.current?.abort();
+      detailRequestRef.current = null; verifyRequestRef.current = null;
+      setSelectedJobDetail(null); setSelectedJobId(''); setDetailInstances([]); setLoadingDetail(false); setVerifyingDocumentKeys([]); setContinuingTargetIds([]);
+    };
+    const stopLocked = onVaultLocked(invalidate), stopChanged = onVaultChanged(invalidate);
+    return () => { stopLocked(); stopChanged(); detailRequestRef.current?.abort(); verifyRequestRef.current?.abort(); };
+  }, []);
+
+  async function openJobDetails(id: string) {
+    detailRequestRef.current?.abort(); verifyRequestRef.current?.abort(); verifyRequestRef.current = null;
+    const controller = new AbortController(); detailRequestRef.current = controller;
+    setSelectedJobId(id); setSelectedJobDetail(null); setDetailInstances([]); setLoadingDetail(true); setVerifyingDocumentKeys([]); setContinuingTargetIds([]); setError('');
+    try {
+      const [response, saved] = await Promise.all([getMigrationJob(id, controller.signal), listSavedInstances().catch(() => ({ instances: [] }))]);
+      if (controller.signal.aborted || detailRequestRef.current !== controller) return;
+      if (response.job.id !== id) throw new Error('The returned job did not match the selected history entry.');
+      setSelectedJobDetail(response.job); setDetailInstances(saved.instances);
+    } catch (detailError) {
+      if (!controller.signal.aborted) setError(detailError instanceof Error ? detailError.message : 'Could not load the saved job details.');
+    } finally {
+      if (detailRequestRef.current === controller) { detailRequestRef.current = null; setLoadingDetail(false); }
+    }
+  }
+
+  async function verifyExistingCopy(targetId: string, sourceDocumentId?: string) {
+    const job = selectedJobDetail;
+    if (!job || loadingDetail || verifyRequestRef.current) return;
+    const target = readDashboardPackageResults(job)?.find(row => row.targetId === targetId);
+    if (!target) return;
+    if (sourceDocumentId !== undefined) {
+      const document = target.documents.find(row => row.sourceDocumentId === sourceDocumentId);
+      if (!document || !dashboardPackageCopyCanVerify(document)) return;
+    } else if (!['needs_review', 'waiting_approval'].includes(target.status)
+      || target.documents.some(document => document.status === 'uncertain' || dashboardPackageCopyCanVerify(document))) return;
+    const controller = new AbortController(); verifyRequestRef.current = controller;
+    if (sourceDocumentId !== undefined) setVerifyingDocumentKeys([JSON.stringify([targetId, sourceDocumentId])]);
+    else setContinuingTargetIds([targetId]);
+    setError('');
+    try {
+      const response = sourceDocumentId === undefined
+        ? await retryDashboardSafeCopyTarget(job.id, targetId, crypto.randomUUID(), controller.signal)
+        : await verifyExistingDashboardPackageCopy(job.id, targetId, sourceDocumentId, crypto.randomUUID(), controller.signal);
+      if (controller.signal.aborted || verifyRequestRef.current !== controller) return;
+      if (response.job.id !== job.id || response.job.details?.safeCopyRequestId !== job.details?.safeCopyRequestId
+        || JSON.stringify([...response.job.documentIds].sort()) !== JSON.stringify([...job.documentIds].sort())
+        || JSON.stringify((response.job.targets || []).map(row => row.id).sort()) !== JSON.stringify((job.targets || []).map(row => row.id).sort())) {
+        throw new Error('The verification result did not match the selected dashboard package.');
+      }
+      setSelectedJobDetail(response.job);
+      setJobs(previous => previous.map(row => row.id === job.id ? { ...row, status: response.job.status,
+        details: { ...row.details, dashboardPackageHistorySummary: dashboardPackageHistorySummary(response.job) } } : row));
+    } catch (verificationError) {
+      if (!controller.signal.aborted) setError(verificationError instanceof Error ? verificationError.message : 'Could not verify the existing dashboard copy.');
+    } finally {
+      if (verifyRequestRef.current === controller) { verifyRequestRef.current = null; setVerifyingDocumentKeys([]); setContinuingTargetIds([]); }
+    }
+  }
 
   const childJobsByParent = useMemo(() => {
     const rows = new Map<string, MigrationJob[]>();
@@ -238,7 +318,7 @@ export function HistoryPage() {
     if (typeFilter === 'migration_jobs') return item.kind === 'migration_job';
     return item.kind === 'operation' && item.entry.type === typeFilter;
   });
-  const selectedJob = jobs.find((job) => job.id === selectedJobId) || null;
+  const selectedJob = selectedJobDetail?.id === selectedJobId ? selectedJobDetail : null;
   const totalItems = entries.length + jobs.length;
 
   async function clearAll() {
@@ -246,6 +326,7 @@ export function HistoryPage() {
     await clearMigrationJobs();
     setJobs([]);
     setSelectedJobId('');
+    setSelectedJobDetail(null);
     setShowClearConfirm(false);
   }
 
@@ -377,6 +458,9 @@ export function HistoryPage() {
               const modelCount = numberDetail(item.job, 'modelCount') || item.job.targets?.length || 0;
               const workbookCount = numberDetail(item.job, 'workbookCount');
               const dashboardCount = numberDetail(item.job, 'dashboardCount') || item.job.documentIds.length;
+              const packageSummary = dashboardPackageHistorySummary(item.job);
+              const identityOnly = item.job.details?.safeCopyProfile === 'safe_copy_v1' && item.job.sourceId === '';
+              const targetCount = packageSummary?.targetCount ?? (item.job.targets?.length || item.job.destinationIds.length);
               return (
                 <div key={item.id} className="card p-4 animate-fadeIn">
                   <div className="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
@@ -386,27 +470,27 @@ export function HistoryPage() {
                         <span className="truncate text-sm font-semibold text-content-primary">{isModelJob ? 'Model migration' : 'Dashboard migration'} from {item.job.sourceLabel}</span>
                       </div>
                       <div className="mt-1 text-xs text-content-secondary">
-                        {formatTime(item.job.createdAt)} · {isModelJob ? `${modelCount} model${modelCount === 1 ? '' : 's'} · ${dashboardCount} dashboard${dashboardCount === 1 ? '' : 's'} · ${workbookCount} workbook${workbookCount === 1 ? '' : 's'}` : `${item.job.documentIds.length} dashboard${item.job.documentIds.length === 1 ? '' : 's'}`} · {item.job.targets?.length || item.job.destinationIds.length} target{(item.job.targets?.length || item.job.destinationIds.length) === 1 ? '' : 's'} · {formatDuration((item.job.endedAt || Date.now()) - (item.job.startedAt || item.job.createdAt))}
+                        {formatTime(item.job.createdAt)} · {packageSummary ? `${packageSummary.dashboardCount} dashboard${packageSummary.dashboardCount === 1 ? '' : 's'} · ${targetCount} target${targetCount === 1 ? '' : 's'}` : identityOnly ? 'Saved dashboard deployment · open Details for its scope' : <>{isModelJob ? `${modelCount} model${modelCount === 1 ? '' : 's'} · ${dashboardCount} dashboard${dashboardCount === 1 ? '' : 's'} · ${workbookCount} workbook${workbookCount === 1 ? '' : 's'}` : `${item.job.documentIds.length} dashboard${item.job.documentIds.length === 1 ? '' : 's'}`} · {targetCount} target{targetCount === 1 ? '' : 's'}</>} · {formatDuration((item.job.endedAt || Date.now()) - (item.job.startedAt || item.job.createdAt))}
                       </div>
                     </div>
                     <div className="flex flex-wrap items-center gap-2">
-                      <StatusChip status={statusForChip(item.job.status)} label={item.job.status} />
-                      <button type="button" onClick={() => setSelectedJobId(item.job.id)} className="btn-secondary text-xs">Details</button>
+                      <StatusChip status={packageSummary?.pendingVerificationCount ? 'warning' : statusForChip(item.job.status)} label={packageSummary?.pendingVerificationCount ? 'Created · verification pending' : item.job.status} />
+                      <button type="button" onClick={() => void openJobDetails(item.job.id)} className="btn-secondary text-xs">Details</button>
                     </div>
                   </div>
-                  <div className="mt-3 grid gap-2 text-xs sm:grid-cols-4">
+                  {packageSummary || identityOnly ? <DashboardPackageHistoryCounts job={item.job} /> : <div className="mt-3 grid gap-2 text-xs sm:grid-cols-4">
                     <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{item.job.items.length}</span><br />Steps</div>
                     <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{counts.succeeded}</span><br />Succeeded</div>
                     <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{counts.failed}</span><br />Failed</div>
                     <div className="rounded-card bg-surface-secondary p-2"><span className="font-semibold">{children.length}</span><br />Retries</div>
-                  </div>
+                  </div>}
                   {children.length > 0 && (
                     <div className="mt-3 space-y-2 border-l-2 border-omni-100 pl-3">
                       {children.map((child) => (
                         <button
                           key={child.id}
                           type="button"
-                          onClick={() => setSelectedJobId(child.id)}
+                          onClick={() => void openJobDetails(child.id)}
                           className="block w-full rounded-card border border-border-subtle bg-surface-secondary px-3 py-2 text-left text-xs hover:border-omni-300"
                         >
                           <span className="font-semibold text-content-primary">Retry job</span>
@@ -420,8 +504,12 @@ export function HistoryPage() {
             })}
           </div>
           <div className="space-y-4">
-            {selectedJob ? (
-              <JobDetail job={selectedJob} />
+            {loadingDetail ? <p className="card p-5 text-sm text-content-secondary" role="status">Loading saved job details…</p> : selectedJob ? (
+              <HistoryJobDetail job={selectedJob} onVerifyExisting={(targetId, sourceDocumentId) => void verifyExistingCopy(targetId, sourceDocumentId)} verifyingDocumentKeys={verifyingDocumentKeys} onContinue={targetId => void verifyExistingCopy(targetId)} continuingTargetIds={continuingTargetIds}
+                destinations={Object.fromEntries((selectedJob.targets || []).map(target => {
+                  const instance = detailInstances.find(row => row.id === target.destinationInstanceId);
+                  return [target.id, { label: instance?.label || target.destinationInstanceId, baseUrl: instance?.baseUrl }];
+                }))} />
             ) : (
               <div className="card p-5 text-sm text-content-secondary">
                 Select a migration job to inspect its redacted step history, retry lineage, import IDs, warnings, and post-action results.

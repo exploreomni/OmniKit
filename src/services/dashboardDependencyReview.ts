@@ -23,23 +23,52 @@ export interface DashboardReadinessCauseGroup {
   findings: DashboardDependencyFinding[];
   references: string[];
   documentIds: string[];
+  fieldReferences: string[];
+  categories: DashboardFindingCategory[];
+  sourceScope: DashboardDependencyFinding['sourceScope'];
+  workbookCopy: boolean;
 }
 
-/** Exact server root causes compact repeated observations, without hiding independent blockers. */
+/** These exact producer codes identify local definitions and their copy prerequisite, not model repairs. */
+export function isDashboardWorkbookCopyFinding(finding: DashboardDependencyFinding): boolean {
+  return finding.sourceScope === 'workbook' && finding.kind !== 'security' && (
+    finding.causeCode === 'WORKBOOK_FIELD_IDENTIFIED'
+    || finding.causeCode === 'WORKBOOK_COPY_CAPABILITY_UNVERIFIED'
+    || (finding.causeCode === 'WORKBOOK_COPY_PREREQUISITE' && finding.reference === 'workbook_copy_capability')
+  );
+}
+
+const SOURCE_FILE_REVIEW_CODES = new Set([
+  'SOURCE_YAML_MALFORMED', 'SOURCE_YAML_UNSUPPORTED_SHAPE', 'SOURCE_YAML_UNSUPPORTED_FEATURE',
+  'SOURCE_YAML_LIMIT', 'SOURCE_YAML_READ_UNAVAILABLE', 'WORKBOOK_OVERLAY_PRESERVATION_REQUIRED',
+]);
+
+/** Server identity crosses display categories, never source scope or independent security evidence. */
 export function groupDashboardReadinessCauses(findings: DashboardDependencyFinding[]): DashboardReadinessCauseGroup[] {
   const groups = new Map<string, DashboardReadinessCauseGroup>();
   for (const finding of findings) {
     // Security remains independent even if an older producer reuses another cause ID.
     const family = finding.kind === 'security' ? 'security' : 'dependency';
-    const key = JSON.stringify([finding.category || 'cannot_verify', finding.sourceScope || 'unknown', family,
-      finding.rootCauseId ? ['root', finding.rootCauseId] : ['reason', finding.causeCode || '', finding.kind, finding.message]]);
+    const workbookCopy = isDashboardWorkbookCopyFinding(finding);
+    const documents = [...new Set(finding.documentIds)].sort();
+    // A known workbook prerequisite and its field effects share an origin only
+    // when their complete document sets match. Do not infer origins from names.
+    const identity = SOURCE_FILE_REVIEW_CODES.has(finding.causeCode || '')
+      ? ['source_file_review', finding.causeCode, finding.sourceFileName || finding.reference, documents, finding.rootCauseId || '']
+      : workbookCopy && documents.length > 0 ? ['workbook_copy', documents]
+      : finding.rootCauseId ? ['root', finding.rootCauseId]
+      : ['reason', finding.category || 'cannot_verify', finding.causeCode || '', finding.kind, finding.message];
+    const key = JSON.stringify([finding.sourceScope || 'unknown', family, identity]);
     let group = groups.get(key);
     if (!group) {
-      group = { id: key, message: finding.message, findings: [], references: [], documentIds: [] };
+      group = { id: key, message: finding.message, findings: [], references: [], documentIds: [], fieldReferences: [], categories: [], sourceScope: finding.sourceScope, workbookCopy };
       groups.set(key, group);
     }
     group.findings.push(finding);
     if (!group.references.includes(finding.reference)) group.references.push(finding.reference);
+    if (finding.kind === 'field' && !group.fieldReferences.includes(finding.reference)) group.fieldReferences.push(finding.reference);
+    const category = finding.category || 'cannot_verify';
+    if (!group.categories.includes(category)) group.categories.push(category);
     for (const documentId of finding.documentIds) if (!group.documentIds.includes(documentId)) group.documentIds.push(documentId);
   }
   return [...groups.values()];

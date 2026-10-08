@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parse, stringify } from 'yaml';
 import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../shared/dashboardDeploymentPlan';
 import { approveDashboardTopicRepair, previewDashboardTopicRepair } from '../server/services/dashboardTopicRepair';
 import { readReviewedReconstructedTopics } from '../server/services/dashboardTopicRepairEvidence';
 import { dashboardRepairSnapshotHash as hash, issueDashboardRepairApproval, verifyDashboardRepairApproval } from '../server/services/dashboardRepairApproval';
@@ -42,7 +43,7 @@ beforeEach(() => {
   workbookFiles = {};
   state = { name: 'Example dashboard', modelId: 'source-model', workbookModelId: 'workbook', containers: [],
     queryPresentations: { data: { q: { topicName: 'missing_topic', query: { fields: ['orders.id'] } } }, order: ['q'] } };
-  plan = { version: 2, evidenceVersion: 4, id: 'example-plan', revision: 1, createdAt: 1, updatedAt: 1,
+  plan = { version: 2, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: 'example-plan', revision: 1, createdAt: 1, updatedAt: 1,
     intent: { profile: 'safe_copy_v1', requestId: '11111111-1111-4111-8111-111111111111',
       source: { instanceId: 'source', connectionId: 'source-connection', documentIds: ['dashboard'] },
       destinations: [{ targetId: 'route', instanceId: 'target', connectionId: 'target-connection', modelId: 'target-model' }] },

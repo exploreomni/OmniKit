@@ -149,3 +149,128 @@ test('workbook presentation scalars are supported but unknown shapes and securit
     assert.equal(result.findings[0].reference, 'workbook_overlay');
   }
 });
+
+test('empty, comment-only, and null-root workbook documents are no definitions without altering raw YAML', async () => {
+  const shared = { 'orders.view': view({ id: field() }) };
+  for (const yaml of ['', ' \r\n# Example authored comment\r\n', '---\n# No definitions\n...\n', 'null\n', '~ # no extension\n', '{}\n']) {
+    const workbook = { model: yaml, relationships: yaml, 'orders.view': yaml, 'example.topic': yaml };
+    const result = await evidence(shared, workbook, ['orders.id']);
+    assert.equal(result.workbookFiles, workbook, 'the complete authored strings remain authoritative');
+    assert.equal(result.sharedFiles, shared);
+    assert.equal(result.unverified, false, yaml);
+    assert.deepEqual(result.findings, []);
+    assert.equal(result.fields[0].provenance, 'shared_authored');
+    assert.equal(result.fields[0].sourceScope, 'shared');
+    assert.equal(result.fields[0].sharedWriteAllowed, true);
+    assert.deepEqual(result.requiredWorkbookFiles, []);
+  }
+});
+
+test('a successfully parsed empty shared view does not invent inherited field definitions', async () => {
+  for (const yaml of ['# No authored fields\n', 'null\n', '---\n...\n']) {
+    const result = await evidence({ 'orders.view': yaml }, {}, ['orders.id']);
+    assert.equal(result.fields[0].provenance, 'inherited_unverified');
+    assert.equal(result.fields[0].definition, undefined);
+    assert.equal(result.fields[0].sharedWriteAllowed, false);
+    assert.equal(result.findings.some((finding) => finding.causeCode?.startsWith('SOURCE_YAML_')), false);
+    assert.equal(result.sharedFiles['orders.view'], yaml);
+  }
+});
+
+test('valid relationship sequences preserve workbook scope and role aliases without shared promotion', async () => {
+  const shared = { 'orders.view': view({ id: field() }) };
+  const rows = [
+    { join_from_view: 'orders', join_to_view: 'regions', join_to_view_as: 'shipping_region', on_sql: '${orders.shipping_region} = ${shipping_region.id}' },
+    { join_from_view: 'orders', join_to_view: 'regions', join_to_view_as: 'billing_region', on_sql: '${orders.billing_region} = ${billing_region.id}' },
+  ];
+  for (const yaml of [JSON.stringify(rows), JSON.stringify({ relationships: rows })]) {
+    const workbook = { relationships: yaml };
+    const result = await evidence(shared, workbook, ['orders.id']);
+    assert.equal(result.workbookFiles, workbook);
+    assert.equal(Object.hasOwn(result.sharedFiles, 'relationships'), false);
+    assert.equal(result.fields[0].sharedWriteAllowed, true, 'file preservation remains distinct from authored field provenance');
+    assert.equal(result.unverified, true);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].sourceScope, 'workbook');
+    assert.equal(result.findings[0].sourceFileName, 'relationships');
+    assert.equal(result.findings[0].causeCode, 'WORKBOOK_OVERLAY_PRESERVATION_REQUIRED');
+    assert.match(result.findings[0].message, /valid authored definitions/);
+  }
+  for (const yaml of ['[]\n', 'relationships: []\n']) {
+    const result = await evidence(shared, { relationships: yaml }, ['orders.id']);
+    assert.equal(result.unverified, false);
+    assert.deepEqual(result.findings, []);
+  }
+});
+
+test('valid unsupported file shapes are distinguished from syntax failures', async () => {
+  const shared = { 'orders.view': view({ id: field() }) };
+  for (const [sourceFileName, yaml] of [
+    ['orders.view', '[]\n'], ['orders.view', 'false\n'], ['orders.view', '"null"\n'],
+    ['model', '[]\n'], ['example.topic', '- base_view: orders\n'],
+    ['relationships', '- unsupported: value\n'],
+    ['relationships', '- join_from_view: orders\n  join_to_view: regions\n- join_from_view: orders\n  join_to_view: regions\n'],
+  ]) {
+    const result = await evidence(shared, { [sourceFileName]: yaml }, ['orders.id']);
+    assert.equal(result.unverified, true);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].sourceFileName, sourceFileName);
+    assert.equal(result.findings[0].sourceScope, 'workbook');
+    assert.equal(result.findings[0].causeCode, 'SOURCE_YAML_UNSUPPORTED_SHAPE');
+    assert.equal(result.workbookFiles[sourceFileName], yaml);
+    if (sourceFileName.endsWith('.view')) assert.equal(result.fields[0].sharedWriteAllowed, false);
+  }
+});
+
+test('malformed YAML yields one scoped file cause with safe location, not empty definitions or raw diagnostics', async () => {
+  const yaml = 'dimensions:\n  private_example_text: [\n';
+  for (const scope of ['shared', 'workbook'] as const) {
+    const result = await evidence(scope === 'shared' ? { 'orders.view': yaml } : { 'orders.view': view({ id: field(), total: field() }) },
+      scope === 'workbook' ? { 'orders.view': yaml } : {}, ['orders.id', 'orders.total']);
+    assert.equal(result.unverified, true);
+    assert.equal(result.findings.length, 1, 'the same file failure is not repeated for each field');
+    assert.equal(result.findings[0].sourceFileName, 'orders.view');
+    assert.equal(result.findings[0].sourceScope, scope);
+    assert.equal(result.findings[0].causeCode, 'SOURCE_YAML_MALFORMED');
+    assert.match(result.findings[0].message, /line \d+/);
+    assert.equal(JSON.stringify(result.findings).includes('private_example_text'), false);
+    for (const item of result.fields) {
+      assert.equal(item.provenance, 'unverified');
+      assert.equal(item.sourceScope, scope);
+      assert.equal(item.sharedWriteAllowed, false);
+      assert.equal(item.definition, undefined);
+    }
+    assert.equal((scope === 'shared' ? result.sharedFiles : result.workbookFiles)['orders.view'], yaml);
+  }
+});
+
+test('aliases, custom tags, duplicate keys, and bounded parser limits remain failed evidence', async () => {
+  const shared = { 'orders.view': view({ id: field() }) };
+  for (const [yaml, causeCode] of [
+    ['dimensions: &fields {id: {sql: "${TABLE}.id"}}\nmeasures: *fields\n', 'SOURCE_YAML_UNSUPPORTED_FEATURE'],
+    ['!example null\n', 'SOURCE_YAML_UNSUPPORTED_FEATURE'],
+    ['dimensions: {}\ndimensions: {}\n', 'SOURCE_YAML_MALFORMED'],
+    ['dimensions: {__proto__: {sql: "${TABLE}.id"}}\n', 'SOURCE_YAML_UNSUPPORTED_SHAPE'],
+    ['#' + 'x'.repeat(5_000_000), 'SOURCE_YAML_LIMIT'],
+  ]) {
+    const result = await evidence(shared, { 'orders.view': yaml }, ['orders.id']);
+    assert.equal(result.unverified, true);
+    assert.equal(result.fields[0].sharedWriteAllowed, false);
+    assert.equal(result.findings.length, 1);
+    assert.equal(result.findings[0].causeCode, causeCode);
+    assert.equal(result.findings[0].sourceScope, 'workbook');
+    assert.equal(result.workbookFiles['orders.view'], yaml);
+  }
+});
+
+test('field-shape failures retain their file scope while known local overrides stay local', async () => {
+  const malformed = await evidence({ 'orders.view': 'dimensions: [id]\n' }, {}, ['orders.id']);
+  assert.equal(malformed.fields[0].sourceScope, 'shared');
+  assert.equal(malformed.findings[0].sourceFileName, 'orders.view');
+  assert.equal(malformed.findings[0].causeCode, 'SOURCE_YAML_UNSUPPORTED_SHAPE');
+  const known = await evidence({ 'orders.view': view({ id: field() }) }, { 'orders.view': 'dimensions:\n  id:\n    label: Workbook label\n' }, ['orders.id']);
+  assert.equal(known.fields[0].provenance, 'workbook_override');
+  assert.equal(known.fields[0].sourceScope, 'workbook');
+  assert.equal(known.findings[0].sourceScope, 'workbook');
+  assert.equal(known.fields[0].sharedWriteAllowed, false);
+});

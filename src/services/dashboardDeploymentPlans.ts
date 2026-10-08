@@ -6,9 +6,12 @@ import type { DashboardTopicRepairPreview } from '../../shared/dashboardTopicRep
 import { ApiError } from './omniApi';
 import { emitVaultLocked } from './vaultEvents';
 import { DASHBOARD_READINESS_STAGES, type DashboardReadinessProgressEvent } from '../../shared/dashboardReadiness';
+import type { DashboardPackagePreview } from '../../shared/dashboardPackage';
+import type { DashboardPackageBindingMapping } from '../../shared/dashboardPackageBindings';
 
 export type { DashboardDeploymentPlan, DashboardDeploymentHandoff, DashboardDeploymentTargetReadiness } from '../../shared/dashboardDeploymentPlan';
 export type { DashboardReadinessProgressEvent } from '../../shared/dashboardReadiness';
+export type { DashboardPackageSummary, DashboardPackagePreview, DashboardPackageTargetResult } from '../../shared/dashboardPackage';
 
 const base = '/api/migration-jobs/deployment-plans';
 export function previewDashboardTopicRepair(planId: string, input: { revision: number; targetId: string; sourceTopicName: string; targetTopicName: string; baseView?: string; selectedJoinPaths?: Record<string, string> }, signal?: AbortSignal) {
@@ -134,15 +137,22 @@ export interface DashboardDeploymentTargetUpdate {
   targetId: string;
   topicMappings?: DashboardSafeCopyTopicMapping[];
   workbookCopy?: { stagingFolderId: string } | null;
+  bindingMappings?: DashboardPackageBindingMapping[];
+  packageFingerprint?: string;
+}
+export function previewDashboardPackage(id: string, revision: number, targetId: string, signal?: AbortSignal) {
+  return apiFetch<DashboardPackagePreview>(`${base}/${encodeURIComponent(id)}/package-preview`, {
+    method: 'POST', body: JSON.stringify({ revision, targetId }), signal,
+  });
 }
 export function updateDashboardDeploymentPlan(id: string, update: DashboardDeploymentTargetUpdate, signal?: AbortSignal) {
   return apiFetch<{ plan: DashboardDeploymentPlan }>(`${base}/${encodeURIComponent(id)}`, {
     method: 'PATCH', body: JSON.stringify(update), signal,
   });
 }
-export function deployDashboardDeploymentPlan(id: string, revision: number, targetIds: string[], requestId: string) {
+export function deployDashboardDeploymentPlan(id: string, revision: number, targetIds: string[], requestId: string, confirmations?: { confirmDestinationAudience: boolean; confirmDependencies: boolean }) {
   return apiFetch<{ job: MigrationJob; plan: DashboardDeploymentPlan }>(`${base}/${encodeURIComponent(id)}/deploy`, {
-    method: 'POST', body: JSON.stringify({ revision, targetIds, requestId }),
+    method: 'POST', body: JSON.stringify({ revision, targetIds, requestId, ...confirmations }),
   });
 }
 export function linkDashboardModelRepair(id: string, targetId: string, jobId: string) {

@@ -293,6 +293,7 @@ export interface MigrationTarget {
   semanticPatches?: MigrationSemanticPatch[];
   queryValidationWaivers?: MigrationQueryValidationWaiver[];
   workbookCopy?: { stagingFolderId: string };
+  bindingMappings?: import('../../shared/dashboardPackageBindings').DashboardPackageBindingMapping[];
 }
 
 export interface MigrationQueryValidationWaiver {
@@ -4664,6 +4665,7 @@ function normalizeTargets(input: {
         permissionDecisions: normalizePermissionDecisions(target.permissionDecisions),
         semanticPatches: normalizeSemanticPatches(target.semanticPatches),
         queryValidationWaivers: normalizeQueryValidationWaivers(target.queryValidationWaivers),
+        ...(target.bindingMappings ? { bindingMappings: structuredClone(target.bindingMappings) } : {}),
         ...(target.workbookCopy?.stagingFolderId?.trim()
           ? { workbookCopy: { stagingFolderId: target.workbookCopy.stagingFolderId.trim() } }
           : {}),

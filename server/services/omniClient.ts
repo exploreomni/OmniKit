@@ -174,6 +174,8 @@ export interface OmniFolderRecord {
 export interface OmniDocumentRecord {
   id: string;
   identifier: string;
+  /** Native document UUID, distinct from the legacy slug-valued id. Never inferred from identifier. */
+  documentId?: string;
   name: string;
   connectionId?: string;
   folderId?: string;
@@ -1266,6 +1268,7 @@ function normalizeOmniDocumentRecords(all: unknown[]): OmniDocumentRecord[] {
     return {
       id,
       identifier: id,
+      documentId: firstString(row.documentId, row.document_id, row.id, row.uuid),
       name: String(row.name ?? row.title ?? id),
       connectionId: firstString(row.connectionId, row.connection_id, nested(row, 'connection', 'id')),
       folderId: firstString(row.folderId, row.folder_id, nested(row, 'folder', 'id')),
@@ -2575,9 +2578,10 @@ export class OmniClient {
     return { files: normalizedFiles, checksums, raw: data };
   }
 
-  async createModel(input: OmniCreateModelInput): Promise<OmniCreateModelResult> {
+  async createModel(input: OmniCreateModelInput, writeGuard?: OmniWriteDispatchGuard): Promise<OmniCreateModelResult> {
     const path = '/api/v1/models';
     const response = await this.request('POST', '/api/v1/models', {
+      writeGuard,
       body: {
         connectionId: input.connectionId,
         modelName: input.modelName,
@@ -2648,13 +2652,13 @@ export class OmniClient {
     };
   }
 
-  async createModelBranch(input: { connectionId: string; baseModelId: string; branchName: string }): Promise<OmniModelBranchResult> {
+  async createModelBranch(input: { connectionId: string; baseModelId: string; branchName: string }, writeGuard?: OmniWriteDispatchGuard): Promise<OmniModelBranchResult> {
     const model = await this.createModel({
       connectionId: input.connectionId,
       modelName: input.branchName,
       modelKind: 'BRANCH',
       baseModelId: input.baseModelId,
-    });
+    }, writeGuard);
     return { id: model.id, name: model.name, raw: model.raw };
   }
 
@@ -2677,13 +2681,14 @@ export class OmniClient {
     branchId?: string;
     previousChecksum?: string;
     commitMessage?: string;
+    mode?: 'combined' | 'extension';
   }, writeGuard?: OmniWriteDispatchGuard): Promise<unknown> {
     const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
       writeGuard,
       body: {
         fileName: input.fileName,
         yaml: input.yaml,
-        mode: 'combined',
+        mode: input.mode || 'combined',
         branchId: input.branchId,
         previousChecksum: input.previousChecksum,
         commitMessage: input.commitMessage,
@@ -2883,8 +2888,9 @@ export class OmniClient {
     publishDrafts?: boolean;
     deleteBranch?: boolean;
     forceOverrideGitSettings?: boolean;
-  } = {}): Promise<Record<string, unknown>> {
+  } = {}, writeGuard?: OmniWriteDispatchGuard): Promise<Record<string, unknown>> {
     const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(modelId)}/branch/${encodeURIComponent(branchName)}/merge`, {
+      writeGuard,
       body: {
         publish_drafts: options.publishDrafts === true,
         delete_branch: options.deleteBranch === true,
@@ -3150,7 +3156,7 @@ export class OmniClient {
 
   async exportDocument(identifier: string, signal?: AbortSignal): Promise<Record<string, unknown>> {
     const response = await this.request('GET', `/api/unstable/documents/${encodeURIComponent(identifier)}/export`, { signal });
-    return await response.json() as Record<string, unknown>;
+    return (await readBoundedJsonResponse(response, 32 * 1024 * 1024, { signal: this.combinedSignal(signal), timeoutMs: this.requestTimeoutMs })).data as Record<string, unknown>;
   }
 
   async importDocument(input: {
@@ -3158,7 +3164,8 @@ export class OmniClient {
     baseModelId: string;
     folderPath?: string;
     documentName: string;
-  }): Promise<{ identifier: string; documentId: string; raw: unknown }> {
+    identifier?: string;
+  }, writeGuard?: OmniWriteDispatchGuard): Promise<{ identifier: string; documentId: string; workbookModelId?: string; miniUuidMap?: Record<string, string>; raw: unknown }> {
     const payload: Record<string, unknown> = {
       ...input.exportPayload,
       baseModelId: input.baseModelId,
@@ -3170,13 +3177,25 @@ export class OmniClient {
       },
     };
     if (input.folderPath) payload.folderPath = input.folderPath;
-    delete payload.identifier;
+    if (input.identifier !== undefined) {
+      if (!/^[a-z0-9](?:[a-z0-9_-]*[a-z0-9])?$/.test(input.identifier) || input.identifier.length > 254) throw new Error('Invalid imported document identifier.');
+      payload.identifier = input.identifier;
+    } else delete payload.identifier;
 
-    const response = await this.request('POST', '/api/unstable/documents/import', { body: payload });
-    const raw = await response.json() as Record<string, unknown>;
-    const identifier = firstString(raw.identifier, raw.miniUuid, nested(raw, 'document', 'identifier')) ?? '';
-    const documentId = firstString(raw.documentId, raw.id, nested(raw, 'document', 'id')) ?? '';
-    return { identifier, documentId, raw };
+    const response = await this.request('POST', '/api/unstable/documents/import', { body: payload, writeGuard });
+    const raw = (await readBoundedJsonResponse(response, 4 * 1024 * 1024, { signal: this.combinedSignal(writeGuard?.signal), timeoutMs: this.requestTimeoutMs })).data;
+    if (!isRecord(raw)) throw new Error('Imported document response has no verifiable identity.');
+    const identifier = firstString(raw.identifier, raw.miniUuid, nested(raw, 'document', 'identifier'), nested(raw, 'workbook', 'identifier'), nested(raw, 'workbook', 'miniUuid')) ?? '';
+    const documentId = firstString(raw.documentId, raw.id, nested(raw, 'document', 'id'), nested(raw, 'workbook', 'id')) ?? '';
+    const workbookModelId = firstString(raw.workbookModelId, nested(raw, 'workbookModel', 'id'), nested(raw, 'workbook', 'workbookModelId'));
+    if (input.identifier !== undefined && identifier !== input.identifier) throw new Error('Imported document identifier differs from the approved identifier. Reconcile the import before continuing.');
+    if (writeGuard && (![identifier, documentId].every(value => /^[A-Za-z0-9_-]{1,256}$/.test(value)))) throw new Error('Imported document response has no exact verifiable identity.');
+    if (raw.miniUuidMap !== undefined && (!isRecord(raw.miniUuidMap) || Object.entries(raw.miniUuidMap).some(([from, to]) => !/^[A-Za-z0-9_-]{1,256}$/.test(from)
+      || typeof to !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(to)) || new Set(Object.values(raw.miniUuidMap)).size !== Object.keys(raw.miniUuidMap).length)) {
+      throw new Error('Imported tile identity mapping is malformed or ambiguous.');
+    }
+    return { identifier, documentId, ...(workbookModelId ? { workbookModelId } : {}),
+      ...(raw.miniUuidMap !== undefined ? { miniUuidMap: raw.miniUuidMap as Record<string, string> } : {}), raw };
   }
 
   async moveDocument(documentId: string, folderPath: string): Promise<void> {

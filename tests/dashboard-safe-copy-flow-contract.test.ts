@@ -23,7 +23,7 @@ test('safe-copy is the default experience and legacy Dashboard Migrator is a laz
 test('the default safe-copy experience exposes four accessible screens with readiness before deployment', () => {
   assert.match(
     flowSource,
-    /STEP_LABELS\s*=\s*\['Choose dashboards',\s*'Choose destinations',\s*'Review readiness',\s*'Deploy and track'\]\s+as const/,
+    /STEP_LABELS\s*=\s*\['Choose dashboards',\s*'Choose destinations',\s*'Review package',\s*'Deploy and track'\]\s+as const/,
   );
   assert.equal((flowSource.match(/draft\.step === [012]/g) || []).length, 3);
   assert.match(flowSource, /aria-label="Dashboard move steps"/);
@@ -61,6 +61,13 @@ test('the safe-copy flow does not expose legacy destructive or expert controls',
   ]) {
     assert.doesNotMatch(flowSource, forbiddenControl);
   }
+});
+
+test('migration navigation keeps the reading and keyboard order on narrow screens', () => {
+  assert.doesNotMatch(flowSource, /flex-col-reverse|flex-row-reverse/);
+  assert.match(flowSource, /recheck readiness, include ready destinations, and continue/);
+  const readinessFooter = flowSource.slice(flowSource.indexOf('Back to destinations'), flowSource.indexOf('{draft.step === 3 &&'));
+  assert.match(readinessFooter, /Review deployment/);
 });
 
 test('new starts use reviewed deployment plans and never call legacy migration starts', () => {

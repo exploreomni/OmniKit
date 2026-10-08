@@ -29,17 +29,47 @@ test('98 repeated observations become one reason group with deduplicated referen
   assert.equal(JSON.stringify(findings), original);
 });
 
-test('authoritative root causes compact repeated effects but retain independent scope and security blockers', () => {
+test('authoritative root causes cross display categories but retain independent scope and security blockers', () => {
   const findings = Array.from({ length: 98 }, (_, index) => finding({ id: `effect-${index}`, rootCauseId: 'missing-view', causeCode: 'DESTINATION_VIEW_UNAVAILABLE', category: 'model_migrator', sourceScope: 'shared', reference: `example.field_${index % 14}`, message: `Observation ${index}`, documentIds: [`dashboard-${index % 3}`] }));
+  const sameRootOtherCategory = finding({ rootCauseId: 'missing-view', category: 'cannot_verify', sourceScope: 'shared' });
   const groups = groupDashboardReadinessCauses([...findings,
     finding({ kind: 'security', rootCauseId: 'missing-view', category: 'model_migrator', sourceScope: 'shared' }),
-    finding({ rootCauseId: 'missing-view', category: 'cannot_verify', sourceScope: 'shared' }),
+    sameRootOtherCategory,
     finding({ rootCauseId: 'missing-view', category: 'model_migrator', sourceScope: 'workbook' }),
   ]);
-  assert.equal(groups.length, 4);
+  assert.equal(groups.length, 3);
+  assert.deepEqual(groups[0].findings, [...findings, sameRootOtherCategory]);
+  assert.equal(groups[0].references.length, 15);
+  assert.equal(groups[0].documentIds.length, 4);
+  assert.deepEqual(groups[0].categories, ['model_migrator', 'cannot_verify']);
+});
+
+test('one workbook copy prerequisite groups exact-origin field effects across categories without losing evidence', () => {
+  const fields = Array.from({ length: 12 }, (_, index) => finding({
+    id: `local-${index}`, reference: `example.local_${index % 4}`, category: 'included_with_dashboard', sourceScope: 'workbook',
+    causeCode: 'WORKBOOK_FIELD_IDENTIFIED', rootCauseId: 'workbook_definitions:example-dashboard',
+  }));
+  const prerequisite = finding({ id: 'copy', kind: 'document', reference: 'workbook_copy_capability', category: 'cannot_verify', sourceScope: 'workbook',
+    causeCode: 'WORKBOOK_COPY_PREREQUISITE', rootCauseId: 'workbook_copy_capability' });
+  const findings = [...fields, prerequisite];
+  const before = JSON.stringify(findings);
+  const groups = groupDashboardReadinessCauses(findings);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].workbookCopy, true);
+  assert.equal(groups[0].fieldReferences.length, 4);
+  assert.deepEqual(groups[0].categories, ['included_with_dashboard', 'cannot_verify']);
   assert.deepEqual(groups[0].findings, findings);
-  assert.equal(groups[0].references.length, 14);
-  assert.equal(groups[0].documentIds.length, 3);
+  assert.deepEqual(groups[0].documentIds, ['example-dashboard']);
+  assert.equal(JSON.stringify(findings), before);
+  const independent = groupDashboardReadinessCauses([...findings,
+    { ...prerequisite, id: 'other-workbook', documentIds: ['other-dashboard'] },
+    { ...prerequisite, id: 'overlay', causeCode: 'WORKBOOK_OVERLAY_UNVERIFIED', rootCauseId: 'workbook_overlay:example-dashboard' },
+    { ...prerequisite, id: 'access', kind: 'security' },
+    { ...prerequisite, id: 'shared', sourceScope: 'shared' },
+    { ...prerequisite, id: 'unbound', documentIds: [] },
+  ]);
+  assert.equal(independent.length, 6);
+  assert.deepEqual(independent[0].findings, findings);
 });
 
 test('cause grouping without server identity only merges exact kind, scope, category and wording', () => {
@@ -48,6 +78,19 @@ test('cause grouping without server identity only merges exact kind, scope, cate
   assert.equal(groups.length, 4);
   assert.equal(groups[0].findings.length, 2);
   assert.equal(groups[0].findings[0], original);
+});
+
+test('typed source file issues keep their exact diagnostic and file origins independent', () => {
+  const original = finding({ causeCode: 'SOURCE_YAML_UNSUPPORTED_SHAPE', rootCauseId: 'source-file', sourceScope: 'workbook' });
+  const groups = groupDashboardReadinessCauses([original,
+    { ...original, id: 'same-file-duplicate', category: 'cannot_verify' },
+    { ...original, id: 'different-code', causeCode: 'WORKBOOK_OVERLAY_PRESERVATION_REQUIRED' },
+    { ...original, id: 'different-file', sourceFileName: 'other.view' },
+    { ...original, id: 'different-workbook', documentIds: ['other-dashboard'] },
+  ]);
+  assert.equal(groups.length, 4);
+  assert.equal(groups[0].findings.length, 2);
+  assert.equal(groups[0].workbookCopy, false);
 });
 
 test('source-file diagnostics remain source issues when an exact topic definition is unavailable', () => {

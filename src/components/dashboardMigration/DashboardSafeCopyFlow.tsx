@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'r
 import { useLocation, useNavigate } from 'react-router';
 import { useConnection } from '@/hooks/useConnection';
 import { ApiError } from '@/services/omniApi';
+import { onVaultChanged, onVaultLocked } from '@/services/vaultEvents';
 import {
   AlertTriangle,
   ArrowLeft,
@@ -26,6 +27,8 @@ import { ComboBox } from '@/components/ui/ComboBox';
 import { SearchInput } from '@/components/ui/SearchInput';
 import { StatusChip } from '@/components/ui/StatusChip';
 import { DashboardReadinessReview } from './DashboardReadinessReview';
+import { DashboardPackageConfirmations, DashboardPackageResults } from './DashboardPackageReview';
+import { dashboardPackageCopyCanVerify, dashboardPackageCreatedCounts, dashboardPackageResultsVerified, dashboardPackageReviewComplete, readDashboardPackageResults } from './dashboardPackagePresentation';
 import { dashboardReadinessIsStale, staleDashboardReadiness } from './dashboardReadinessPresentation';
 import { DestinationFolderPicker } from './DestinationFolderPicker';
 import { DESTINATIONS_PER_PAGE, destinationPage } from './dashboardDestinationSelection';
@@ -42,6 +45,7 @@ import {
   listModelMigratorModels,
   listSavedInstances,
   retryDashboardSafeCopyTarget,
+  verifyExistingDashboardPackageCopy,
   subscribeMigrationJob,
   type InstanceDocument,
   type InstanceDocumentInventory,
@@ -94,7 +98,7 @@ const MAX_DESTINATIONS = 100;
 const DASHBOARD_PAGE_SIZE = 100;
 const PROGRESS_DOCUMENT_PAGE_SIZE = 20;
 const TRACKING_REFRESH_MS = 4_000;
-const STEP_LABELS = ['Choose dashboards', 'Choose destinations', 'Review readiness', 'Deploy and track'] as const;
+const STEP_LABELS = ['Choose dashboards', 'Choose destinations', 'Review package', 'Deploy and track'] as const;
 
 interface DestinationCatalog {
   connections: ModelMigratorConnection[];
@@ -269,6 +273,12 @@ export function DashboardSafeCopyFlow() {
   const [destinationCatalogs, setDestinationCatalogs] = useState<Record<string, DestinationCatalog>>({});
   const [job, setJob] = useState<MigrationJob | null>(null);
   const [deploymentPlan, setDeploymentPlan] = useState<DashboardDeploymentPlan | null>(null);
+  const [packageReviewReceipts, setPackageReviewReceipts] = useState<{ key: string; fingerprints: Record<string, string> }>({ key: '', fingerprints: {} });
+  const [deploymentConfirmations, setDeploymentConfirmations] = useState({ key: '', audience: false, dependencies: false });
+  const [vaultReviewEpoch, setVaultReviewEpoch] = useState(0);
+  const [checkingPackageResults, setCheckingPackageResults] = useState(false);
+  const [verifyingPackageDocuments, setVerifyingPackageDocuments] = useState<string[]>([]);
+  const packageVerificationAbortRef = useRef<AbortController | null>(null);
   const [topicRepairBusy, setTopicRepairBusy] = useState(false);
   const latestDeploymentPlan = useRef(deploymentPlan);
   latestDeploymentPlan.current = deploymentPlan;
@@ -336,6 +346,17 @@ export function DashboardSafeCopyFlow() {
   );
   const sourceInstance = instances.find((instance) => instance.id === draft.sourceId);
   const currentPlan = deploymentPlan && deploymentPlan.id === draft.planId ? deploymentPlan : null;
+  const packageReviewKey = JSON.stringify([currentPlan?.id, currentPlan?.revision, draft.requestId, connection.instanceId, vaultStatus?.unlocked, vaultReviewEpoch]);
+  const packageReviewKeyRef = useRef(packageReviewKey);
+  packageReviewKeyRef.current = packageReviewKey;
+  const reviewedPackages = packageReviewReceipts.key === packageReviewKey ? packageReviewReceipts.fingerprints : {};
+  const recordPackageReview = useCallback((targetId: string, fingerprint: string) => {
+    if (packageReviewKeyRef.current !== packageReviewKey) return;
+    const expected = currentPlan?.targets.find((target) => target.targetId === targetId)?.package?.fingerprint;
+    if (fingerprint && fingerprint !== expected) return;
+    setPackageReviewReceipts((previous) => ({ key: packageReviewKey, fingerprints: { ...(previous.key === packageReviewKey ? previous.fingerprints : {}), [targetId]: fingerprint } }));
+    setDeploymentConfirmations({ key: '', audience: false, dependencies: false });
+  }, [currentPlan, packageReviewKey]);
   const sourcePlanRestoring = Boolean((draft.planId || returnPlanId) && !currentPlan);
   const sourceCatalog = sourceConnectionCatalog.instanceId === draft.sourceId ? sourceConnectionCatalog : EMPTY_SOURCE_CONNECTION_CATALOG;
   const sourceConnections = sourceCatalog.connections;
@@ -343,8 +364,11 @@ export function DashboardSafeCopyFlow() {
   if (draft.sourceConnectionId && !sourceConnectionOptions.some((option) => option.value === draft.sourceConnectionId)) {
     sourceConnectionOptions.unshift({ value: draft.sourceConnectionId, label: `Selected connection (${draft.sourceConnectionId})`, subtitle: sourceCatalog.loaded ? 'Saved selection — not in the returned catalog' : 'Saved selection — connection catalog not loaded' });
   }
-  const readyTargetIds = checkingReadiness || dashboardReadinessIsStale(currentPlan) ? [] : currentPlan?.targets.filter((row) => row.status === 'ready' && !row.deploymentJobId).map((row) => row.targetId) || [];
+  const readyTargetIds = checkingReadiness || dashboardReadinessIsStale(currentPlan) ? [] : currentPlan?.targets.filter((row) => row.status === 'ready' && !row.deploymentJobId && dashboardPackageReviewComplete(row.package, reviewedPackages[row.targetId])).map((row) => row.targetId) || [];
   const selectedReadyTargetIds = (draft.selectedTargetIds || []).filter((id) => readyTargetIds.includes(id));
+  const confirmationKey = JSON.stringify([packageReviewKey, selectedReadyTargetIds]);
+  const confirmDestinationAudience = deploymentConfirmations.key === confirmationKey && deploymentConfirmations.audience;
+  const confirmDependencies = deploymentConfirmations.key === confirmationKey && deploymentConfirmations.dependencies;
   const heldTargetCount = draft.destinations.length - selectedReadyTargetIds.length;
   const selectedDocumentIds = useMemo(() => new Set(draft.selectedDocumentIds), [draft.selectedDocumentIds]);
   const filteredDocuments = useMemo(() => {
@@ -361,24 +385,30 @@ export function DashboardSafeCopyFlow() {
     const ids = new Set([document.id, document.identifier].filter((value): value is string => Boolean(value)));
     return [...ids].map((id) => [id, document.name]);
   })), [documents]);
-  const progress = useMemo(() => job ? dashboardSafeCopyJobProgress(job, {
+  const packageResults = useMemo(() => job ? readDashboardPackageResults(job) : null, [job]);
+  const packageCreatedCounts = packageResults === null ? null : dashboardPackageCreatedCounts(packageResults);
+  const packageVerificationContext = JSON.stringify([job?.id, draft.requestId, connection.instanceId, vaultReviewEpoch, vaultStatus?.unlocked]);
+  const packageVerificationContextRef = useRef(packageVerificationContext);
+  packageVerificationContextRef.current = packageVerificationContext;
+  const progress = useMemo(() => job && packageResults === null ? dashboardSafeCopyJobProgress(job, {
     defaultDocumentLimit: 0,
     sourceLabelByDocumentId,
     documentLimitByTarget: expandedProgressTargetId ? {
       [expandedProgressTargetId]: visibleProgressDocuments[expandedProgressTargetId] || PROGRESS_DOCUMENT_PAGE_SIZE,
     } : {},
-  }) : [], [expandedProgressTargetId, job, sourceLabelByDocumentId, visibleProgressDocuments]);
+  }) : [], [expandedProgressTargetId, job, packageResults, sourceLabelByDocumentId, visibleProgressDocuments]);
   const strictlyVerifiedMove = Boolean(
     job
-    && job.status === 'succeeded'
+    && (packageResults !== null ? dashboardPackageResultsVerified(job, packageResults) : (
+    job.status === 'succeeded'
     && (job.targets?.length || 0) > 0
     && progress.length === job.targets?.length
-    && progress.every((target) => target.phase === 'succeeded'),
+    && progress.every((target) => target.phase === 'succeeded'))),
   );
-  const globalReconciliationHold = job?.details?.safeCopyExecutionState === 'reconciliation_required'
-    || progress.some((target) => target.blocksNewScope);
-  const globalEvidenceHold = progress.some((target) => target.globalHold);
-  const unresolvedWriteEvidence = globalReconciliationHold || progress.some((target) => (
+  const globalReconciliationHold = packageResults !== null ? packageResults.some((target) => target.status === 'uncertain')
+    : job?.details?.safeCopyExecutionState === 'reconciliation_required' || progress.some((target) => target.blocksNewScope);
+  const globalEvidenceHold = packageResults !== null ? packageResults.length !== job?.targets?.length : progress.some((target) => target.globalHold);
+  const unresolvedWriteEvidence = globalReconciliationHold || Boolean(packageCreatedCounts?.pendingVerification) || (packageResults !== null && (globalEvidenceHold || packageResults.some((target) => target.status === 'waiting_approval'))) || progress.some((target) => (
     target.phase === 'copying'
     || target.phase === 'verifying'
     || target.phase === 'reconciliation_required'
@@ -388,10 +418,19 @@ export function DashboardSafeCopyFlow() {
     && isDashboardSafeCopyTerminal(job.status)
     && !unresolvedWriteEvidence,
   );
-  const displayedJobStatus = globalReconciliationHold
+  const packageRunning = packageResults !== null && (job?.status === 'pending' || job?.status === 'running');
+  const displayedJobStatus = verifyingPackageDocuments.length > 0
+    ? { label: 'Verifying existing copy', chip: 'in_progress' }
+    : packageRunning
+    ? { label: packageResults?.length === 0 ? 'Preparing dashboard package' : 'Deploying dashboard package', chip: 'in_progress' }
+    : packageCreatedCounts && packageCreatedCounts.pendingVerification > 0
+    ? { label: 'Dashboard created · verification pending', chip: 'warning' }
+    : globalReconciliationHold
     ? { label: 'Reconciliation required', chip: 'warning' }
     : globalEvidenceHold
     ? { label: 'Verification evidence incomplete', chip: 'warning' }
+    : packageResults?.some((target) => target.status === 'waiting_approval')
+    ? { label: 'Awaiting model approval', chip: 'warning' }
     : job?.status === 'succeeded' && !strictlyVerifiedMove
     ? { label: 'Verification evidence incomplete', chip: 'warning' }
     : job ? { label: jobStatusLabel(job), chip: jobStatusChip(job) } : undefined;
@@ -420,6 +459,35 @@ export function DashboardSafeCopyFlow() {
   }, [job?.id]);
 
   useEffect(() => {
+    if (!checkingReadiness && !savingPlanTargetId && !topicRepairBusy) return;
+    setPackageReviewReceipts({ key: '', fingerprints: {} });
+    setDeploymentConfirmations({ key: '', audience: false, dependencies: false });
+  }, [checkingReadiness, savingPlanTargetId, topicRepairBusy]);
+
+  useEffect(() => {
+    packageVerificationAbortRef.current?.abort();
+    packageVerificationAbortRef.current = null;
+    setVerifyingPackageDocuments([]);
+    return () => { packageVerificationAbortRef.current?.abort(); };
+  }, [packageVerificationContext]);
+
+  useEffect(() => {
+    const invalidate = () => {
+      packageVerificationAbortRef.current?.abort();
+      setVaultReviewEpoch((epoch) => epoch + 1);
+      setPackageReviewReceipts({ key: '', fingerprints: {} });
+      setDeploymentConfirmations({ key: '', audience: false, dependencies: false });
+    };
+    const stopLocked = onVaultLocked(() => { invalidate(); setVaultStatus((status) => status ? { ...status, unlocked: false } : status); });
+    const stopChanged = onVaultChanged(invalidate);
+    return () => { stopLocked(); stopChanged(); };
+  }, []);
+
+  useEffect(() => {
+    if (packageResults !== null) {
+      setProgressAnnouncement(packageResults.map((target) => `${target.stage}: ${target.message || target.status.replace(/_/g, ' ')}.`).join(' '));
+      return;
+    }
     if (!job) {
       announcedProgressRef.current = { jobId: '', values: new Map() };
       setProgressAnnouncement('');
@@ -457,7 +525,7 @@ export function DashboardSafeCopyFlow() {
       const remaining = changes.length - visible.length;
       setProgressAnnouncement(`${visible.join(' ')}${remaining > 0 ? ` ${remaining} more status changes.` : ''}`);
     }
-  }, [job, progress]);
+  }, [job, packageResults, progress]);
 
   useEffect(() => {
     writeDashboardSafeCopyDraft(draft);
@@ -1162,6 +1230,7 @@ export function DashboardSafeCopyFlow() {
   function resolveInModelMigrator(targetId: string) {
     if (!currentPlan || checkingReadiness || savingPlanTargetId) return;
     writeDashboardSafeCopyDraft(draft);
+    if (currentPlan.packageVersion === 1) { navigate('/models/migrate'); return; }
     navigate('/models/migrate', { state: { version: 2, source: 'dashboard_deployment_plan', planId: currentPlan.id, targetId } });
   }
 
@@ -1204,11 +1273,16 @@ export function DashboardSafeCopyFlow() {
       setError('Check readiness and explicitly select at least one ready destination before deploying.');
       return;
     }
+    if (!vaultStatus?.unlocked || !confirmDestinationAudience || !confirmDependencies) {
+      setError('Review the current package, then confirm its dependency changes and the destination audience before deploying.');
+      return;
+    }
     if (draft.selectedDocumentIds.length * draft.destinations.length > DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS) {
       setError(`Reduce the move to ${DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS.toLocaleString()} dashboard-destination copies or fewer.`);
       return;
     }
     submitGuardRef.current = true;
+    setDeploymentConfirmations({ key: '', audience: false, dependencies: false });
     setSubmitting(true);
     setError('');
     setMessage('Starting the selected ready destinations...');
@@ -1217,7 +1291,7 @@ export function DashboardSafeCopyFlow() {
     dispatchDraft({ type: 'prepare_deployment', deploymentRequestId });
     writeDashboardSafeCopyDraft(requestDraft);
     try {
-      const response = await deployDashboardDeploymentPlan(currentPlan.id, currentPlan.revision, selectedReadyTargetIds, deploymentRequestId);
+      const response = await deployDashboardDeploymentPlan(currentPlan.id, currentPlan.revision, selectedReadyTargetIds, deploymentRequestId, { confirmDestinationAudience: true, confirmDependencies: true });
       if (!isDashboardSafeCopyJobForRequest(response.job, deploymentRequestId)
         || !sameDocumentScope(response.job.documentIds, currentPlan.intent.source.documentIds)
         || !sameDocumentScope((response.job.targets || []).map((row) => row.id), selectedReadyTargetIds)) {
@@ -1242,8 +1316,22 @@ export function DashboardSafeCopyFlow() {
     }
   }
 
+  async function checkPackageResults() {
+    if (!job || checkingPackageResults) return;
+    const jobId = job.id;
+    setCheckingPackageResults(true);
+    try {
+      const response = await getMigrationJob(jobId);
+      if (jobRef.current?.id !== jobId) return;
+      if (response.job.id !== jobId || !isDashboardSafeCopyJobForRequest(response.job, draft.requestId)) throw new Error('The refreshed result did not match this deployment.');
+      if (shouldApplyDashboardSafeCopyJobSnapshot(jobRef.current, response.job)) { jobRef.current = response.job; setJob(response.job); }
+    } catch (resultError) {
+      if (jobRef.current?.id === jobId) setError(resultError instanceof Error ? resultError.message : 'Could not check the latest package result.');
+    } finally { setCheckingPackageResults(false); }
+  }
+
   async function retryTarget(targetId: string) {
-    if (!job || retryGuardRef.current.has(targetId)) return;
+    if (!job || retryGuardRef.current.has(targetId) || packageVerificationAbortRef.current) return;
     retryGuardRef.current.add(targetId);
     setRetryingTargetIds((current) => [...current, targetId]);
     setError('');
@@ -1258,12 +1346,40 @@ export function DashboardSafeCopyFlow() {
         setJob(response.job);
       }
       setTrackingRevision((revision) => revision + 1);
-      setMessage('Destination retry accepted. OmniKit will reconcile prior evidence before any new write.');
+      setMessage(packageResults !== null ? 'Package continuation accepted. Prior results will be checked before unfinished approved work continues.' : 'Destination retry accepted. OmniKit will reconcile prior evidence before any new write.');
     } catch (retryError) {
       setError(retryError instanceof Error ? retryError.message : 'Could not retry this destination.');
     } finally {
       retryGuardRef.current.delete(targetId);
       setRetryingTargetIds((current) => current.filter((id) => id !== targetId));
+    }
+  }
+
+  async function verifyExistingCopy(targetId: string, sourceDocumentId: string) {
+    if (!job || !vaultStatus?.unlocked || packageVerificationAbortRef.current || retryGuardRef.current.size > 0) return;
+    const document = packageResults?.find(target => target.targetId === targetId)?.documents.find(row => row.sourceDocumentId === sourceDocumentId);
+    if (!document || !dashboardPackageCopyCanVerify(document)) return;
+    const context = packageVerificationContext;
+    const controller = new AbortController();
+    packageVerificationAbortRef.current = controller;
+    setVerifyingPackageDocuments([JSON.stringify([targetId, sourceDocumentId])]);
+    setError(''); setMessage('Verifying the retained dashboard copy; it will not be imported again. Remaining approved destination work may continue.');
+    try {
+      const response = await verifyExistingDashboardPackageCopy(job.id, targetId, sourceDocumentId, newDashboardSafeCopyRequestId(), controller.signal);
+      if (controller.signal.aborted || packageVerificationContextRef.current !== context || jobRef.current?.id !== job.id) return;
+      if (response.job.id !== job.id || !isDashboardSafeCopyJobForRequest(response.job, draft.requestId)) throw new Error('The verification response did not match this deployment.');
+      if (shouldApplyDashboardSafeCopyJobSnapshot(jobRef.current, response.job, { allowTerminalReopen: true })) {
+        jobRef.current = response.job; setJob(response.job);
+      }
+      setTrackingRevision(revision => revision + 1);
+      setMessage('The existing-copy verification result is shown below. No second import of this dashboard was requested.');
+    } catch (verificationError) {
+      if (!controller.signal.aborted && packageVerificationContextRef.current === context) {
+        setError(verificationError instanceof Error ? verificationError.message : 'The existing copy could not be verified.');
+        setMessage('The existing dashboard is retained. Check its latest result before any further action.');
+      }
+    } finally {
+      if (packageVerificationAbortRef.current === controller) { packageVerificationAbortRef.current = null; setVerifyingPackageDocuments([]); }
     }
   }
 
@@ -1343,7 +1459,7 @@ export function DashboardSafeCopyFlow() {
       && hasVerifiedDashboardSelection(documents, draft.selectedDocumentIds, draft.sourceConnectionId))),
   );
   const destinationsReady = draft.destinations.length > 0
-    && draft.destinations.every((row) => row.connectionId && row.modelId);
+    && draft.destinations.every((row) => row.connectionId && row.modelId && (row.folderId || row.folderPath));
 
   if (loading && !job) {
     return (
@@ -1664,7 +1780,7 @@ export function DashboardSafeCopyFlow() {
                     <div className="mb-1.5 text-xs font-semibold text-content-secondary">Model</div>
                     <ComboBox options={modelOptions.map((model) => ({ value: model.id, label: modelDisplayLabel(model), subtitle: model.connectionName || model.connectionId }))} value={destination.modelId} onChange={(value) => setDestinationModel(destination.targetId, value)} allowFreeText={false} ariaLabel={`${rowLabel} model`} disabled={!destination.connectionId || catalog.loading} placeholder={destination.connectionId ? 'Choose model' : 'Choose connection first'} emptyLabel="No shared models for this connection" optionLayout="stacked" />
                   </div>
-                  <DestinationFolderPicker rowLabel={rowLabel} folderId={destination.folderId} folderPath={destination.folderPath} disabled={!instance}
+                  <DestinationFolderPicker required rowLabel={rowLabel} folderId={destination.folderId} folderPath={destination.folderPath} disabled={!instance}
                     catalog={instance ? destinationFolders.catalogs[destinationFolderCacheKey(instance)] || EMPTY_FOLDER_CATALOG : EMPTY_FOLDER_CATALOG}
                     onLoad={(force) => { if (instance) void destinationFolders.load(instance, force); }} onChange={(patch) => updateDestination(destination.targetId, patch)} />
                 </div>
@@ -1684,9 +1800,9 @@ export function DashboardSafeCopyFlow() {
           )}
           <div className="card p-5">
             <p className="text-xs leading-5 text-content-secondary">Copies receive distinct names when needed. {DESTINATION_ACCESS_NOTICE}</p>
-            <div className="mt-4 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <button type="button" onClick={() => goToStep(0)} className="btn-secondary justify-center"><ArrowLeft size={15} aria-hidden="true" />Back</button>
-              <button type="button" onClick={() => { goToStep(2); if (!currentPlan) void checkReadiness(); }} disabled={!destinationsReady || !sourceReady} className="btn-primary justify-center">Review readiness<ArrowRight size={15} aria-hidden="true" /></button>
+              <button type="button" onClick={() => { goToStep(2); if (!currentPlan) void checkReadiness(); }} disabled={!destinationsReady || !sourceReady} className="btn-primary justify-center">Review package<ArrowRight size={15} aria-hidden="true" /></button>
             </div>
           </div>
         </section>
@@ -1695,8 +1811,12 @@ export function DashboardSafeCopyFlow() {
       {draft.step === 2 && !draft.jobId && (
         <section className="space-y-5" aria-labelledby="safe-copy-readiness-heading">
           <div className="card p-5">
-            <h2 ref={headingRef} tabIndex={-1} id="safe-copy-readiness-heading" className="text-lg font-semibold text-content-primary">Review readiness</h2>
-            <p className="mt-1 text-sm leading-6 text-content-secondary">Review source definitions, any destination topic choices, and remaining evidence gaps. Workbook-local definitions stay local; copying them is unavailable until workbook-copy capability is verified. Model Migrator reviews shared-model repairs only.</p>
+            <h2 ref={headingRef} tabIndex={-1} id="safe-copy-readiness-heading" className="text-lg font-semibold text-content-primary">Review package</h2>
+            {currentPlan && currentPlan.packageVersion !== 1 && <div className="mt-3 rounded-card border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
+              <p>This saved plan uses the previous workflow. It remains available for recovery; start a new package plan to copy dashboards and dependencies in one flow.</p>
+              <button type="button" className="btn-secondary btn-sm mt-2" disabled={checkingReadiness || Boolean(savingPlanTargetId)} onClick={startAnotherMove}>Start a new package plan</button>
+            </div>}
+            <p className="mt-1 text-sm leading-6 text-content-secondary">Review what travels with the dashboards, the missing destination definitions to add, and any decisions needed. Then recheck readiness, include ready destinations, and continue. Workbook-local definitions stay with their dashboards; Model Migrator is optional for transformations or conflicts.</p>
             <div className="mt-5">
               <DashboardReadinessReview
                 plan={currentPlan}
@@ -1706,6 +1826,9 @@ export function DashboardSafeCopyFlow() {
                 onCancel={readinessStartedAt !== null ? cancelReadiness : undefined}
                 savingTargetId={savingPlanTargetId}
                 selectedTargetIds={selectedReadyTargetIds}
+                reviewedPackages={reviewedPackages}
+                reviewContextKey={packageReviewKey}
+                onPackageReviewed={recordPackageReview}
                 destinationLabels={Object.fromEntries(draft.destinations.map((destination) => {
                   const catalog = destinationCatalogs[destination.instanceId];
                   const model = catalog?.models.find((row) => row.id === destination.modelId);
@@ -1737,7 +1860,7 @@ export function DashboardSafeCopyFlow() {
               />
             </div>
           </div>
-          <div className="card flex flex-col-reverse gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
+          <div className="card flex flex-col gap-3 p-5 sm:flex-row sm:items-center sm:justify-between">
             <button type="button" onClick={() => goToStep(1)} disabled={checkingReadiness || topicRepairBusy || Boolean(savingPlanTargetId)} className="btn-secondary justify-center"><ArrowLeft size={15} aria-hidden="true" />Back to destinations</button>
             <button type="button" onClick={() => goToStep(3)} disabled={checkingReadiness || topicRepairBusy || Boolean(savingPlanTargetId) || selectedReadyTargetIds.length === 0} className="btn-primary justify-center">Review deployment ({selectedReadyTargetIds.length})<ArrowRight size={15} aria-hidden="true" /></button>
           </div>
@@ -1802,11 +1925,12 @@ export function DashboardSafeCopyFlow() {
                     Existing content is not replaced or deleted. {DESTINATION_ACCESS_NOTICE}
                   </div>
                 </div>
-                <div className="mt-5 flex flex-col-reverse gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <DashboardPackageConfirmations audience={confirmDestinationAudience} dependencies={confirmDependencies} disabled={submitting || checkingReadiness || selectedReadyTargetIds.length === 0} onChange={(field, checked) => setDeploymentConfirmations((previous) => ({ ...(previous.key === confirmationKey ? previous : { key: confirmationKey, audience: false, dependencies: false }), [field]: checked }))} />
+                <div className="mt-5 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                   <button type="button" onClick={() => goToStep(2)} disabled={submitting} className="btn-secondary justify-center">
                     <ArrowLeft size={15} aria-hidden="true" /> Back
                   </button>
-                  <button type="button" onClick={() => void startMove()} disabled={submitting || checkingReadiness || Boolean(savingPlanTargetId) || !currentPlan || selectedReadyTargetIds.length === 0} className="btn-primary justify-center">
+                  <button type="button" onClick={() => void startMove()} disabled={submitting || checkingReadiness || Boolean(savingPlanTargetId) || !currentPlan || selectedReadyTargetIds.length === 0 || !confirmDestinationAudience || !confirmDependencies} className="btn-primary justify-center">
                     {submitting ? <Loader2 size={15} className="motion-safe:animate-spin" aria-hidden="true" /> : <FolderInput size={15} aria-hidden="true" />}
                     {submitting ? 'Starting deployment…' : `Deploy to ${selectedReadyTargetIds.length} destination${selectedReadyTargetIds.length === 1 ? '' : 's'}`}
                   </button>
@@ -1818,12 +1942,13 @@ export function DashboardSafeCopyFlow() {
               <div className="mt-5 rounded-card border border-border bg-surface-secondary p-4">
                 {globalReconciliationHold && (
                   <div role="alert" className="mb-3 rounded-card border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-950">
-                    This move is paused for reconciliation. Retry the affected destination before starting another move.
+                    {packageResults !== null ? 'This package has an uncertain outcome. Check its latest result before taking further action; do not submit another copy.' : 'This move is paused for reconciliation. Retry the affected destination before starting another move.'}
                   </div>
                 )}
                 <p className="text-xs leading-5 text-content-secondary">
-                  Each destination advances independently through prepare, copy, verify, and complete.
+                  {packageResults !== null ? 'Each destination reports its actual package stage and readback result. Awaiting approval and uncertain outcomes are not completed deployments.' : 'Each destination advances independently through prepare, copy, verify, and complete.'}
                 </p>
+                {packageResults !== null && <button type="button" className="btn-secondary btn-sm mt-3" disabled={checkingPackageResults} onClick={() => void checkPackageResults()}>{checkingPackageResults ? 'Checking latest results…' : 'Check latest results'}</button>}
                 <details className="mt-3 text-xs text-content-secondary">
                   <summary className="cursor-pointer font-semibold">Technical details</summary>
                   <div className="mt-2 break-all font-mono text-[10px] text-content-primary">Job {job.id}</div>
@@ -1832,7 +1957,8 @@ export function DashboardSafeCopyFlow() {
             )}
           </div>
 
-          {job && progress.map((target, targetIndex) => {
+          {job && packageResults !== null && <DashboardPackageResults key={`${job.id}:${vaultReviewEpoch}`} results={packageResults} running={packageRunning} disabled={!vaultStatus?.unlocked} onContinue={(targetId) => void retryTarget(targetId)} continuingTargetIds={retryingTargetIds} onVerifyExisting={(targetId, sourceDocumentId) => void verifyExistingCopy(targetId, sourceDocumentId)} verifyingDocumentKeys={verifyingPackageDocuments} destinations={Object.fromEntries((job.targets || []).map((target) => [target.id, { label: instanceById.get(target.destinationInstanceId)?.label || target.destinationInstanceId, baseUrl: instanceById.get(target.destinationInstanceId)?.baseUrl }]))} />}
+          {job && packageResults === null && progress.map((target, targetIndex) => {
             const retrying = retryingTargetIds.includes(target.targetId);
             const actions = dashboardSafeCopyTargetActions(target);
             const destinationInstance = instanceById.get(target.destinationId);
@@ -2039,8 +2165,8 @@ export function DashboardSafeCopyFlow() {
                   </h3>
                   <p className="mt-1 text-sm text-content-secondary">
                     {strictlyVerifiedMove
-                      ? `The deployed dashboards passed content, query, and direct-access verification. ${DESTINATION_ACCESS_NOTICE}`
-                      : 'Successful destinations are preserved. Only destinations shown above as needing attention should be retried or opened in Model Migrator.'}
+                      ? packageResults !== null ? 'All included dashboard packages have verified readback results. Review the destination audience and business behavior before treating the migration as accepted.' : `The deployed dashboards passed content, query, and direct-access verification. ${DESTINATION_ACCESS_NOTICE}`
+                      : packageResults !== null ? 'Review the package results above. Verified destinations are preserved; uncertain outcomes require inspection before any further copy.' : 'Successful destinations are preserved. Only destinations shown above as needing attention should be retried or opened in Model Migrator.'}
                   </p>
                 </div>
               </div>

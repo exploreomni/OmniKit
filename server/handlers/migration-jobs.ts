@@ -1,6 +1,6 @@
 import { jsonHeaders, sseHeaders } from '../security';
 import { previewDashboardTopicRepair, approveDashboardTopicRepair } from '../services/dashboardTopicRepair';
-import { createDashboardDeploymentPlan, getDashboardDeploymentPlan, recheckDashboardDeploymentPlan, deployDashboardDeploymentPlan, linkDashboardModelRepair, updateDashboardDeploymentPlan } from '../services/dashboardDeploymentPlans';
+import { createDashboardDeploymentPlan, getDashboardDeploymentPlan, recheckDashboardDeploymentPlan, deployDashboardDeploymentPlan, linkDashboardModelRepair, updateDashboardDeploymentPlan, previewDashboardDeploymentPackage } from '../services/dashboardDeploymentPlans';
 import { createDashboardReadinessContext, dashboardReadinessStream, type DashboardReadinessRunContext } from '../services/dashboardReadinessControl';
 import type { DashboardDeploymentPlan } from '../../shared/dashboardDeploymentPlan';
 import {
@@ -50,7 +50,9 @@ import {
   retryDashboardSafeCopyJobTarget,
   type DashboardSafeCopyRuntimeResult,
   withDashboardSafeCopyClientEvidence,
+  dashboardSafeCopyIntentFromJob,
 } from '../services/dashboardSafeCopyRuntime';
+import { verifyDashboardPackageImport } from '../services/dashboardPackageRuntime';
 import {
   isDashboardSafeCopyV1Enabled,
   isLegacyDashboardMigratorInternalEnabled,
@@ -152,6 +154,13 @@ function clientJob(job: MigrationJob): MigrationJob {
 
 function safeCopyHistoryIdentity(job: MigrationJob): MigrationJob {
   if (!isDashboardSafeCopyJob(job)) return job;
+  const packageResults = job.details?.dashboardPackageResults;
+  const packageDocuments = Array.isArray(packageResults) ? packageResults.flatMap(row => Array.isArray(row.documents) ? row.documents : []) : [];
+  const packageReceipts = job.details?.dashboardPackageReceipts as Record<string, { imports?: Record<string, { imported?: boolean; documentId?: string; identifier?: string }> }> | undefined;
+  const createdCount = packageReceipts && typeof packageReceipts === 'object' ? Object.values(packageReceipts)
+    .flatMap(row => row?.imports && typeof row.imports === 'object' ? Object.values(row.imports) : [])
+    .filter(row => row?.imported === true && typeof row.documentId === 'string' && typeof row.identifier === 'string').length : 0;
+  const verifiedCount = packageDocuments.filter(row => row.status === 'verified').length;
   return {
     id: job.id,
     workflow: 'dashboard',
@@ -172,6 +181,10 @@ function safeCopyHistoryIdentity(job: MigrationJob): MigrationJob {
       operationMode: 'safe_copy',
       safeCopyRequestId: job.details?.safeCopyRequestId,
       safeCopyEvidenceRevision: job.details?.safeCopyEvidenceRevision,
+      ...((job.details?.safeCopyDeployment as { packageCopy?: unknown } | undefined)?.packageCopy ? { dashboardPackageHistorySummary: {
+        version: 1, dashboardCount: job.documentIds.length, targetCount: job.targets?.length || 0, stepCount: job.items.length,
+        createdCount, verifiedCount, pendingVerificationCount: Math.max(0, createdCount - verifiedCount),
+      } } : {}),
     },
     items: [],
   };
@@ -590,10 +603,15 @@ export async function migrationJobsHandler(
       if (req.method === 'POST' && parts.length === 3 && parts[2] === 'recheck') {
         return await readinessResponse((run) => recheckDashboardDeploymentPlan(id, run));
       }
+      if (req.method === 'POST' && parts.length === 3 && parts[2] === 'package-preview') {
+        const body = await safeCopyBodyJson(req) as Record<string, unknown>;
+        return json(await previewDashboardDeploymentPackage(id, { revision: Number(body.revision), targetId: String(body.targetId || '') }, req.signal));
+      }
       if (req.method === 'POST' && parts.length === 3 && parts[2] === 'deploy') {
         const body = await bodyJson(req);
         const result = await deployDashboardDeploymentPlan(id, {
           revision: Number(body.revision), targetIds: body.targetIds as string[], requestId: String(body.requestId || ''),
+          confirmDestinationAudience: body.confirmDestinationAudience === true, confirmDependencies: body.confirmDependencies === true,
         }, dependencies.safeCopyPreparation === undefined ? prepareAndRunDashboardSafeCopyJob : dependencies.safeCopyPreparation, req.signal);
         return json({ ...result, job: clientJob(result.job) });
       }
@@ -682,8 +700,10 @@ export async function migrationJobsHandler(
       && parts.length === 4
       && parts[1] === 'targets'
       && parts[3] === 'retry';
+    const isPackageImportVerification = req.method === 'POST' && parts.length === 4
+      && parts[1] === 'targets' && parts[3] === 'verify-import';
     if (
-      (isSafeCopyStart || isSafeCopyTargetRetry)
+      (isSafeCopyStart || isSafeCopyTargetRetry || isPackageImportVerification)
       && !isDashboardSafeCopyV1Enabled()
     ) {
       return json({ error: 'Safe-copy workflow is not enabled.' }, 404);
@@ -719,6 +739,28 @@ export async function migrationJobsHandler(
 
     const locked = requireUnlocked();
     if (locked) return locked;
+
+    if (isPackageImportVerification) {
+      const job = getJob(parts[0]);
+      if (!job || !isDashboardSafeCopyJob(job)) return json({ error: 'Dashboard package job not found.' }, 404);
+      try {
+        const raw = await safeCopyBodyJson(req);
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new DashboardSafeCopyError('SAFE_COPY_INVALID_BODY', 'Verification requires a JSON object.');
+        const body = raw as Record<string, unknown>;
+        if (Object.keys(body).some(key => !['requestId', 'sourceDocumentId'].includes(key)) || url.searchParams.size) {
+          throw new DashboardSafeCopyError('SAFE_COPY_UNKNOWN_FIELD', 'Verification contains an unsupported field or query parameter.');
+        }
+        const requestId = parseSafeCopyRetryRequest({ requestId: body.requestId });
+        if (typeof body.sourceDocumentId !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(body.sourceDocumentId)) {
+          throw new DashboardSafeCopyError('SAFE_COPY_INVALID_BODY', 'An exact source dashboard identity is required.');
+        }
+        const result = await verifyDashboardPackageImport(job.id, dashboardSafeCopyIntentFromJob(job), parts[2], body.sourceDocumentId, requestId);
+        return json({ job: clientJob(result.job) });
+      } catch (error) {
+        if (isDashboardSafeCopyError(error)) return json({ error: error.message, code: error.code }, error.statusCode);
+        throw error;
+      }
+    }
 
     if (req.method === 'POST' && parts.length === 2 && parts[1] === 'mutation-adjudications') {
       try {

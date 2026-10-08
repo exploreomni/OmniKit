@@ -1,3 +1,5 @@
+import { isDashboardPackageBindingMapping, type DashboardPackageBindingMapping } from './dashboardPackageBindings';
+
 export const DASHBOARD_SAFE_COPY_PROFILE = 'safe_copy_v1' as const;
 export const DASHBOARD_SAFE_COPY_RESOLVER_VERSION = 'safe-copy-resolver-v1' as const;
 
@@ -52,6 +54,12 @@ export interface DashboardSafeCopyDeployment {
   modelHashes: Record<string, string>;
   sourceModelHashes?: Record<string, string>;
   workbookCopies?: Record<string, DashboardSafeCopyWorkbookEvidence>;
+  packageCopy?: {
+    version: 1;
+    targetFingerprints: Record<string, string>;
+    confirmDestinationAudience: true;
+    confirmDependencies: true;
+  };
 }
 
 export interface DashboardSafeCopyDestination {
@@ -64,6 +72,7 @@ export interface DashboardSafeCopyDestination {
   topicMappings?: DashboardSafeCopyTopicMapping[];
   queryViewMappings?: DashboardSafeCopyQueryViewMapping[];
   workbookCopy?: DashboardSafeCopyWorkbookCopy;
+  bindingMappings?: DashboardPackageBindingMapping[];
 }
 
 export interface DashboardSafeCopyIntent {
@@ -76,6 +85,7 @@ export interface DashboardSafeCopyIntent {
 }
 
 export type DashboardSafeCopyErrorCode =
+  | 'PACKAGE_IMPORT_RECONCILIATION_REQUIRED'
   | 'SAFE_COPY_INVALID_BODY'
   | 'SAFE_COPY_UNKNOWN_FIELD'
   | 'SAFE_COPY_INVALID_PROFILE'
@@ -198,7 +208,7 @@ function parseDestination(value: unknown, index: number, contentOnly = false): D
   }
   assertOnlyKeys(
     value,
-    ['targetId', 'instanceId', 'connectionId', 'modelId', 'folderId', 'folderPath', 'topicMappings', 'queryViewMappings', 'workbookCopy'],
+    ['targetId', 'instanceId', 'connectionId', 'modelId', 'folderId', 'folderPath', 'topicMappings', 'queryViewMappings', 'workbookCopy', 'bindingMappings'],
     `destinations[${index}]`,
   );
   const destination: DashboardSafeCopyDestination = {
@@ -211,6 +221,17 @@ function parseDestination(value: unknown, index: number, contentOnly = false): D
   const folderPath = optionalFolderPath(value.folderPath);
   if (folderId) destination.folderId = folderId;
   if (folderPath) destination.folderPath = folderPath;
+  if (value.bindingMappings !== undefined) {
+    if (!contentOnly || !Array.isArray(value.bindingMappings) || value.bindingMappings.length > 500
+      || value.bindingMappings.some(mapping => !isDashboardPackageBindingMapping(mapping))
+      || new Set(value.bindingMappings.map(mapping => mapping.sourceFileName)).size !== value.bindingMappings.length
+      || new Set(value.bindingMappings.map(mapping => mapping.targetFileName)).size !== value.bindingMappings.length) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'Database/schema choices must be a bounded list of unique, exact reviewed view bindings.');
+    }
+    destination.bindingMappings = value.bindingMappings.map(mapping => ({ sourceFileName: mapping.sourceFileName,
+      targetFileName: mapping.targetFileName, source: { ...mapping.source }, destination: { ...mapping.destination } }))
+      .sort((a, b) => compareCanonicalStrings(a.sourceFileName, b.sourceFileName));
+  }
   if (value.workbookCopy !== undefined) {
     if (!contentOnly || !isRecord(value.workbookCopy)) {
       throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DESTINATION', 'Workbook-local copy requires a reviewed deployment plan and an explicit staging folder.');
@@ -279,6 +300,7 @@ function destinationCanonicalKey(destination: DashboardSafeCopyDestination): str
     ...(destination.topicMappings ? { topicMappings: destination.topicMappings } : {}),
     ...(destination.queryViewMappings ? { queryViewMappings: destination.queryViewMappings } : {}),
     ...(destination.workbookCopy ? { workbookCopy: destination.workbookCopy } : {}),
+    ...(destination.bindingMappings ? { bindingMappings: destination.bindingMappings } : {}),
   });
 }
 
@@ -340,7 +362,7 @@ export function parseDashboardSafeCopyDeploymentEvidence(
   if (!isRecord(value) || value.version !== 2) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Deployment must contain version 2 preflight evidence.');
   }
-  assertOnlyKeys(value, ['version', 'planId', 'sourceHashes', 'modelHashes', 'sourceModelHashes', 'workbookCopies'], 'deployment');
+  assertOnlyKeys(value, ['version', 'planId', 'sourceHashes', 'modelHashes', 'sourceModelHashes', 'workbookCopies', 'packageCopy'], 'deployment');
   const hashes = (input: unknown, expectedIds: string[], label: string): Record<string, string> => {
     if (!isRecord(input) || Object.keys(input).length !== expectedIds.length) {
       throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', `${label} must cover the exact approved scope.`);
@@ -400,6 +422,16 @@ export function parseDashboardSafeCopyDeploymentEvidence(
   if (destinations.some((destination) => destination.workbookCopy) && !Object.keys(workbookCopies || {}).length) {
     throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Workbook-local copy requires immutable authored workbook evidence.');
   }
+  let packageCopy: DashboardSafeCopyDeployment['packageCopy'];
+  if (value.packageCopy !== undefined) {
+    const item = value.packageCopy;
+    if (!isRecord(item) || item.version !== 1 || item.confirmDestinationAudience !== true || item.confirmDependencies !== true) {
+      throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Package deployment requires explicit dependency and destination-audience approval.');
+    }
+    assertOnlyKeys(item, ['version', 'targetFingerprints', 'confirmDestinationAudience', 'confirmDependencies'], 'packageCopy');
+    packageCopy = { version: 1, targetFingerprints: hashes(item.targetFingerprints, destinations.map(row => row.targetId), 'targetFingerprints'),
+      confirmDestinationAudience: true, confirmDependencies: true };
+  }
   return {
     version: 2,
     planId: requiredIdentifier(value.planId, 'deployment.planId', 'SAFE_COPY_INVALID_DEPLOYMENT'),
@@ -407,6 +439,7 @@ export function parseDashboardSafeCopyDeploymentEvidence(
     modelHashes: hashes(value.modelHashes, destinations.map((destination) => destination.targetId), 'modelHashes'),
     ...(sourceModelHashes ? { sourceModelHashes } : {}),
     ...(workbookCopies ? { workbookCopies } : {}),
+    ...(packageCopy ? { packageCopy } : {}),
   };
 }
 
@@ -425,6 +458,9 @@ function parseIntent(value: unknown, contentOnlyPreflight = false): DashboardSaf
   const source = parseSource(value.source);
   const destinations = parseDestinations(value.destinations, contentOnlyPreflight || value.deployment !== undefined);
   const deployment = value.deployment === undefined ? undefined : parseDashboardSafeCopyDeploymentEvidence(value.deployment, source, destinations);
+  if (!contentOnlyPreflight && destinations.some(destination => destination.bindingMappings?.length) && !deployment?.packageCopy) {
+    throw new DashboardSafeCopyError('SAFE_COPY_INVALID_DEPLOYMENT', 'Database/schema choices require reviewed dashboard-package deployment evidence.');
+  }
   if ((deployment || contentOnlyPreflight) && value.options !== undefined) {
     if (!isRecord(value.options) || Object.entries(value.options).some(([key, option]) => (
       !['emptyFirst', 'deleteSourceOnSuccess', 'refreshSchemaOnComplete'].includes(key) || option !== false
@@ -484,6 +520,9 @@ export function scopeDashboardSafeCopyIntent(
       modelHashes: Object.fromEntries(destinations.map((destination) => [
         destination.targetId, intent.deployment!.modelHashes[destination.targetId],
       ])),
+      ...(intent.deployment.packageCopy ? { packageCopy: { ...intent.deployment.packageCopy,
+        targetFingerprints: Object.fromEntries(destinations.map(destination => [destination.targetId, intent.deployment!.packageCopy!.targetFingerprints[destination.targetId]])),
+      } } : {}),
     } } : {}),
   };
 }

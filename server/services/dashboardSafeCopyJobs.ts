@@ -174,6 +174,7 @@ function storedIntent(job: MigrationJob): DashboardSafeCopyIntent | undefined {
         ...(target.targetFolderId ? { folderId: target.targetFolderId } : {}),
         ...(target.targetFolderPath ? { folderPath: target.targetFolderPath } : {}),
         ...(target.workbookCopy ? { workbookCopy: { ...target.workbookCopy } } : {}),
+        ...(target.bindingMappings ? { bindingMappings: structuredClone(target.bindingMappings) } : {}),
         ...(target.topicMappings?.length ? { topicMappings: target.topicMappings.map((mapping) => ({
           sourceTopicName: mapping.sourceTopicName, action: mapping.action, targetTopicName: mapping.targetTopicName,
         })) } : {}),
@@ -396,6 +397,7 @@ function migrationTargets(intent: DashboardSafeCopyIntent): MigrationTarget[] {
       targetFolderId: destination.folderId,
       targetFolderPath: destination.folderPath,
       ...(destination.workbookCopy ? { workbookCopy: { ...destination.workbookCopy } } : {}),
+      ...(destination.bindingMappings ? { bindingMappings: structuredClone(destination.bindingMappings) } : {}),
       ...(destination.topicMappings ? { topicMappings: destination.topicMappings.map((mapping) => ({ ...mapping })) } : {}),
       ...(destination.queryViewMappings ? { queryViewMappings: destination.queryViewMappings.map((mapping) => ({ ...mapping })) } : {}),
     };
@@ -580,6 +582,7 @@ export function createDashboardSafeCopyJob(
       safeCopyPreparationState: 'queued',
       safeCopyTargetCount: targets.length,
       ...(intent.deployment ? { safeCopyDeployment: intent.deployment } : {}),
+      ...(intent.deployment?.packageCopy ? { dashboardPackageResults: [], dashboardPackageReceipts: {} } : {}),
     },
     items: [],
   };

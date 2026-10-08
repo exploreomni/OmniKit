@@ -1,4 +1,4 @@
-import { parse } from 'yaml';
+import { isAlias, isMap, isNode, isScalar, isSeq, parseDocument, visit } from 'yaml';
 
 export type DashboardSourceFieldProvenance =
   | 'shared_authored' | 'workbook_local' | 'workbook_override' | 'inherited_unverified' | 'unverified';
@@ -8,6 +8,7 @@ export interface DashboardSourceFieldEvidence {
   provenance: DashboardSourceFieldProvenance;
   sourceModelId?: string;
   sourceFileName?: string;
+  sourceScope?: 'shared' | 'workbook';
   definition?: unknown;
   dependencies: string[];
   sharedWriteAllowed: boolean;
@@ -20,7 +21,7 @@ export interface DashboardSourceEvidence {
   requiredSharedFiles: string[];
   requiredWorkbookFiles: string[];
   blockedSharedWriteReferences: string[];
-  findings: Array<{ reference: string; message: string; sourceFileName?: string }>;
+  findings: Array<{ reference: string; message: string; sourceFileName?: string; sourceScope?: 'shared' | 'workbook'; causeCode?: string }>;
   unverified: boolean;
 }
 
@@ -40,6 +41,78 @@ export interface DashboardSourceReferenceContext {
 const FIELD_KEYS = new Set(['field', 'fieldName', 'field_name', 'column_name', 'columnName', 'fields', 'pivots', 'sorts', 'filters', 'filter', 'measures', 'dimensions', 'x', 'y', 'series']);
 const FIELD_PATTERN = /\b([A-Za-z_][\w/]*\.[A-Za-z_][\w]*(?:\[[A-Za-z_][\w]*\])?)\b/g;
 const MAX_REFERENCES = 5_000;
+const MAX_YAML_LENGTH = 5_000_000;
+
+type ParsedSourceYaml = { kind: 'empty' } | { kind: 'mapping'; value: Record<string, unknown> }
+  | { kind: 'relationships'; value: Record<string, unknown>[] };
+
+class SourceYamlEvidenceError extends Error {
+  constructor(readonly causeCode: string, message: string, readonly sourceFileName: string, readonly sourceScope: 'shared' | 'workbook') {
+    super(message);
+  }
+}
+
+/** Parsing never normalizes or replaces the complete authored strings returned to callers. */
+function parseSourceYaml(text: string, file: string, workbook: boolean): ParsedSourceYaml {
+  const scope = workbook ? 'workbook' : 'shared';
+  const reject = (code: string, message: string): never => { throw new SourceYamlEvidenceError(code, message, file, scope); };
+  if (text.length > MAX_YAML_LENGTH) reject('SOURCE_YAML_LIMIT', 'Source YAML exceeds the bounded file-size limit; review this file separately.');
+  let document;
+  try {
+    document = parseDocument(text, { uniqueKeys: true, strict: true, prettyErrors: false });
+  } catch {
+    return reject('SOURCE_YAML_MALFORMED', 'Source YAML syntax could not be parsed; correct this file before rechecking its definitions.');
+  }
+  if (document.errors.length) {
+    const offset = document.errors[0].pos?.[0];
+    const location = typeof offset === 'number' ? ` at line ${text.slice(0, offset).split('\n').length}` : '';
+    reject('SOURCE_YAML_MALFORMED', `Source YAML has invalid syntax${location}; correct this file before rechecking its definitions.`);
+  }
+  if (document.warnings.length) reject('SOURCE_YAML_UNSUPPORTED_FEATURE', 'Source YAML uses a tag or feature requiring explicit interpretation; it is not an empty file.');
+  let nodes = 0;
+  visit(document, (_key, node, path) => {
+    if (++nodes > 100_000 || path.length > 64) reject('SOURCE_YAML_LIMIT', 'Source YAML nesting or node count exceeds the bounded evidence scope.');
+    if (isAlias(node) || (isNode(node) && 'anchor' in node && node.anchor)) {
+      reject('SOURCE_YAML_UNSUPPORTED_FEATURE', 'Source YAML anchors or aliases require explicit interpretation before definitions can be verified.');
+    }
+    if (isNode(node) && node.tag && !['tag:yaml.org,2002:map', 'tag:yaml.org,2002:seq', 'tag:yaml.org,2002:str', 'tag:yaml.org,2002:null', 'tag:yaml.org,2002:bool', 'tag:yaml.org,2002:int', 'tag:yaml.org,2002:float'].includes(node.tag)) {
+      reject('SOURCE_YAML_UNSUPPORTED_FEATURE', 'Source YAML custom tags require explicit interpretation before definitions can be verified.');
+    }
+    if (isMap(node)) for (const pair of node.items) {
+      if (!isScalar(pair.key) || typeof pair.key.value !== 'string' || ['<<', '__proto__', 'constructor', 'prototype'].includes(pair.key.value)) {
+        reject('SOURCE_YAML_UNSUPPORTED_SHAPE', 'Source YAML requires ordinary string mapping keys; merge or structured keys need explicit review.');
+      }
+    }
+  });
+  if (!document.contents || (isScalar(document.contents) && document.contents.value === null)) return { kind: 'empty' };
+  const value: unknown = document.toJS({ maxAliasCount: 0 });
+  const relationshipList = (items: unknown): items is Record<string, unknown>[] => {
+    if (!Array.isArray(items)) return false;
+    const identities = new Set<string>();
+    for (const item of items) {
+      if (!record(item) || typeof item.join_from_view !== 'string' || !item.join_from_view.trim()
+        || typeof item.join_to_view !== 'string' || !item.join_to_view.trim()) return false;
+      const aliases: Array<[string, string]> = [];
+      for (const side of ['from', 'to']) {
+        const values = ['join_' + side + '_view_as', 'join_' + side + '_view_alias'].filter((key) => Object.hasOwn(item, key)).map((key) => item[key]);
+        if (values.some((alias) => typeof alias !== 'string' || !alias.trim() || alias !== alias.trim()) || new Set(values).size > 1) return false;
+        if (values.length) aliases.push([side, values[0] as string]);
+      }
+      const identity = JSON.stringify([item.join_from_view, item.join_to_view, aliases]);
+      if (identities.has(identity)) return false;
+      identities.add(identity);
+    }
+    return true;
+  };
+  if (file === 'relationships') {
+    if (isSeq(document.contents) && relationshipList(value)) return { kind: 'relationships', value };
+    if (record(value) && !Object.keys(value).length) return { kind: 'empty' };
+    if (record(value) && Object.keys(value).length === 1 && relationshipList(value.relationships)) return { kind: 'relationships', value: value.relationships };
+    return reject('SOURCE_YAML_UNSUPPORTED_SHAPE', 'The relationships file requires a relationship list with complete, unique view and alias identities; preserve unsupported shapes explicitly.');
+  }
+  if (!record(value)) return reject('SOURCE_YAML_UNSUPPORTED_SHAPE', `${file.endsWith('.view') ? 'A view' : 'This source'} file requires a YAML mapping, not a scalar or sequence; no definitions were inferred.`);
+  return { kind: 'mapping', value };
+}
 
 function record(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value);
@@ -130,9 +203,18 @@ export async function readDashboardSourceEvidence(input: {
     blockedSharedWriteReferences: [], findings: [], unverified: false,
   };
   let globallyUnverified = false;
-  const add = (reference: string, message: string, sourceFileName?: string, unverified = true) => {
-    result.findings.push({ reference, message, ...(sourceFileName ? { sourceFileName } : {}) });
+  const add = (reference: string, message: string, sourceFileName?: string, unverified = true,
+    details?: { sourceScope: 'shared' | 'workbook'; causeCode?: string }) => {
+    result.findings.push({ reference, message, ...(sourceFileName ? { sourceFileName } : {}), ...details });
     result.unverified ||= unverified;
+  };
+  const reportedYaml = new Set<string>();
+  const reportYaml = (error: SourceYamlEvidenceError) => {
+    const key = `${error.sourceScope}:${error.sourceFileName}`;
+    if (reportedYaml.has(key)) return;
+    reportedYaml.add(key);
+    add(error.sourceScope === 'workbook' ? 'workbook_overlay' : 'source_yaml', error.message, error.sourceFileName, true,
+      { sourceScope: error.sourceScope, causeCode: error.causeCode });
   };
   const read = async (modelId: string, workbook: boolean) => {
     try {
@@ -143,7 +225,8 @@ export async function readDashboardSourceEvidence(input: {
       globallyUnverified = true;
       add(workbook ? 'workbook_model' : 'shared_model', workbook
         ? 'Workbook extension YAML could not be verified; shared-model repair is not authorized.'
-        : 'Authored shared-model YAML could not be verified.');
+        : 'Authored shared-model YAML could not be verified.', undefined, true,
+      { sourceScope: workbook ? 'workbook' : 'shared', causeCode: 'SOURCE_YAML_READ_UNAVAILABLE' });
       return {};
     }
   };
@@ -156,17 +239,28 @@ export async function readDashboardSourceEvidence(input: {
       input.workbookModelId ? read(input.workbookModelId, true) : Promise.resolve({}),
     ]);
   }
-  const parsed = new Map<string, Record<string, unknown>>();
-  const load = (file: string | undefined, workbook: boolean): Record<string, unknown> => {
-    if (!file) return {};
+  const parsed = new Map<string, ParsedSourceYaml>();
+  const parseFailures = new Map<string, SourceYamlEvidenceError>();
+  const loadFile = (file: string, workbook: boolean): ParsedSourceYaml => {
     const key = `${workbook ? 'workbook' : 'shared'}:${file}`;
+    const failure = parseFailures.get(key);
+    if (failure) throw failure;
     if (!parsed.has(key)) {
-      const text = (workbook ? result.workbookFiles : result.sharedFiles)[file];
-      const value: unknown = text.trim() ? parse(text, { maxAliasCount: 50 }) : {};
-      if (!record(value)) throw new Error('Unsupported source YAML root.');
-      parsed.set(key, value);
+      try {
+        parsed.set(key, parseSourceYaml((workbook ? result.workbookFiles : result.sharedFiles)[file], file, workbook));
+      } catch (error) {
+        if (error instanceof SourceYamlEvidenceError) parseFailures.set(key, error);
+        throw error;
+      }
     }
     return parsed.get(key)!;
+  };
+  const load = (file: string | undefined, workbook: boolean): Record<string, unknown> => {
+    if (!file) return {};
+    const fileEvidence = loadFile(file, workbook);
+    if (fileEvidence.kind === 'relationships') throw new SourceYamlEvidenceError('SOURCE_YAML_UNSUPPORTED_SHAPE',
+      'Relationship definitions cannot stand in for an authored view mapping.', file, workbook ? 'workbook' : 'shared');
+    return fileEvidence.kind === 'mapping' ? fileEvidence.value : {};
   };
   // Only bounded presentation scalars are supported here. Unknown semantics and
   // security remain a file-level prerequisite, not failed evidence for every field.
@@ -177,16 +271,27 @@ export async function readDashboardSourceEvidence(input: {
   );
   for (const file of Object.keys(result.workbookFiles)) {
     try {
-      const value = load(file, true);
+      const fileEvidence = loadFile(file, true);
+      if (fileEvidence.kind === 'empty') continue;
+      if (fileEvidence.kind === 'relationships') {
+        if (fileEvidence.value.length) add('workbook_overlay', 'Workbook-local relationships are valid authored definitions but require explicit preservation in the workbook; they cannot become shared-model proposals.', file, true,
+          { sourceScope: 'workbook', causeCode: 'WORKBOOK_OVERLAY_PRESERVATION_REQUIRED' });
+        continue;
+      }
+      const value = fileEvidence.value;
       const unsupported = file.endsWith('.view')
         ? Object.keys(value).filter((key) => !['dimensions', 'measures'].includes(key) && !presentation(key, value[key]))
         : Object.keys(value);
       for (const section of ['dimensions', 'measures']) {
-        if (value[section] !== undefined && !record(value[section])) unsupported.push(section);
+        if (value[section] !== undefined && !record(value[section])) throw new SourceYamlEvidenceError('SOURCE_YAML_UNSUPPORTED_SHAPE',
+          `The ${section} section requires a YAML mapping of field names to definitions; review this workbook file before rechecking.`, file, 'workbook');
       }
-      if (unsupported.length) add('workbook_overlay', `Workbook-local properties require explicit preservation: ${[...new Set(unsupported)].sort().join(', ')}. Shared-model proposals are withheld.`, file);
-    } catch {
-      add('workbook_overlay', 'Workbook-local YAML cannot be interpreted safely; explicit preservation review is required and shared-model proposals are withheld.', file);
+      if (unsupported.length) add('workbook_overlay', `Workbook-local properties require explicit preservation: ${[...new Set(unsupported)].sort().join(', ')}. Shared-model proposals are withheld.`, file, true,
+        { sourceScope: 'workbook', causeCode: 'WORKBOOK_OVERLAY_PRESERVATION_REQUIRED' });
+    } catch (error) {
+      if (error instanceof SourceYamlEvidenceError) reportYaml(error);
+      else add('workbook_overlay', 'Workbook-local YAML cannot be interpreted safely; explicit preservation review is required and shared-model proposals are withheld.', file, true,
+        { sourceScope: 'workbook', causeCode: 'SOURCE_YAML_UNSUPPORTED_SHAPE' });
     }
   }
   const pending = new Set<string>();
@@ -212,6 +317,17 @@ export async function readDashboardSourceEvidence(input: {
   const unresolvedMacros = new Set<string>();
   const contextCache = new Map<string, { references: Set<string>; unverified: boolean }>();
   const activeContexts = new Set<string>();
+  const sourceField = (value: Record<string, unknown>, field: string, file: string | undefined, workbook: boolean) => {
+    try {
+      return fieldDefinition(value, field);
+    } catch (error) {
+      if (!file) throw error;
+      const message = error instanceof Error && error.message === 'Ambiguous source field definition.'
+        ? 'The requested field has ambiguous authored identities across dimensions or measures; resolve the ambiguity before rechecking.'
+        : 'Source field sections must be mappings and each field must have a mapping or null definition; this authored shape needs explicit review.';
+      throw new SourceYamlEvidenceError('SOURCE_YAML_UNSUPPORTED_SHAPE', message, file, workbook ? 'workbook' : 'shared');
+    }
+  };
   const referenceContext = (view: string, sharedView: Record<string, unknown>, workbookView: Record<string, unknown>, file: string | undefined, kind: 'field' | 'view', onRelation: (name: string) => void, onUnverified: () => void): DashboardSourceReferenceContext => ({
     kind,
     fieldNames: new Set([sharedView, workbookView].flatMap((value) => ['dimensions', 'measures'].flatMap((section) => Object.keys(record(value[section]) ? value[section] : {}))).map((name) => name.toLowerCase())),
@@ -275,21 +391,24 @@ export async function readDashboardSourceEvidence(input: {
       const workbookFile = viewFile(result.workbookFiles, view);
       const sharedView = load(sharedFile, false);
       const workbookView = load(workbookFile, true);
-      const shared = fieldDefinition(sharedView, field);
-      const workbook = fieldDefinition(workbookView, field);
+      const shared = sourceField(sharedView, field, sharedFile, false);
+      const workbook = sourceField(workbookView, field, workbookFile, true);
       if (workbook && workbookFile) {
         evidence.provenance = shared ? 'workbook_override' : 'workbook_local';
         evidence.sourceModelId = input.workbookModelId;
         evidence.sourceFileName = workbookFile;
+        evidence.sourceScope = 'workbook';
         evidence.definition = shared ? overlayDefinition(shared.definition, workbook.definition) : workbook.definition;
         workbookRequired.add(workbookFile);
         add(reference, shared
           ? 'A workbook-local override must be preserved in the workbook; it cannot become a shared-model repair.'
-          : 'A workbook-local field must be preserved in the workbook; it cannot become a shared-model repair.', workbookFile, false);
+          : 'A workbook-local field must be preserved in the workbook; it cannot become a shared-model repair.', workbookFile, false,
+        { sourceScope: 'workbook', causeCode: 'WORKBOOK_FIELD_IDENTIFIED' });
       } else if (shared && sharedFile) {
         evidence.provenance = 'shared_authored';
         evidence.sourceModelId = input.sharedModelId;
         evidence.sourceFileName = sharedFile;
+        evidence.sourceScope = 'shared';
         evidence.definition = shared.definition;
         evidence.sharedWriteAllowed = true;
       } else {
@@ -312,10 +431,15 @@ export async function readDashboardSourceEvidence(input: {
       ])].filter((dependency) => dependency !== reference).sort();
       if (context.unverified || unverifiedMacro) evidence.sharedWriteAllowed = false;
       for (const dependency of evidence.dependencies) pending.add(dependency);
-    } catch {
+    } catch (error) {
       evidence.provenance = 'unverified';
       evidence.sharedWriteAllowed = false;
-      add(reference, 'The authored source field is ambiguous or unsupported and cannot authorize a shared-model repair.');
+      if (error instanceof SourceYamlEvidenceError) {
+        evidence.sourceFileName ??= error.sourceFileName;
+        evidence.sourceScope ??= error.sourceScope;
+        reportYaml(error);
+      } else add(reference, 'The authored source field is ambiguous or unsupported and cannot authorize a shared-model repair.', evidence.sourceFileName, true,
+        evidence.sourceScope ? { sourceScope: evidence.sourceScope, causeCode: 'SOURCE_DEFINITION_UNAVAILABLE' } : undefined);
     }
   }
   if (globallyUnverified) for (const evidence of fields.values()) evidence.sharedWriteAllowed = false;

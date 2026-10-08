@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import handler from '../server/handlers/model-migrator';
 import type { DashboardDeploymentPlan } from '../shared/dashboardDeploymentPlan';
+import { DASHBOARD_READINESS_EVIDENCE_VERSION } from '../shared/dashboardDeploymentPlan';
 import type { MigrationJob, ModelMigrationJobInput } from '../server/services/migrationJobs';
 import { closeJobStoreForTests } from '../server/services/jobStore';
 import { getInstance, lockVault, resetVault, unlockVault, upsertInstance } from '../server/services/nativeVault';
@@ -37,7 +38,7 @@ beforeEach(() => {
   state = { modelId: 'source-model', workbookModelId: 'workbook', name: 'Example dashboard', containers: [] };
   workbookFiles = {};
   readCount = 0;
-  plan = { version: 2, evidenceVersion: 4, id: 'repair-plan', revision: 1, createdAt: 1, updatedAt: 1,
+  plan = { version: 2, evidenceVersion: DASHBOARD_READINESS_EVIDENCE_VERSION, id: 'repair-plan', revision: 1, createdAt: 1, updatedAt: 1,
     intent: { profile: 'safe_copy_v1', requestId: '11111111-1111-4111-8111-111111111111',
       source: { instanceId: 'source', connectionId: 'source-connection', documentIds: ['dashboard'] },
       destinations: [{ targetId: 'route', instanceId: 'target', connectionId: 'target-connection', modelId: 'target-model' }] },

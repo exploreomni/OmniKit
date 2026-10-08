@@ -6,6 +6,7 @@ import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarg
 import { parseDashboardSafeCopyDeploymentEvidence } from '../../shared/dashboardSafeCopyContract';
 import { topicMigrationDestinationPath } from './topicMigrationVerification';
 import { isTopicMigrationBranchName, isTopicMigrationBranchNameForPlan } from '../../shared/topicMigrationBranchNames';
+import { isDashboardPackageBindingMapping } from '../../shared/dashboardPackageBindings';
 
 const REDACTED = '[redacted]';
 const EMAIL_PATTERN = /(?<![A-Z0-9._%+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?=[^A-Z0-9]|$)/gi;
@@ -196,6 +197,11 @@ export function sanitizeJobItem(item: MigrationJobItem, job?: Pick<MigrationJob,
 export function sanitizeMigrationTarget(target: MigrationTarget): MigrationTarget {
   return {
     ...target,
+    // Typed, snapshot-bound identities must remain exact for execution recovery.
+    // Never pass through unvalidated mapping objects or arbitrary extra fields.
+    bindingMappings: Array.isArray(target.bindingMappings) && target.bindingMappings.length <= 500
+      && target.bindingMappings.every(mapping => isDashboardPackageBindingMapping(mapping))
+      ? structuredClone(target.bindingMappings) : undefined,
     destinationLabel: target.destinationLabel ? redactSensitiveText(target.destinationLabel) : target.destinationLabel,
     targetModelName: target.targetModelName ? redactSensitiveText(target.targetModelName) : target.targetModelName,
     targetFolderPath: target.targetFolderPath ? redactSensitiveText(target.targetFolderPath) : target.targetFolderPath,
@@ -244,7 +250,7 @@ export function sanitizeJob(job: MigrationJob): MigrationJob {
     targets: job.targets?.map(sanitizeMigrationTarget),
     routeGroups: job.routeGroups?.map(sanitizeMigrationRouteGroup),
     postMigrationActions: job.postMigrationActions.map(sanitizePostMigrationAction),
-    details: sanitizeDetails(job.details, job.id),
+    details: sanitizeDetails(job.details, job.id, job),
     items: job.items.map(item => sanitizeJobItem(item, job)),
   };
 }
@@ -306,7 +312,7 @@ function preserveTopicFileNames(files: unknown, sanitized: unknown, binding: Rec
   });
 }
 
-function sanitizeDetails(value: Record<string, unknown> | undefined, jobId?: string): Record<string, unknown> | undefined {
+function sanitizeDetails(value: Record<string, unknown> | undefined, jobId?: string, job?: MigrationJob): Record<string, unknown> | undefined {
   if (!value) return value;
   const sanitized = sanitizeUnknown(value) as Record<string, unknown>;
   const profile = value.branchPreparation as Record<string, unknown> | undefined;
@@ -361,7 +367,111 @@ function sanitizeDetails(value: Record<string, unknown> | undefined, jobId?: str
       }
     } else delete sanitized.safeCopyDeployment;
   }
+  if (job) preserveDashboardPackageEvidence(value, sanitized, job);
   return sanitized;
+}
+
+/** Package recovery identities are data, but only inside an exact, approved package scope. */
+function preserveDashboardPackageEvidence(value: Record<string, unknown>, sanitized: Record<string, unknown>, job: MigrationJob): void {
+  if (job.workflow !== 'dashboard' || value.safeCopyProfile !== 'safe_copy_v1' || value.operationMode !== 'safe_copy') return;
+  const object = (entry: unknown): entry is Record<string, unknown> => Boolean(entry && typeof entry === 'object' && !Array.isArray(entry));
+  const identity = (entry: unknown): entry is string => typeof entry === 'string'
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(entry) && !SENSITIVE_KEY_PATTERN.test(entry)
+    && entry.replace(OMNI_TOKEN_PATTERN, REDACTED) === entry && entry.replace(SECRET_ASSIGNMENT_PATTERN, REDACTED) === entry
+    && !['__proto__', 'prototype', 'constructor'].includes(entry);
+  const digest = (entry: unknown): entry is string => typeof entry === 'string' && CANONICAL_SAFE_COPY_DIGEST_PATTERN.test(entry);
+  const identifier = (entry: unknown): entry is string => typeof entry === 'string' && /^[a-f0-9]{12}$/.test(entry);
+  const branchName = (entry: unknown): entry is string => typeof entry === 'string'
+    && /^omnikit-dashboard-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z$/.test(entry);
+  const only = (entry: Record<string, unknown>, keys: string[]) => Object.keys(entry).every(key => keys.includes(key));
+  const optional = (entry: Record<string, unknown>, key: string, check: (candidate: unknown) => boolean) => entry[key] === undefined || check(entry[key]);
+  const text = (entry: unknown) => typeof entry === 'string' && entry.length <= 16_384;
+  const boolean = (entry: unknown) => typeof entry === 'boolean';
+  let approval: ReturnType<typeof parseDashboardSafeCopyDeploymentEvidence>;
+  try {
+    if (!job.targets?.length || job.targets.length > 100 || !job.documentIds.length || job.documentIds.length > 500
+      || !job.targets.every(target => identity(target.id)) || !job.documentIds.every(identity)) return;
+    approval = parseDashboardSafeCopyDeploymentEvidence(value.safeCopyDeployment,
+      { documentIds: job.documentIds }, job.targets.map(target => ({ targetId: target.id })));
+  } catch { return; }
+  if (!approval.packageCopy) return;
+  const targets = new Set(job.targets.map(target => target.id));
+  const documents = new Set(job.documentIds);
+  let mappingBudget = 50_000;
+  const validMap = (entry: unknown) => {
+    if (!object(entry)) return false;
+    const pairs = Object.entries(entry);
+    mappingBudget -= pairs.length;
+    return mappingBudget >= 0 && pairs.length <= 10_000 && new Set(pairs.map(([, to]) => to)).size === pairs.length
+      && pairs.every(([from, to]) => identity(from) && identity(to) && /^[A-Za-z0-9_-]+$/.test(from) && /^[A-Za-z0-9_-]+$/.test(to));
+  };
+  const receipts = value.dashboardPackageReceipts;
+  delete sanitized.dashboardPackageImportRecoveries;
+  if (object(receipts) && Object.keys(receipts).length <= targets.size && Object.entries(receipts).every(([targetId, row]) =>
+    targets.has(targetId) && object(row)
+    && only(row, ['fingerprint', 'baselineHash', 'expectedHash', 'branchId', 'branchName', 'branchVerified', 'modelReady', 'imports'])
+    && digest(row.fingerprint) && row.fingerprint === approval.packageCopy!.targetFingerprints[targetId]
+    && digest(row.baselineHash) && optional(row, 'expectedHash', digest)
+    && optional(row, 'branchId', identity) && optional(row, 'branchName', branchName)
+    && optional(row, 'branchVerified', boolean) && optional(row, 'modelReady', boolean)
+    && object(row.imports) && Object.keys(row.imports).length <= documents.size
+    && Object.entries(row.imports).every(([sourceId, imported]) => documents.has(sourceId) && object(imported)
+      && only(imported, ['sourceDocumentId', 'identifier', 'name', 'nameHash', 'documentId', 'miniUuidMap', 'imported', 'localsVerified', 'contentVerified', 'queriesVerified', 'verified'])
+      && imported.sourceDocumentId === sourceId && identifier(imported.identifier) && text(imported.name)
+      && optional(imported, 'nameHash', digest) && optional(imported, 'documentId', identity) && optional(imported, 'miniUuidMap', validMap)
+      && ['imported', 'localsVerified', 'contentVerified', 'queriesVerified', 'verified'].every(key => optional(imported, key, boolean))))) {
+    sanitized.dashboardPackageReceipts = Object.fromEntries(Object.entries(receipts).map(([targetId, entry]) => {
+      const row = entry as Record<string, unknown>;
+      return [targetId, { ...row, imports: Object.fromEntries(Object.entries(row.imports as Record<string, Record<string, unknown>>)
+        .map(([sourceId, imported]) => [sourceId, { ...imported, name: redactSensitiveText(imported.name as string) }])) }];
+    }));
+    const audits = value.dashboardPackageImportRecoveries;
+    if (Array.isArray(audits) && audits.length <= 100 && new Set(audits.map(audit => object(audit) ? audit.requestId : undefined)).size === audits.length
+      && audits.every(audit => {
+        if (!object(audit) || !only(audit, ['version', 'requestId', 'jobId', 'targetId', 'sourceDocumentId', 'itemId',
+          'destinationInstanceId', 'modelId', 'documentId', 'identifier', 'verifiedAt', 'previousState', 'outcome',
+          'sourceHash', 'mainHash', 'contentHash', 'jobEvidenceHash']) || audit.version !== 1
+          || typeof audit.requestId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(audit.requestId)
+          || audit.jobId !== job.id || !identity(audit.targetId) || !documents.has(audit.sourceDocumentId as string)
+          || !identity(audit.itemId) || !identity(audit.destinationInstanceId) || !identity(audit.modelId)
+          || !identity(audit.documentId) || !identifier(audit.identifier)
+          || audit.previousState !== 'uncertain' || audit.outcome !== 'verified_existing_import'
+          || typeof audit.verifiedAt !== 'number' || !Number.isSafeInteger(audit.verifiedAt) || audit.verifiedAt <= 0
+          || !['sourceHash', 'mainHash', 'contentHash', 'jobEvidenceHash'].every(key => digest(audit[key]))) return false;
+        const target = job.targets!.find(row => row.id === audit.targetId);
+        const receipt = receipts[audit.targetId];
+        const imported = object(receipt) && object(receipt.imports) ? receipt.imports[audit.sourceDocumentId as string] : undefined;
+        const items = job.items.filter(item => item.id === audit.itemId);
+        const item = items[0];
+        return target?.destinationInstanceId === audit.destinationInstanceId && target.targetModelId === audit.modelId
+          && object(imported) && imported.imported === true && imported.documentId === audit.documentId && imported.identifier === audit.identifier
+          && audit.sourceHash === approval.sourceHashes[audit.sourceDocumentId as string] && object(receipt) && audit.mainHash === receipt.expectedHash
+          && items.length === 1 && item.jobId === job.id && item.targetId === audit.targetId && item.destinationId === audit.destinationInstanceId
+          && item.targetModelId === audit.modelId && item.kind === 'document_verify' && item.status === 'failed'
+          && typeof item.endedAt === 'number' && item.endedAt <= audit.verifiedAt
+          && item.details?.dashboardPackageWrite === true && item.details.safeCopyAttempt === true
+          && item.details.safeCopyAttemptState === 'verified' && item.details.packageOperation === `import:${audit.sourceDocumentId}`;
+      })) sanitized.dashboardPackageImportRecoveries = structuredClone(audits);
+  }
+  const results = value.dashboardPackageResults;
+  const documentStatuses = ['verified', 'needs_review', 'uncertain', 'failed'];
+  if (Array.isArray(results) && results.length <= targets.size && new Set(results.map(row => object(row) ? row.targetId : undefined)).size === results.length
+    && results.every(row => object(row) && only(row, ['targetId', 'status', 'stage', 'message', 'branchId', 'branchName', 'documents'])
+      && targets.has(row.targetId as string) && [...documentStatuses, 'waiting_approval'].includes(row.status as string)
+      && text(row.stage) && optional(row, 'message', text) && optional(row, 'branchId', identity) && optional(row, 'branchName', branchName)
+      && Array.isArray(row.documents) && row.documents.length <= documents.size
+      && new Set(row.documents.map(document => object(document) ? document.sourceDocumentId : undefined)).size === row.documents.length
+      && row.documents.every(document => object(document)
+        && only(document, ['sourceDocumentId', 'name', 'documentId', 'identifier', 'url', 'status', 'message'])
+        && documents.has(document.sourceDocumentId as string) && text(document.name) && documentStatuses.includes(document.status as string)
+        && optional(document, 'documentId', identity) && optional(document, 'identifier', identifier)
+        && optional(document, 'url', text) && optional(document, 'message', text)))) {
+    sanitized.dashboardPackageResults = results.map(row => ({ ...row, stage: redactSensitiveText(row.stage),
+      ...(row.message === undefined ? {} : { message: redactSensitiveText(row.message) }),
+      documents: row.documents.map((document: Record<string, unknown>) => ({ ...document, name: redactSensitiveText(document.name as string),
+        ...(document.message === undefined ? {} : { message: redactSensitiveText(document.message as string) }),
+        ...(document.url === undefined ? {} : { url: redactSensitiveText(document.url as string) }) })) }));
+  }
 }
 
 /** Only this bounded, approval-bound audit shape may preserve typed hashes and mapped path identities. */

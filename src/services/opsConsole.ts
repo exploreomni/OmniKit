@@ -882,6 +882,7 @@ export interface DashboardSafeCopyIntentInput {
     folderId?: string;
     folderPath?: string;
     workbookCopy?: { stagingFolderId: string };
+    bindingMappings?: import('../../shared/dashboardPackageBindings').DashboardPackageBindingMapping[];
     topicMappings?: Array<{
       sourceTopicName: string;
       action: 'map_existing' | 'copy_source';
@@ -1424,13 +1425,21 @@ export async function createDashboardSafeCopyJob(input: DashboardSafeCopyIntentI
   });
 }
 
-export async function retryDashboardSafeCopyTarget(jobId: string, targetId: string, requestId: string) {
+export async function retryDashboardSafeCopyTarget(jobId: string, targetId: string, requestId: string, signal?: AbortSignal) {
   return apiFetch<{ job: MigrationJob; execution?: unknown }>(
     `/api/migration-jobs/${encodeURIComponent(jobId)}/targets/${encodeURIComponent(targetId)}/retry`,
     {
       method: 'POST',
       body: JSON.stringify({ requestId }),
+      signal,
     },
+  );
+}
+
+export async function verifyExistingDashboardPackageCopy(jobId: string, targetId: string, sourceDocumentId: string, requestId: string, signal?: AbortSignal) {
+  return apiFetch<{ job: MigrationJob }>(
+    `/api/migration-jobs/${encodeURIComponent(jobId)}/targets/${encodeURIComponent(targetId)}/verify-import`,
+    { method: 'POST', body: JSON.stringify({ requestId, sourceDocumentId }), signal },
   );
 }
 
@@ -1441,8 +1450,8 @@ export async function createOpsMigrationJob(input: MigrationJobInput) {
   });
 }
 
-export async function getMigrationJob(id: string) {
-  return apiFetch<{ job: MigrationJob }>(`/api/migration-jobs/${encodeURIComponent(id)}`);
+export async function getMigrationJob(id: string, signal?: AbortSignal) {
+  return apiFetch<{ job: MigrationJob }>(`/api/migration-jobs/${encodeURIComponent(id)}`, { signal });
 }
 
 export async function listMigrationJobs() {

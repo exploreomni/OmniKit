@@ -1,5 +1,9 @@
 import type { DashboardSafeCopyIntent, DashboardSafeCopyDeployment } from './dashboardSafeCopyContract';
 import type { DashboardReadinessStage } from './dashboardReadiness';
+import type { DashboardPackageSummary } from './dashboardPackage';
+
+/** Changes to evidence interpretation require a fresh review of saved plans. */
+export const DASHBOARD_READINESS_EVIDENCE_VERSION = 6;
 
 export type DashboardReadinessStatus = 'ready' | 'model_changes_required' | 'unverified' | 'needs_recheck';
 export type DashboardFindingCategory = 'included_with_dashboard' | 'topic_mapping_required' | 'model_migrator' | 'cannot_verify';
@@ -24,6 +28,7 @@ export interface DashboardTopicChoice {
   documentIds: string[];
 }
 export interface DashboardDeploymentTargetReadiness {
+  package?: DashboardPackageSummary;
   targetId: string;
   status: DashboardReadinessStatus;
   findings: DashboardDependencyFinding[];
@@ -37,6 +42,8 @@ export interface DashboardDeploymentTargetReadiness {
   topicChoices?: DashboardTopicChoice[];
 }
 export interface DashboardDeploymentPlan {
+  /** Absent on legacy content-only plans, which retain their old execution contract. */
+  packageVersion?: 1;
   version: 2;
   id: string;
   revision: number;

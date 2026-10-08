@@ -82,6 +82,7 @@ import {
 } from './omniClient';
 import { getInstance, type SavedInstance } from './nativeVault';
 import { dashboardWorkbookHasAuthoredDefinitions, getDashboardWorkbookCopyCapability } from './dashboardWorkbookCopy';
+import { withDashboardPackageRecoveryEvidence } from './dashboardPackageRuntime';
 
 const SAFE_COPY_RUNTIME_VERSION = 1;
 const SAFE_COPY_VERIFIER_VERSION = 1;
@@ -2376,6 +2377,7 @@ export function dashboardSafeCopyIntentFromJob(job: MigrationJob): DashboardSafe
       ...(target.targetFolderId ? { folderId: target.targetFolderId } : {}),
       ...(target.targetFolderPath ? { folderPath: target.targetFolderPath } : {}),
       ...(target.workbookCopy ? { workbookCopy: { ...target.workbookCopy } } : {}),
+      ...(target.bindingMappings ? { bindingMappings: structuredClone(target.bindingMappings) } : {}),
       ...(target.topicMappings?.length ? { topicMappings: target.topicMappings.map((mapping) => ({
         sourceTopicName: mapping.sourceTopicName, action: mapping.action, targetTopicName: mapping.targetTopicName,
       })) } : {}),
@@ -2445,6 +2447,12 @@ function cacheDashboardSafeCopyClientEvidence(
 
 export function withDashboardSafeCopyClientEvidence(job: MigrationJob): MigrationJob {
   if (!isDashboardSafeCopyJob(job)) return job;
+  // Package results have a separate versioned proof contract. Never convert
+  // native imports into legacy content-only success evidence.
+  if ((job.details?.safeCopyDeployment as DashboardSafeCopyIntent['deployment'])?.packageCopy) {
+    try { return withDashboardPackageRecoveryEvidence(job, dashboardSafeCopyIntentFromJob(job)); }
+    catch { return job; }
+  }
   const evidenceRevision = detailsNumber(job.details, 'safeCopyEvidenceRevision') || 0;
   const cached = safeCopyClientEvidenceCache.get(job.id);
   if (cached?.revision === evidenceRevision && cached.source === job) {
@@ -2725,6 +2733,10 @@ export async function runDashboardSafeCopyJob(
   activeRuntimeJobs.add(jobId);
   try {
     const intent = canonicalDashboardSafeCopyIntent(rawIntent);
+    if (intent.deployment?.packageCopy) {
+      const { runDashboardPackageJob } = await import('./dashboardPackageRuntime');
+      return await runDashboardPackageJob(jobId, intent);
+    }
     const beforePreparation = (services.getJob || getJob)(jobId);
     if (beforePreparation && isDashboardSafeCopyJob(beforePreparation)
       && !['canceled', 'succeeded', 'partial'].includes(beforePreparation.status)
@@ -2831,8 +2843,13 @@ export async function retryDashboardSafeCopyJobTarget(
   if (!job || !isDashboardSafeCopyJob(job)) {
     throw new SafeCopyRuntimeError('SAFE_COPY_JOB_MISSING', 'The safe-copy retry job is unavailable.');
   }
-  if (jobTargetStatus(job, targetId) === 'succeeded') return { job };
   const intent = dashboardSafeCopyIntentFromJob(job);
+  if (intent.deployment?.packageCopy) {
+    if (!intent.destinations.some(destination => destination.targetId === targetId)) throw new Error('Choose a destination from this package job.');
+    const { runDashboardPackageJob } = await import('./dashboardPackageRuntime');
+    return await runDashboardPackageJob(jobId, intent, targetId);
+  }
+  if (jobTargetStatus(job, targetId) === 'succeeded') return { job };
   const context = createContext(job, intent, services);
   const recovery = materializeVerifiedAttemptResults(context);
   if (!recovery.persisted) {

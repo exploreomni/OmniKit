@@ -7,6 +7,7 @@ import type {
 } from '@/services/opsConsole';
 import { DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS } from '../../../shared/dashboardSafeCopyContract';
 import type { DashboardDeploymentPlan } from '../../../shared/dashboardDeploymentPlan';
+import type { DashboardPackageBindingMapping } from '../../../shared/dashboardPackageBindings';
 
 export { DASHBOARD_SAFE_COPY_MAX_MATRIX_CELLS };
 
@@ -62,6 +63,7 @@ export interface DashboardSafeCopyDestinationDraft {
   topicMappings?: DashboardSafeCopyTopicMappingDraft[];
   queryViewMappings?: DashboardSafeCopyQueryViewMappingDraft[];
   workbookCopy?: { stagingFolderId: string };
+  bindingMappings?: DashboardPackageBindingMapping[];
 }
 
 export interface DashboardSafeCopyDraft {
@@ -1024,6 +1026,8 @@ function planningUpdate(
   return {
     ...state,
     ...patch,
+    // A new draft/scope needs its own explicit physical-binding review.
+    destinations: (patch.destinations || state.destinations).map(row => ({ ...row, bindingMappings: undefined })),
     requestId,
     jobId: undefined,
     planId: undefined,
@@ -1114,7 +1118,7 @@ export function dashboardSafeCopyDraftReducer(
             || (action.patch.connectionId !== undefined && action.patch.connectionId !== row.connectionId)
             || (action.patch.modelId !== undefined && action.patch.modelId !== row.modelId);
           return { ...row, ...action.patch,
-            ...(modelScopeChanged ? { topicMappings: undefined, queryViewMappings: undefined } : {}),
+            ...(modelScopeChanged ? { topicMappings: undefined, queryViewMappings: undefined, bindingMappings: undefined } : {}),
             ...(instanceChanged ? { workbookCopy: undefined } : {}),
           };
         }),
@@ -1232,6 +1236,7 @@ export function dashboardSafeCopyIntentFromDraft(
             .map((m) => ({ sourceQueryViewName: m.sourceQueryViewName, action: m.action, targetQueryViewName: m.targetQueryViewName })),
         } : {}),
         ...(row.workbookCopy ? { workbookCopy: { stagingFolderId: row.workbookCopy.stagingFolderId } } : {}),
+        ...(row.bindingMappings ? { bindingMappings: row.bindingMappings } : {}),
       };
     }),
     ...(draft.emptyFirst || draft.deleteSourceOnSuccess || draft.refreshSchemaOnComplete ? {
