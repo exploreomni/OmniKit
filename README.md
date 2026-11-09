@@ -49,7 +49,7 @@ documented in [SECURITY.md](SECURITY.md), [SUPPORT.md](SUPPORT.md), and
 | Tool | Version | Notes |
 | --- | --- | --- |
 | Node.js | 22.22.0 or newer | CI validates Node 22.22.0. Check with `node --version`. Download at [nodejs.org](https://nodejs.org). |
-| npm | 10 or newer (bundled with current Node LTS) | Yarn or pnpm also work. |
+| npm | 10 or newer | Use npm with the checked-in lockfile. Other package managers are not verified against the security overrides. |
 | Browser | Current Chromium | Supported for the required local browser checks. Firefox and WebKit remain compatibility targets; see [the browser matrix](docs/support/browser-matrix.md). |
 | Omni instance | Reachable from your machine | You also need a personal API key. |
 
@@ -68,7 +68,7 @@ Step-by-step from zero:
    ```
 2. **Install dependencies.**
    ```bash
-   npm install
+   npm ci
    ```
 3. **Start the app.**
    ```bash
@@ -236,6 +236,7 @@ Key points:
 - **Scoped local handlers.** Most `/api/<name>` routes forward one REST call to your selected Omni instance using either a native-vault reference token or a dedicated saved-instance server-side lookup. Native vault, saved instance, metrics, and migration-job routes run locally and keep secrets on the server side.
 - **Local-only binding.** The server listens on `127.0.0.1`, so nothing else on your LAN can reach it.
 - **No hosted database.** Persistent app state lives in your browser (`localStorage` + IndexedDB) plus local-only files under `./data/` for the native encrypted vault and sanitized migration job history. The active saved instance is kept in same-tab `sessionStorage` as a non-secret vault reference and is cleared by the Data Privacy wipe action.
+- **Keep state private.** Dev and preview include the local API: keep them on loopback and do not expose them through a tunnel. Vite blocks static reads of the state directory, configured vault/history files and their sidecars, and encrypted backups. Keep custom state and backups outside `public/` and `dist/`; public build assets must be regular files, not symlinks. No vault migration is required.
 - **Native encrypted vault.** Saved Omni instance profiles are encrypted in `./data/vault.enc` by default using Node `crypto` with scrypt and AES-256-GCM. Plaintext API keys are never returned to the browser; UI responses use masked keys only. Writes are atomic — the vault is written to a temp file and renamed, and the previous ciphertext is kept as a single `./data/vault.enc.bak` generation — so an interrupted write or a failed passphrase change cannot destroy your saved credentials. Resetting the vault removes the backup along with the vault itself.
 - **Encrypted Fleet history.** Complete portfolio refreshes can retain one compact summary per UTC day in the same encrypted native vault. History is same-day idempotent, bounded to 90 days, and excludes raw identity records, emails, credentials, URLs, and upstream responses. Partial or interrupted scans do not add a daily history entry.
 - **Legacy multi-instance cutover.** Instance Manager can import compatible `omni-multi-instance-tools` vault files after the native vault is unlocked. The legacy passphrase is used only for that local import request, valid profiles are re-encrypted into the native vault, duplicate base URLs are skipped, and unsupported legacy-only settings are reported in the dry-run summary.
@@ -256,7 +257,7 @@ Key points:
 | `npm run build` | Build the production bundle into `dist/`. |
 | `npm run start` | Build, then serve `dist/` plus the API proxy on a single port. |
 | `npm run serve` | Serve an existing `dist/` plus the API proxy (skips rebuild). |
-| `npm run preview` | Vite's built-in static preview (UI only, no API). |
+| `npm run preview` | Preview the built UI on loopback with OmniKit's local API enabled. Treat it like the app, not a public static site. |
 | `npm run typecheck` | Run `tsc --noEmit` across the React app source. |
 | `npm run typecheck:node` | Run `tsc --noEmit` across the local Node server source. |
 | `npm run lint` | Run ESLint. |
@@ -284,7 +285,7 @@ Key points:
 | `npm run test:fleet-admin:contracts` | Run every focused Fleet and Administration data-truth, readiness, identity, content, SSO, deep-link, and progressive-disclosure contract suite. |
 | `npm run test:browser:release` | Run the deterministic Chromium release sequence for Fleet, routing, Administration, UI hardening, Dashboard Safe Copy, Model Migrator, and accessibility. |
 | `npm run test:release-gate-coverage` | Verify recursively that the canonical package and CI gates reach every test suite without missing scripts or command cycles. |
-| `npm run test:security` | Run focused vault, job-history, and post-action security regression tests. |
+| `npm run test:security` | Run focused vault, job-history, post-action, and dev-server file-access regression tests. |
 | `npm run security:audit` | Run `npm audit --audit-level=moderate`. |
 | `npm run security:check` | Run the canonical local release gate: supply-chain controls, focused JavaScript/TypeScript and Chromium suites, typechecks, lint, build, and bundle budgets. |
 

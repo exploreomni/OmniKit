@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'path';
 import { omniApiPlugin } from './server/vitePlugin';
+import { localStateBoundary } from './server/viteStateBoundary';
 
 function normalizedBuildToken(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -52,7 +53,7 @@ const omniKitVersion = resolvePackageVersion();
 const omniKitBuildSha = resolveBuildSha();
 
 export default defineConfig({
-  plugins: [react(), omniApiPlugin()],
+  plugins: [localStateBoundary(), react(), omniApiPlugin()],
   define: {
     __OMNIKIT_VERSION__: JSON.stringify(omniKitVersion),
     __OMNIKIT_BUILD_SHA__: JSON.stringify(omniKitBuildSha),
