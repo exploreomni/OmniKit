@@ -65,7 +65,7 @@
     "test:fleet-admin:contracts": "npm run test:admin-collection-contract && npm run test:admin-readiness && npm run test:admin-readiness:frontend && npm run test:content-health-contract && npm run test:generate-embed-url && npm run test:identity-read-contract && npm run test:omni-deep-links && npm run test:portfolio-overview:frontend && npm run test:ui-progressive-disclosure",
     "test:release-gate-coverage": "node --test tests/release-gate-coverage.test.mjs",
     "test:job-store": "tsx --test tests/job-store-recovery.test.ts",
-    "test:security": "tsx --test --test-concurrency=1 tests/security-regression.test.ts tests/job-store-recovery.test.ts",
+    "test:security": "tsx --test --test-concurrency=1 tests/security-regression.test.ts tests/job-store-recovery.test.ts tests/vite-state-boundary.test.mjs",
     "test:instance-connect": "tsx --test --test-concurrency=1 tests/instance-connect.test.ts",
     "test:ai-content-studio": "tsx --tsconfig tsconfig.app.json --test --test-concurrency=1 tests/ai-content-studio.test.ts tests/ai-content-studio-api.test.ts tests/ai-result-transport-matrix.test.ts tests/ai-content-markdown.test.tsx",
     "verify:omni-api-contracts": "tsx scripts/verify-omni-api-contracts.ts",
@@ -110,10 +110,11 @@
     "tsx": "^4.22.4",
     "typescript": "^5.5.3",
     "typescript-eslint": "^8.65.0",
-    "vite": "^6.4.2"
+    "vite": "^6.4.6"
   },
   "overrides": {
     "esbuild": "^0.28.1",
-    "nanoid": "3.3.18"
+    "nanoid": "3.3.18",
+    "minimatch": "^11.0.1"
   }
 }
