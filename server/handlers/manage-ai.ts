@@ -1,15 +1,12 @@
-import { lookup as dnsLookup } from 'node:dns';
-import type { LookupAddress, LookupOptions } from 'node:dns';
-import { request as httpsRequest } from 'node:https';
-import type { IncomingMessage } from 'node:http';
-import type { LookupFunction } from 'node:net';
-import { isIP } from 'node:net';
-import { assertSafeOutboundUrl, isPrivateOrLocalAddress, validateBaseUrl, jsonHeaders } from '../security';
+import { assertSafeOutboundUrl, validateBaseUrl, jsonHeaders } from '../security';
+import { requestOmniJson, type OmniJsonRequest, type OmniJsonResponse } from '../services/omniJsonTransport';
 import { aiPromptSecurityError } from '../services/aiPromptSecurity';
 import {
   AI_PROMPT_MAX_CHARACTERS,
   AI_REQUEST_BODY_MAX_CHARACTERS,
 } from '../../src/services/aiPromptSecurityShared';
+
+export { createPublicOnlyLookup as createAiPublicOnlyLookup, readBoundedJson } from '../services/omniJsonTransport';
 
 type AiAction =
   | 'pick-topic'
@@ -303,56 +300,6 @@ function validateAttachments(value: unknown): AiAttachment[] | Response {
     });
   }
   return attachments;
-}
-
-function isJsonContentType(
-  contentType: string | string[] | undefined,
-  allowOctetStreamJson = false,
-): boolean {
-  const normalized = (Array.isArray(contentType) ? contentType[0] : contentType)
-    ?.split(';', 1)[0].trim().toLowerCase() || '';
-  return normalized === 'application/json'
-    || normalized.endsWith('+json')
-    || (allowOctetStreamJson && normalized === 'application/octet-stream');
-}
-
-export async function readBoundedJson(
-  response: IncomingMessage,
-  maximumBytes = AI_UPSTREAM_RESPONSE_MAX_BYTES,
-  allowOctetStreamJson = false,
-): Promise<unknown> {
-  const declaredLength = Number(response.headers['content-length'] || '0');
-  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
-    response.destroy();
-    throw Object.assign(new Error('response-too-large'), { statusCode: 502 });
-  }
-  if (!isJsonContentType(response.headers['content-type'], allowOctetStreamJson)) {
-    response.destroy();
-    throw Object.assign(new Error('non-json-response'), { statusCode: 502 });
-  }
-  const chunks: Buffer[] = [];
-  let bytesRead = 0;
-  for await (const value of response) {
-    const chunk = typeof value === 'string' ? Buffer.from(value) : Buffer.from(value);
-    bytesRead += chunk.byteLength;
-    if (bytesRead > maximumBytes) {
-      response.destroy();
-      throw Object.assign(new Error('response-too-large'), { statusCode: 502 });
-    }
-    chunks.push(chunk);
-  }
-
-  const text = Buffer.concat(chunks, bytesRead).toString('utf8');
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw Object.assign(new Error('invalid-json-response'), { statusCode: 502 });
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw Object.assign(new Error('invalid-json-response'), { statusCode: 502 });
-  }
-  return parsed;
 }
 
 function invalidContentStudioResult(): Error & { statusCode: number; code: string } {
@@ -986,12 +933,7 @@ function sanitizeUpstreamValue(
   }));
 }
 
-interface AiOutboundResponse {
-  status: number;
-  data?: unknown;
-}
-
-function upstreamErrorResponse(response: AiOutboundResponse, resource = 'Omni AI'): Response {
+function upstreamErrorResponse(response: OmniJsonResponse, resource = 'Omni AI'): Response {
   const status = response.status >= 300 && response.status < 400 ? 502 : response.status;
   const publicStatus = status >= 400 && status <= 599 ? status : 502;
   const message = publicStatus === 401
@@ -1006,90 +948,8 @@ function upstreamErrorResponse(response: AiOutboundResponse, resource = 'Omni AI
   return jsonResponse({ error: message }, publicStatus);
 }
 
-type DnsLookup = typeof dnsLookup;
-
-/** Connection-bound public-only resolver; exported solely for deterministic SSRF regression tests. */
-export function createAiPublicOnlyLookup(resolve: DnsLookup = dnsLookup): LookupFunction {
-  return (hostname, options, callback) => {
-    const requestedAll = options.all === true;
-    const lookupOptions: LookupOptions = { ...options, all: true, verbatim: true };
-    resolve(hostname, lookupOptions, (error, records) => {
-      if (error) {
-        callback(error, '', 0);
-        return;
-      }
-      const addresses = records as LookupAddress[];
-      if (addresses.length === 0) {
-        callback(Object.assign(new Error('base_url host could not be resolved safely while connecting.'), {
-          code: 'ENOTFOUND',
-          statusCode: 502,
-        }), '', 0);
-        return;
-      }
-      if (addresses.some((record) => isPrivateOrLocalAddress(record.address))) {
-        callback(Object.assign(new Error('base_url resolved to a local or private network address while connecting.'), {
-          code: 'EACCES',
-          statusCode: 400,
-        }), '', 0);
-        return;
-      }
-      if (requestedAll) callback(null, addresses);
-      else callback(null, addresses[0].address, addresses[0].family);
-    });
-  };
-}
-
-interface AiOutboundRequest {
-  url: string;
-  method: string;
-  headers: Record<string, string>;
-  body?: string;
-  signal: AbortSignal;
-  maximumResponseBytes?: number;
-  allowOctetStreamJson?: boolean;
-}
-
-async function sendAiOutboundRequest(request: AiOutboundRequest): Promise<AiOutboundResponse> {
-  const parsed = new URL(request.url);
-  return new Promise((resolve, reject) => {
-    const outbound = httpsRequest(parsed, {
-      method: request.method,
-      headers: request.headers,
-      agent: false,
-      lookup: createAiPublicOnlyLookup(),
-      ...(isIP(parsed.hostname) ? {} : { servername: parsed.hostname }),
-      signal: request.signal,
-    }, (response) => {
-      const status = response.statusCode || 0;
-      if (status >= 300 && status < 400) {
-        response.destroy();
-        resolve({ status });
-        return;
-      }
-      if (status < 200 || status >= 300) {
-        response.destroy();
-        resolve({ status });
-        return;
-      }
-      if (status === 204) {
-        response.destroy();
-        resolve({ status, data: { success: true } });
-        return;
-      }
-      void readBoundedJson(
-        response,
-        request.maximumResponseBytes,
-        request.allowOctetStreamJson,
-      ).then((data) => resolve({ status, data }), reject);
-    });
-    outbound.once('error', reject);
-    if (request.body !== undefined) outbound.write(request.body);
-    outbound.end();
-  });
-}
-
 export interface ManageAiDependencies {
-  request?: (request: AiOutboundRequest) => Promise<AiOutboundResponse>;
+  request?: (request: OmniJsonRequest) => Promise<OmniJsonResponse>;
   validateOutbound?: (url: string) => Promise<void>;
   timeoutMs?: number;
 }
@@ -1178,7 +1038,7 @@ export async function handleManageAi(req: Request, dependencies: ManageAiDepende
       url: string,
       method: 'GET' | 'DELETE',
       maximumResponseBytes = AI_UPSTREAM_RESPONSE_MAX_BYTES,
-    ): Promise<AiOutboundResponse | Response> => {
+    ): Promise<OmniJsonResponse | Response> => {
       try {
         await (dependencies.validateOutbound || ((candidate: string) => (
           assertSafeOutboundUrl(candidate, { label: 'base_url' })
@@ -1193,7 +1053,7 @@ export async function handleManageAi(req: Request, dependencies: ManageAiDepende
           error: timedOut ? 'Omni content verification timed out.' : 'Omni content verification was cancelled.',
         }, timedOut ? 504 : 499);
       }
-      return (dependencies.request || sendAiOutboundRequest)({
+      return (dependencies.request || requestOmniJson)({
         url,
         method,
         headers: authHeaders,
@@ -1404,7 +1264,7 @@ export async function handleManageAi(req: Request, dependencies: ManageAiDepende
       return jsonResponse({ error: timedOut ? 'Omni AI request timed out.' : 'Omni AI request was cancelled.' }, timedOut ? 504 : 499);
     }
 
-    const response = await (dependencies.request || sendAiOutboundRequest)({
+    const response = await (dependencies.request || requestOmniJson)({
       url: targetUrl,
       method: init.method,
       headers: init.headers,

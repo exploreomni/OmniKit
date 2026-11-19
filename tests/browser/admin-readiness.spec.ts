@@ -921,7 +921,7 @@ async function prepareReadiness(
         });
       }
       return json(route, {
-        url: `${TENANT_ORIGIN}/embed/login?contentPath=%2Fdashboards%2Fqa&externalId=fixture&name=Fixture&nonce=fixtureNonceValue1&signature=fixtureSignatureValueThatIsLongEnough12345`,
+        url: `${TENANT_ORIGIN}/embed/login?payload=fixture-payload&signature=fixture-signature`,
       });
     }
     if (url.pathname === '/api/manage-users' && body.action === 'list') {
