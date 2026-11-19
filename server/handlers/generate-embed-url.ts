@@ -1,9 +1,10 @@
+import { unpackSignedPayload } from '@omni-co/embed';
 import { assertSafeOutboundUrl, jsonHeaders, validateBaseUrl } from '../security';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
 const SAFE_NONCE_PATTERN = /^[A-Za-z0-9_-]{16,256}$/;
-const SAFE_SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
-const SIGNED_QUERY_PARAMETERS = new Set(['contentPath', 'externalId', 'name', 'nonce', 'signature', 'email', 'groups']);
+const SAFE_SIGNATURE_PATTERN = /^[A-Za-z0-9+/_-]{43}=?$/;
+const ALLOWED_QUERY_PARAMETERS = new Set(['payload', 'signature', 'sdk']);
 const ALLOWED_EMBED_DATA_KEYS = new Set(['contentPath', 'externalId', 'name', 'email', 'groups']);
 const PROHIBITED_QUERY_PARAMETERS = new Set([
   'secret',
@@ -79,13 +80,6 @@ function expectedSignedHost(baseUrl: URL): string {
   return baseUrl.host.toLowerCase();
 }
 
-function exactQueryValue(url: URL, key: string, expected: string): void {
-  const values = url.searchParams.getAll(key);
-  if (values.length !== 1 || values[0] !== expected) {
-    throw statusError('Omni returned a signed embed URL whose required identity values did not match the request.', 502);
-  }
-}
-
 function containsAsciiWhitespaceOrControl(value: string): boolean {
   for (const character of value) {
     const codePoint = character.codePointAt(0) ?? 0;
@@ -128,57 +122,73 @@ function validateSignedEmbedUrl(
     throw statusError('Omni returned a signed embed URL for an unexpected host.', 502);
   }
 
-  const allowedQueryParameters = new Set([
-    'contentPath', 'externalId', 'name', 'nonce', 'signature',
-    ...(required.email ? ['email'] : []),
-    ...(required.groups ? ['groups'] : []),
-  ]);
   for (const key of parsedUrl.searchParams.keys()) {
-    const canonicalKey = [...SIGNED_QUERY_PARAMETERS].find((candidate) => candidate.toLowerCase() === key.toLowerCase());
+    const canonicalKey = [...ALLOWED_QUERY_PARAMETERS].find((candidate) => candidate.toLowerCase() === key.toLowerCase());
     if (canonicalKey && key !== canonicalKey) {
       throw statusError('Omni returned a signed embed URL with an ambiguous protected query parameter.', 502);
     }
     if (PROHIBITED_QUERY_PARAMETERS.has(key.toLowerCase())) {
       throw statusError('Omni returned a signed embed URL containing a prohibited credential parameter.', 502);
     }
-    if (!allowedQueryParameters.has(key)) {
+    if (!ALLOWED_QUERY_PARAMETERS.has(key)) {
       throw statusError('Omni returned a signed embed URL with an unexpected query parameter.', 502);
+    }
+    if (parsedUrl.searchParams.getAll(key).length !== 1) {
+      throw statusError('Omni returned a signed embed URL with a duplicate query parameter.', 502);
     }
   }
   if ([...parsedUrl.searchParams].some(([key, value]) => key.includes(embedSecret) || value.includes(embedSecret))) {
     throw statusError('Omni returned a signed embed URL containing prohibited secret material.', 502);
   }
 
-  exactQueryValue(parsedUrl, 'contentPath', required.contentPath);
-  exactQueryValue(parsedUrl, 'externalId', required.externalId);
-  exactQueryValue(parsedUrl, 'name', required.name);
-  if (required.email) exactQueryValue(parsedUrl, 'email', required.email);
+  if ((parsedUrl.searchParams.get('sdk')?.length ?? 0) > 64) {
+    throw statusError('Omni returned a signed embed URL with invalid SDK telemetry.', 502);
+  }
+
+  const payload = parsedUrl.searchParams.get('payload');
+  const signature = parsedUrl.searchParams.get('signature');
+  let signed: ReturnType<typeof unpackSignedPayload>;
+  try {
+    if (!payload || !signature || !SAFE_SIGNATURE_PATTERN.test(signature)) throw new Error('Invalid v1 parameters');
+    signed = unpackSignedPayload({ payload, signature, secret: embedSecret });
+  } catch {
+    throw statusError('Omni returned an invalid v1 signed embed URL.', 502);
+  }
+
+  const allowedPayloadParameters = new Set([
+    'loginUrl', 'contentPath', 'externalId', 'name', 'nonce', 'exp',
+    ...(required.email ? ['email'] : []),
+    ...(required.groups ? ['groups'] : []),
+  ]);
+  if (Object.keys(signed).some((key) => !allowedPayloadParameters.has(key))) {
+    throw statusError('Omni returned a signed embed URL with an unexpected signed payload parameter.', 502);
+  }
+  if (Object.values(signed).flat().some((value) => typeof value === 'string' && value.includes(embedSecret))) {
+    throw statusError('Omni returned a signed embed URL containing prohibited secret material.', 502);
+  }
+  if (signed.loginUrl !== `${parsedUrl.origin}/embed/login`) {
+    throw statusError('Omni returned a signed embed URL whose signed login URL did not match the request.', 502);
+  }
+  if (
+    signed.contentPath !== required.contentPath
+    || signed.externalId !== required.externalId
+    || signed.name !== required.name
+    || signed.email !== required.email
+  ) {
+    throw statusError('Omni returned a signed embed URL whose required identity values did not match the request.', 502);
+  }
   if (required.groups) {
-    const groupValues = parsedUrl.searchParams.getAll('groups');
-    let parsedGroups: unknown = null;
-    try {
-      parsedGroups = groupValues.length === 1 ? JSON.parse(groupValues[0]) : null;
-    } catch {
-      parsedGroups = null;
-    }
     if (
-      !Array.isArray(parsedGroups)
-      || parsedGroups.length !== required.groups.length
-      || parsedGroups.some((group, index) => group !== required.groups?.[index])
+      !Array.isArray(signed.groups)
+      || signed.groups.length !== required.groups.length
+      || signed.groups.some((group, index) => group !== required.groups?.[index])
     ) {
       throw statusError('Omni returned a signed embed URL whose group values did not match the request.', 502);
     }
   }
 
-  const nonceValues = parsedUrl.searchParams.getAll('nonce');
-  const signatureValues = parsedUrl.searchParams.getAll('signature');
-  if (
-    nonceValues.length !== 1
-    || signatureValues.length !== 1
-    || !SAFE_NONCE_PATTERN.test(nonceValues[0])
-    || !SAFE_SIGNATURE_PATTERN.test(signatureValues[0])
-  ) {
-    throw statusError('Omni returned a signed embed URL without safe nonce and signature values.', 502);
+  if (!SAFE_NONCE_PATTERN.test(signed.nonce)) {
+    throw statusError('Omni returned a signed embed URL without a safe nonce value.', 502);
   }
 
   return parsedUrl.toString();
@@ -250,7 +260,7 @@ export async function generateSignedEmbedUrl(
         externalId,
         name,
         ...(email ? { email } : {}),
-        ...(groups ? { groups } : {}),
+        ...(groups ? { groups: JSON.stringify(groups) } : {}),
         secret: embedSecret,
       }),
     });

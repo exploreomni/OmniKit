@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { test } from 'node:test';
+import { deflateRawSync } from 'node:zlib';
+import { packSignedPayload, type SignedPayloadParams } from '@omni-co/embed';
 
 import handler, { generateSignedEmbedUrl } from '../server/handlers/generate-embed-url';
 import { generateEmbedUrl as requestSignedEmbedUrl } from '../src/services/omniApi';
@@ -15,20 +18,21 @@ const baseInput = {
 };
 
 const NONCE = 'nonce_1234567890abcdefghijklmnop';
-const SIGNATURE = 'signature_abcdefghijklmnopqrstuvwxyz0123456789';
 
 function signedUrl(
   host = 'example.embed-omniapp.co',
-  optional: { email?: string; groups?: string[] } = {},
+  overrides: Partial<SignedPayloadParams> = {},
+  secret = baseInput.embedSecret,
 ): string {
   const url = new URL(`https://${host}/embed/login`);
-  url.searchParams.set('contentPath', String(baseInput.embedData.contentPath));
-  url.searchParams.set('externalId', String(baseInput.embedData.externalId));
-  url.searchParams.set('name', String(baseInput.embedData.name));
-  if (optional.email) url.searchParams.set('email', optional.email);
-  if (optional.groups) url.searchParams.set('groups', JSON.stringify(optional.groups));
-  url.searchParams.set('nonce', NONCE);
-  url.searchParams.set('signature', SIGNATURE);
+  const { payload, signature } = packSignedPayload({
+    loginUrl: url.toString(),
+    ...baseInput.embedData,
+    nonce: NONCE,
+    ...overrides,
+  }, secret, { now: () => Date.UTC(2026, 10, 19) });
+  url.searchParams.set('payload', payload);
+  url.searchParams.set('signature', signature);
   return url.toString();
 }
 
@@ -132,30 +136,37 @@ test('optional email and groups are normalized, forwarded, and bound to the sign
     }) as typeof fetch,
   });
 
-  assert.deepEqual(capturedBody, { ...baseInput.embedData, ...optional, secret: baseInput.embedSecret });
+  assert.deepEqual(capturedBody, {
+    ...baseInput.embedData,
+    email: optional.email,
+    groups: JSON.stringify(optional.groups),
+    secret: baseInput.embedSecret,
+  });
   assert.deepEqual(result, { url: signedUrl('example.embed-omniapp.co', optional) });
+});
+
+test('v1 output accepts optional unsigned SDK telemetry and standard padded signatures', async () => {
+  const url = new URL(signedUrl());
+  url.searchParams.set('sdk', '@omni-co/embed@1.3.0');
+  const signature = url.searchParams.get('signature')!;
+  url.searchParams.set('signature', Buffer.from(signature, 'base64url').toString('base64'));
+  const result = await generateSignedEmbedUrl(baseInput, {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: (async () => generatedResponse(url.toString())) as typeof fetch,
+  });
+  assert.deepEqual(result, { url: url.toString() });
 });
 
 test('signed output rejects changed, missing, extra, or malformed optional identity claims', async () => {
   const optional = { email: 'person@example.invalid', groups: ['Finance', 'Operations'] };
   const input = { ...baseInput, embedData: { ...baseInput.embedData, ...optional } };
-  const candidates: string[] = [];
-
-  const missingEmail = new URL(signedUrl('example.embed-omniapp.co', optional));
-  missingEmail.searchParams.delete('email');
-  candidates.push(missingEmail.toString());
-  const changedEmail = new URL(signedUrl('example.embed-omniapp.co', optional));
-  changedEmail.searchParams.set('email', 'different@example.invalid');
-  candidates.push(changedEmail.toString());
-  const missingGroups = new URL(signedUrl('example.embed-omniapp.co', optional));
-  missingGroups.searchParams.delete('groups');
-  candidates.push(missingGroups.toString());
-  const reorderedGroups = new URL(signedUrl('example.embed-omniapp.co', optional));
-  reorderedGroups.searchParams.set('groups', JSON.stringify([...optional.groups].reverse()));
-  candidates.push(reorderedGroups.toString());
-  const malformedGroups = new URL(signedUrl('example.embed-omniapp.co', optional));
-  malformedGroups.searchParams.set('groups', 'not-json');
-  candidates.push(malformedGroups.toString());
+  const candidates = [
+    signedUrl('example.embed-omniapp.co', { groups: optional.groups }),
+    signedUrl('example.embed-omniapp.co', { ...optional, email: 'different@example.invalid' }),
+    signedUrl('example.embed-omniapp.co', { email: optional.email }),
+    signedUrl('example.embed-omniapp.co', { ...optional, groups: [...optional.groups].reverse() }),
+    signedUrl('example.embed-omniapp.co', { ...optional, groups: 'not-json' as unknown as string[] }),
+  ];
   const unexpected = new URL(signedUrl('example.embed-omniapp.co', optional));
   unexpected.searchParams.set('mode', 'read');
   candidates.push(unexpected.toString());
@@ -167,12 +178,12 @@ test('signed output rejects changed, missing, extra, or malformed optional ident
     }));
   }
 
-  const unexpectedOptional = new URL(signedUrl());
-  unexpectedOptional.searchParams.set('email', optional.email);
-  await assert.rejects(generateSignedEmbedUrl(baseInput, {
-    assertSafeUrl: async () => undefined,
-    fetchImpl: (async () => generatedResponse(unexpectedOptional.toString())) as typeof fetch,
-  }), /unexpected query parameter/);
+  for (const extra of [{ email: optional.email }, { groups: optional.groups }, { entity: 'Unexpected entity' }]) {
+    await assert.rejects(generateSignedEmbedUrl(baseInput, {
+      assertSafeUrl: async () => undefined,
+      fetchImpl: (async () => generatedResponse(signedUrl('example.embed-omniapp.co', extra))) as typeof fetch,
+    }), /unexpected signed payload parameter/);
+  }
 });
 
 test('upstream failures never expose response bodies or the embed secret', async () => {
@@ -277,56 +288,109 @@ test('signed output rejects wrong schemes, userinfo, fragments, and ambiguous ra
   }
 });
 
-test('signed output requires exact single identity, nonce, and signature parameters', async () => {
+test('signed output binds the verified login URL, identity, and content to the request', async () => {
+  const overrides = [
+    { externalId: 'different-external-id' },
+    { name: 'Different Person' },
+    { contentPath: '/dashboards/different' },
+    { loginUrl: 'https://attacker.example/embed/login' },
+    { loginUrl: 'https://example.embed-omniapp.co/embed/other' },
+    { loginUrl: 'https://example.embed-omniapp.co/embed/login?extra=value' },
+    { nonce: '../../unsafe' },
+  ];
+  for (const override of overrides) {
+    await assert.rejects(generateSignedEmbedUrl(baseInput, {
+      assertSafeUrl: async () => undefined,
+      fetchImpl: (async () => generatedResponse(signedUrl('example.embed-omniapp.co', override))) as typeof fetch,
+    }), (error: unknown) => {
+      assert.equal((error as { statusCode: number }).statusCode, 502);
+      return true;
+    });
+  }
+});
+
+test('v1 output rejects tampering, wrong secrets, and malformed signed payloads', async () => {
+  const valid = new URL(signedUrl());
+  const tampered = new URL(signedUrl('example.embed-omniapp.co', { nonce: 'different_1234567890abcdefghijklmnop' }));
+  valid.searchParams.set('payload', tampered.searchParams.get('payload')!);
+  const candidates = [valid.toString(), signedUrl('example.embed-omniapp.co', {}, 'different-test-secret')];
+  for (const key of ['payload', 'signature']) {
+    const invalid = new URL(signedUrl());
+    invalid.searchParams.set(key, 'invalid');
+    candidates.push(invalid.toString());
+  }
+  for (const candidate of candidates) {
+    await assert.rejects(generateSignedEmbedUrl(baseInput, {
+      assertSafeUrl: async () => undefined,
+      fetchImpl: (async () => generatedResponse(candidate)) as typeof fetch,
+    }), /invalid v1 signed embed URL/);
+  }
+});
+
+test('v1 output rejects authenticated payloads with missing or invalid required fields', async () => {
+  const params: Record<string, unknown> = {
+    loginUrl: 'https://example.embed-omniapp.co/embed/login',
+    ...baseInput.embedData,
+    nonce: NONCE,
+    exp: Date.UTC(2026, 10, 20) / 1000,
+  };
+  const candidates: Record<string, unknown>[] = [];
+  for (const key of Object.keys(params)) {
+    const missing = { ...params };
+    delete missing[key];
+    candidates.push(missing);
+  }
+  candidates.push({ ...params, exp: 'not-an-epoch' }, { ...params, exp: null }, { ...params, name: 123 });
+  for (const candidate of candidates) {
+    // Construct invalid signed data directly because the SDK packer rejects it.
+    const payload = deflateRawSync(Buffer.from(JSON.stringify(candidate))).toString('base64url');
+    const signature = createHmac('sha256', baseInput.embedSecret).update(payload).digest('base64url');
+    const url = new URL(String(params.loginUrl));
+    url.searchParams.set('payload', payload);
+    url.searchParams.set('signature', signature);
+    await assert.rejects(generateSignedEmbedUrl(baseInput, {
+      assertSafeUrl: async () => undefined,
+      fetchImpl: (async () => generatedResponse(url.toString())) as typeof fetch,
+    }), /invalid v1 signed embed URL/);
+  }
+});
+
+test('v1 output rejects duplicate, missing, ambiguous, or unexpected query parameters', async () => {
   const candidates: string[] = [];
-
-  const wrongIdentity = new URL(signedUrl());
-  wrongIdentity.searchParams.set('externalId', 'different-external-id');
-  candidates.push(wrongIdentity.toString());
-
-  const duplicateIdentity = new URL(signedUrl());
-  duplicateIdentity.searchParams.append('contentPath', String(baseInput.embedData.contentPath));
-  candidates.push(duplicateIdentity.toString());
-
-  const missingName = new URL(signedUrl());
-  missingName.searchParams.delete('name');
-  candidates.push(missingName.toString());
-
-  const queryLookalike = new URL(signedUrl());
-  queryLookalike.searchParams.append('ContentPath', String(baseInput.embedData.contentPath));
-  candidates.push(queryLookalike.toString());
-
-  const unsafeNonce = new URL(signedUrl());
-  unsafeNonce.searchParams.set('nonce', '../../unsafe');
-  candidates.push(unsafeNonce.toString());
-
-  const missingNonce = new URL(signedUrl());
-  missingNonce.searchParams.delete('nonce');
-  candidates.push(missingNonce.toString());
-
-  const duplicateNonce = new URL(signedUrl());
-  duplicateNonce.searchParams.append('nonce', NONCE);
-  candidates.push(duplicateNonce.toString());
-
-  const duplicateSignature = new URL(signedUrl());
-  duplicateSignature.searchParams.append('signature', SIGNATURE);
-  candidates.push(duplicateSignature.toString());
-
-  const missingSignature = new URL(signedUrl());
-  missingSignature.searchParams.delete('signature');
-  candidates.push(missingSignature.toString());
-
-  const shortSignature = new URL(signedUrl());
-  shortSignature.searchParams.set('signature', 'too-short');
-  candidates.push(shortSignature.toString());
-
-  const leakedSecret = new URL(signedUrl());
-  leakedSecret.searchParams.set('secret', baseInput.embedSecret);
-  candidates.push(leakedSecret.toString());
-
-  const disguisedSecret = new URL(signedUrl());
-  disguisedSecret.searchParams.set('optionalField', `prefix-${baseInput.embedSecret}-suffix`);
-  candidates.push(disguisedSecret.toString());
+  for (const key of ['payload', 'signature', 'sdk']) {
+    const duplicate = new URL(signedUrl());
+    const value = duplicate.searchParams.get(key) ?? '@omni-co/embed@1.3.0';
+    duplicate.searchParams.set(key, value);
+    duplicate.searchParams.append(key, value);
+    candidates.push(duplicate.toString());
+    const lookalike = new URL(signedUrl());
+    lookalike.searchParams.set(key.toUpperCase(), value);
+    candidates.push(lookalike.toString());
+  }
+  for (const key of ['payload', 'signature']) {
+    const missing = new URL(signedUrl());
+    missing.searchParams.delete(key);
+    candidates.push(missing.toString());
+  }
+  for (const [key, value] of [
+    ['contentPath', baseInput.embedData.contentPath],
+    ['externalId', baseInput.embedData.externalId],
+    ['name', baseInput.embedData.name],
+    ['nonce', NONCE],
+    ['secret', baseInput.embedSecret],
+    ['optionalField', `prefix-${baseInput.embedSecret}-suffix`],
+    ['sdk', `prefix-${baseInput.embedSecret}-suffix`],
+    ['sdk', 'x'.repeat(65)],
+  ]) {
+    const extra = new URL(signedUrl());
+    extra.searchParams.set(key, value);
+    candidates.push(extra.toString());
+  }
+  const legacy = new URL('https://example.embed-omniapp.co/embed/login');
+  for (const [key, value] of Object.entries({ ...baseInput.embedData, nonce: NONCE, signature: 'legacy-test-signature' })) {
+    legacy.searchParams.set(key, value);
+  }
+  candidates.push(legacy.toString());
 
   for (const candidate of candidates) {
     await assert.rejects(
@@ -336,6 +400,7 @@ test('signed output requires exact single identity, nonce, and signature paramet
       }),
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
+        assert.equal((error as { statusCode: number }).statusCode, 502);
         assert.equal(message.includes(candidate), false);
         assert.equal(message.includes(baseInput.embedSecret), false);
         return true;
@@ -344,15 +409,30 @@ test('signed output requires exact single identity, nonce, and signature paramet
   }
 });
 
+test('v1 output never forwards secret material inside a verified payload', async () => {
+  const name = `Example ${baseInput.embedSecret}`;
+  await assert.rejects(generateSignedEmbedUrl({
+    ...baseInput,
+    embedData: { ...baseInput.embedData, name },
+  }, {
+    assertSafeUrl: async () => undefined,
+    fetchImpl: (async () => generatedResponse(signedUrl('example.embed-omniapp.co', { name }))) as typeof fetch,
+  }), (error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    assert.match(message, /prohibited secret material/);
+    assert.equal(message.includes(baseInput.embedSecret), false);
+    return true;
+  });
+});
+
 test('ambiguous response fields and rejected URL values are never echoed', async () => {
   const privateMarker = 'raw-url-private-marker';
-  const rejected = new URL(signedUrl());
-  rejected.searchParams.set('name', privateMarker);
+  const rejected = signedUrl('example.embed-omniapp.co', { name: privateMarker });
 
   await assert.rejects(
     generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(rejected.toString())) as typeof fetch,
+      fetchImpl: (async () => generatedResponse(rejected)) as typeof fetch,
     }),
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);

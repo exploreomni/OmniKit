@@ -82,6 +82,7 @@
     "security:check": "npm run typecheck && npm run typecheck:node && npm run lint && npm run build && npm run verify:bundle-budgets && npm run security:supply-chain && npm run test:security && npm run test:dashboard-safe-copy && npm run test:instance-connect && npm run test:ai-content-studio && npm run test:fleet-admin:contracts && npm run test:omni-api-contracts && npm run test:control-evidence && npm run verify:omni-api-contracts && npm run test:documents-v2-contract && npm run test:dashboard-migration && npm run test:migration-planner && npm run test:model-migrator && npm run test:model-governance && npm run test:frontend-performance && npm run test:governance-controls && npm run verify:release-governance && npm run test:semantic-studio && npm run test:browser:release && npm run test:instance-dashboard && npm run test:user-health && npm run test:user-management && npm run test:workspace-snapshot && npm run test:portfolio-overview && npm run test:dashboard-downloads && npm run test:deck-builder"
   },
   "dependencies": {
+    "@omni-co/embed": "1.3.0",
     "apache-arrow": "^21.1.0",
     "jszip": "^3.10.1",
     "lucide-react": "^1.29.0",
