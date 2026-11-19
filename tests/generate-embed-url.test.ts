@@ -1,10 +1,22 @@
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
+import type { IncomingMessage } from 'node:http';
+import { Readable } from 'node:stream';
 import { test } from 'node:test';
 import { deflateRawSync } from 'node:zlib';
-import { packSignedPayload, type SignedPayloadParams } from '@omni-co/embed';
+
+import {
+  DEFAULT_EXPIRES_IN_SECONDS,
+  MAX_EXPIRES_IN_SECONDS,
+  embedSsoContentDiscovery,
+  embedSsoDashboard,
+  embedSsoWorkbook,
+  packSignedPayload,
+  type SignedPayloadParams,
+} from '@omni-co/embed';
 
 import handler, { generateSignedEmbedUrl } from '../server/handlers/generate-embed-url';
+import { readBoundedJson, type OmniJsonRequest, type OmniJsonResponse } from '../server/services/omniJsonTransport';
 import { generateEmbedUrl as requestSignedEmbedUrl } from '../src/services/omniApi';
 
 const baseInput = {
@@ -17,6 +29,7 @@ const baseInput = {
   },
 };
 
+const SIGNED_AT = Date.now();
 const NONCE = 'nonce_1234567890abcdefghijklmnop';
 
 function signedUrl(
@@ -30,41 +43,47 @@ function signedUrl(
     ...baseInput.embedData,
     nonce: NONCE,
     ...overrides,
-  }, secret, { now: () => Date.UTC(2026, 10, 19) });
+  }, secret, { now: () => SIGNED_AT });
   url.searchParams.set('payload', payload);
   url.searchParams.set('signature', signature);
   return url.toString();
 }
 
-function generatedResponse(url: string, extra: Record<string, unknown> = {}): Response {
-  return new Response(JSON.stringify({ url, ...extra }), {
-    status: 200,
-    headers: { 'Content-Type': 'application/json' },
-  });
+function generatedResponse(url: string, extra: Record<string, unknown> = {}): OmniJsonResponse {
+  return { status: 200, data: { url, ...extra } };
 }
 
 test('standard SSO generation sends the secret in the JSON body without an Authorization header', async () => {
-  let capturedUrl = '';
-  let capturedInit: RequestInit | undefined;
+  let capturedRequest: OmniJsonRequest | undefined;
   const result = await generateSignedEmbedUrl(baseInput, {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async (input: string | URL | Request, init?: RequestInit) => {
-      capturedUrl = String(input);
-      capturedInit = init;
+    request: async (request) => {
+      capturedRequest = request;
       return generatedResponse(signedUrl());
-    }) as typeof fetch,
+    },
   });
 
-  assert.equal(capturedUrl, 'https://example.omniapp.co/embed/sso/generate-url');
-  assert.equal(capturedInit?.method, 'POST');
-  const headers = new Headers(capturedInit?.headers);
+  assert.equal(capturedRequest?.url, 'https://example.omniapp.co/embed/sso/generate-url');
+  assert.equal(capturedRequest?.method, 'POST');
+  assert.equal(capturedRequest.maximumResponseBytes, 128 * 1024);
+  const headers = new Headers(capturedRequest?.headers);
   assert.equal(headers.has('Authorization'), false);
-  assert.deepEqual(JSON.parse(String(capturedInit?.body)), {
+  assert.deepEqual(JSON.parse(String(capturedRequest?.body)), {
     ...baseInput.embedData,
     secret: baseInput.embedSecret,
   });
   assert.deepEqual(result, { url: signedUrl() });
   assert.equal(JSON.stringify(result).includes(baseInput.embedSecret), false);
+});
+
+test('the generator response limit applies even without a content-length header', async () => {
+  const body = Buffer.from(JSON.stringify({ url: 'example' }));
+  const response = () => Object.assign(Readable.from([body.subarray(0, 4), body.subarray(4)]), {
+    headers: { 'content-type': 'application/json' },
+  }) as IncomingMessage;
+
+  assert.deepEqual(await readBoundedJson(response(), body.length), { url: 'example' });
+  await assert.rejects(readBoundedJson(response(), body.length - 1), /response-too-large/);
 });
 
 test('browser signing requests bypass retained in-flight request keying', async (t) => {
@@ -93,10 +112,10 @@ test('generation requires contentPath, externalId, name, and an embed secret bef
   let calls = 0;
   const dependencies = {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async () => {
+    request: async () => {
       calls += 1;
-      return new Response('{}');
-    }) as typeof fetch,
+      return { status: 200, data: {} };
+    },
   };
 
   await assert.rejects(
@@ -117,7 +136,7 @@ test('generation requires contentPath, externalId, name, and an embed secret bef
 test('optional email and groups are normalized, forwarded, and bound to the signed output', async () => {
   const optional = {
     email: 'person@example.invalid',
-    groups: ['Finance', 'Operations'],
+    groups: ['Finance 50%', 'R&D Operations'],
   };
   const input = {
     ...baseInput,
@@ -130,10 +149,10 @@ test('optional email and groups are normalized, forwarded, and bound to the sign
   let capturedBody: Record<string, unknown> | null = null;
   const result = await generateSignedEmbedUrl(input, {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async (_input: string | URL | Request, init?: RequestInit) => {
-      capturedBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    request: async (request) => {
+      capturedBody = JSON.parse(String(request.body)) as Record<string, unknown>;
       return generatedResponse(signedUrl('example.embed-omniapp.co', optional));
-    }) as typeof fetch,
+    },
   });
 
   assert.deepEqual(capturedBody, {
@@ -152,9 +171,66 @@ test('v1 output accepts optional unsigned SDK telemetry and standard padded sign
   url.searchParams.set('signature', Buffer.from(signature, 'base64url').toString('base64'));
   const result = await generateSignedEmbedUrl(baseInput, {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async () => generatedResponse(url.toString())) as typeof fetch,
+    request: async () => generatedResponse(url.toString()),
   });
   assert.deepEqual(result, { url: url.toString() });
+});
+
+test('SDK dashboard and workbook links keep the requested document and deep link', async () => {
+  const props = {
+    host: 'example.embed-omniapp.co',
+    secret: baseInput.embedSecret,
+    externalId: baseInput.embedData.externalId,
+    name: baseInput.embedData.name,
+  };
+  const dashboard = await embedSsoDashboard({ ...props, contentId: 'example' });
+  const workbook = await embedSsoWorkbook({ ...props, contentId: 'example' });
+  const tabPath = '/dashboards/example/chat';
+  const tab = await embedSsoContentDiscovery({ ...props, path: tabPath });
+  for (const [url, requested] of [
+    [dashboard, '/embed/dashboards/example'],
+    [workbook, '/w/example'],
+    [workbook, '/w/example/duplicate'],
+    [tab, `/embed${tabPath}`],
+  ]) {
+    const input = { ...baseInput, embedData: { ...baseInput.embedData, contentPath: requested } };
+    const result = await generateSignedEmbedUrl(input, {
+      assertSafeUrl: async () => undefined,
+      request: async () => generatedResponse(url),
+    });
+    assert.equal(result.url, url);
+  }
+  for (const [url, requested] of [
+    [dashboard, '/embed/dashboards/another'],
+    [dashboard, `/embed${tabPath}`],
+    [workbook, '/w/another'],
+    [tab, `${tabPath}?filter=important`],
+  ]) {
+    const input = { ...baseInput, embedData: { ...baseInput.embedData, contentPath: requested } };
+    await assert.rejects(generateSignedEmbedUrl(input, {
+      assertSafeUrl: async () => undefined,
+      request: async () => generatedResponse(url),
+    }), /did not match the request/);
+  }
+});
+
+test('v1 output enforces the signed expiry window at the time the URL is returned', async (t) => {
+  const url = signedUrl();
+  const dependencies = {
+    assertSafeUrl: async () => undefined,
+    request: async () => generatedResponse(url),
+  };
+  const expiresAt = (Math.floor(SIGNED_AT / 1000) + DEFAULT_EXPIRES_IN_SECONDS) * 1000;
+  const earliestValid = expiresAt - MAX_EXPIRES_IN_SECONDS * 1000;
+  const clock = t.mock.method(Date, 'now', () => earliestValid);
+  for (const now of [earliestValid, expiresAt - 1000]) {
+    clock.mock.mockImplementation(() => now);
+    assert.deepEqual(await generateSignedEmbedUrl(baseInput, dependencies), { url });
+  }
+  for (const now of [earliestValid - 1000, expiresAt, expiresAt + 1000]) {
+    clock.mock.mockImplementation(() => now);
+    await assert.rejects(generateSignedEmbedUrl(baseInput, dependencies), /validity period/);
+  }
 });
 
 test('signed output rejects changed, missing, extra, or malformed optional identity claims', async () => {
@@ -174,14 +250,14 @@ test('signed output rejects changed, missing, extra, or malformed optional ident
   for (const candidate of candidates) {
     await assert.rejects(generateSignedEmbedUrl(input, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(candidate)) as typeof fetch,
+      request: async () => generatedResponse(candidate),
     }));
   }
 
   for (const extra of [{ email: optional.email }, { groups: optional.groups }, { entity: 'Unexpected entity' }]) {
     await assert.rejects(generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(signedUrl('example.embed-omniapp.co', extra))) as typeof fetch,
+      request: async () => generatedResponse(signedUrl('example.embed-omniapp.co', extra)),
     }), /unexpected signed payload parameter/);
   }
 });
@@ -191,7 +267,7 @@ test('upstream failures never expose response bodies or the embed secret', async
   await assert.rejects(
     generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => new Response(`${upstreamMarker}:${baseInput.embedSecret}`, { status: 403 })) as typeof fetch,
+      request: async () => ({ status: 403, data: `${upstreamMarker}:${baseInput.embedSecret}` }),
     }),
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -207,10 +283,7 @@ test('redirects and Omni host lookalikes are rejected', async () => {
   await assert.rejects(
     generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => new Response(null, {
-        status: 302,
-        headers: { Location: 'https://attacker.example/embed' },
-      })) as typeof fetch,
+      request: async () => ({ status: 302 }),
     }),
     /HTTP 302/,
   );
@@ -223,7 +296,7 @@ test('redirects and Omni host lookalikes are rejected', async () => {
     await assert.rejects(
       generateSignedEmbedUrl(baseInput, {
         assertSafeUrl: async () => undefined,
-        fetchImpl: (async () => generatedResponse(signedUrl(host))) as typeof fetch,
+        request: async () => generatedResponse(signedUrl(host)),
       }),
       /unexpected host/,
     );
@@ -233,13 +306,13 @@ test('redirects and Omni host lookalikes are rejected', async () => {
   await assert.rejects(
     generateSignedEmbedUrl(trailingDotBase, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(signedUrl('example.omniapp.co.'))) as typeof fetch,
+      request: async () => generatedResponse(signedUrl('example.omniapp.co.')),
     }),
     /unexpected host/,
   );
   assert.deepEqual(await generateSignedEmbedUrl(trailingDotBase, {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async () => generatedResponse(signedUrl())) as typeof fetch,
+    request: async () => generatedResponse(signedUrl()),
   }), { url: signedUrl() });
 });
 
@@ -248,14 +321,14 @@ test('custom vanity bases accept only the exact same host', async () => {
   const valid = signedUrl('analytics.customer.example');
   const result = await generateSignedEmbedUrl(customInput, {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async () => generatedResponse(valid)) as typeof fetch,
+    request: async () => generatedResponse(valid),
   });
   assert.deepEqual(result, { url: valid });
 
   await assert.rejects(
     generateSignedEmbedUrl(customInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(signedUrl('embed.customer.example'))) as typeof fetch,
+      request: async () => generatedResponse(signedUrl('embed.customer.example')),
     }),
     /unexpected host/,
   );
@@ -281,7 +354,7 @@ test('signed output rejects wrong schemes, userinfo, fragments, and ambiguous ra
     await assert.rejects(
       generateSignedEmbedUrl(baseInput, {
         assertSafeUrl: async () => undefined,
-        fetchImpl: (async () => generatedResponse(candidate)) as typeof fetch,
+        request: async () => generatedResponse(candidate),
       }),
       /invalid signed embed URL|documented standard SSO URL shape/,
     );
@@ -301,7 +374,7 @@ test('signed output binds the verified login URL, identity, and content to the r
   for (const override of overrides) {
     await assert.rejects(generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(signedUrl('example.embed-omniapp.co', override))) as typeof fetch,
+      request: async () => generatedResponse(signedUrl('example.embed-omniapp.co', override)),
     }), (error: unknown) => {
       assert.equal((error as { statusCode: number }).statusCode, 502);
       return true;
@@ -322,7 +395,7 @@ test('v1 output rejects tampering, wrong secrets, and malformed signed payloads'
   for (const candidate of candidates) {
     await assert.rejects(generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(candidate)) as typeof fetch,
+      request: async () => generatedResponse(candidate),
     }), /invalid v1 signed embed URL/);
   }
 });
@@ -332,7 +405,7 @@ test('v1 output rejects authenticated payloads with missing or invalid required 
     loginUrl: 'https://example.embed-omniapp.co/embed/login',
     ...baseInput.embedData,
     nonce: NONCE,
-    exp: Date.UTC(2026, 10, 20) / 1000,
+    exp: Math.floor(SIGNED_AT / 1000) + DEFAULT_EXPIRES_IN_SECONDS,
   };
   const candidates: Record<string, unknown>[] = [];
   for (const key of Object.keys(params)) {
@@ -350,7 +423,7 @@ test('v1 output rejects authenticated payloads with missing or invalid required 
     url.searchParams.set('signature', signature);
     await assert.rejects(generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(url.toString())) as typeof fetch,
+      request: async () => generatedResponse(url.toString()),
     }), /invalid v1 signed embed URL/);
   }
 });
@@ -396,7 +469,7 @@ test('v1 output rejects duplicate, missing, ambiguous, or unexpected query param
     await assert.rejects(
       generateSignedEmbedUrl(baseInput, {
         assertSafeUrl: async () => undefined,
-        fetchImpl: (async () => generatedResponse(candidate)) as typeof fetch,
+        request: async () => generatedResponse(candidate),
       }),
       (error: unknown) => {
         const message = error instanceof Error ? error.message : String(error);
@@ -416,7 +489,7 @@ test('v1 output never forwards secret material inside a verified payload', async
     embedData: { ...baseInput.embedData, name },
   }, {
     assertSafeUrl: async () => undefined,
-    fetchImpl: (async () => generatedResponse(signedUrl('example.embed-omniapp.co', { name }))) as typeof fetch,
+    request: async () => generatedResponse(signedUrl('example.embed-omniapp.co', { name })),
   }), (error: unknown) => {
     const message = error instanceof Error ? error.message : String(error);
     assert.match(message, /prohibited secret material/);
@@ -432,7 +505,7 @@ test('ambiguous response fields and rejected URL values are never echoed', async
   await assert.rejects(
     generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(rejected)) as typeof fetch,
+      request: async () => generatedResponse(rejected),
     }),
     (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
@@ -445,7 +518,7 @@ test('ambiguous response fields and rejected URL values are never echoed', async
   await assert.rejects(
     generateSignedEmbedUrl(baseInput, {
       assertSafeUrl: async () => undefined,
-      fetchImpl: (async () => generatedResponse(signedUrl(), { embed_url: signedUrl() })) as typeof fetch,
+      request: async () => generatedResponse(signedUrl(), { embed_url: signedUrl() }),
     }),
     /ambiguous signed embed URL response/,
   );

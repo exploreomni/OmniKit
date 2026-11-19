@@ -1,7 +1,11 @@
-import { unpackSignedPayload } from '@omni-co/embed';
+import { MAX_EXPIRES_IN_SECONDS, unpackSignedPayload } from '@omni-co/embed';
+
 import { assertSafeOutboundUrl, jsonHeaders, validateBaseUrl } from '../security';
+import { requestOmniJson } from '../services/omniJsonTransport';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+// The SDK accepts up to 64 KiB of encoded payload. Allow room for the URL and JSON envelope.
+const MAX_GENERATOR_RESPONSE_BYTES = 128 * 1024;
 const SAFE_NONCE_PATTERN = /^[A-Za-z0-9_-]{16,256}$/;
 const SAFE_SIGNATURE_PATTERN = /^[A-Za-z0-9+/_-]{43}=?$/;
 const ALLOWED_QUERY_PARAMETERS = new Set(['payload', 'signature', 'sdk']);
@@ -32,7 +36,7 @@ export interface GenerateEmbedUrlInput {
 }
 
 export interface GenerateEmbedUrlDependencies {
-  fetchImpl?: typeof fetch;
+  request?: typeof requestOmniJson;
   assertSafeUrl?: (url: string) => Promise<void>;
   timeoutMs?: number;
 }
@@ -88,6 +92,15 @@ function containsAsciiWhitespaceOrControl(value: string): boolean {
   return false;
 }
 
+function matchesRequestedContent(signedPath: string, requestedPath: string): boolean {
+  if (signedPath === requestedPath) return true;
+  // Omni removes the legacy dashboard prefix and signs workbook entry links in duplicate mode.
+  if (requestedPath.startsWith('/embed/dashboards/')) {
+    return signedPath === requestedPath.slice('/embed'.length);
+  }
+  return /^\/w\/[A-Za-z0-9_-]+$/.test(requestedPath) && signedPath === `${requestedPath}/duplicate`;
+}
+
 function validateSignedEmbedUrl(
   generatedUrl: string,
   baseUrl: URL,
@@ -122,23 +135,25 @@ function validateSignedEmbedUrl(
     throw statusError('Omni returned a signed embed URL for an unexpected host.', 502);
   }
 
-  for (const key of parsedUrl.searchParams.keys()) {
-    const canonicalKey = [...ALLOWED_QUERY_PARAMETERS].find((candidate) => candidate.toLowerCase() === key.toLowerCase());
-    if (canonicalKey && key !== canonicalKey) {
+  const seenParameters = new Set<string>();
+  for (const [key, value] of parsedUrl.searchParams) {
+    const lowerKey = key.toLowerCase();
+    if (key !== lowerKey && ALLOWED_QUERY_PARAMETERS.has(lowerKey)) {
       throw statusError('Omni returned a signed embed URL with an ambiguous protected query parameter.', 502);
     }
-    if (PROHIBITED_QUERY_PARAMETERS.has(key.toLowerCase())) {
+    if (PROHIBITED_QUERY_PARAMETERS.has(lowerKey)) {
       throw statusError('Omni returned a signed embed URL containing a prohibited credential parameter.', 502);
     }
     if (!ALLOWED_QUERY_PARAMETERS.has(key)) {
       throw statusError('Omni returned a signed embed URL with an unexpected query parameter.', 502);
     }
-    if (parsedUrl.searchParams.getAll(key).length !== 1) {
+    if (seenParameters.has(key)) {
       throw statusError('Omni returned a signed embed URL with a duplicate query parameter.', 502);
     }
-  }
-  if ([...parsedUrl.searchParams].some(([key, value]) => key.includes(embedSecret) || value.includes(embedSecret))) {
-    throw statusError('Omni returned a signed embed URL containing prohibited secret material.', 502);
+    seenParameters.add(key);
+    if (key.includes(embedSecret) || value.includes(embedSecret)) {
+      throw statusError('Omni returned a signed embed URL containing prohibited secret material.', 502);
+    }
   }
 
   if ((parsedUrl.searchParams.get('sdk')?.length ?? 0) > 64) {
@@ -147,12 +162,19 @@ function validateSignedEmbedUrl(
 
   const payload = parsedUrl.searchParams.get('payload');
   const signature = parsedUrl.searchParams.get('signature');
+  if (!payload || !signature || !SAFE_SIGNATURE_PATTERN.test(signature)) {
+    throw statusError('Omni returned an invalid v1 signed embed URL.', 502);
+  }
   let signed: ReturnType<typeof unpackSignedPayload>;
   try {
-    if (!payload || !signature || !SAFE_SIGNATURE_PATTERN.test(signature)) throw new Error('Invalid v1 parameters');
     signed = unpackSignedPayload({ payload, signature, secret: embedSecret });
   } catch {
     throw statusError('Omni returned an invalid v1 signed embed URL.', 502);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (!Number.isSafeInteger(signed.exp) || signed.exp <= now || signed.exp > now + MAX_EXPIRES_IN_SECONDS) {
+    throw statusError('Omni returned a signed embed URL outside its allowed validity period.', 502);
   }
 
   const allowedPayloadParameters = new Set([
@@ -170,21 +192,20 @@ function validateSignedEmbedUrl(
     throw statusError('Omni returned a signed embed URL whose signed login URL did not match the request.', 502);
   }
   if (
-    signed.contentPath !== required.contentPath
+    !matchesRequestedContent(signed.contentPath, required.contentPath)
     || signed.externalId !== required.externalId
     || signed.name !== required.name
     || signed.email !== required.email
   ) {
     throw statusError('Omni returned a signed embed URL whose required identity values did not match the request.', 502);
   }
-  if (required.groups) {
-    if (
-      !Array.isArray(signed.groups)
-      || signed.groups.length !== required.groups.length
-      || signed.groups.some((group, index) => group !== required.groups?.[index])
-    ) {
-      throw statusError('Omni returned a signed embed URL whose group values did not match the request.', 502);
-    }
+  const expectedGroups = required.groups;
+  if (expectedGroups && (
+    !Array.isArray(signed.groups)
+    || signed.groups.length !== expectedGroups.length
+    || signed.groups.some((group, index) => group !== expectedGroups[index])
+  )) {
+    throw statusError('Omni returned a signed embed URL whose group values did not match the request.', 502);
   }
 
   if (!SAFE_NONCE_PATTERN.test(signed.nonce)) {
@@ -241,19 +262,20 @@ export async function generateSignedEmbedUrl(
   const requestUrl = `${cleanUrl}/embed/sso/generate-url`;
   const assertSafeUrl = dependencies.assertSafeUrl
     || ((url: string) => assertSafeOutboundUrl(url, { label: 'base_url' }));
-  const fetchImpl = dependencies.fetchImpl || fetch;
+  const request = dependencies.request ?? requestOmniJson;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), dependencies.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
   try {
     await assertSafeUrl(requestUrl);
-    const response = await fetchImpl(requestUrl, {
+    const response = await request({
+      url: requestUrl,
       method: 'POST',
       headers: {
         Accept: 'application/json',
         'Content-Type': 'application/json',
       },
-      redirect: 'manual',
+      maximumResponseBytes: MAX_GENERATOR_RESPONSE_BYTES,
       signal: controller.signal,
       body: JSON.stringify({
         contentPath,
@@ -265,14 +287,14 @@ export async function generateSignedEmbedUrl(
       }),
     });
 
-    if (!response.ok) {
+    if (response.status < 200 || response.status >= 300) {
       throw statusError(
         `Omni rejected standard SSO URL generation with HTTP ${response.status}. Verify the embed secret and required identity fields in Omni.`,
         response.status >= 400 && response.status < 600 ? response.status : 502,
       );
     }
 
-    const payload = await response.json().catch(() => null) as unknown;
+    const payload = response.data;
     const payloadRecord = payload && typeof payload === 'object' && !Array.isArray(payload)
       ? payload as Record<string, unknown>
       : null;
@@ -322,7 +344,7 @@ export default async function handler(req: Request): Promise<Response> {
     return json({
       error: statusCode === 400
         ? (error instanceof Error ? error.message : 'Invalid embed URL request.')
-        : 'Signed embed URL generation could not be completed. Verify the standard SSO configuration in Omni.',
+        : 'Signed embed URL generation could not be completed. Verify the embed secret and v1 standard SSO configuration in Omni.',
     }, statusCode);
   }
 }

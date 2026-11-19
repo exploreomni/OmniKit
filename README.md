@@ -179,6 +179,8 @@ Each workspace has an on-demand **Read-only readiness** panel. It uses documente
 
 For Standard SSO, enter the content path, external ID, name, optional email and groups, and embed secret for that request. The secret is sent through the local signing request and cleared after every attempt; OmniKit does not keep a recent signed-URL or secret ledger. Changing any identity-affecting input invalidates the displayed URL. A generated URL confirms that Omni accepted the signing request; it does not prove end-user access.
 
+The generator requires v1 Standard SSO. Before displaying the link, OmniKit verifies its signature, destination, content, identity, groups, and expiry. If your instance still generates legacy links, see [Omni’s v1 migration guide](https://docs.omni.co/embed/setup/standard-sso/migrate-to-latest).
+
 Workspace navigation, filters, drilldowns, readiness controls, and dialogs are keyboard operable. Use the skip link to move to main content; dialogs keep focus inside while open, close with Escape, and return focus to the opener. Fleet and Administration layouts are designed to remain usable at 320-pixel width without horizontal page overflow.
 
 ### Data & AI creation and migration
