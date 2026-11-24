@@ -20,6 +20,7 @@ const byKey: QueryFiles = { '2': { [name]: header + stringify(approved) } };
 
 function fixture() {
   const initial = { extension: header + stringify(partial), composed: header + stringify({ ...unrelated, measures: { max_date: measure } }),
+    sourceEditable: header + stringify(effective), writtenEditable: header + stringify(effective),
     parent: header + stringify(parent), kind: 'QUERY', children: [orphan], total: 1, retainedSuppression: true, divergentResolved: false };
   const writes: Array<{ method: string; path: string; body: unknown }> = [];
   const owner = (id: string) => ({ id, deletedAt: null, modelKind: id === workbook ? 'WORKBOOK' : initial.kind,
@@ -36,7 +37,9 @@ function fixture() {
     if (params.get('mode') === 'extension') return { files: { [name]: initial.extension }, checksums: { [name]: 'extension-cas' } };
     assert.equal(params.get('fileName'), '^orders\\.view$');
     const resolved = params.get('fullyResolved') === 'true';
-    const text = id === source ? header + stringify(effective) : id === workbook || id === model ? initial.parent : initial.composed;
+    let text = id === source ? initial.sourceEditable : initial.composed;
+    if (id === workbook || id === model) text = initial.parent;
+    else if (resolved) text = header + stringify(effective);
     const yaml = resolved && id === orphan && initial.divergentResolved ? header + stringify({ ...effective,
       measures: { max_date: { ...measure, filters: { status: 'active' } } } }) : text;
     return { files: { [name]: yaml }, ...(resolved ? {} : { checksums: { [name]: (id === workbook ? 'parent:' : 'child:') + text.length } }),
@@ -53,7 +56,7 @@ function fixture() {
     assert.ok(String(data.yaml).startsWith(header));
     assert.deepEqual(parse(String(data.yaml)), { ...parent, ...approved });
     if (initial.retainedSuppression) initial.extension = header + stringify(approved);
-    initial.composed = header + stringify(effective);
+    initial.composed = initial.writtenEditable;
     return { success: true, fileName: name };
   };
   async function options() {
@@ -81,6 +84,45 @@ test('checks a fresh target before creating a workbook when source and destinati
   assert.ok(plan['2'][name]);
   f.initial.parent = header + stringify({ ...parent, table_name: 'OTHER_TABLE' });
   await assert.rejects(inspectNewQueryDestination(options.read, model, byKey, options.evidenceByKey), /cannot reproduce/);
+  assert.deepEqual(f.writes, []);
+});
+
+test('writes the inherited alias but verifies the child rendering in each mode, including an already repaired orphan', async () => {
+  const rendered = header + stringify({ ...unrelated, measures: { max_date: measure } });
+  for (const alreadyRepaired of [false, true]) {
+    const f = fixture();
+    f.initial.sourceEditable = rendered;
+    f.initial.writtenEditable = rendered;
+    if (alreadyRepaired) f.initial.extension = header + stringify(approved);
+    const options = await f.options();
+    await inspectNewQueryDestination(options.read, model, byKey, options.evidenceByKey);
+    await restoreQueryFiles({ ...options, reviewedRecovery: await inspectQueryRecovery(options) });
+    assert.deepEqual(f.writes.map(w => w.method), alreadyRepaired ? ['PUT'] : ['POST', 'PUT']);
+  }
+});
+
+test('rejects wrong or absent explicit aliases and unrelated readback changes before binding', async () => {
+  const withoutAlias = { ...unrelated, measures: { max_date: measure } };
+  const cases = [
+    { source: withoutAlias, written: { ...withoutAlias, renamed_from: 'different' } },
+    { source: effective, written: withoutAlias },
+    { source: withoutAlias, written: { ...withoutAlias, dimensions: { region: { sql: 'region', renamed_from: 'previous_region' } } } },
+  ];
+  for (const { source, written } of cases) {
+    const f = fixture();
+    f.initial.sourceEditable = header + stringify(source);
+    f.initial.writtenEditable = header + stringify(written);
+    const options = await f.options();
+    await assert.rejects(restoreQueryFiles({ ...options, reviewedRecovery: await inspectQueryRecovery(options) }), /differs after/);
+    assert.deepEqual(f.writes.map(w => w.method), ['POST']);
+  }
+  const f = fixture(), options = await f.options();
+  f.initial.composed = header + stringify({ ...effective, renamed_from: 'conflict' });
+  await assert.rejects(inspectQueryRecovery(options), /conflicting rename/);
+  for (const alias of [null, '']) {
+    f.initial.sourceEditable = header + stringify({ ...effective, renamed_from: alias });
+    await assert.rejects(f.options(), /unsupported rename/);
+  }
   assert.deepEqual(f.writes, []);
 });
 

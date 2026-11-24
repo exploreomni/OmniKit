@@ -8,7 +8,7 @@ export type QueryFiles = Record<string, Files>;
 export type AppRead = (path: string, task: string) => Promise<unknown>;
 export type AppWrite = (method: string, path: string, body?: unknown) => Promise<unknown>;
 type Fields = Record<string, unknown>;
-interface EffectiveView { viewName: string; physical: Fields; fields: Record<string, Fields> }
+interface EffectiveView { viewName: string; renamedFrom: string | null; physical: Fields; fields: Record<string, Fields> }
 interface QueryFileEvidence { editable: EffectiveView; resolved: EffectiveView }
 export type QueryEvidence = Record<string, Record<string, QueryFileEvidence>>;
 
@@ -116,6 +116,13 @@ async function combinedFile(read: AppRead, id: string, name: string, resolved = 
   return { root, viewName, header: header?.[0], checksum: typeof checksum === 'string' ? checksum : '' };
 }
 
+function renderedRename(root: Fields): string | null {
+  if (!Object.hasOwn(root, 'renamed_from')) return null;
+  const alias = root.renamed_from;
+  requireState(typeof alias === 'string' && alias.trim().length > 0, 'The composed view has an unsupported rename alias.');
+  return alias;
+}
+
 function queryEvidence(view: Awaited<ReturnType<typeof combinedFile>>, names: Array<[string, string, Fields]>): EffectiveView {
   const fields: Record<string, Fields> = {};
   for (const [group, name] of names) {
@@ -125,7 +132,7 @@ function queryEvidence(view: Awaited<ReturnType<typeof combinedFile>>, names: Ar
   }
   const physical = Object.fromEntries(Object.entries(view.root).filter(([key]) =>
     ['table_name', 'sql_table_name', 'schema', 'catalog', 'database', 'sql', 'query'].includes(key)));
-  return { viewName: view.viewName, fields, physical };
+  return { viewName: view.viewName, renamedFrom: renderedRename(view.root), fields, physical };
 }
 
 export async function readQueryIntentEvidence(read: AppRead, id: string, files: Files) {
@@ -153,8 +160,11 @@ async function prepareCombined(read: AppRead, parentId: string, childId: string 
   const root = structuredClone(child.root);
   const fields = namedFields(authored);
   if (authored.ignored_props !== undefined) requireState(isDeepStrictEqual(authored.ignored_props, { renamed_from: true }), 'A view suppression is unsupported.');
-  if (authored.ignored_props || !Object.hasOwn(parent.root, 'renamed_from')) delete root.renamed_from;
-  else root.renamed_from = parent.root.renamed_from;
+  const parentRename = renderedRename(parent.root);
+  const childRename = renderedRename(child.root);
+  requireState(childRename === null || childRename === parentRename, 'The destination query view has a conflicting rename alias.');
+  if (authored.ignored_props || parentRename === null) delete root.renamed_from;
+  else root.renamed_from = parentRename;
   for (const [group, name, field] of fields) {
     const definitions = root[group] ??= {};
     requireState(record(definitions), 'The destination field collection is unsupported.');
@@ -169,7 +179,11 @@ async function prepareCombined(read: AppRead, parentId: string, childId: string 
     }
     definitions[name] = merged;
   }
-  const projected = queryEvidence({ ...child, root }, fields);
+  // Omni needs the parent alias in the payload to preserve inheritance, but a
+  // child layer can omit that inherited alias when it renders editable YAML.
+  const expectedCombined = { ...root };
+  if (parentRename !== null && !authored.ignored_props && source.editable.renamedFrom === null) delete expectedCombined.renamed_from;
+  const projected = queryEvidence({ ...child, root: expectedCombined }, fields);
   requireState(isDeepStrictEqual(projected, source.editable), 'The destination model cannot reproduce the approved effective query fields.');
   const payload = structuredClone(root);
   if (authored.ignored_props) payload.ignored_props = authored.ignored_props;
@@ -178,7 +192,7 @@ async function prepareCombined(read: AppRead, parentId: string, childId: string 
   }
   const encoded = (child.header ? child.header + '\n' : '') + stringify(payload);
   requireState(Buffer.byteLength(encoded) <= 256 * 1024, 'The composed query file exceeds the size limit.');
-  return { yaml: encoded, checksum: child.checksum, expectedCombined: root, parentChecksum: parent.checksum };
+  return { yaml: encoded, checksum: child.checksum, expectedCombined, parentChecksum: parent.checksum };
 }
 
 export async function inspectNewQueryDestination(read: AppRead, modelId: string, byKey: QueryFiles, evidenceByKey: QueryEvidence) {
