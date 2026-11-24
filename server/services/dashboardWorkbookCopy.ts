@@ -1,18 +1,19 @@
 import { createHash } from 'node:crypto';
 import { parseDocument } from 'yaml';
 import { getDashboardWorkbookCopyCapability } from '../../shared/dashboardWorkbookCopyCapability';
+import { isEmptyModelExtensionRoot } from './modelExtensionYaml';
 
 export { getDashboardWorkbookCopyCapability } from '../../shared/dashboardWorkbookCopyCapability';
 
 /** Only a provably empty YAML root is ignorable; unfamiliar or invalid content blocks. */
 export function dashboardWorkbookHasAuthoredDefinitions(files: Record<string, string>): boolean {
-  return Object.values(files).some((yaml) => {
+  return Object.entries(files).some(([fileName, yaml]) => {
     if (typeof yaml !== 'string' || yaml.length > 5_000_000) return true;
     try {
       const document = parseDocument(yaml);
-      if (document.errors.length) return true;
+      if (document.errors.length || document.warnings.length) return true;
       const root: unknown = document.toJS({ maxAliasCount: 100 });
-      return root !== null && root !== undefined && !(typeof root === 'object' && !Array.isArray(root) && Object.keys(root).length === 0);
+      return !isEmptyModelExtensionRoot(fileName, root);
     } catch {
       return true;
     }
