@@ -16,6 +16,18 @@ import type {
   MigrationTarget,
 } from '../server/services/migrationJobs';
 import type { DashboardSafeCopyIntent } from '../shared/dashboardSafeCopyContract';
+import { OmniClientError } from '../server/services/omniClient';
+
+test('inspection failures identify the failed read and preserve the credential boundary', async () => {
+  const [result] = await prepareDashboardSafeCopyTargets(intent(['b']), [target('b')], {
+    buildPlan: async () => { throw new OmniClientError(403, 'https://example.invalid/api/v1/models/private-id/yaml?secret=private-value', 'private upstream body'); },
+  });
+  assert.equal(result.status, 'needs_attention');
+  if (result.status === 'needs_attention') {
+    assert.match(result.exceptions[0].message, /model YAML.*HTTP 403/);
+    assert.doesNotMatch(result.exceptions[0].message, /private|example.invalid/);
+  }
+});
 
 function target(id: string): MigrationTarget {
   return {
