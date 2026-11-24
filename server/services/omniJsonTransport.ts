@@ -28,6 +28,7 @@ export async function readBoundedJson(
   response: IncomingMessage,
   maximumBytes = DEFAULT_RESPONSE_MAX_BYTES,
   allowOctetStreamJson = false,
+  expectedRoot: 'object' | 'array' = 'object',
 ): Promise<unknown> {
   const declaredLength = Number(response.headers['content-length'] || '0');
   if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
@@ -57,7 +58,7 @@ export async function readBoundedJson(
   } catch {
     throw Object.assign(new Error('invalid-json-response'), { statusCode: 502 });
   }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) !== (expectedRoot === 'array')) {
     throw Object.assign(new Error('invalid-json-response'), { statusCode: 502 });
   }
   return parsed;
@@ -104,6 +105,7 @@ export interface OmniJsonRequest {
   signal: AbortSignal;
   maximumResponseBytes?: number;
   allowOctetStreamJson?: boolean;
+  expectedRoot?: 'object' | 'array';
 }
 
 export async function requestOmniJson(request: OmniJsonRequest): Promise<OmniJsonResponse> {
@@ -135,6 +137,7 @@ export async function requestOmniJson(request: OmniJsonRequest): Promise<OmniJso
         response,
         request.maximumResponseBytes,
         request.allowOctetStreamJson,
+        request.expectedRoot,
       ).then((data) => resolve({ status, data }), reject);
     });
     outbound.once('error', reject);

@@ -7,8 +7,8 @@ import { dashboardWorkbookHasAuthoredDefinitions } from '../services/dashboardWo
 import { getInstance, VAULT_SESSION_ABORT_SIGNAL, type SavedInstance } from '../services/nativeVault';
 import { requestOmniJson } from '../services/omniJsonTransport';
 import {
-  CopyError, modelMetadata, portableFiles, readExtension, record, requireQueryCopyRoutes,
-  requireState, restoreQueryFiles, sameQueryFiles, type QueryFiles,
+  CopyError, inspectNewQueryDestination, inspectQueryRecovery, modelMetadata, portableFiles, readExtension, readQueryIntentEvidence, record,
+  requireQueryCopyRoutes, requireState, restoreQueryFiles, sameQueryFiles, type QueryEvidence, type QueryFiles,
 } from '../services/nativeAppQueryModels';
 
 const documentIdentifier = z.string().regex(/^[a-z0-9_-]{2,48}$/i);
@@ -20,11 +20,18 @@ const copyInput = z.object({
   destinationIdentifier: documentIdentifier,
   destinationModelId: z.uuid(),
   destinationFolderId: z.uuid().optional(),
+  recovery: z.object({
+    draftIdentifier: documentIdentifier,
+    publishedWorkbookModelId: z.uuid(),
+    draftWorkbookModelId: z.uuid(),
+    queryModelIdsByKey: z.record(z.string().regex(/^[1-9][0-9]*$/), z.uuid()).optional(),
+  }).strict().optional(),
   previewDigest: z.string().regex(/^[0-9a-f]{64}$/).optional(),
 }).strict();
 
 const MAX_APP_HTML_BYTES = 2 * 1024 * 1024;
 const MAX_READ_BYTES = 16 * 1024 * 1024;
+const activeTargets = new Set<string>();
 
 function digest(value: unknown): string {
   // Sort object keys for comparisons between independent API reads. Array order carries meaning.
@@ -33,19 +40,15 @@ function digest(value: unknown): string {
   return createHash('sha256').update(canonical).digest('hex');
 }
 
-function appContent(doc: unknown, app: unknown, identifier: string, path: string, draft: boolean) {
-  requireState(record(doc) && (!doc.draftOf || (draft && record(doc.draftOf) && doc.draftOf.identifier === identifier))
-    && record(doc.app) && doc.app.url === path + '/app',
-    'Select a published native App using its current identifier.');
+function workbookContent(doc: unknown, identifier: string, draft: boolean) {
+  requireState(record(doc) && (!doc.draftOf || (draft && record(doc.draftOf) && doc.draftOf.identifier === identifier)),
+    'The workbook does not belong to the selected document.');
   requireState(!('containers' in doc) && typeof doc.name === 'string' && doc.name.trim()
     && (typeof doc.description === 'string' || doc.description == null),
   'The source document metadata is incomplete or includes a dashboard.');
   requireState(typeof doc.modelId === 'string' && typeof doc.workbookModelId === 'string'
     && z.uuid().safeParse(doc.modelId).success && z.uuid().safeParse(doc.workbookModelId).success
     && doc.modelId !== doc.workbookModelId, 'The published workbook model binding could not be verified.');
-  requireState(record(app) && typeof app.html === 'string' && app.html.trim()
-    && Buffer.byteLength(app.html) <= MAX_APP_HTML_BYTES && record(app.settings),
-  'The App must have published HTML within the 2 MiB create limit and readable sandbox settings.');
 
   if (doc.controls !== undefined) {
     const controls = doc.controls;
@@ -100,9 +103,28 @@ function appContent(doc: unknown, app: unknown, identifier: string, path: string
     bindings,
     name: doc.name,
     description: doc.description ?? null,
-    app: { html: app.html, settings: app.settings },
     queryPresentations: { data: tabs, order },
   };
+}
+
+function appContent(doc: unknown, app: unknown, path: string) {
+  requireState(record(doc) && record(doc.app) && doc.app.url === path + '/app',
+    'The App does not belong to the selected workbook.');
+  requireState(record(app) && typeof app.html === 'string' && app.html.trim()
+    && Buffer.byteLength(app.html) <= MAX_APP_HTML_BYTES && record(app.settings),
+  'The App must have HTML within the 2 MiB create limit and readable sandbox settings.');
+  return { html: app.html, settings: app.settings };
+}
+
+async function checkMainDraft(
+  read: (path: string, task: string) => Promise<unknown>,
+  identifier: string, draftIdentifier: string, workbookModelId: string,
+) {
+  const drafts = await read('/api/v1/documents/' + identifier + '/drafts', 'Check active main draft');
+  const main = Array.isArray(drafts) ? drafts.filter(d => record(d) && d.branch === null && d.status === 'active') : [];
+  requireState(main.length === 1 && main[0].identifier === draftIdentifier && main[0].publishedIdentifier === identifier
+    && main[0].workbookModelId === workbookModelId && main[0].draftOutOfDate === false,
+  'The selected draft is no longer the current main draft.');
 }
 
 export async function handleNativeAppCopy(req: Request, dependencies: {
@@ -116,8 +138,14 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
   if (!parsed.success) return json({ error: 'Provide valid saved profile IDs, document identifiers, and a destination model UUID.' }, 400);
   const { action, previewDigest, ...scope } = parsed.data;
   if (action === 'apply' && !previewDigest) return json({ error: 'Preview the App copy before applying it.' }, 400);
+  const recovery = scope.recovery;
+  if (recovery && (scope.destinationFolderId || recovery.draftIdentifier === scope.destinationIdentifier
+    || recovery.publishedWorkbookModelId === recovery.draftWorkbookModelId)) {
+    return json({ error: 'For recovery, select the existing document and its distinct published and draft workbooks. Folder placement is set at creation.' }, 400);
+  }
 
   let dispatched = false;
+  let activeKey: string | undefined;
   let recoveryDraft: string | undefined;
   let stage = 'creating the destination';
   try {
@@ -130,6 +158,12 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
     }
     const sourcePath = '/api/v2/documents/' + encodeURIComponent(scope.sourceIdentifier);
     const targetPath = '/api/v2/documents/' + encodeURIComponent(scope.destinationIdentifier);
+    if (action === 'apply') {
+      const key = new URL(destination.baseUrl).origin + targetPath.toLowerCase();
+      if (activeTargets.has(key)) throw new CopyError(409, 'This destination already has an App copy in progress.');
+      activeTargets.add(key);
+      activeKey = key;
+    }
     const signals = [req.signal, AbortSignal.timeout(action === 'apply' ? 240_000 : 90_000)];
     for (const instance of [source, destination]) {
       const session = instance[VAULT_SESSION_ABORT_SIGNAL];
@@ -139,12 +173,16 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
     const request = dependencies.request ?? requestOmniJson;
     async function call(instance: SavedInstance, path: string, method = 'GET', body?: unknown) {
       signal.throwIfAborted();
+      const encoded = body === undefined ? undefined : JSON.stringify(body);
       if (method !== 'GET') {
         for (const before of [source!, destination!]) {
           const current = profile(before.id);
           if (!current || current.baseUrl !== before.baseUrl || current.apiKey !== before.apiKey
             || current.updatedAt !== before.updatedAt || current.role !== before.role) {
             throw new CopyError(409, 'A saved profile changed. Preview again.');
+          }
+          if (before.apiKey && encoded?.includes(JSON.stringify(before.apiKey).slice(1, -1))) {
+            throw new CopyError(422, 'The write contains saved credential material and cannot be dispatched.');
           }
         }
         dispatched = true;
@@ -153,8 +191,10 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
         method,
         url: new URL(path, instance.baseUrl).href,
         headers: { Authorization: 'Bearer ' + instance.apiKey, Accept: 'application/json', 'Content-Type': 'application/json' },
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(encoded === undefined ? {} : { body: encoded }),
         maximumResponseBytes: MAX_READ_BYTES,
+        ...(method === 'GET' && path === '/api/v1/documents/' + scope.destinationIdentifier + '/drafts'
+          ? { expectedRoot: 'array' } : {}),
         signal,
       });
     }
@@ -167,12 +207,13 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
       const [doc, app] = await Promise.all([
         read(instance, path, 'Read published workbook'), read(instance, path + '/app', 'Read published native App'),
       ]);
-      const copy = appContent(doc, app, identifier, path, draft);
+      const copy = { ...workbookContent(doc, identifier, draft), app: appContent(doc, app, path) };
       const get = (route: string, task: string) => read(instance, route, task);
       const workbook = await readExtension(get, copy.workbookModelId);
       requireState(!dashboardWorkbookHasAuthoredDefinitions(workbook.files),
         'Resolve workbook-local definitions before copying this App.');
       const byKey: QueryFiles = {};
+      const evidenceByKey: QueryEvidence = {};
       const entries = Object.entries(copy.bindings);
       let size = 0, count = 0;
       for (let start = 0; start < entries.length; start += 4) {
@@ -186,17 +227,24 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
           requireState(metadata.modelKind === 'QUERY' && metadata.baseModelId === copy.workbookModelId,
             'The authored query model is not owned by this workbook.');
           byKey[key] = files;
+          const evidence = await readQueryIntentEvidence(get, modelId, files);
+          if (Object.keys(evidence).length) evidenceByKey[key] = evidence;
         }));
       }
-      return { ...copy, byKey };
+      return { ...copy, byKey, evidenceByKey };
     }
 
     const copy = await readApp(source, sourcePath, scope.sourceIdentifier);
     const target = await call(destination, targetPath);
-    if (target.status === 200) throw new CopyError(409, 'The destination identifier already exists. Inspect it before choosing a new identifier.');
-    if (target.status !== 404) throw new CopyError(422, 'Could not check the destination identifier (HTTP ' + target.status + ').');
+    if (recovery) {
+      requireState(target.status === 200 && record(target.data) && !('app' in target.data),
+        'Recovery requires an existing published workbook scaffold without a published App.');
+    } else {
+      if (target.status === 200) throw new CopyError(409, 'The destination identifier already exists. Inspect it before choosing a new identifier.');
+      if (target.status !== 404) throw new CopyError(422, 'Could not check the destination identifier (HTTP ' + target.status + ').');
+    }
 
-    const { sourceModelId, workbookModelId, bindings, byKey, ...content } = copy;
+    const { sourceModelId, workbookModelId, bindings, byKey, evidenceByKey, ...content } = copy;
     const authored = Object.keys(byKey).length > 0;
     const targetRead = (path: string, task: string) => read(destination!, path, task);
     let connectionId = '';
@@ -220,9 +268,45 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
         throw new CopyError(422, 'App content contains saved credential material and cannot be transferred.');
       }
     }
+    function checkWorkbook(result: ReturnType<typeof workbookContent>) {
+      requireState(result.sourceModelId === scope.destinationModelId && result.name === copy.name
+        && result.description === copy.description && isDeepStrictEqual(result.queryPresentations, copy.queryPresentations),
+      'The destination workbook or its ordered queries differ from the approved source.');
+    }
+    function checkContent(result: typeof copy) {
+      checkWorkbook(result);
+      requireState(isDeepStrictEqual(result.app, copy.app), 'The destination App HTML or settings differ from the approved source.');
+    }
+    async function inspectRecovery() {
+      if (!recovery) return undefined;
+      requireState(authored && record(target.data) && !('settings' in target.data),
+        'Recovery requires query-local definitions and a workbook-only destination.');
+      const scaffold = workbookContent(target.data, scope.destinationIdentifier, false);
+      checkWorkbook(scaffold);
+      requireState(scaffold.workbookModelId === recovery.publishedWorkbookModelId, 'The published workbook identity changed.');
+      const parent = await modelMetadata(targetRead, scaffold.workbookModelId);
+      requireState(parent.modelKind === 'WORKBOOK' && parent.baseModelId === scope.destinationModelId && parent.connectionId === connectionId,
+        'The published scaffold is outside the selected model or connection.');
+      for (const id of [scaffold.workbookModelId, ...Object.values(scaffold.bindings)]) {
+        const ext = await readExtension(targetRead, id);
+        requireState(!dashboardWorkbookHasAuthoredDefinitions(ext.files), 'The published scaffold already has authored model definitions.');
+      }
+      await checkMainDraft(targetRead, scope.destinationIdentifier, recovery.draftIdentifier, recovery.draftWorkbookModelId);
+      const draftPath = targetPath + '/draft/' + recovery.draftIdentifier;
+      const before = await readApp(destination!, draftPath, scope.destinationIdentifier, true);
+      checkContent(before);
+      requireState(before.workbookModelId === recovery.draftWorkbookModelId, 'The selected recovery draft workbook changed.');
+      const queryState = await inspectQueryRecovery({
+        read: targetRead, destinationModelId: scope.destinationModelId, draftWorkbookId: before.workbookModelId,
+        connectionId, bindings: before.bindings, byKey, evidenceByKey, queryModelIdsByKey: recovery.queryModelIdsByKey,
+      });
+      return { draftPath, before, queryState, scaffoldBindings: scaffold.bindings };
+    }
+    const recoveryState = await inspectRecovery();
+    const newQueryDestination = recovery ? undefined : await inspectNewQueryDestination(targetRead, scope.destinationModelId, byKey, evidenceByKey);
     const fingerprint = digest({ scope, sourceOrigin: source.baseUrl, destinationOrigin: destination.baseUrl,
       sourceProfileVersion: source.updatedAt, destinationProfileVersion: destination.updatedAt,
-      sourceModelId, workbookModelId, bindings, byKey, connectionId, body });
+      sourceModelId, workbookModelId, bindings, byKey, evidenceByKey, connectionId, body, recoveryState, newQueryDestination });
     const details = {
       sourceIdentifier: scope.sourceIdentifier, destinationIdentifier: scope.destinationIdentifier,
       destinationModelId: scope.destinationModelId, destinationFolderId: scope.destinationFolderId ?? null,
@@ -230,6 +314,18 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
       htmlBytes: Buffer.byteLength(copy.app.html), settings: copy.app.settings,
       queryModelCount: Object.keys(byKey).length,
       queryModelFileCount: Object.values(byKey).reduce((count, files) => count + Object.keys(files).length, 0),
+      ...(recovery && recoveryState && {
+        recovery,
+        recoveryTabs: Object.keys(byKey).map(key => {
+          const boundId = recoveryState.before.bindings[key];
+          const reconciledId = recovery.queryModelIdsByKey?.[key];
+          return {
+            key, name: copy.queryPresentations.data[key].name, sourceFileCount: Object.keys(byKey[key]).length,
+            destinationQueryModelId: boundId ?? reconciledId ?? null,
+            modelAction: boundId ? 'keep_binding' : reconciledId ? 'bind_existing' : 'create_and_bind',
+          };
+        }),
+      }),
     };
     if (action === 'preview') return json({ status: 'preview', previewDigest: fingerprint, ...details });
     if (previewDigest !== fingerprint) throw new CopyError(409, 'The App, profile, or destination changed. Preview again.');
@@ -237,80 +333,107 @@ export async function handleNativeAppCopy(req: Request, dependencies: {
     // Never automatically resend an authenticated create after an ambiguous result.
     signal.throwIfAborted();
     const { app, ...workbookBody } = body;
-    const created = await call(destination, '/api/v2/documents', 'POST', authored ? { ...workbookBody, containers: null } : body);
-    if (created.status >= 400 && created.status < 500 && created.status !== 408) {
-      dispatched = false;
-      throw new CopyError(created.status, 'Omni declined the App creation (HTTP ' + created.status + '). Check destination permissions, identifiers, and model.');
+    let warningCount = 0;
+    if (!recovery) {
+      const created = await call(destination, '/api/v2/documents', 'POST', authored ? { ...workbookBody, containers: null } : body);
+      if (created.status >= 400 && created.status < 500 && created.status !== 408) {
+        dispatched = false;
+        throw new CopyError(created.status, 'Omni declined the App creation (HTTP ' + created.status + '). Check destination permissions, identifiers, and model.');
+      }
+      requireState(created.status === 201 && record(created.data) && created.data.identifier === scope.destinationIdentifier,
+        'The create response could not be verified.');
+      warningCount = Array.isArray(created.data.warnings) ? created.data.warnings.length : 0;
     }
-    requireState(created.status === 201 && record(created.data) && created.data.identifier === scope.destinationIdentifier,
-      'The create response could not be verified.');
-    const checkContent = (result: typeof copy) => requireState(result.sourceModelId === scope.destinationModelId
-      && result.name === copy.name && result.description === copy.description && isDeepStrictEqual(result.app, copy.app)
-      && isDeepStrictEqual(result.queryPresentations, copy.queryPresentations), 'App content differs from the approved source.');
-    let warningCount = Array.isArray(created.data.warnings) ? created.data.warnings.length : 0;
     if (authored) {
-      stage = 'preparing the new workbook draft';
+      stage = 'checking the destination workbook';
       const write = async (method: string, path: string, payload?: unknown) => {
         const response = await call(destination!, path, method, payload);
-        requireState(response.status === 200, 'The destination draft write was unverified.');
+        requireState(response.status === 200, 'Omni returned HTTP ' + response.status + ' for the destination write.');
         return response.data;
       };
-      const scaffold = await targetRead(targetPath, 'Read new destination workbook');
-      requireState(record(scaffold) && !scaffold.app && !scaffold.containers && !scaffold.draftOf
-        && scaffold.name === copy.name && scaffold.modelId === scope.destinationModelId && z.uuid().safeParse(scaffold.workbookModelId).success,
-      'The new destination workbook could not be verified.');
-      const draft = await write('PATCH', targetPath + '/draft', { summary: 'Copy reviewed App query models' });
-      requireState(record(draft) && draft.identifier === scope.destinationIdentifier && typeof draft.draftIdentifier === 'string'
-        && documentIdentifier.safeParse(draft.draftIdentifier).success && draft.draftIdentifier !== scope.destinationIdentifier,
-      'The new destination draft could not be verified.');
-      recoveryDraft = draft.draftIdentifier;
-      const draftPath = targetPath + '/draft/' + recoveryDraft;
-      const initial = await targetRead(draftPath, 'Read new destination draft');
-      requireState(record(initial) && !initial.app && !initial.containers && initial.modelId === scope.destinationModelId
-        && initial.name === copy.name && typeof initial.workbookModelId === 'string' && z.uuid().safeParse(initial.workbookModelId).success
-        && initial.workbookModelId !== scaffold.workbookModelId && initial.workbookModelId !== scope.destinationModelId,
-      'The named draft is not a new destination workbook.');
-      const parent = await modelMetadata(targetRead, initial.workbookModelId);
-      requireState(parent.modelKind === 'WORKBOOK' && parent.baseModelId === scope.destinationModelId && parent.connectionId === connectionId,
-        'The draft workbook ownership could not be verified.');
-      const attached = await write('PUT', draftPath + '/app', app);
-      requireState(record(attached) && attached.identifier === scope.destinationIdentifier && attached.draftIdentifier === recoveryDraft,
-        'The App attachment identified a different draft.');
-      warningCount += Array.isArray(attached.warnings) ? attached.warnings.length : 0;
-      const before = await readApp(destination, draftPath, scope.destinationIdentifier, true);
-      checkContent(before);
-      requireState(before.workbookModelId === initial.workbookModelId && !Object.keys(before.byKey).length,
-        'The destination draft has unexpected authored content.');
+      let before: typeof copy;
+      let draftPath: string;
+      if (recovery) {
+        requireState(recoveryState, 'The selected draft has no reviewed recovery plan.');
+        recoveryDraft = recovery.draftIdentifier;
+        ({ draftPath, before } = recoveryState);
+        await checkMainDraft(targetRead, scope.destinationIdentifier, recoveryDraft, before.workbookModelId);
+      } else {
+        const scaffold = await targetRead(targetPath, 'Read new destination workbook');
+        requireState(record(scaffold) && !scaffold.app && !scaffold.containers && !scaffold.draftOf
+          && scaffold.name === copy.name && scaffold.modelId === scope.destinationModelId && z.uuid().safeParse(scaffold.workbookModelId).success,
+        'The new destination workbook could not be verified.');
+        stage = 'creating the workbook draft';
+        const draft = await write('PATCH', targetPath + '/draft', { summary: 'Copy reviewed App query models' });
+        requireState(record(draft) && draft.identifier === scope.destinationIdentifier && typeof draft.draftIdentifier === 'string'
+          && documentIdentifier.safeParse(draft.draftIdentifier).success && draft.draftIdentifier !== scope.destinationIdentifier,
+        'The new destination draft could not be verified.');
+        recoveryDraft = draft.draftIdentifier;
+        draftPath = targetPath + '/draft/' + recoveryDraft;
+        stage = 'verifying draft workbook ownership';
+        const initial = await targetRead(draftPath, 'Read new destination draft');
+        requireState(record(initial) && !initial.app && !initial.containers && initial.modelId === scope.destinationModelId
+          && initial.name === copy.name && typeof initial.workbookModelId === 'string' && z.uuid().safeParse(initial.workbookModelId).success
+          && initial.workbookModelId !== scaffold.workbookModelId && initial.workbookModelId !== scope.destinationModelId,
+        'The named draft is not a new destination workbook.');
+        const parent = await modelMetadata(targetRead, initial.workbookModelId);
+        requireState(parent.modelKind === 'WORKBOOK' && parent.baseModelId === scope.destinationModelId && parent.connectionId === connectionId,
+          'The draft workbook ownership could not be verified.');
+        stage = 'attaching the App to the draft';
+        const attached = await write('PUT', draftPath + '/app', app);
+        requireState(record(attached) && attached.identifier === scope.destinationIdentifier && attached.draftIdentifier === recoveryDraft,
+          'The App attachment identified a different draft.');
+        warningCount += Array.isArray(attached.warnings) ? attached.warnings.length : 0;
+        stage = 'checking the draft App and its query tabs';
+        before = await readApp(destination, draftPath, scope.destinationIdentifier, true);
+        checkContent(before);
+        requireState(before.workbookModelId === initial.workbookModelId && !Object.keys(before.byKey).length,
+          'The destination draft has unexpected authored content.');
+      }
       stage = 'restoring the draft query models';
       const expectedBindings = await restoreQueryFiles({
-        read: targetRead, write, draftPath, draftWorkbookId: initial.workbookModelId, connectionId,
-        bindings: before.bindings, byKey,
+        read: targetRead, write, draftPath, draftWorkbookId: before.workbookModelId, connectionId,
+        bindings: before.bindings, byKey, evidenceByKey, reviewedRecovery: recoveryState?.queryState,
+        verifyBindings: async expected => {
+          const doc = await targetRead(draftPath, 'Recheck named draft query bindings');
+          const current = workbookContent(doc, scope.destinationIdentifier, true);
+          checkWorkbook(current);
+          requireState(record(doc) && record(doc.app) && doc.app.url === draftPath + '/app'
+            && current.workbookModelId === before.workbookModelId && isDeepStrictEqual(current.bindings, expected),
+          'The named draft or its query bindings changed. Inspect it before continuing.');
+        },
       });
       const reviewed = await readApp(destination, draftPath, scope.destinationIdentifier, true);
       checkContent(reviewed);
-      requireState(reviewed.workbookModelId === initial.workbookModelId && isDeepStrictEqual(reviewed.bindings, expectedBindings)
-        && sameQueryFiles(reviewed.byKey, byKey), 'Destination draft query model parity is unverified.');
+      requireState(reviewed.workbookModelId === before.workbookModelId && isDeepStrictEqual(reviewed.bindings, expectedBindings)
+        && sameQueryFiles(reviewed.byKey, byKey) && isDeepStrictEqual(reviewed.evidenceByKey, evidenceByKey),
+      'Destination draft query model parity is unverified.');
       stage = 'verifying and publishing the main draft';
-      const drafts = await targetRead('/api/v1/documents/' + scope.destinationIdentifier + '/drafts', 'Check main draft before publishing');
-      const main = Array.isArray(drafts) ? drafts.filter(d => record(d) && d.branch === null && d.status === 'active') : [];
-      requireState(main.length === 1 && main[0].identifier === recoveryDraft && main[0].publishedIdentifier === scope.destinationIdentifier
-        && main[0].workbookModelId === initial.workbookModelId && main[0].draftOutOfDate === false,
-      'The active main draft changed before publication.');
+      await checkMainDraft(targetRead, scope.destinationIdentifier, recoveryDraft, before.workbookModelId);
       const published = await write('POST', targetPath + '/draft/publish');
       requireState(record(published) && published.identifier === scope.destinationIdentifier, 'Publication was unverified.');
     }
     stage = 'verifying the published App';
     const published = await readApp(destination, targetPath, scope.destinationIdentifier);
     checkContent(published);
-    requireState(sameQueryFiles(published.byKey, byKey), 'Published query model parity is unverified.');
+    requireState(sameQueryFiles(published.byKey, byKey) && isDeepStrictEqual(published.evidenceByKey, evidenceByKey),
+      'Published query model parity is unverified.');
     return json({ status: 'verified', ...details, warningCount, verification: 'published_app_and_query_definitions',
       warning: warningCount ? 'Omni returned App policy warnings. Review sandbox settings in the destination.' : undefined });
   } catch (error) {
-    if (dispatched) return json({ error: 'Published parity is unverified. Inspect the destination and its draft before retrying.',
-      stage, destinationIdentifier: scope.destinationIdentifier, draftIdentifier: recoveryDraft }, 502);
+    if (dispatched) {
+      const reason = error instanceof CopyError ? error.message : 'The request ended before its outcome could be verified.';
+      const location = 'destination ' + scope.destinationIdentifier + (recoveryDraft ? ', draft ' + recoveryDraft : '');
+      return json({
+        code: 'APP_COPY_UNVERIFIED', stage, destinationIdentifier: scope.destinationIdentifier, draftIdentifier: recoveryDraft,
+        error: 'App copy stopped while ' + stage + '. ' + reason + ' Inspect ' + location + ' before retrying.',
+      }, 502);
+    }
     if (error instanceof CopyError) return json({ error: error.message }, error.status);
     if ((error as { statusCode?: number })?.statusCode === 423) return json({ error: 'Unlock the native vault before copying an App.' }, 423);
     return json({ error: 'App copy could not complete its checks. Verify the saved profiles, API access, and connection.' }, 502);
+  } finally {
+    if (activeKey) activeTargets.delete(activeKey);
   }
 }
 

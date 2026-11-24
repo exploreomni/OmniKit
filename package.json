@@ -71,7 +71,7 @@
     "verify:omni-api-contracts": "tsx scripts/verify-omni-api-contracts.ts",
     "test:omni-api-contracts": "tsx --tsconfig tsconfig.app.json --test tests/omni-api-contracts.test.ts tests/omni-api-capabilities.test.ts tests/omni-api-contract-radar.test.ts tests/omni-api-contract-radar-frontend.test.ts tests/manage-topics.test.ts tests/omni-api-request-policy.test.ts",
     "canary:omni-api": "tsx scripts/run-omni-api-canary.ts",
-    "test:documents-v2-contract": "tsx --test tests/documents-v2-contract.test.ts tests/documents-v2-adapter.test.ts tests/list-documents.test.ts tests/native-app-copy.test.ts && node scripts/check-retired-document-endpoints.mjs",
+    "test:documents-v2-contract": "tsx --test tests/documents-v2-contract.test.ts tests/documents-v2-adapter.test.ts tests/list-documents.test.ts tests/native-app-copy.test.ts tests/native-app-query-recovery.test.ts && node scripts/check-retired-document-endpoints.mjs",
     "test:deck-builder": "tsx --tsconfig tsconfig.app.json --test tests/deck-builder.test.ts tests/dashboard-search.test.tsx",
     "test:control-evidence": "tsx --tsconfig tsconfig.app.json --test tests/evidence-bundle.test.ts tests/ai-governance.test.ts tests/delivery-ownership.test.ts tests/role-enablement.test.ts",
     "security:audit": "node scripts/audit-npm-dependencies.mjs",

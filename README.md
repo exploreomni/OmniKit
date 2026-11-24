@@ -153,6 +153,8 @@ Unlock the local vault and confirm the destination model contains the topics and
 
 For query-local dimensions or measures in `.view` files, preview checks whether the destination advertises the required draft APIs. Apply creates a workbook, restores the definitions on a new draft, verifies the tab bindings, then publishes and rereads the App. Leave the new workbook and draft untouched until verification finishes. If a write is interrupted, use the returned destination identifier, draft identifier when available, and stage to inspect the partial copy before retrying.
 
+**Resume an interrupted copy.** If the destination contains a workbook scaffold and its current main draft already has the matching App, use the same endpoint with `action: "preview"` and a `recovery` object. Supply the verified `publishedWorkbookModelId`, `draftWorkbookModelId` and `draftIdentifier`. For an authored query model created before its tab was bound, supply its verified UUID in `recovery.queryModelIdsByKey`, keyed by the original workbook tab key. Omit `destinationFolderId` for recovery. Review the target and bindings, then submit the identical scope with `action: "apply"` and the **new recovery preview digest**. Recovery completes the existing draft. An unrelated model, conflicting field or stale draft stops the operation.
+
 This path requires Documents V2 App reads on both tenants and document creation on the destination. Workbook-level definitions, access policies in query-local fields, file uploads, foreign-model tabs and document controls require separate preparation. [Read App content](https://docs.omni.co/api/apps/read-app-content) · [Create a document](https://docs.omni.co/api/documents-v2/create-document)
 
 ### Deck Builder
