@@ -65,6 +65,7 @@ import {
   createReviewedModelPullRequestHandoff,
   discardReviewedModelBranch,
   ReviewedPullRequestVerificationError,
+  safeModelReviewUrl,
   stageGovernedTopicMutation,
   validateReviewedModelBranch,
   type GovernedTopicFileEvidence,
@@ -74,6 +75,7 @@ import {
 import {
   findAuthoredTopicYamlFile,
   hasUnchangedAuthoredTopicRelationships,
+  normalizeTopicYamlForDeploy,
   preserveExistingTopicYaml,
 } from '@/services/topicYamlGovernance';
 import {
@@ -2767,45 +2769,6 @@ function buildDeployDiffs(mainYaml: OmniModelYamlResponse | null, devYaml: OmniM
     };
   });
 }
-
-function quoteYamlFlowArrayItems(value: string) {
-  return value
-    .split(',')
-    .map((item) => item.trim())
-    .filter(Boolean)
-    .map((item) => {
-      const unquoted = item.replace(/^["']|["']$/g, '');
-      return `"${unquoted.replace(/"/g, '\\"')}"`;
-    })
-    .join(', ');
-}
-
-function normalizeTopicYamlForDeploy(yaml: string) {
-  const lines = yaml.split('\n');
-  const normalizedLines = lines.flatMap((line) => {
-    const fieldsMatch = line.match(/^(\s*fields:\s*)\[(.*)\]\s*$/);
-    if (fieldsMatch) {
-      return [`${fieldsMatch[1]}[${quoteYamlFlowArrayItems(fieldsMatch[2])}]`];
-    }
-
-    const sortMatch = line.match(/^(\s*)sorts:\s*\[\{\s*column_name:\s*([^,}]+),\s*sort_descending:\s*(true|false)\s*\}\]\s*$/i);
-    if (sortMatch) {
-      const indent = sortMatch[1];
-      const field = sortMatch[2].trim().replace(/^["']|["']$/g, '');
-      const desc = sortMatch[3].toLowerCase();
-      return [
-        `${indent}sorts:`,
-        `${indent}  - field: "${field}"`,
-        `${indent}    desc: ${desc}`,
-      ];
-    }
-
-    return [line];
-  });
-
-  return normalizedLines.join('\n');
-}
-
 function cleanYamlScalar(value: string) {
   return value.trim().replace(/^["']|["']$/g, '');
 }
@@ -8145,6 +8108,9 @@ export function TopicsPage() {
   const omniReviewUrl = omniReviewTargetId
     ? `${omniReviewOrigin}/models/${encodeURIComponent(omniReviewTargetId)}`
     : omniReviewOrigin;
+  const handoffReviewLink = safeModelReviewUrl(deployHandoffUrl);
+  const signOffLink = handoffReviewLink ?? safeModelReviewUrl(omniReviewUrl);
+  const reconciliationLink = handoffReviewLink ?? safeModelReviewUrl(modelWriteCapability?.webUrl, omniReviewUrl);
   const solutionGenerationStatusLabel = solutionGenerationProgress
     ? `File ${solutionGenerationProgress.currentIndex + 1} of ${solutionGenerationProgress.fileNames.length}: ${solutionGenerationProgress.fileNames[solutionGenerationProgress.currentIndex] || 'semantic package'}`
     : '';
@@ -9884,7 +9850,7 @@ export function TopicsPage() {
 	            OmniKit created a review handoff, but the package could not be revalidated. Do not merge it until the latest model and branch are reviewed again.
 	          </div>
 	          <a
-	            href={deployHandoffUrl}
+	            href={handoffReviewLink}
 	            target="_blank"
 	            rel="noreferrer"
 	            className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-red-800 underline underline-offset-2"
@@ -9909,7 +9875,7 @@ export function TopicsPage() {
 	            OmniKit cannot prove the final pull-request state. The branch may already be committed, so retry is disabled until you reconcile the returned review evidence in Omni.
 	          </div>
 	          <a
-	            href={deployHandoffUrl || modelWriteCapability?.webUrl || omniReviewUrl}
+	            href={reconciliationLink}
 	            target="_blank"
 	            rel="noreferrer"
 	            className="mt-2 inline-flex items-center gap-1.5 text-xs font-semibold text-amber-900 underline underline-offset-2"
@@ -12221,7 +12187,7 @@ export function TopicsPage() {
 			                            {deployReadyForOmniReview ? (
 			                              deployHandoffStatus === 'ready' ? (
 			                                <a
-		                                  href={deployHandoffUrl || omniReviewUrl}
+		                                  href={signOffLink}
 	                                  target="_blank"
 	                                  rel="noreferrer"
 	                                  className="btn-primary text-sm w-full sm:w-auto sm:min-w-[260px] justify-center"
@@ -12231,7 +12197,7 @@ export function TopicsPage() {
 			                                </a>
 			                              ) : deployHandoffStatus === 'unknown' ? (
 			                                <a
-	                                  href={deployHandoffUrl || modelWriteCapability?.webUrl || omniReviewUrl}
+	                                  href={reconciliationLink}
 			                                  target="_blank"
 			                                  rel="noreferrer"
 			                                  className="btn-secondary border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100 text-sm w-full sm:w-auto sm:min-w-[260px] justify-center"
@@ -12241,7 +12207,7 @@ export function TopicsPage() {
 			                                </a>
 			                              ) : deployHandoffStatus === 'failed' && deployHandoffUrl ? (
 			                                <a
-			                                  href={deployHandoffUrl}
+			                                  href={handoffReviewLink}
 			                                  target="_blank"
 			                                  rel="noreferrer"
 			                                  className="btn-secondary border-red-200 bg-red-50 text-red-800 hover:bg-red-100 text-sm w-full sm:w-auto sm:min-w-[260px] justify-center"

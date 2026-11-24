@@ -1,11 +1,38 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { parse } from 'yaml';
 
 import {
   findAuthoredTopicYamlFile,
   hasUnchangedAuthoredTopicRelationships,
+  normalizeTopicYamlForDeploy,
   preserveExistingTopicYaml,
 } from '../src/services/topicYamlGovernance';
+
+test('topic deploy normalization round-trips scalar contents and quoted delimiters', () => {
+  const names = ['orders.amount', 'notes, current', 'owner "choice"', 'labels\\quarter', 'true'];
+  const input = [
+    "fields: [orders.amount, 'notes, current', 'owner \"choice\"', 'labels\\quarter', true]",
+    "sorts: [{column_name: 'owner \"choice\", current', sort_descending: false}]",
+    '',
+  ].join('\n');
+  const normalized = normalizeTopicYamlForDeploy(input);
+  assert.deepEqual(parse(normalized), {
+    fields: names,
+    sorts: [{ field: 'owner "choice", current', desc: false }],
+  });
+  assert.equal(normalizeTopicYamlForDeploy(normalized), normalized);
+});
+
+test('topic deploy normalization retains block scalar examples and special YAML structures', () => {
+  const example = 'sql: |\n  fields: [keep.as.written]\n  sorts: [{column_name: keep.me, sort_descending: true}]\n';
+  const structures = 'fields: [{group: sample}]\n';
+  assert.equal(normalizeTopicYamlForDeploy(example + structures), example + structures);
+  const alias = 'example: &field orders.amount\nfields: [*field]\n';
+  assert.equal(normalizeTopicYamlForDeploy(alias), alias);
+  const normalized = normalizeTopicYamlForDeploy('fields: ["orders.amount", orders.created_at[month], *, "notes, current"]\n');
+  assert.deepEqual(parse(normalized), { fields: ['orders.amount', 'orders.created_at[month]', '*', 'notes, current'] });
+});
 
 test('topic file discovery preserves an exact nested authored path', () => {
   const result = findAuthoredTopicYamlFile({

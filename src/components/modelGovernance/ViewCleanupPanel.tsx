@@ -34,6 +34,7 @@ import {
   isGovernanceEditableModel,
   prepareReviewedModelHandoff,
   ReviewedPullRequestVerificationError,
+  safeModelReviewUrl,
   startReviewedModelBranch,
   type ReviewedModelBranch,
   type ReviewedHandoffResult,
@@ -962,7 +963,7 @@ export function ViewCleanupPanel({
 
       {result && (
         <section className="card p-5" aria-live="polite">
-          <div className="flex items-start gap-3"><CheckCircle2 size={20} className={result.mode === 'discarded' ? 'text-content-secondary' : 'text-green-700'} /><div className="min-w-0"><h3 className="font-semibold text-content-primary">{result.title}</h3><p className="mt-1 text-sm text-content-secondary">{result.message}</p>{result.url && <a href={result.url} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-omni-700 underline">{result.mode === 'pull_request' ? 'Open pull request' : result.mode === 'quarantined' ? 'Open Omni to reconcile' : 'Open Omni for sign-off'} <ExternalLink size={13} /></a>}{result.removedViews && <div className="mt-2 text-sm text-content-secondary">Removed: {result.removedViews.join(', ')}</div>}</div></div>
+          <div className="flex items-start gap-3"><CheckCircle2 size={20} className={result.mode === 'discarded' ? 'text-content-secondary' : 'text-green-700'} /><div className="min-w-0"><h3 className="font-semibold text-content-primary">{result.title}</h3><p className="mt-1 text-sm text-content-secondary">{result.message}</p>{result.url && <a href={safeModelReviewUrl(result.url)} target="_blank" rel="noreferrer" className="mt-2 inline-flex items-center gap-1 text-sm text-omni-700 underline">{result.mode === 'pull_request' ? 'Open pull request' : result.mode === 'quarantined' ? 'Open Omni to reconcile' : 'Open Omni for sign-off'} <ExternalLink size={13} /></a>}{result.removedViews && <div className="mt-2 text-sm text-content-secondary">Removed: {result.removedViews.join(', ')}</div>}</div></div>
         </section>
       )}
 

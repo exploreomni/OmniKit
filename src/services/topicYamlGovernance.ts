@@ -1,5 +1,75 @@
-import { isMap, isNode, isSeq, parseDocument, type Pair, type Schema, type YAMLMap } from 'yaml';
+import { isMap, isNode, isScalar, isSeq, LineCounter, parseDocument, visit, type Pair, type Schema, type YAMLMap } from 'yaml';
 import type { OmniModelYamlResponse } from './omniApi';
+
+const deploymentYamlOptions = { schema: 'failsafe', prettyErrors: false } as const;
+
+function flowFieldNames(value: string): string[] | undefined {
+  const parsed = parseDocument('[' + value + ']', deploymentYamlOptions);
+  const fields = parsed.contents;
+  if (!parsed.errors.length && !parsed.warnings.length && isSeq(fields)) {
+    const names: string[] = [];
+    for (const item of fields.items) {
+      if (!isScalar(item) || typeof item.value !== 'string' || item.anchor || item.tag || item.comment) return undefined;
+      names.push(item.value);
+    }
+    return names;
+  }
+
+  // Bare Omni wildcards and timeframes can be valid field references but invalid YAML flow scalars.
+  const token = /[ \t]*("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[\w.*:-]+(?:\[[\w.-]+\])?)[ \t]*(,|$)/y;
+  const names: string[] = [];
+  while (token.lastIndex < value.length) {
+    const match = token.exec(value);
+    if (!match) return undefined;
+    const item = match[1];
+    if (item.startsWith('"') || item.startsWith("'")) {
+      const scalar = parseDocument(item, deploymentYamlOptions);
+      if (scalar.errors.length || scalar.warnings.length || !isScalar(scalar.contents)
+        || typeof scalar.contents.value !== 'string') return undefined;
+      names.push(scalar.contents.value);
+    } else if (item.startsWith('*') && item !== '*') {
+      return undefined;
+    } else {
+      names.push(item);
+    }
+  }
+  return names;
+}
+
+/** Preserve unrelated bytes and only normalize actual fields/sorts keys in an authored topic. */
+export function normalizeTopicYamlForDeploy(yaml: string): string {
+  if (!/^[ \t]*(?:fields|sorts):[ \t]*\[/m.test(yaml)) return yaml;
+  const lineCounter = new LineCounter();
+  const document = parseDocument(yaml, { ...deploymentYamlOptions, lineCounter });
+  const lines = yaml.split('\n');
+  visit(document, {
+    Pair(_key, pair) {
+      if (!isScalar(pair.key) || !pair.key.range || !['fields', 'sorts'].includes(String(pair.key.value))) return;
+      const index = lineCounter.linePos(pair.key.range[0]).line - 1;
+      const line = lines[index];
+      const fields = line.match(/^(\s*fields:\s*)\[(.*)\](\s*)$/);
+      if (fields) {
+        const names = flowFieldNames(fields[2]);
+        if (names) lines[index] = fields[1] + '[' + names.map(name => JSON.stringify(name)).join(', ') + ']' + fields[3];
+        return;
+      }
+      const sort = line.match(/^(\s*)sorts:\s*\[\{\s*column_name:\s*(.+),\s*sort_descending:\s*(true|false)\s*\}\](\s*)$/i);
+      if (sort) {
+        const parsed = parseDocument(sort[2].trim(), deploymentYamlOptions);
+        const field = parsed.contents;
+        if (parsed.errors.length || parsed.warnings.length || !isScalar(field) || typeof field.value !== 'string'
+          || field.tag || field.anchor || field.comment || field.type === 'PLAIN' && /[,{}]/.test(field.value)) return;
+        const indent = sort[1];
+        lines[index] = [
+          indent + 'sorts:',
+          indent + '  - field: ' + JSON.stringify(field.value),
+          indent + '    desc: ' + sort[3].toLowerCase() + sort[4],
+        ].join('\n');
+      }
+    },
+  });
+  return lines.join('\n');
+}
 
 export interface PreservedTopicYaml {
   yaml: string;

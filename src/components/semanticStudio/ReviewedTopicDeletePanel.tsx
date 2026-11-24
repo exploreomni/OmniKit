@@ -4,6 +4,7 @@ import {
   createReviewedModelPullRequestHandoff,
   discardReviewedModelBranch,
   ReviewedPullRequestVerificationError,
+  safeModelReviewUrl,
   stageGovernedTopicMutation,
   startReviewedModelBranch,
   type GovernedTopicMutationEvidence,
@@ -256,7 +257,7 @@ export function ReviewedTopicDeletePanel({
             )}
             <div className="flex flex-wrap gap-2">
               {handoff.status === 'ready' || handoff.status === 'quarantined' ? (
-                <a href={handoff.url} target="_blank" rel="noreferrer" className="btn-primary text-xs">
+                <a href={safeModelReviewUrl(handoff.url)} target="_blank" rel="noreferrer" className="btn-primary text-xs">
                   <ExternalLink size={14} /> {handoff.status === 'quarantined' ? 'Open Omni to reconcile' : branch.capability.pullRequestRequired ? 'Open pull request' : 'Open Omni for sign-off'}
                 </a>
               ) : (
@@ -275,7 +276,7 @@ export function ReviewedTopicDeletePanel({
                 Discard review branch
               </button>
               {handoff.status === 'failed' && handoff.url && (
-                <a href={handoff.url} target="_blank" rel="noreferrer" className="btn-secondary text-xs">
+                <a href={safeModelReviewUrl(handoff.url)} target="_blank" rel="noreferrer" className="btn-secondary text-xs">
                   <ExternalLink size={14} /> Open reported review
                 </a>
               )}
