@@ -1675,6 +1675,29 @@ test('AI Content Studio groups duplicate dashboard names by authoritative connec
 
   const inspectedDashboardIds: string[] = [];
   const documentStateReads: string[] = [];
+  const selectedInstance = state.instances[0];
+  await page.route(`**/api/instances/${selectedInstance.id}/document-state?**`, async (route) => {
+    const params = new URL(route.request().url()).searchParams;
+    const identifier = params.get('identifier');
+    expect(route.request().method()).toBe('GET');
+    expect(params.get('expectedOrigin')).toBe(new URL(selectedInstance.baseUrl).origin);
+    if (identifier !== 'duplicate-dashboard-east' && identifier !== 'duplicate-dashboard-west') {
+      return route.fulfill({ status: 404, json: { error: 'Unknown fixture document.' } });
+    }
+    documentStateReads.push(identifier);
+    const west = identifier === 'duplicate-dashboard-west';
+    await route.fulfill({
+      json: {
+        id: identifier,
+        name: 'Authoritative document state name differs from the picker label',
+        modelId: west ? 'model-ai-content' : 'model-ai-content-east',
+        workbookModelId: west ? 'workbook-model-west' : 'workbook-model-east',
+        queryPresentations: {},
+        containers: [],
+        controls: [],
+      },
+    });
+  });
   await page.route('**/api/omni-proxy', async (route) => {
     const body = route.request().postDataJSON() as Record<string, unknown>;
     const endpoint = String(body.endpoint || '');
@@ -1687,28 +1710,6 @@ test('AI Content Studio groups duplicate dashboard names by authoritative connec
             { id: 'connection-east', name: 'Authoritative east connection' },
             { id: 'connection-west', name: 'Authoritative west connection' },
           ],
-        }),
-      });
-      return;
-    }
-    const documentStateMatch = endpoint.match(/\/v2\/documents\/(duplicate-dashboard-(?:east|west))$/);
-    if (documentStateMatch) {
-      documentStateReads.push(documentStateMatch[1]);
-      await route.fulfill({
-        status: 200,
-        contentType: 'application/json',
-        body: JSON.stringify({
-          id: documentStateMatch[1],
-          name: 'Authoritative document state name differs from the picker label',
-          modelId: documentStateMatch[1] === 'duplicate-dashboard-west'
-            ? 'model-ai-content'
-            : 'model-ai-content-east',
-          workbookModelId: documentStateMatch[1] === 'duplicate-dashboard-west'
-            ? 'workbook-model-west'
-            : 'workbook-model-east',
-          queryPresentations: {},
-          containers: [],
-          controls: [],
         }),
       });
       return;
