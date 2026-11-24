@@ -2714,7 +2714,7 @@ export class OmniClient {
     const error = isRecord(result) ? firstString(result.saveError, result.message) : undefined;
     // A save error can contain quoted user values or multiline excerpts of the submitted file.
     const reason = error && redactSensitiveText(error.split(/[\r\n]/, 1)[0].replaceAll(this.instance.apiKey, '[redacted]'))
-      .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '[redacted]').slice(0, 350);
+      .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '[redacted]').replace(/\b(user_attribute\s*[:=]\s*)\S+/gi, '$1[redacted]').slice(0, 350);
     throw new OmniClientError(response.ok ? 422 : response.status, path,
       `${filename}: ${reason || 'Omni rejected the YAML save.'}`, 'MODEL_YAML_SAVE_FAILED', response.status);
   }
@@ -2750,14 +2750,19 @@ export class OmniClient {
         }
         previousChecksum = existed ? liveChecksum as string : undefined;
       }
-      results.push(await this.updateModelYamlFile({
+      const fileName = input.reviewedDestinationFiles ? topicYamlWriteFileName(file.fileName, file.yaml) : file.fileName;
+      const result = await this.updateModelYamlFile({
         modelId: input.modelId,
         branchId: input.branchId,
-        fileName: input.reviewedDestinationFiles ? topicYamlWriteFileName(file.fileName, file.yaml) : file.fileName,
+        fileName,
         yaml: file.yaml,
         previousChecksum,
         commitMessage: input.commitMessage,
-      }));
+      });
+      if (input.reviewedDestinationFiles && (!isRecord(result) || result.success !== true || result.fileName !== fileName)) {
+        throw new Error('Omni did not confirm the save for ' + redactSensitiveText(file.fileName) + '. Inspect the destination branch before retrying.');
+      }
+      results.push(result);
     }
     return { files: results };
   }

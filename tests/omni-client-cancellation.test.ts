@@ -27,7 +27,8 @@ test('reviewed YAML writes use the current branch checksum and omit it for confi
         ? response({ files: existing, checksums: { 'existing.view': 'branch-checksum' } })
         : response({ files: {}, checksums: {} });
     }
-    saved.push(JSON.parse(String(init?.body))); return response({ success: true });
+    const body = JSON.parse(String(init?.body));
+    saved.push(body); return response({ success: true, fileName: body.fileName });
   });
   await api.updateModelYamlFiles({ modelId: 'target', branchId: 'review-branch', reviewedDestinationFiles: existing, files: [
     { fileName: 'existing.view', yaml: 'label: New', previousChecksum: 'source-checksum' },
@@ -38,7 +39,7 @@ test('reviewed YAML writes use the current branch checksum and omit it for confi
 });
 
 test('reviewed YAML batch stops on drift, incomplete evidence or an Omni save conflict', async () => {
-  for (const problem of ['edited', 'created', 'deleted', 'no-checksum', 'malformed', 'concurrent-save', 'invalid-yaml']) {
+  for (const problem of ['edited', 'created', 'deleted', 'no-checksum', 'malformed', 'concurrent-save', 'invalid-yaml', 'wrong-receipt']) {
     let reads = 0, writes = 0;
     const api = client(new AbortController().signal, async (_input, init) => {
       if (init?.method === 'GET') {
@@ -48,6 +49,7 @@ test('reviewed YAML batch stops on drift, incomplete evidence or an Omni save co
           checksums: problem === 'no-checksum' || problem === 'deleted' ? {} : { model: 'live-branch-token' } });
       }
       writes++;
+      if (problem === 'wrong-receipt') return response({ success: true, fileName: 'unrelated.view' });
       if (problem === 'concurrent-save') return response({ success: false, file_conflict_error: true, saveError: 'opaque details' }, 400);
       return response({ success: false, saveError: "Unknown attribute 'confidential value'\napi_key: example-secret" }, 400);
     });
@@ -58,10 +60,11 @@ test('reviewed YAML batch stops on drift, incomplete evidence or an Omni save co
       assert.match(error.message, /model/);
       if (problem === 'invalid-yaml') {
         assert.match(error.message, /Unknown attribute/); assert.doesNotMatch(error.message, /confidential value|example-secret/);
-      } else if (problem !== 'malformed') assert.match(error.message, /MODEL_YAML_CONFLICT/);
+      } else if (problem === 'wrong-receipt') assert.match(error.message, /did not confirm/);
+      else if (problem !== 'malformed') assert.match(error.message, /MODEL_YAML_CONFLICT/);
       return true;
     });
-    assert.equal(reads, 1); assert.equal(writes, ['concurrent-save', 'invalid-yaml'].includes(problem) ? 1 : 0);
+    assert.equal(reads, 1); assert.equal(writes, ['concurrent-save', 'invalid-yaml', 'wrong-receipt'].includes(problem) ? 1 : 0);
   }
 });
 
