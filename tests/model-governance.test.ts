@@ -443,6 +443,10 @@ test('model review links validate Git configuration, error evidence, and manual 
     assert.equal(handoff.url, browserConnection.baseUrl);
   }
   assert.equal(normalizeModelGitCapability(model, { webUrl: review }).webUrl, review);
+  assert.equal(
+    safeModelReviewUrl("https://git.example/team's/pr/12?path=a%2Fb&view=split#owner's"),
+    'https://git.example/team%27s/pr/12?path=a%2Fb&view=split#owner%27s',
+  );
 });
 
 test('reviewed model handoff creates a PR for protected models', async (t) => {

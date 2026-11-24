@@ -153,8 +153,9 @@ export function safeModelReviewUrl(...candidates: Array<string | undefined>): st
     try {
       const url = new URL(value);
       if (url.protocol !== 'https:' || url.username || url.password) continue;
-      const path = value === url.origin ? '' : url.pathname;
-      return `https://${url.host}${path}${url.search}${url.hash}`;
+      const href = value === url.origin ? url.origin : url.href;
+      // Encode markup delimiters while preserving URL separators and existing percent escapes.
+      return href.replace(/[<>"']/g, char => '%' + char.charCodeAt(0).toString(16).toUpperCase());
     } catch {
       continue;
     }
