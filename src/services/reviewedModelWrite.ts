@@ -63,7 +63,7 @@ export class ReviewedPullRequestVerificationError extends Error {
   constructor(message: string, evidence: { reviewUrl?: string; commitRef?: string } = {}) {
     super(message);
     this.name = 'ReviewedPullRequestVerificationError';
-    this.reviewUrl = evidence.reviewUrl;
+    this.reviewUrl = safeModelReviewUrl(evidence.reviewUrl);
     this.commitRef = evidence.commitRef;
   }
 }
@@ -145,17 +145,25 @@ function record(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 
-function reviewedPullRequestResult(raw: Record<string, unknown>): ReviewedHandoffResult {
-  const documentedUrl = firstString(raw.pr_url);
-  const url = (() => {
-    if (!documentedUrl) return undefined;
+export function safeModelReviewUrl(...candidates: Array<string | undefined>): string | undefined {
+  for (const candidate of candidates) {
+    if (typeof candidate !== 'string') continue;
+    const value = candidate.trim();
+    if (!/^https:\/\//i.test(value)) continue;
     try {
-      const parsed = new URL(documentedUrl);
-      return parsed.protocol === 'https:' ? parsed.toString() : undefined;
+      const url = new URL(value);
+      if (url.protocol !== 'https:' || url.username || url.password) continue;
+      const path = value === url.origin ? '' : url.pathname;
+      return `https://${url.host}${path}${url.search}${url.hash}`;
     } catch {
-      return undefined;
+      continue;
     }
-  })();
+  }
+  return undefined;
+}
+
+function reviewedPullRequestResult(raw: Record<string, unknown>): ReviewedHandoffResult {
+  const url = safeModelReviewUrl(firstString(raw.pr_url));
   const commitRef = firstString(raw.git_sha);
   const inSync = raw.in_sync === true;
   const didSync = typeof raw.did_sync === 'boolean' ? raw.did_sync : undefined;
@@ -283,7 +291,7 @@ export function normalizeModelGitCapability(
     gitConfigurationKnown: known,
     gitFollower,
     pullRequestRequired,
-    webUrl: firstString(raw?.webUrl, raw?.web_url),
+    webUrl: safeModelReviewUrl(raw?.webUrl, raw?.web_url),
     raw,
   };
 }
@@ -626,7 +634,7 @@ export async function prepareReviewedModelHandoff(
   return {
     mode: 'manual_handoff',
     message: 'The validated development branch remains unchanged for final sign-off in Omni. OmniKit did not merge or publish it.',
-    url: branch.capability.webUrl || connection.baseUrl,
+    url: safeModelReviewUrl(branch.capability.webUrl, connection.baseUrl),
     raw: {
       handoff: 'manual',
       model_id: branch.modelId,

@@ -24,6 +24,7 @@ import {
   normalizeModelGitCapability,
   prepareReviewedModelHandoff,
   ReviewedPullRequestVerificationError,
+  safeModelReviewUrl,
   validateReviewedModelBranch,
   type ReviewedModelBranch,
 } from '../src/services/reviewedModelWrite';
@@ -426,6 +427,22 @@ test('governed release UI callers provide explicit scoped impact evidence', () =
   assert.ok((cleanup.match(/collectTargetedAffectedContent\(/g) || []).length >= 4);
   assert.ok((topicDelete.match(/collectTargetedAffectedContent\(/g) || []).length >= 2);
   assert.doesNotMatch(evidencePanel, /No affected content items were returned/);
+});
+
+test('model review links validate Git configuration, error evidence, and manual fallbacks', async () => {
+  const model = { id: 'model-a', name: 'Example model', kind: 'SHARED' };
+  const review = 'https://git.example/repo/pull/12?diff=split#files';
+  for (const unsafe of ['about:blank', '//git.example/pr', 'http://git.example/pr', 'https://user@git.example/pr']) {
+    assert.equal(safeModelReviewUrl(unsafe), undefined);
+    assert.equal(safeModelReviewUrl(unsafe, review), review);
+    assert.equal(normalizeModelGitCapability(model, { web_url: unsafe }).webUrl, undefined);
+    assert.equal(new ReviewedPullRequestVerificationError('Review pending', { reviewUrl: unsafe }).reviewUrl, undefined);
+    const branch = reviewedBranch();
+    branch.capability.webUrl = unsafe;
+    const handoff = await prepareReviewedModelHandoff(browserConnection, branch, 'Review the branch');
+    assert.equal(handoff.url, browserConnection.baseUrl);
+  }
+  assert.equal(normalizeModelGitCapability(model, { webUrl: review }).webUrl, review);
 });
 
 test('reviewed model handoff creates a PR for protected models', async (t) => {
