@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { isAlias, isMap, isNode, isScalar, isSeq, parseDocument } from 'yaml';
 import type { TopicBranchComparison, TopicBranchFileComparison, TopicMigrationFile } from '../../shared/topicMigration';
+import { assertUniqueTopicExportKey, topicYamlWriteFileName } from './modelMigration/topicFileIdentity';
 
 export const TOPIC_BRANCH_COMPARISON_POLICY = 'topic_branch_readback_v1' as const;
 const namespace = /^[A-Za-z_][\w$-]*(?:\.[A-Za-z_][\w$-]*){0,2}$/;
@@ -107,6 +108,18 @@ export function compareTopicMigrationBranch(input: {
     let destination: string;
     try { destination = topicMigrationDestinationPath(file, input.schemaMapText); }
     catch (error) { issue('PATH_MAPPING_INVALID', error instanceof Error ? error.message : 'Invalid destination mapping.', file.fileName); continue; }
+    if (file.kind === 'topic') {
+      try {
+        assertUniqueTopicExportKey(destination, input.baseline);
+        assertUniqueTopicExportKey(destination, input.actual);
+        if (file.writeFileName !== undefined && topicYamlWriteFileName(destination, file.proposed) !== file.writeFileName) {
+          throw new Error('The reviewed topic write name does not match its exported identity.');
+        }
+      } catch (error) {
+        issue('TOPIC_IDENTITY_CONFLICT', error instanceof Error ? error.message : 'Ambiguous topic identity.', destination);
+        continue;
+      }
+    }
     if ([...writes.keys()].some(name => name.toLowerCase() === destination.toLowerCase())) {
       issue('PATH_COLLISION', 'Multiple approved files resolve to the same destination.', destination); continue;
     }
@@ -127,7 +140,7 @@ export function compareTopicMigrationBranch(input: {
   for (const [name, yaml] of Object.entries(expected)) {
     const file = writes.get(name);
     const compared: TopicBranchFileComparison | undefined = file ? { sourceFileName: file.sourceFileName,
-      submittedFileName: file.fileName, destinationFileName: name,
+      submittedFileName: file.writeFileName ?? file.fileName, destinationFileName: name,
       classification: file.sourceFileName === name ? 'exact' : 'mapped_path' } : undefined;
     if (compared) files.push(compared);
     if (!Object.hasOwn(input.actual, name)) {

@@ -25,6 +25,7 @@ import manageUsers from './handlers/manage-users';
 import migrate from './handlers/migrate';
 import migrationJobs from './handlers/migration-jobs';
 import modelMigrator from './handlers/model-migrator';
+import nativeAppCopy from './handlers/native-app-copy';
 import omniProxy from './handlers/omni-proxy';
 import omniApiCapabilities from './handlers/omni-api-capabilities';
 import omniApiContractRadar from './handlers/omni-api-contract-radar';
@@ -37,7 +38,7 @@ import { redactSensitiveText } from './services/jobSanitizer';
 type Handler = (req: Request) => Promise<Response>;
 const MAX_BODY_BYTES = 25 * 1024 * 1024;
 const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
-const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator', 'dashboard-downloads', 'deck-recipes', 'portfolio-overview', 'admin-readiness']);
+const VAULT_HYDRATION_SKIP_PREFIXES = new Set(['vault', 'instances', 'migration-jobs', 'instance-dashboard', 'model-migrator', 'native-app-copy', 'dashboard-downloads', 'deck-recipes', 'portfolio-overview', 'admin-readiness']);
 
 const routes: Record<string, Handler> = {
   'admin-readiness': adminReadiness,
@@ -64,6 +65,7 @@ const routes: Record<string, Handler> = {
   migrate,
   'migration-jobs': migrationJobs,
   'model-migrator': modelMigrator,
+  'native-app-copy': nativeAppCopy,
   'omni-proxy': omniProxy,
   'omni-api-capabilities': omniApiCapabilities,
   'omni-api-contract-radar': omniApiContractRadar,

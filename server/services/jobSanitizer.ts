@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from 'node:util';
 import { createHash } from 'node:crypto';
+import { isScalar, parseDocument, visit } from 'yaml';
 import type { TopicMigrationExecutionBinding } from '../../shared/topicMigration';
 import type { PostMigrationAction } from './nativeVault';
 import type { MigrationJob, MigrationJobItem, MigrationRouteGroup, MigrationTarget, ModelMigrationAcceptedFile } from './migrationJobs';
@@ -259,16 +260,47 @@ export function sanitizeJobHistory(jobs: MigrationJob[]): MigrationJob[] {
   return jobs.map(sanitizeJob);
 }
 
-/** Probe the actual job-history paths before a one-use topic approval is offered. */
-export function canPreserveTopicMigrationJobEvidence(binding: TopicMigrationExecutionBinding, files: ModelMigrationAcceptedFile[], branchName: string): boolean {
-  const model = { sourceModelId: binding.request.sourceModelId, targetModelId: binding.request.targetModelId,
-    targetConnectionId: binding.request.targetConnectionId, branchName };
-  const details = { branchPreparation: { profile: 'branch_preparation_v1' }, topicMigration: binding, retryInput: { topicMigration: binding, models: [{ ...model, acceptedFiles: files }] } };
-  const writeDetails = { ...model, files };
-  const safeWrite = sanitizeJobItemDetails(writeDetails)!;
-  const validatedBinding = preserveTopicBindingDigests(binding, true);
-  if (validatedBinding) preserveTopicFileNames(files, safeWrite.files, validatedBinding);
-  return isDeepStrictEqual(sanitizeDetails(details), details) && isDeepStrictEqual(safeWrite, writeDetails);
+// Only public system definition names in the YAML user_attribute slot are references.
+// All other bytes, including comments, inline credentials and user values, retain normal protection.
+const SYSTEM_ATTRIBUTE_REFERENCES = new Set([
+  'omni_user_id', 'omni_user_name', 'omni_user_email', 'omni_user_locale', 'omni_user_timezone',
+  'omni_is_org_admin', 'omni_user_groups', 'omni_user_embed_entity', 'omni_user_embed_external_id',
+  'omni_user_user_entities_suggestion_id', 'omni_allows_personal_content', 'omni_chat_on_right_side', 'omni_user_homepage',
+  'omni_email_sender_username', 'omni_email_sender_name',
+]);
+
+function isTransferableTopicYaml(yaml: string): boolean {
+  if (redactSensitiveText(yaml) === yaml) return true;
+  const document = parseDocument(yaml, { logLevel: 'silent' });
+  if (document.errors.length) return false;
+  const references: Array<[number, number]> = [];
+  visit(document, {
+    Pair(_key, pair) {
+      if (isScalar(pair.key) && pair.key.value === 'user_attribute' && isScalar(pair.value)
+        && typeof pair.value.value === 'string' && SYSTEM_ATTRIBUTE_REFERENCES.has(pair.value.value) && pair.value.range) {
+        const [start, end] = pair.value.range, name = pair.value.value;
+        if ([name, "'" + name + "'", '"' + name + '"'].includes(yaml.slice(start, end))) references.push([start, end]);
+      }
+    },
+  });
+  // Inspect the raw spans between public references. Never rewrite the approved payload.
+  let inspected = '', offset = 0;
+  for (const [start, end] of references) {
+    inspected += yaml.slice(offset, start) + 'public_attribute';
+    offset = end;
+  }
+  inspected += yaml.slice(offset);
+  return redactSensitiveText(inspected) === inspected;
+}
+
+export function canPreserveTopicMigrationJobEvidence(binding: TopicMigrationExecutionBinding, files: ModelMigrationAcceptedFile[]): boolean {
+  const details = { branchPreparation: { profile: 'branch_preparation_v1' }, topicMigration: binding };
+  const safeWrite = sanitizeJobItemDetails({ files })!;
+  const validated = preserveTopicBindingDigests(binding, true);
+  if (validated) preserveTopicFileNames(files, safeWrite.files, validated);
+  const safeFiles = safeWrite.files as ModelMigrationAcceptedFile[];
+  return isDeepStrictEqual(sanitizeDetails(details), details) && files.every((file, index) =>
+    safeFiles[index].fileName === file.fileName && isTransferableTopicYaml(file.yaml));
 }
 
 function approvedTopicFileContext(details: Record<string, unknown> | undefined) {

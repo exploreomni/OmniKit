@@ -2,6 +2,8 @@ import { createHash } from 'node:crypto';
 
 import { assertSafeOutboundUrl, validateBaseUrl } from '../security';
 import { aiPromptSecurityError } from './aiPromptSecurity';
+import { redactSensitiveText } from './jobSanitizer';
+import { assertUniqueTopicExportKey, modelYamlReadPattern, topicYamlWriteFileName } from './modelMigration/topicFileIdentity';
 import { AI_PROMPT_MAX_CHARACTERS } from '../../src/services/aiPromptSecurityShared';
 import {
   VAULT_SESSION_ABORT_SIGNAL,
@@ -2683,8 +2685,10 @@ export class OmniClient {
     commitMessage?: string;
     mode?: 'combined' | 'extension';
   }, writeGuard?: OmniWriteDispatchGuard): Promise<unknown> {
-    const response = await this.request('POST', `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`, {
+    const path = `/api/v1/models/${encodeURIComponent(input.modelId)}/yaml`;
+    const response = await this.request('POST', path, {
       writeGuard,
+      allowStatuses: [400, 409, 412, 422],
       body: {
         fileName: input.fileName,
         yaml: input.yaml,
@@ -2694,26 +2698,71 @@ export class OmniClient {
         commitMessage: input.commitMessage,
       },
     });
-    return this.readJsonOrFallback(response, {});
+    let result: unknown;
+    if (response.ok) {
+      result = await this.readJsonOrFallback(response, {});
+      if (!isRecord(result) || (!omniBodyIndicatesFailure(result) && result.file_conflict_error !== true)) return result;
+    } else {
+      const text = await readBoundedErrorText(response);
+      try { result = JSON.parse(text); } catch { result = {}; }
+    }
+    const filename = redactSensitiveText(input.fileName);
+    if (response.status === 409 || response.status === 412 || (isRecord(result) && result.file_conflict_error === true)) {
+      throw new OmniClientError(409, path, `${filename} changed on the destination. Review the current branch before retrying.`,
+        'MODEL_YAML_CONFLICT', response.status);
+    }
+    const error = isRecord(result) ? firstString(result.saveError, result.message) : undefined;
+    // A save error can contain quoted user values or multiline excerpts of the submitted file.
+    const reason = error && redactSensitiveText(error.split(/[\r\n]/, 1)[0].replaceAll(this.instance.apiKey, '[redacted]'))
+      .replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '[redacted]').replace(/\b(user_attribute\s*[:=]\s*)\S+/gi, '$1[redacted]').slice(0, 350);
+    throw new OmniClientError(response.ok ? 422 : response.status, path,
+      `${filename}: ${reason || 'Omni rejected the YAML save.'}`, 'MODEL_YAML_SAVE_FAILED', response.status);
   }
 
   async updateModelYamlFiles(input: {
     modelId: string;
     branchId: string;
     files: Array<{ fileName: string; yaml: string; previousChecksum?: string }>;
+    reviewedDestinationFiles?: Readonly<Record<string, string>>;
     commitMessage?: string;
   }): Promise<unknown> {
     if (input.files.length === 0) return {};
     const results: unknown[] = [];
     for (const file of input.files) {
-      results.push(await this.updateModelYamlFile({
+      let previousChecksum = file.previousChecksum;
+      if (input.reviewedDestinationFiles) {
+        const name = file.fileName;
+        const read = await this.getModelYaml(input.modelId, {
+          branchId: input.branchId, fileName: modelYamlReadPattern(name), mode: 'combined', fullyResolved: false, includeChecksums: true,
+        });
+        const raw = read.raw;
+        if (!isRecord(raw) || !isRecord(raw.files) || Object.values(raw.files).some(value => typeof value !== 'string')
+          || (raw.checksums !== undefined && !isRecord(raw.checksums))) {
+          throw new Error('Omni returned incomplete destination YAML evidence for ' + redactSensitiveText(name) + '.');
+        }
+        assertUniqueTopicExportKey(name, raw.files);
+        const existed = Object.hasOwn(input.reviewedDestinationFiles, name);
+        const liveChecksum = isRecord(raw.checksums) && Object.hasOwn(raw.checksums, name) ? raw.checksums[name] : undefined;
+        if (existed !== Object.hasOwn(raw.files, name) || (existed && raw.files[name] !== input.reviewedDestinationFiles[name])
+          || (existed ? typeof liveChecksum !== 'string' || !liveChecksum.trim() : liveChecksum !== undefined)) {
+          throw new OmniClientError(409, '/api/v1/models/' + encodeURIComponent(input.modelId) + '/yaml',
+            redactSensitiveText(name) + ' no longer matches the reviewed destination. Review the branch before retrying.', 'MODEL_YAML_CONFLICT');
+        }
+        previousChecksum = existed ? liveChecksum as string : undefined;
+      }
+      const fileName = input.reviewedDestinationFiles ? topicYamlWriteFileName(file.fileName, file.yaml) : file.fileName;
+      const result = await this.updateModelYamlFile({
         modelId: input.modelId,
         branchId: input.branchId,
-        fileName: file.fileName,
+        fileName,
         yaml: file.yaml,
-        previousChecksum: file.previousChecksum,
+        previousChecksum,
         commitMessage: input.commitMessage,
-      }));
+      });
+      if (input.reviewedDestinationFiles && (!isRecord(result) || result.success !== true || result.fileName !== fileName)) {
+        throw new Error('Omni did not confirm the save for ' + redactSensitiveText(file.fileName) + '. Inspect the destination branch before retrying.');
+      }
+      results.push(result);
     }
     return { files: results };
   }

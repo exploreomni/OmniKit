@@ -16,10 +16,9 @@ const binding = (): TopicMigrationExecutionBinding => ({
     keepDestinationDefinitions: { 'SOURCE.PUBLIC/records.view': { destinationFileName: 'omni_demo.analytics/records.view', sourceHash, targetHash } },
   },
 });
-const branch = 'omnikit-topics-11111111-1111-4111-8111-111111111111';
 
 test('snapshot-bound destination preservation survives typed history sanitization', () => {
-  assert.equal(canPreserveTopicMigrationJobEvidence(binding(), [], branch), true);
+  assert.equal(canPreserveTopicMigrationJobEvidence(binding(), []), true);
 });
 
 test('preservation sanitization never exempts stale hashes, credentials, unrelated paths, or arbitrary fields', () => {
@@ -32,6 +31,6 @@ test('preservation sanitization never exempts stale hashes, credentials, unrelat
   ]) {
     const row = binding();
     Object.assign(row.request.keepDestinationDefinitions!['SOURCE.PUBLIC/records.view'], patch);
-    assert.equal(canPreserveTopicMigrationJobEvidence(row, [], branch), false);
+    assert.equal(canPreserveTopicMigrationJobEvidence(row, []), false);
   }
 });

@@ -143,6 +143,18 @@ Fleet evidence follows these rules:
 - **Dashboard Downloads** — export one or more dashboards to local files.
 - **Deck Builder** — build repeatable PowerPoint decks from live Omni dashboard tiles.
 
+### Copy a published native App between saved instances
+
+Unlock the local vault and confirm the destination model contains the topics and fields used by the App's workbook queries. Use `POST /api/native-app-copy` on the running OmniKit server. The request uses saved instance IDs. The source profile must permit reads and the destination profile must permit writes.
+
+1. Send a JSON body with `action` set to `preview`, plus `sourceInstanceId`, `sourceIdentifier`, `destinationInstanceId`, `destinationIdentifier`, and `destinationModelId`. Optionally include `destinationFolderId`. Use the published App's short identifier and choose an unused destination identifier.
+2. Review the returned destination, workbook query names and sandbox settings. Send the same body with `action` set to `apply` and the returned `previewDigest`.
+3. A `verified` result confirms that OmniKit reread the published HTML, sandbox settings, ordered workbook tabs and any copied query-local field definitions. Open the destination App to check rendering, query results, folder placement and audience access.
+
+For query-local dimensions or measures in `.view` files, preview checks whether the destination advertises the required draft APIs. Apply creates a workbook, restores the definitions on a new draft, verifies the tab bindings, then publishes and rereads the App. Leave the new workbook and draft untouched until verification finishes. If a write is interrupted, use the returned destination identifier, draft identifier when available, and stage to inspect the partial copy before retrying.
+
+This path requires Documents V2 App reads on both tenants and document creation on the destination. Workbook-level definitions, access policies in query-local fields, file uploads, foreign-model tabs and document controls require separate preparation. [Read App content](https://docs.omni.co/api/apps/read-app-content) · [Create a document](https://docs.omni.co/api/documents-v2/create-document)
+
 ### Deck Builder
 
 Turn any `.pptx` template into a repeatable Omni-powered deck.
@@ -206,6 +218,8 @@ Studio remains available for Omni-native semantic authoring.
 ### History
 
 Every batch run, migration, and bulk operation is appended here with timestamps and status. Dashboard migration jobs are merged into the same local history view with retry lineage, redacted step details, imported document IDs, semantic-prep audit details, warnings, and post-action results.
+
+If a stopped migration still reserves a destination model, read the original job at `GET /api/migration-jobs/{jobId}`. For an uncertain write, inspect the destination model, branch and exact affected files in Omni. Confirm that the operation has ended. An unlocked operator can then post the verified outcome to `/api/migration-jobs/{jobId}/mutation-adjudications` using the job's current lease item, revision, timestamp and dispatch fingerprint. The endpoint records the evidence and releases that reservation. The original job and its failed steps stay in History. Use a fresh plan for subsequent work.
 
 ### Data Privacy
 

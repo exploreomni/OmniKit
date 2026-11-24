@@ -308,11 +308,11 @@ async function evidence(request: TopicMigrationRequest, signal?: AbortSignal, sa
   const integrityBinding: TopicMigrationExecutionBinding = { planId, revision: hash(analysis), request,
     sourceHash: analysis.sourceHash, targetHash: analysis.targetHash, filesHash: hash(files),
     instanceBoundaryHash: expectedBoundary, topicIds: request.topicIds };
-  if (!canPreserveTopicMigrationJobEvidence(integrityBinding, files, createTopicMigrationBranchName(Date.now()))) {
+  if (!canPreserveTopicMigrationJobEvidence(integrityBinding, files)) {
     analysis.issues = [...analysis.issues, { id: 'history-redaction-integrity', kind: 'validation', severity: 'blocker',
       title: 'Exact migration evidence cannot be preserved',
-      message: 'History protection would change an approved request value, YAML file, or checksum before execution.',
-      nextAction: 'Keep the source unchanged. Resolve the exact-evidence storage limitation before preparing this migration again.',
+      message: 'The reviewed request or model definitions contain protected text.',
+      nextAction: 'Review sensitive literals in the source before preparing this migration again.',
       topicIds: request.topicIds }];
   }
   return { analysis, source, target, sourceYaml, targetYaml, sourceLocations, targetLocations, boundaryHash: expectedBoundary,
@@ -465,12 +465,10 @@ async function persistPlan(request: TopicMigrationRequest, current: Awaited<Retu
     requiresPr: current.requiresPr, branchName: createTopicMigrationBranchName(now, history.map(prior => prior.branchName)), ...(dashboardRepair ? { dashboardRepair } : {}),
     ...(supersedes.length ? { supersedes } : {}) };
   plan.revision = proof(row);
-  const input = executionInput(row);
-  const details = { branchPreparation: BRANCH_PROFILE, topicMigration: input.topicMigration,
-    ...(dashboardRepair ? { dashboardRepair } : {}), retryInput: input };
+  const details = { branchPreparation: BRANCH_PROFILE, topicMigration: binding(row),
+    ...(dashboardRepair ? { dashboardRepair } : {}) };
   const sanitized = sanitizeJob({ sourceLabel: 'Branch review', postMigrationActions: [], items: [], details } as unknown as MigrationJob);
-  if (!isDeepStrictEqual(sanitized.details, details)
-    || !canPreserveTopicMigrationJobEvidence(binding(row), approvedFiles(row), row.branchName)) {
+  if (!isDeepStrictEqual(sanitized.details, details)) {
     plan.status = 'blocked';
     plan.issues.push({ id: 'history-redaction-integrity', kind: 'validation', severity: 'blocker', title: 'Exact review evidence cannot be retained',
       message: 'History protection would change part of the approved package or provenance.', nextAction: 'Resolve exact-evidence storage before preparing this branch.', topicIds: request.topicIds });
@@ -680,7 +678,8 @@ function assertFresh(row: StoredPlan): void {
 }
 function assertInput(row: StoredPlan, input: ModelMigrationJobInput): void {
   const request = row.plan.request;
-  const model = input.models?.[0];
+  if (!input || !Array.isArray(input.models)) fail('The approved model job binding is missing.');
+  const model = input.models[0];
   if (hash(input.topicMigration) !== hash(binding(row)) || input.sourceId !== request.sourceInstanceId || input.targetId !== request.targetInstanceId
     || input.models.length !== 1 || !model || model.sourceModelId !== request.sourceModelId || model.targetModelId !== request.targetModelId
     || model.targetConnectionId !== request.targetConnectionId || model.branchName !== row.branchName || model.mode !== 'translate'
@@ -697,13 +696,13 @@ export function consumeTopicMigrationSubmission(input: ModelMigrationJobInput): 
   if (!row.claim || row.plan.status !== 'ready' || row.plan.jobId) fail('This topic approval has already been used.');
   assertInput(row, input);
 }
-export function linkSubmittedTopicMigrationJob(job: MigrationJob): void {
+export function linkSubmittedTopicMigrationJob(job: MigrationJob, input: ModelMigrationJobInput): void {
   const authority = job.details?.topicMigration as TopicMigrationExecutionBinding | undefined;
   if (!authority) return;
   const row = load(authority.planId);
   if (row.plan.comparisonOnly) fail('A read-only comparison cannot authorize a migration job.');
-  if (!row.claim || row.plan.status !== 'ready' || row.plan.jobId) fail('The topic plan cannot authorize another staging job.');
-  assertInput(row, job.details?.retryInput as ModelMigrationJobInput);
+  if (!row.claim || row.plan.status !== 'ready' || row.plan.jobId || hash(authority) !== hash(binding(row))) fail('The topic plan cannot authorize another staging job.');
+  assertInput(row, input);
   row.plan.status = 'submitted';
   row.plan.jobId = job.id;
   save(row);
@@ -1046,13 +1045,14 @@ export function assertTopicMigrationWriteAuthority(job: MigrationJob): StoredPla
   const row = load(authority.planId);
   assertFresh(row);
   if (row.plan.status !== 'submitted' || row.plan.jobId !== job.id || hash(authority) !== hash(binding(row))) fail('The durable topic approval does not authorize this job.');
-  const input = job.details?.retryInput as ModelMigrationJobInput;
-  assertInput(row, input);
+  const compact = job.details?.fileEvidence === 'reviewed_plan_v1';
+  if (compact && job.details?.retryInput !== undefined) fail('Unexpected executable payload in topic job history.');
+  if (!compact) assertInput(row, job.details?.retryInput as ModelMigrationJobInput);
   const allowed = new Set(['model_translate', 'model_branch_create', 'model_yaml_write', 'model_branch_verify', 'destination_model_mutation']);
   if (hash(job.details?.branchPreparation) !== hash(BRANCH_PROFILE) || hash(job.details?.dashboardRepair) !== hash(row.dashboardRepair)
-    || job.sourceId !== input.sourceId || job.destinationIds.length !== 1 || job.destinationIds[0] !== input.targetId
+    || job.sourceId !== row.plan.request.sourceInstanceId || job.destinationIds.length !== 1 || job.destinationIds[0] !== row.plan.request.targetInstanceId
     || job.emptyFirst || job.replaceSameNamed || job.deleteSourceOnSuccess || job.documentIds.length || job.postMigrationActions.length
-    || job.items.some((item) => !allowed.has(item.kind) || item.destinationId !== input.targetId || item.targetModelId !== row.plan.request.targetModelId)) fail('The topic job contains an unauthorized operation or destination.');
+    || job.items.some((item) => !allowed.has(item.kind) || item.destinationId !== row.plan.request.targetInstanceId || item.targetModelId !== row.plan.request.targetModelId)) fail('The topic job contains an unauthorized operation or destination.');
   for (const item of job.items.filter((candidate) => candidate.kind !== 'destination_model_mutation')) {
     if (item.details?.sourceModelId !== row.plan.request.sourceModelId || item.details?.targetModelId !== row.plan.request.targetModelId
       || item.details?.branchName !== row.branchName
@@ -1062,8 +1062,19 @@ export function assertTopicMigrationWriteAuthority(job: MigrationJob): StoredPla
   }
   const writes = job.items.filter((item) => item.kind === 'model_yaml_write');
   if (['model_translate', 'model_branch_create', 'model_yaml_write', 'model_branch_verify'].some((kind) => job.items.filter((item) => item.kind === kind).length !== 1)) fail('The branch preparation has missing or duplicated execution steps.');
-  if (writes.length !== 1 || hash(writes[0].details?.files) !== hash(approvedFiles(row))) fail('The staged YAML bytes differ from the exact approved topic files.');
+  const write = writes[0].details;
+  const files = approvedFiles(row);
+  const matchesApproval = compact
+    ? write?.files === undefined && write?.acceptedFileCount === files.length
+    : hash(write?.files) === hash(files);
+  if (!matchesApproval) fail('The staged file evidence differs from the exact approved topic files.');
   return row;
+}
+/** Rehydrate execution bytes from the revision-checked private review, never from a history entry. */
+export function reviewedTopicMigrationWrite(job: MigrationJob) {
+  const row = assertTopicMigrationWriteAuthority(job);
+  if (!row) fail('The reviewed destination baseline is unavailable.');
+  return { model: row.plan.request, branchName: row.branchName, files: approvedFiles(row), destinationFiles: row.targetFiles };
 }
 export async function assertTopicMigrationDispatch(job: MigrationJob, targetModelId: string, target: OmniClient, options: { branchId?: string; afterWrite?: boolean } = {}): Promise<void> {
   const row = assertTopicMigrationWriteAuthority(job);

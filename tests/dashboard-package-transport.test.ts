@@ -205,6 +205,94 @@ test('native content verification normalizes paired IDs but preserves tile order
   assert.equal(verifyDashboardPackageContent(pkg, imported, {}, target).verified, false);
 });
 
+test('package readback compares theme definitions and palettes across organization-specific theme IDs', async () => {
+  const { pkg, imported } = await fixture();
+  const theme = { name: 'Example theme', styles: { 'dashboard-background': '#123456' } };
+  Object.assign(pkg.exportPayload.dashboard as object, { dashboardCustomTheme: { customThemeId: 'source-theme', customTheme: theme } });
+  const dashboard = imported.dashboard as Record<string, unknown>;
+  dashboard.dashboardCustomTheme = { customThemeId: 'target-theme', customTheme: structuredClone(theme) };
+  assert.equal(verifyDashboardPackageContent(pkg, imported, tileMap, target).verified, true);
+  dashboard.dashboardCustomTheme = { customThemeId: 'target-theme', customTheme: { ...theme, styles: {} } };
+  assert.match(verifyDashboardPackageContent(pkg, imported, tileMap, target).findings.join(' '), /custom theme/);
+  dashboard.dashboardCustomTheme = null;
+  assert.equal(verifyDashboardPackageContent(pkg, imported, tileMap, target).verified, false);
+  dashboard.dashboardCustomTheme = { customThemeId: 'target-theme', customTheme: theme };
+  pkg.exportPayload.colorPalettes = { 'export-palette-1': { name: 'Example palette', colors: ['#010203'] } };
+  assert.match(verifyDashboardPackageContent(pkg, imported, tileMap, target).findings.join(' '), /palette definitions/);
+  imported.colorPalettes = structuredClone(pkg.exportPayload.colorPalettes);
+  assert.equal(verifyDashboardPackageContent(pkg, imported, tileMap, target).verified, true);
+});
+
+test('native cross-instance exports verify reminted identities while retaining authored and access differences', async () => {
+  const { pkg, imported } = await fixture();
+  for (const [side, value] of [['source', pkg.exportPayload], ['target', imported]] as const) {
+    const identifier = side === 'source' ? 'example-original' : target.identifier;
+    const name = side === 'source' ? pkg.name : target.name;
+    const prefix = (kind: string) => side + '-' + kind;
+    const stamp = side === 'source' ? '2026-01-10T12:00:00Z' : '2026-02-12T12:00:00Z';
+    const ephemeral = '1:' + prefix('tile');
+    Object.assign(value.document as object, {
+      documentId: prefix('doc-id'), stableDocumentId: prefix('stable'), workbookId: prefix('doc-id'),
+      dashboardId: prefix('dashboard'), identifier, dashboardMiniUuid: identifier, name, ephemeral,
+      owner: { id: prefix('actor'), name: prefix('name') }, updater: { id: prefix('actor'), name: prefix('name') },
+      createdAt: stamp, updatedAt: stamp, publishedAt: stamp, scope: 'shared',
+      folder: { id: prefix('folder'), path: side === 'source' ? '/Old' : target.folderPath, name: prefix('folder'), scope: 'shared' },
+      modelId: prefix('workbook'), sharedModelId: prefix('model'), connectionId: prefix('connection'),
+      baseModel: { id: prefix('model'), baseModelId: null, name: prefix('shared'), modelKind: 'SHARED', deletedAt: null, pullRequestRequired: true },
+      connection: { id: prefix('connection'), name: prefix('name'), database: 'analytics', deletedAt: null,
+        userAttributeNameForConnectionEnvironments: 'region', allowsUserSpecificTimezones: true },
+    });
+    const dashboard = value.dashboard as typeof source.dashboard;
+    Object.assign(dashboard, {
+      organizationId: prefix('org'), creator: { id: prefix('actor'), name: prefix('name') },
+      updater: { id: prefix('actor'), name: prefix('name') }, updatedAt: stamp, name, identifier, ephemeral,
+      workbookId: prefix('doc-id'), modelId: prefix('workbook'), sharedModelId: prefix('model'),
+      model: { id: prefix('workbook'), connectionId: prefix('connection'), baseModelId: prefix('model'), modelKind: 'WORKBOOK', deletedAt: null },
+      workbook: { identifier, updatedAt: stamp, organizationRole: 'VIEWER', controlBar: { placement: 'top' } },
+      queryPresentationCollectionId: prefix('collection'),
+      dashboardCustomTheme: { customThemeId: prefix('theme'), customTheme: {
+        id: prefix('theme'), organizationId: prefix('org'), name: 'Amber', createdAt: stamp, updatedAt: stamp, deletedAt: null,
+        embedJsonHash: prefix('embed-hash'), discreteColorPaletteId: 'omni-blues', continuousColorPaletteId: null,
+        styles: { background: '#dd9933' },
+      } },
+    });
+    const tile = dashboard.queryPresentationCollection.queryPresentationCollectionMemberships[0].queryPresentation;
+    Object.assign(tile, { organizationId: prefix('org'), modelId: prefix('workbook'), queryId: prefix('query-record'),
+      visConfigId: prefix('vis'), visConfig: { id: prefix('vis'), jsonHash: prefix('vis-hash'), createdAt: stamp,
+        fields: ['orders.amount'], spec: { color: '#dd9933' } } });
+    Object.assign(tile.query, { modelId: prefix('workbook'), jsonHash: prefix('query-hash') });
+    Object.assign(tile.query.queryJson, { modelId: prefix('workbook') });
+  }
+  delete pkg.exportPayload.colorPalettes;
+  const verify = (actual: Record<string, unknown>) => verifyDashboardPackageContent(pkg, actual, tileMap, target);
+  const good = verify(imported);
+  assert.equal(good.verified, true, good.findings.join(' '));
+  const change = (update: (dashboard: Record<string, unknown>, document: Record<string, unknown>) => void) => {
+    const copy = structuredClone(imported);
+    update(copy.dashboard as Record<string, unknown>, copy.document as Record<string, unknown>);
+    return verify(copy);
+  };
+  assert.equal(change((_, doc) => { doc.ephemeral = '2:target-tile'; }).verified, false);
+  assert.equal(change((_, doc) => { (doc.connection as Record<string, unknown>).id = 'other-connection'; }).verified, false);
+  assert.equal(change((_, doc) => { (doc.connection as Record<string, unknown>).userAttributeNameForConnectionEnvironments = 'other'; }).verified, false);
+  assert.equal(change((_, doc) => { (doc.baseModel as Record<string, unknown>).pullRequestRequired = false; }).verified, false);
+  assert.equal(change((_, doc) => { doc.publishedAt = null; }).verified, false);
+  assert.equal(change((_, doc) => { doc.scope = 'restricted'; }).verified, false);
+  assert.equal(change((_, doc) => { (doc.folder as Record<string, unknown>).path = '/Wrong'; }).verified, false);
+  assert.equal(change((_, doc) => { (doc.folder as Record<string, unknown>).scope = 'global'; }).verified, false);
+  assert.equal(change(dashboard => { dashboard.workbookId = 'different-workbook'; }).verified, false);
+  assert.equal(change(dashboard => { (dashboard.workbook as Record<string, unknown>).organizationRole = 'ADMIN'; }).verified, false);
+  assert.match(change(dashboard => {
+    const theme = dashboard.dashboardCustomTheme as { customTheme: Record<string, unknown> };
+    theme.customTheme.discreteColorPaletteId = 'omni-reds';
+  }).findings.join(' '), /custom theme/);
+  assert.equal(change(dashboard => {
+    const collection = dashboard.queryPresentationCollection as typeof source.dashboard.queryPresentationCollection;
+    const tile = collection.queryPresentationCollectionMemberships[0].queryPresentation as { visConfig?: { spec: object } };
+    Object.assign(tile.visConfig!.spec, { createdAt: 'authored literal' });
+  }).verified, false);
+});
+
 test('guarded client import preserves approved identifier and parses nested identities without write retry', async () => {
   const calls: Array<{ method?: string; body: Record<string, unknown> }> = [];
   let checks = 0;

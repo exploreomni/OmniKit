@@ -13,6 +13,8 @@ import {
   type OmniFolderInventoryResult,
 } from '../server/services/omniClient';
 import type { InstanceFolderInventoryResponse } from '../src/services/opsConsole';
+import { vaultApiKeyReference } from '../src/services/opsConsole';
+import { getDocumentStateV2 } from '../src/services/omniApi';
 import {
   lockVault,
   resetVault,
@@ -78,6 +80,30 @@ afterEach(() => {
   resetVault();
   lockVault();
   rmSync(tempDir, { recursive: true, force: true });
+});
+
+test('Deck Builder reads published V2 state through the selected saved instance', async () => {
+  let upstreamReads = 0;
+  mock.method(OmniClient.prototype, 'getDocumentStateV2', async (identifier: string) => {
+    upstreamReads++;
+    assert.equal(identifier, 'example-dashboard');
+    return { name: 'Example', modelId: 'base-model', workbookModelId: 'workbook-model', queryPresentations: { data: {}, order: [] } };
+  });
+  mock.method(globalThis, 'fetch', async (input: string, init: RequestInit) => {
+    const url = new URL(input, 'http://localhost');
+    assert.equal(url.pathname, '/api/instances/source-1/document-state');
+    assert.equal(init.method, 'GET');
+    assert.equal(init.body, undefined);
+    return instancesHandler(new Request(url, init));
+  });
+  const origin = 'https://source.example.omniapp.co';
+  const saved = vaultApiKeyReference('source-1');
+  const state = await getDocumentStateV2(origin, saved, 'example-dashboard');
+  assert.equal(state.workbookModelId, 'workbook-model');
+  await assert.rejects(getDocumentStateV2(origin, 'raw-key', 'example-dashboard'), /saved Omni instance/);
+  await assert.rejects(getDocumentStateV2(origin, saved, '../draft'), /valid Omni document/);
+  await assert.rejects(getDocumentStateV2('https://other.example.invalid', saved, 'example-dashboard'), /selected instance changed/);
+  assert.equal(upstreamReads, 1);
 });
 
 test('direct lookup verifies dashboard layout and exact connection without scanning the catalog', async () => {

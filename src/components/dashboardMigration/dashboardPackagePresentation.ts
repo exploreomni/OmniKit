@@ -26,9 +26,11 @@ export function dashboardPackagePreviewMatches(summary: DashboardPackageSummary,
   if ((preview.bindingMappings !== undefined && (!Array.isArray(preview.bindingMappings) || preview.bindingMappings.some(mapping => !isDashboardPackageBindingMapping(mapping))))
     || JSON.stringify(preview.bindingMappings || []) !== JSON.stringify(summary.bindingMappings || [])) return false;
   if (preview.files.some((row) => !row || typeof row.fileName !== 'string' || typeof row.sourceFileName !== 'string' || !Object.prototype.hasOwnProperty.call(FILE_ACTIONS, row.action))
-    || preview.documents.some((row) => !row || typeof row.sourceDocumentId !== 'string' || typeof row.name !== 'string' || !Number.isSafeInteger(row.localModelCount) || row.localModelCount < 0)) return false;
+    || preview.documents.some((row) => !row || typeof row.sourceDocumentId !== 'string' || typeof row.name !== 'string'
+      || !Number.isSafeInteger(row.localModelCount) || row.localModelCount < 0
+      || (row.reviewCustomTheme !== undefined && typeof row.reviewCustomTheme !== 'boolean'))) return false;
   const files = (rows: DashboardPackageSummary['files']) => rows.map((row) => JSON.stringify([row.fileName, row.sourceFileName, row.action, row.reason || ''])).sort();
-  const documents = (rows: DashboardPackageSummary['documents']) => rows.map((row) => JSON.stringify([row.sourceDocumentId, row.name, row.localModelCount])).sort();
+  const documents = (rows: DashboardPackageSummary['documents']) => rows.map((row) => JSON.stringify([row.sourceDocumentId, row.name, row.localModelCount, row.reviewCustomTheme === true])).sort();
   return preview.files.every((row) => row && typeof row.before === 'string' && typeof row.after === 'string'
       && (row.sourceComparison === undefined || typeof row.sourceComparison === 'string'))
     && JSON.stringify(files(preview.files)) === JSON.stringify(files(summary.files))

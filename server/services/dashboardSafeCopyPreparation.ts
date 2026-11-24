@@ -11,7 +11,8 @@ import {
 import { publishMigrationJobEvent } from './jobEvents';
 import { getJob, updateJobAtomically, updateJobStatus } from './jobStore';
 import { getInstance } from './nativeVault';
-import { OmniClient } from './omniClient';
+import { OmniClient, OmniClientError, OmniDocumentInventoryDeadlineError, OmniPaginationError, OmniRequestDeadlineError,
+  OmniResponseLimitError, OmniResponseReadDeadlineError } from './omniClient';
 import {
   buildMigrationPlan,
   type DashboardMigrationJobInput,
@@ -446,7 +447,9 @@ async function resolveOneTarget(
         async (instanceId, modelId) => (await snapshot(instanceId, modelId)).raw);
     }
   }
-  let plan = await buildPlan(inputForTarget(intent, target), evidenceContext);
+  const inspectPlan = () => buildPlan(inputForTarget(intent, target), evidenceContext)
+    .catch((cause: unknown) => { throw new InspectionError('Reading dashboard inventory and model dependencies', { cause }); });
+  let plan = await inspectPlan();
   let converged = false;
 
   for (let pass = 0; pass < MAX_RESOLUTION_PASSES; pass += 1) {
@@ -477,7 +480,7 @@ async function resolveOneTarget(
       converged = true;
       break;
     }
-    plan = await buildPlan(inputForTarget(intent, target), evidenceContext);
+    plan = await inspectPlan();
   }
 
   if (!converged) {
@@ -526,7 +529,8 @@ async function resolveOneTarget(
   const patches = writeBearingPatches(target);
   let scratchValidation: DashboardSafeCopyPreparedTarget['scratchValidation'] = 'not_required';
   if (patches.length > 0) {
-    const validation = await validatePatches(inputForTarget(intent, target));
+    const validation = await validatePatches(inputForTarget(intent, target))
+      .catch((cause: unknown) => { throw new InspectionError('Validating the proposed changes on the isolated branch', { cause }); });
     if (!scratchValidationPassed(validation, target)) {
       return fixedException(
         target.id,
@@ -593,12 +597,12 @@ export async function prepareDashboardSafeCopyTargets(
       } else {
         try {
           result = await resolveOneTarget(intent, destination, persistedTarget, dependencies);
-        } catch {
+        } catch (error) {
           result = fixedException(
             destination.targetId,
             'PREPARATION_FAILED',
             'target',
-            'Automatic preparation could not safely inspect this destination.',
+            inspectionFailure(error),
             destination.targetId,
           );
         }
@@ -607,6 +611,31 @@ export async function prepareDashboardSafeCopyTargets(
       return result;
     },
   );
+}
+
+class InspectionError extends Error {}
+
+function inspectionFailure(error: unknown): string {
+  if (error instanceof InspectionError) return `${error.message} failed. ${inspectionFailure(error.cause)}`;
+  if (error instanceof OmniClientError) {
+    const path = URL.canParse(error.url, 'https://omni.invalid') ? new URL(error.url, 'https://omni.invalid').pathname : '';
+    const resource = /\/models\/[^/]+\/yaml$/.test(path) ? 'model YAML'
+      : /\/documents(?:\/|$)/.test(path) ? 'document metadata'
+      : /\/folders(?:\/|$)/.test(path) ? 'folder metadata' : 'migration evidence';
+    const action = error.status === 401 || error.status === 403 ? 'Check the saved credential and its read access.'
+      : error.status === 404 ? 'Recheck the selected document, folder and model.' : 'Check the selected scope and recheck readiness.';
+    return `Omni rejected the ${resource} request (HTTP ${error.httpStatus}). ${action}`;
+  }
+  if (error instanceof OmniPaginationError || error instanceof OmniResponseLimitError) {
+    return 'Omni returned an incomplete inventory. Select a narrower folder and recheck readiness.';
+  }
+  if (error instanceof OmniDocumentInventoryDeadlineError || error instanceof OmniRequestDeadlineError || error instanceof OmniResponseReadDeadlineError) {
+    return 'Reading migration evidence timed out. Check connectivity and narrow the selected folder before rechecking.';
+  }
+  if (error instanceof Error && error.message.startsWith('Source documents not found:')) {
+    return 'The selected dashboards were missing from the source folder inventory. Check their current folder and visibility, then reselect them.';
+  }
+  return 'OmniKit could not finish inspecting the selected source and destination. Recheck the saved profiles and rebuild the readiness review.';
 }
 
 function summaryItem(

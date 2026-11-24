@@ -342,6 +342,28 @@ export async function restoreDashboardPackageLocals(pkg: DashboardPackage, impor
   return receipts;
 }
 
+function themeDefinition(link: Record<string, unknown>): Record<string, unknown> | undefined {
+  const theme = link.customTheme;
+  if (!id(link.customThemeId) || !record(theme) || typeof theme.name !== 'string' || !record(theme.styles)
+    || theme.deletedAt != null || (theme.id !== undefined && theme.id !== link.customThemeId)) return undefined;
+  // The native export includes the database row. Its embed hash also incorporates the organization ID.
+  return Object.fromEntries(Object.entries(theme).filter(([key]) =>
+    !['id', 'organizationId', 'createdAt', 'updatedAt', 'deletedAt', 'embedJsonHash'].includes(key)));
+}
+
+/** Omni serializes tab order and stable tab keys as key:miniUuid pairs. Only the paired miniUUID changes. */
+function tabBindings(value: string, mapping?: Record<string, string>): Array<[string, string]> {
+  const keys = new Set<string>(), tiles = new Set<string>();
+  return decodeURIComponent(value).split(',').map(entry => {
+    const [key, tile, ...rest] = entry.split(':');
+    if (rest.length || !/^[1-9][0-9]*$/.test(key) || !id(tile) || keys.has(key) || tiles.has(tile)
+      || (mapping && !Object.hasOwn(mapping, tile))) fail('The exported tab order or a tab binding could not be verified.');
+    keys.add(key);
+    tiles.add(tile);
+    return [key, mapping ? mapping[tile] : tile];
+  });
+}
+
 /** Verifies the content envelope/tile semantics only. Pair with local YAML receipts and separate query results. */
 export function verifyDashboardPackageContent(pkg: DashboardPackage, importedExport: Record<string, unknown>, miniUuidMap: Record<string, string> = {},
   target?: DashboardPackageTarget): DashboardPackageContentVerification {
@@ -355,20 +377,57 @@ export function verifyDashboardPackageContent(pkg: DashboardPackage, importedExp
     const connectionId = propertyIdentity(importedWorkbook, ['connection_id', 'connectionId']);
     if (!modelId || !connectionId || target && (modelId !== target.modelId || connectionId !== target.connectionId)) fail('Imported destination binding differs from approval.');
     const expected = retargetDashboardPackage(pkg, target || { modelId, connectionId, name: pkg.name, identifier: 'comparison-only' });
+    const sourceDashboard = expected.dashboard as Record<string, unknown>;
+    const importedDashboard = importedExport.dashboard as Record<string, unknown>;
+    const theme = sourceDashboard.dashboardCustomTheme;
+    const actualTheme = importedDashboard.dashboardCustomTheme;
+    if (record(theme)) {
+      const definition = themeDefinition(theme);
+      if (!definition || !record(actualTheme) || !isDeepStrictEqual(definition, themeDefinition(actualTheme))) {
+        fail('The destination custom theme could not be verified against the exported name and styles. Apply the matching theme to the existing dashboard and verify it again.');
+      }
+      sourceDashboard.dashboardCustomTheme = { ...theme, customThemeId: actualTheme.customThemeId, customTheme: actualTheme.customTheme };
+    }
+    if (!isDeepStrictEqual(expected.colorPalettes ?? {}, importedExport.colorPalettes ?? {})) {
+      fail('The exported color palette definitions differ on the destination. Review the palettes on the existing dashboard and verify it again.');
+    }
     const mappings = new Map<string, string>(pairs);
     const bind = (from: string, to: string) => {
       if (mappings.has(from) && mappings.get(from) !== to
         || [...mappings].some(([key, value]) => key !== from && value === to)) fail('Imported content identity mapping is ambiguous.');
       mappings.set(from, to);
     };
+    bind(pkg.connectionId, connectionId);
+    bind(pkg.sharedModelId, modelId);
     const a = memberships(expected), b = memberships(importedExport);
     const targetRows = new Map(b.map(row => [(row.queryPresentation as Record<string, unknown>).miniUuid, row]));
     if (a.length !== b.length) fail('Imported dashboard has missing or additional tiles.');
-    const addIds = (left: unknown, right: unknown) => {
+    const addIds = (left: unknown, right: unknown, key = 'id') => {
       if (!record(left) || !record(right)) return;
-      if (id(left.id) && id(right.id)) bind(left.id, right.id);
+      const from = left[key], to = right[key];
+      if (id(from) && id(to)) bind(from, to);
     };
-    addIds(expected.document, importedExport.document); addIds(expected.dashboard, importedExport.dashboard);
+    const sourceDocument = expected.document as Record<string, unknown>;
+    const targetDocument = importedExport.document as Record<string, unknown>;
+    for (const key of ['id', 'documentId', 'stableDocumentId']) addIds(sourceDocument, targetDocument, key);
+    addIds(sourceDashboard, importedDashboard);
+    addIds(sourceDashboard, importedDashboard, 'organizationId');
+    // The export repeats the approved destination name/identifier on workbook and dashboard wrappers.
+    if (typeof sourceDocument.identifier === 'string') {
+      const identifier = target?.identifier ?? targetDocument.identifier;
+      if (!id(identifier)) fail('The imported document identifier is unavailable.');
+      bind(sourceDocument.identifier, identifier);
+    }
+    if (Object.hasOwn(sourceDashboard, 'name')) sourceDashboard.name = target?.name ?? pkg.name;
+    if (target && (Object.hasOwn(sourceDocument, 'folder') || Object.hasOwn(targetDocument, 'folder'))) {
+      const folder = targetDocument.folder;
+      if (target.folderPath ? !record(folder) || folder.path !== target.folderPath : folder !== null) {
+        fail('The imported dashboard folder differs from the approved destination.');
+      }
+      // Only normalize the selected location. A folder's share scope still has to match.
+      sourceDocument.folder = record(sourceDocument.folder) && record(folder)
+        ? { ...sourceDocument.folder, id: folder.id, name: folder.name, path: folder.path } : folder;
+    }
     addIds((expected.dashboard as Record<string, unknown>).queryPresentationCollection, (importedExport.dashboard as Record<string, unknown>).queryPresentationCollection);
     for (const row of a) {
       const sourceTile = row.queryPresentation as Record<string, unknown>;
@@ -378,23 +437,50 @@ export function verifyDashboardPackageContent(pkg: DashboardPackage, importedExp
       const destinationTile = destinationRow.queryPresentation as Record<string, unknown>;
       bind(sourceTile.miniUuid as string, mapped);
       addIds(row, destinationRow); addIds(sourceTile, destinationTile); addIds(sourceTile.query, destinationTile.query);
+      addIds(sourceTile.visConfig, destinationTile.visConfig);
     }
-    const identityKeys = new Set(['id', 'miniUuid', 'queryPresentationId', 'queryPresentationCollectionId', 'queryId', 'workbookModelId', 'model_extension_id', 'modelExtensionId']);
+    const identityKeys = new Set(['id', 'miniUuid', 'identifier', 'dashboardMiniUuid', 'documentId', 'stableDocumentId',
+      'dashboardId', 'workbookId', 'organizationId', 'connectionId', 'sharedModelId', 'baseModelId', 'modelId',
+      'queryPresentationId', 'sourceQueryPresentationId', 'queryPresentationCollectionId', 'queryId',
+      'visConfigId', 'workbookModelId', 'allowedPrivateToWorkbookModelId', 'model_extension_id', 'modelExtensionId']);
     const membershipPath = 'dashboard.queryPresentationCollection.queryPresentationCollectionMemberships.[]';
-    const metadataPaths = new Set(['document', 'dashboard', 'dashboard.queryPresentationCollection', membershipPath,
-      membershipPath + '.queryPresentation', membershipPath + '.queryPresentation.query']);
+    const presentation = membershipPath + '.queryPresentation';
+    const metadataPaths = new Set(['document', 'document.connection', 'document.baseModel', 'dashboard', 'dashboard.model',
+      'dashboard.workbook', 'dashboard.queryPresentationCollection', membershipPath, presentation,
+      presentation + '.query', presentation + '.visConfig']);
+    // These are derived from the import actor, destination connection/model or content-addressed storage.
+    // Deliberately scoped to exact paths: e.g. a filter, style, or chart spec can have fields with the same names.
+    const instanceMetadata: Record<string, string[]> = {
+      document: ['owner', 'updater', 'lastItemIndex'],
+      'document.connection': ['name'],
+      'document.baseModel': ['name'],
+      dashboard: ['creator', 'updater'],
+      [presentation + '.query']: ['jsonHash'],
+      [presentation + '.visConfig']: ['jsonHash'],
+    };
     const normalize = (value: unknown, fromSource: boolean, path: string[] = []): unknown => {
       if (Array.isArray(value)) return value.map(child => normalize(child, fromSource, [...path, '[]']));
       if (!record(value)) return value;
-      const metadata = metadataPaths.has(path.join('.'));
-      const queryRoot = path.join('.') === membershipPath + '.queryPresentation.query.queryJson';
-      return Object.fromEntries(Object.entries(value).filter(([key]) => !(metadata && ['createdAt', 'updatedAt', 'created_at', 'updated_at'].includes(key)))
-        .map(([key, child]) => [key, fromSource && (metadata || queryRoot && ['model_extension_id', 'modelExtensionId'].includes(key))
-          && identityKeys.has(key) && typeof child === 'string' && mappings.has(child)
-          ? mappings.get(child) : normalize(child, fromSource, [...path, key])]));
+      const location = path.join('.');
+      const metadata = metadataPaths.has(location);
+      const queryRoot = location === presentation + '.query.queryJson';
+      const ignored = Object.hasOwn(instanceMetadata, location) ? instanceMetadata[location] : [];
+      const entries = Object.entries(value).filter(([key]) => !ignored.includes(key)
+        && !(metadata && ['createdAt', 'updatedAt', 'created_at', 'updated_at'].includes(key)));
+      return Object.fromEntries(entries.map(([key, child]) => {
+        if (location === 'document' && key === 'publishedAt' && typeof child === 'string'
+          && Number.isFinite(Date.parse(child))) return [key, 'published'];
+        if ((location === 'document' || location === 'dashboard') && key === 'ephemeral' && typeof child === 'string') {
+          return [key, tabBindings(child, fromSource ? miniUuidMap : undefined)];
+        }
+        const boundIdentity = metadata && identityKeys.has(key)
+          || queryRoot && ['modelId', 'model_extension_id', 'modelExtensionId'].includes(key);
+        return [key, fromSource && boundIdentity && typeof child === 'string' && mappings.has(child)
+          ? mappings.get(child) : normalize(child, fromSource, [...path, key])];
+      }));
     };
     const content = (value: Record<string, unknown>) => Object.fromEntries(Object.entries(value)
-      .filter(([key]) => !['workbookModel', 'queryModels', 'baseModelId', 'identifier', 'folderPath'].includes(key)));
+      .filter(([key]) => !['workbookModel', 'queryModels', 'baseModelId', 'identifier', 'folderPath', 'colorPalettes'].includes(key)));
     if (!isDeepStrictEqual(normalize(content(expected), true), normalize(content(importedExport), false))) fail('Imported dashboard content or tile semantics differ from the approved package.');
     return { verified: true, findings: [], sourceHash, destinationHash, checkedTiles: listDashboardPackageTiles(importedExport).length,
       queriesVerified: false, localModelsVerified: false };

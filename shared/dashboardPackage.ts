@@ -11,7 +11,7 @@ export interface DashboardPackageIssue { code: string; reference: string; messag
 export interface DashboardPackageSummary {
   version: 1;
   fingerprint: string;
-  documents: Array<{ sourceDocumentId: string; name: string; localModelCount: number }>;
+  documents: Array<{ sourceDocumentId: string; name: string; localModelCount: number; reviewCustomTheme?: boolean }>;
   files: DashboardPackageFileSummary[];
   issues: DashboardPackageIssue[];
   /** Exact physical binding comparisons; never table, SQL, or security rewrites. */

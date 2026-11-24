@@ -20,7 +20,7 @@ import { getInstance, lockVault, resetVault, unlockVault, upsertInstance } from 
 import { OmniClient, OmniClientError } from '../server/services/omniClient';
 import { dashboardSafeCopyStateHash as hash } from '../server/services/dashboardSafeCopyRuntime';
 import { dashboardRepairInstanceBoundaryHash } from '../server/services/dashboardRepairRuntime';
-import { sanitizeJob, sanitizeJobItem } from '../server/services/jobSanitizer';
+import { sanitizeJob } from '../server/services/jobSanitizer';
 import { subscribeMigrationJobEvents, type MigrationJobEvent } from '../server/services/jobEvents';
 import { applyTopicBranchCorrection, getTopicBranchCorrection, prepareTopicBranchCorrection, reconcileTopicBranchCorrection } from '../server/services/topicBranchCorrections';
 import { readTopicMigrationTableNameEvidence } from '../server/services/topicMigrationTableNameEvidence';
@@ -865,7 +865,7 @@ test('branch verification recovery preserves authored topic paths with spaces', 
   const result = await verifyTopicMigrationBranch(plan.id, { revision: plan.revision, requestId: randomUUID() });
   assert.equal(result.verification.verified, true);
   assert.ok(result.verification.files.some(file => file.sourceFileName === 'Example Domain/example.topic'
-    && file.submittedFileName === 'Example Domain/example.topic' && file.destinationFileName === 'Example Domain/example.topic'));
+    && file.submittedFileName === 'example.topic' && file.destinationFileName === 'Example Domain/example.topic'));
   assert.deepEqual(result.job.items, job.items);
 });
 
@@ -890,7 +890,7 @@ test('branch verification normal afterWrite accepts formatting only but rejects 
   assert.equal(failed.details?.branchReceipt, undefined);
 });
 
-test('branch verification canonical mapped submission preserves only approved contextual filenames', async () => {
+test('branch verification canonical mapped submission writes approved paths and stores only the file count', async () => {
   sourceFiles['SOURCE.PUBLIC/records.view'] = sourceFiles['records.view']; delete sourceFiles['records.view'];
   const plan = await createTopicMigrationPlan({ ...request(), schemaMapText: 'SOURCE.PUBLIC -> omni_example.data' });
   assert.equal(plan.status, 'ready', JSON.stringify(plan.issues));
@@ -899,11 +899,9 @@ test('branch verification canonical mapped submission preserves only approved co
   assert.equal(job.status, 'succeeded', JSON.stringify(job.items));
   assert.ok(Object.hasOwn(branches.get('branch-1')!.files, 'omni_example.data/records.view'));
   const write = job.items.find(item => item.kind === 'model_yaml_write')!;
-  const approved = write.details!.files as Array<{ fileName: string; yaml: string }>;
-  assert.ok(approved.some(file => file.fileName === 'omni_example.data/records.view'));
+  assert.equal(write.details?.acceptedFileCount, plan.files.filter(file => ['create', 'add'].includes(file.status)).length);
+  assert.equal(write.details?.files, undefined);
   assert.deepEqual(sanitizeJob(job).items, job.items);
-  const isolated = sanitizeJobItem(write).details!.files as Array<{ fileName: string }>;
-  assert.ok(isolated.some(file => file.fileName.includes('[redacted]')), 'An isolated file path has no bound namespace exception.');
   assert.equal(branchCreates, 1); assert.equal(yamlWrites, 1);
 });
 
@@ -1235,6 +1233,21 @@ test('branch review retains partial/unrelated branches without a success receipt
   assert.equal((await createTopicMigrationPlan(request())).id, plan.id);
 });
 
+test('a successful write response for an incomplete file set cannot produce a prepared branch receipt', async t => {
+  const plan = await ready();
+  t.mock.method(OmniClient.prototype, 'updateModelYamlFiles', async (input: Parameters<OmniClient['updateModelYamlFiles']>[0]) => {
+    const completed = input.files.find(file => file.fileName === 'records.view')!;
+    branches.get(input.branchId)!.files[completed.fileName] = completed.yaml;
+    return { success: true };
+  });
+  const job = await finished((await stage(plan)).job.id);
+  assert.equal(job.items.find(item => item.kind === 'model_yaml_write')?.status, 'succeeded');
+  assert.equal(job.items.find(item => item.kind === 'model_branch_verify')?.status, 'failed');
+  assert.notEqual(job.status, 'succeeded');
+  assert.equal(job.details?.branchReceipt, undefined);
+  assert.equal(getTopicMigrationPlan(plan.id).branchReceipt, undefined);
+});
+
 test('branch review exact readback rejects unrelated edits and source drift after branch creation', async () => {
   injectUnrelatedFile = true;
   const job = await finished((await stage(await ready())).job.id);
@@ -1278,6 +1291,46 @@ test('branch review legacy plans and jobs are readable but cannot publish, stage
   assert.equal((await post('jobs', { sourceId: 'source', targetId: 'target' })).status, 410);
   const cleared = await historyHandler(new Request('http://localhost/api/migration-jobs', { method: 'DELETE' }));
   assert.equal(cleared.status, 409); assert.ok(getJob(legacy.id));
+});
+
+test('reviewed user attributes use exact plan bytes while job history and events contain only a file receipt', async t => {
+  sourceFiles['example.topic'] += 'access_filters: [{field: records.id, user_attribute: "omni_user_email"}]\n';
+  const original = OmniClient.prototype.updateModelYamlFiles;
+  const write = t.mock.method(OmniClient.prototype, 'updateModelYamlFiles', async function (this: OmniClient, ...args: Parameters<OmniClient['updateModelYamlFiles']>) {
+    assert.deepEqual(args[0].reviewedDestinationFiles, targetFiles);
+    return original.apply(this, args);
+  });
+  const plan = await ready();
+  const { job: staged } = await stage(plan);
+  const events: MigrationJobEvent[] = [];
+  const unsubscribe = subscribeMigrationJobEvents(staged.id, event => events.push(event));
+  try {
+    const complete = await finished(staged.id);
+    assert.equal(complete.status, 'succeeded', JSON.stringify(complete.items));
+    assert.equal(write.mock.callCount(), 1);
+    const expected = plan.files.find(file => file.fileName === 'example.topic')!.proposed;
+    assert.equal(branches.get('branch-1')!.files['example.topic'], expected);
+    assert.equal(parse(expected).access_filters[0].user_attribute, 'omni_user_email');
+    assert.ok(complete.details?.branchReceipt);
+    assert.ok(events.length);
+    assert.doesNotMatch(JSON.stringify([staged, complete, events]) + readFileSync(process.env.OMNIKIT_JOB_HISTORY_PATH!, 'utf8'),
+      /omni_user_email|base_view|acceptedFiles|fictional-secret/);
+  } finally { unsubscribe(); }
+});
+
+test('reviewed attribute references never authorize an opaque credential or sensitive adjacent text', async () => {
+  const original = sourceFiles['example.topic'];
+  for (const line of [
+    'access_filters: [{field: records.id, user_attribute: omni_opaqueFixtureCredential}]',
+    'access_filters: [{field: records.id, user_attribute: omni_user_email}] # password: fixture-value',
+  ]) {
+    sourceFiles['example.topic'] = original + line + '\n';
+    const plan = await createTopicMigrationPlan(request());
+    assert.equal(plan.status, 'blocked');
+    assert.ok(plan.issues.some(issue => issue.id === 'history-redaction-integrity'));
+    await assert.rejects(stage(plan), /blockers/);
+  }
+  assert.equal(branchCreates, 0); assert.equal(yamlWrites, 0);
 });
 
 test('branch review history redaction blocks approval before a one-use claim exists', async () => {

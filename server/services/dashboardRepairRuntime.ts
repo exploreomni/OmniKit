@@ -1,4 +1,4 @@
-import type { MigrationJob, ModelMigrationJobInput } from './migrationJobs';
+import type { MigrationJob, ModelMigrationAcceptedFile, ModelMigrationJobInput } from './migrationJobs';
 import type { OmniClient } from './omniClient';
 import { dashboardRepairSnapshotHash } from './dashboardRepairApproval';
 import { assertDashboardRepairYamlPreservesTarget } from './dashboardRepairYaml';
@@ -88,7 +88,7 @@ export async function readDashboardRepairSourceBinding(input: {
 
 /** Enforce the review again at dispatch, not just in the browser or HTTP handler. */
 export async function assertAdditiveDashboardRepairDispatch(job: MigrationJob, targetModelId: string, source: OmniClient, target: OmniClient,
-  options: { branchId?: string; beforeMerge?: boolean } = {}): Promise<void> {
+  options: { branchId?: string; beforeMerge?: boolean; reviewedFiles?: ModelMigrationAcceptedFile[] } = {}): Promise<void> {
   const repair = job.details?.dashboardRepair as ModelMigrationJobInput['dashboardRepair'];
   if (!repair) return;
   if (repair.additiveOnly !== true || !repair.targetModelHash || !repair.approvedFilesHash || !validHashes(repair.sourceModelHashes)
@@ -98,13 +98,11 @@ export async function assertAdditiveDashboardRepairDispatch(job: MigrationJob, t
   if (job.destinationIds.length !== 1 || dashboardRepairInstanceBoundaryHash(job.sourceId, job.destinationIds[0], targetModelId, Object.keys(repair.sourceModelHashes)) !== repair.instanceBoundaryHash) {
     reviewRequired('A saved instance changed after approval.');
   }
-  const writes = job.items.filter((item) => item.kind === 'model_yaml_write').flatMap((item) => {
+  const files = options.reviewedFiles ?? job.items.filter(item => item.kind === 'model_yaml_write').flatMap(item => {
     if (!Array.isArray(item.details?.files)) throw new Error('Approved repair files are unavailable.');
-    return item.details.files.map((value) => {
-      const row = value as { fileName: string; yaml: string; previousChecksum?: string };
-      return { fileName: row.fileName, yaml: row.yaml, previousChecksum: row.previousChecksum };
-    });
+    return item.details.files as ModelMigrationAcceptedFile[];
   });
+  const writes = files.map(file => ({ fileName: file.fileName, yaml: file.yaml, previousChecksum: file.previousChecksum }));
   if (dashboardRepairSnapshotHash(writes) !== repair.approvedFilesHash || writes.length !== new Set(writes.map((file) => file.fileName)).size) {
     throw new Error('The staged file set differs from the exact approved diff. A fresh review is required.');
   }

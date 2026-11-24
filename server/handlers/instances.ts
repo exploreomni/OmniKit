@@ -1180,6 +1180,25 @@ export default async function handler(
       });
     }
 
+    if (req.method === 'GET' && parts.length === 2 && parts[1] === 'document-state') {
+      const identifier = url.searchParams.get('identifier') || '';
+      if (!/^[a-z0-9_-]{2,48}$/i.test(identifier)) return json({ error: 'Provide a document identifier.' }, 400);
+      const instance = getInstance(id);
+      if (!instance) return json({ error: 'Instance not found.' }, 404);
+      const origin = url.searchParams.get('expectedOrigin');
+      if (origin && origin !== new URL(instance.baseUrl).origin) return json({ error: 'The selected instance changed.' }, 409);
+      const client = new OmniClient(instance, {
+        requestTimeoutMs: DOCUMENT_INVENTORY_REQUEST_TIMEOUT_MS,
+        maxReadRetries: DOCUMENT_INVENTORY_MAX_READ_RETRIES,
+        fetchImpl: (input, init) => pinnedOmniFetch(input, init, dependencies, DOCUMENT_METADATA_TRANSPORT_MAX_RESPONSE_BYTES),
+      });
+      const state = await client.getDocumentStateV2(identifier, req.signal);
+      const current = getInstance(id);
+      if (!current || !sameCredentialBoundary(instance, current)) return json({ error: 'The saved instance changed during the read.' }, 409);
+      if (state.draftOf) return json({ error: 'Select a published document.' }, 422);
+      return json(state);
+    }
+
     if (req.method === 'GET' && (parts[1] === 'document-lookup'
       || (parts[1] === 'documents' && url.searchParams.has('documentIds')
         && url.searchParams.get('allFolders') === 'true'

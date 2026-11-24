@@ -545,11 +545,11 @@ async function importDashboard(
   baseUrl: string,
   apiKey: string,
   payload: unknown
-): Promise<{ data: unknown; error?: string; payloadSnapshot?: string }> {
+): Promise<{ data: unknown; error?: string }> {
   try {
     const cleanUrl = baseUrl.replace(/\/+$/, "");
     const bodyStr = JSON.stringify(payload);
-    const response = await fetchWithRetry(
+    const response = await fetchWithTimeout(
       `${cleanUrl}/api/unstable/documents/import`,
       {
         method: "POST",
@@ -562,66 +562,60 @@ async function importDashboard(
       30000
     );
 
+    if (response.status >= 500 || response.status === 408) {
+      return { data: null, error: `Import outcome is unverified (HTTP ${response.status}). Inspect the destination before retrying.` };
+    }
     if (!response.ok) {
-      const text = await response.text();
-      return {
-        data: null,
-        error: `Import failed (${response.status}): ${text.slice(0, 300)}`,
-        payloadSnapshot: bodyStr.slice(0, 500),
-      };
+      return { data: null, error: `Omni declined the dashboard import (HTTP ${response.status}). Check the target model, folder and import permissions.` };
     }
 
     const data = await response.json();
     if (!data) {
-      return { data: null, error: "Import returned empty response." };
+      return { data: null, error: "Import outcome is unverified. Inspect the destination before retrying." };
     }
     return { data };
-  } catch (error) {
-    const msg = error instanceof Error ? error.message : "Unknown error";
-    return { data: null, error: `Import error: ${msg}` };
+  } catch {
+    return { data: null, error: "Import outcome is unverified. Inspect the destination before retrying." };
   }
 }
 
 function injectFolderPath(obj: unknown, folder: string): boolean {
   if (!obj || typeof obj !== "object" || Array.isArray(obj)) return false;
   const record = obj as Record<string, unknown>;
-  record["filePath"] = folder;
+  record["folderPath"] = folder;
   return true;
 }
 
-function extractImportedDocumentId(importResponse: unknown): string | null {
-  if (!importResponse || typeof importResponse !== "object") return null;
-  const rec = importResponse as Record<string, unknown>;
-
-  const str = (v: unknown): string | null =>
-    typeof v === "string" && v.length > 0 ? v : null;
-
-  const fromRecord = (r: Record<string, unknown>): string | null =>
-    str(r.id) ?? str(r.identifier) ?? str(r.slug) ?? str(r.documentId) ?? str(r.document_id);
-
-  const direct = fromRecord(rec);
-  if (direct) return direct;
-
-  for (const key of ["document", "data", "dashboard", "result"]) {
-    if (rec[key] && typeof rec[key] === "object" && !Array.isArray(rec[key])) {
-      const nested = fromRecord(rec[key] as Record<string, unknown>);
-      if (nested) return nested;
+function importedDocumentIdentifier(importResponse: unknown): string | null {
+  // The folder API resolves a published workbook identifier. An import can
+  // also return distinct internal UUIDs for its workbook and dashboard.
+  const identifiers = new Set<unknown>();
+  function collect(value: unknown, depth: number) {
+    if (!value || typeof value !== "object" || Array.isArray(value) || depth > 3) return;
+    const record = value as Record<string, unknown>;
+    for (const key of ["identifier", "documentIdentifier", "document_identifier", "slug"]) {
+      if (record[key] != null) identifiers.add(record[key]);
+    }
+    for (const key of ["workbook", "document", "dashboard", "data", "result"]) {
+      if (record[key]) collect(record[key], depth + 1);
     }
   }
-
-  return null;
+  collect(importResponse, 0);
+  const [identifier] = identifiers;
+  return identifiers.size === 1 && typeof identifier === "string" && /^[a-z0-9_-]{2,48}$/i.test(identifier)
+    ? identifier : null;
 }
 
 async function moveDocumentToFolder(
   baseUrl: string,
   apiKey: string,
-  documentId: string,
+  identifier: string,
   folder: string
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const cleanUrl = baseUrl.replace(/\/+$/, "");
-    const response = await fetchWithRetry(
-      `${cleanUrl}/api/v1/documents/${documentId}/move`,
+    const response = await fetchWithTimeout(
+      `${cleanUrl}/api/v1/documents/${encodeURIComponent(identifier)}/move`,
       {
         method: "PUT",
         headers: {
@@ -634,8 +628,7 @@ async function moveDocumentToFolder(
     );
 
     if (!response.ok) {
-      const text = await response.text();
-      return { success: false, error: `Move failed (${response.status}): ${text.slice(0, 200)}` };
+      return { success: false, error: `Folder move returned HTTP ${response.status}. Inspect the imported dashboard's placement.` };
     }
     return { success: true };
   } catch (err) {
@@ -992,14 +985,11 @@ export default async function handler(req: Request): Promise<Response> {
 
             if (importResult.error) {
               failed++;
-              const errorMsg = importResult.payloadSnapshot
-                ? `${importResult.error} [payload preview: ${importResult.payloadSnapshot}]`
-                : importResult.error;
               const result = {
                 id: dashboard.id,
                 name: dashboard.name,
                 status: "failed",
-                error: errorMsg,
+                error: importResult.error,
                 source_model: sourceModel,
                 target_model: effectiveTarget,
               };
@@ -1017,7 +1007,7 @@ export default async function handler(req: Request): Promise<Response> {
               let folderMoveWarning: string | undefined;
 
               if (folderRequested) {
-                const importedId = extractImportedDocumentId(importResult.data);
+                const importedId = importedDocumentIdentifier(importResult.data);
                 if (importedId) {
                   const moveResult = await moveDocumentToFolder(
                     target.base_url,
@@ -1052,7 +1042,7 @@ export default async function handler(req: Request): Promise<Response> {
                     });
                   }
                 } else {
-                  folderMoveWarning = "Dashboard imported but could not determine new document ID for folder move.";
+                  folderMoveWarning = "Dashboard imported. Its published identifier could not be verified, so review its destination folder.";
                   sendEvent({
                     type: "diagnostic",
                     dashboard_id: dashboard.id,
