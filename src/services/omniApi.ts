@@ -1,4 +1,5 @@
 import { emitVaultLocked } from './vaultEvents';
+import { effectiveUserModelRole, isDirectUserModelRole } from '../../shared/userModelRoleEvidence';
 import { VAULT_API_KEY_REFERENCE_PREFIX } from './connectionGuards';
 import type { OmniUserAttributes } from '@/types';
 import { parseTopicInventoryResponse, type TopicInventoryRecord } from './topicsRequestState';
@@ -2179,6 +2180,7 @@ export interface UserModelRoleAssignmentProof {
 export interface UserModelRoleAssignmentResponse extends UserModelRoleListResponse {
   assignment: UserModelRoleAssignmentProof;
   role: UserModelRoleRecord;
+  effectiveAccess: ReturnType<typeof effectiveUserModelRole<UserModelRoleRecord>>;
   verified: true;
 }
 
@@ -2281,8 +2283,8 @@ function parseUserModelRoleListResponse(
   if (!isRecord(value) || !Array.isArray(value.results) || value.results.length > USER_MODEL_ROLE_MAX_RESULTS) {
     throw new Error('OmniKit returned an invalid user model-role response.');
   }
-  if (!isUserModelRoleUuid(value.membershipId)) {
-    throw new Error('OmniKit returned an invalid user model-role response.');
+  if (value.membershipId !== scope.userId) {
+    throw new Error('OmniKit returned role evidence for a different or missing membership.');
   }
   const results = value.results.map((role) => parseUserModelRoleRecord(role, scope));
   return {
@@ -2300,8 +2302,8 @@ function parseUserModelRoleAssignmentProof(
     !isRecord(value)
     || value.userId !== scope.userId
     || value.roleName !== roleName
-    || !isUserModelRoleUuidOrNull(value.modelId)
-    || !isUserModelRoleUuidOrNull(value.connectionId)
+    || !isUserModelRoleUuid(value.modelId)
+    || !isUserModelRoleUuid(value.connectionId)
     || (scope.modelId !== undefined && value.modelId !== scope.modelId)
     || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
   ) {
@@ -2399,17 +2401,20 @@ export async function assignUserModelRole(
     role.roleName !== input.roleName
     || role.modelId !== assignment.modelId
     || role.connectionId !== assignment.connectionId
-    || (role.from.type !== 'USER' && role.from.type !== 'User Role')
+    || !isDirectUserModelRole(role)
     || !list.results.some((candidate) => (
       candidate.roleName === role.roleName
       && candidate.modelId === assignment.modelId
       && candidate.connectionId === assignment.connectionId
-      && (candidate.from.type === 'USER' || candidate.from.type === 'User Role')
+      && candidate.from.type === role.from.type
+      && candidate.baseRole === role.baseRole
+      && candidate.priority === role.priority
+      && candidate.resolved === role.resolved
     ))
   ) {
     throw new Error('OmniKit could not verify the user model-role assignment.');
   }
-  return { ...list, assignment, role, verified: true };
+  return { ...list, assignment, role, verified: true, effectiveAccess: effectiveUserModelRole(list.results, assignment) };
 }
 
 export async function createUser(baseUrl: string, apiKey: string, body: Record<string, unknown>, options: { signal?: AbortSignal } = {}) {

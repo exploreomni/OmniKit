@@ -1,4 +1,5 @@
 import { assertSafeOutboundUrl, validateBaseUrl, jsonHeaders } from '../security';
+import { effectiveUserModelRole, isDirectUserModelRole } from '../../shared/userModelRoleEvidence';
 import {
   buildIdentityAccessEvidence,
   IdentityAccessEvidenceError,
@@ -643,11 +644,11 @@ function parseModelRoleRecord(value: unknown, scope: UserModelRoleScope): UserMo
   ) {
     throw new ModelRoleResponseError('INVALID_MODEL_ROLE_RESPONSE', `invalid_fields=${failures.join(',')}`);
   }
-  if (scope.modelId && modelId !== scope.modelId) {
-    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
-  }
   if (scope.connectionId && connectionId !== scope.connectionId) {
-    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE", "readback_connection");
+  }
+  if (scope.modelId && modelId !== scope.modelId && connectionId !== scope.modelId) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE", "readback_model");
   }
   return {
     roleName,
@@ -665,19 +666,23 @@ function parseModelRoleAssignmentProof(
   scope: UserModelRoleScope,
   roleName: UserModelRoleName,
 ): UserModelRoleAssignmentProof {
-  if (
-    !isRecord(value)
-    || value.userId !== scope.userId
-    || value.roleName !== roleName
-    || !isOmniIdOrNull(value.modelId)
-    || !isOmniIdOrNull(value.connectionId)
+  if (!isRecord(value)) throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED", "assignment_receipt_shape");
+  // Omni's handler returns membershipId. The public POST example uses userId
+  // for the same path identifier. Every identity supplied must match that path.
+  const ids = ['membershipId', 'userId'].filter(key => Object.hasOwn(value, key));
+  if (!ids.length || ids.some(key => value[key] !== scope.userId)) {
+    throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED", "assignment_receipt_identity");
+  }
+  if (value.roleName !== roleName
+    || !isOmniId(value.modelId)
+    || !isOmniId(value.connectionId)
     || (scope.modelId !== undefined && value.modelId !== scope.modelId)
     || (scope.connectionId !== undefined && value.connectionId !== scope.connectionId)
   ) {
-    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+    throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED", "assignment_receipt_role_or_scope");
   }
   return {
-    userId: value.userId,
+    userId: scope.userId,
     roleName,
     modelId: value.modelId,
     connectionId: value.connectionId,
@@ -708,10 +713,13 @@ async function readModelRoles(
   if (!isRecord(payload) || !Array.isArray(payload.results) || payload.results.length > MAX_MODEL_ROLE_RECORDS) {
     throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
   }
-  if (!isOmniId(payload.membershipId)) {
-    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE");
+  if (payload.membershipId !== scope.userId) {
+    throw new ModelRoleResponseError("INVALID_MODEL_ROLE_RESPONSE", "readback_membership");
   }
-  const roles = payload.results.map((role) => parseModelRoleRecord(role, scope));
+  // A schema-model ID also matches sibling models on its connection upstream.
+  // Validate the rows, then use only the exact requested model as evidence.
+  const roles = payload.results.map((role) => parseModelRoleRecord(role, scope))
+    .filter(role => !scope.modelId || role.modelId === scope.modelId);
   return {
     membershipId: payload.membershipId,
     results: roles,
@@ -727,7 +735,7 @@ function directAssignedModelRole(
     candidate.roleName === roleName
     && candidate.modelId === assignment.modelId
     && candidate.connectionId === assignment.connectionId
-    && (candidate.from.type === "USER" || candidate.from.type === "User Role")
+    && isDirectUserModelRole(candidate)
   ));
 }
 
@@ -775,6 +783,9 @@ async function verifyAssignedModelRole(
         && RETRYABLE_MODEL_ROLE_VERIFICATION_STATUSES.has(error.status)
         && attempt < delays.length - 1;
       if (canRetry) continue;
+      if (error instanceof ModelRoleResponseError) {
+        throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED", error.diagnostic ?? "readback_shape_or_scope");
+      }
       if (error instanceof ModelRoleUpstreamHttpError) {
         throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED");
       }
@@ -942,7 +953,14 @@ export default async function handler(
               await response.body?.cancel().catch(() => undefined);
               throw new ModelRoleUpstreamHttpError(response.status, retryAfterMs);
             }
-            return readBoundedJson(response);
+            try {
+              return await readBoundedJson(response);
+            } catch (error) {
+              if (error instanceof ModelRoleResponseError) {
+                throw new ModelRoleResponseError("MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED", "assignment_receipt_body");
+              }
+              throw error;
+            }
           },
         );
         const assignment = parseModelRoleAssignmentProof(
@@ -965,7 +983,7 @@ export default async function handler(
           roleName,
           dependencies,
         );
-        return json({ ...verifiedRoles, assignment, role, verified: true });
+        return json({ ...verifiedRoles, assignment, role, verified: true, effectiveAccess: effectiveUserModelRole(verifiedRoles.results, assignment) });
       }
 
       default:
@@ -987,9 +1005,9 @@ export default async function handler(
     if (error instanceof UserMutationRequestError) return json({ error: error.message, code: 'INVALID_USER_MUTATION' }, 400);
     if (error instanceof ModelRoleResponseError) {
       const message = error.code === "MODEL_ROLE_ASSIGNMENT_NOT_VERIFIED"
-        ? "Omni did not verify the requested user model-role assignment."
-        : `Omni returned an invalid user model-role response.${error.diagnostic ? ` [${error.diagnostic}]` : ''}`;
-      return json({ error: message, code: error.code }, 502);
+        ? "OmniKit could not verify the direct assignment after the write. Read the membership’s roles before retrying."
+        : "Omni returned an invalid user model-role response.";
+      return json({ error: message + (error.diagnostic ? ` [${error.diagnostic}]` : ''), code: error.code }, 502);
     }
     if (error instanceof ModelRoleTransportError) {
       const message = error.code === "MODEL_ROLE_REQUEST_TIMEOUT"

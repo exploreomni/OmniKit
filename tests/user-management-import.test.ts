@@ -43,6 +43,8 @@ function installIdentityImportApiMock(t: TestContext, options: {
   currentDirectRoleName?: string;
   effectiveBaseRoleName?: string;
   effectiveRoleName?: string;
+  effectiveSource?: string;
+  omitResolvedAfterAssignment?: boolean;
 }) {
   const user = {
     id: 'user-casey',
@@ -101,7 +103,7 @@ function installIdentityImportApiMock(t: TestContext, options: {
             modelId: model.id,
             priority: 10,
             resolved: true,
-            from: { type: 'GROUP' },
+            from: { type: options.effectiveSource ?? 'GROUP' },
           }))
         : [];
       const results = [...directRoles, ...inheritedRoles];
@@ -125,12 +127,12 @@ function installIdentityImportApiMock(t: TestContext, options: {
             modelId: directRole.modelId,
             priority: 10,
             resolved: true,
-            from: { type: 'GROUP' },
+            from: { type: options.effectiveSource ?? 'GROUP' },
           }
         : null;
       return jsonResponse({
         membershipId: body.user_id,
-        results: effectiveRole ? [directRole, effectiveRole] : [directRole],
+        results: effectiveRole && !options.omitResolvedAfterAssignment ? [directRole, effectiveRole] : [directRole],
         assignment: {
           userId: body.user_id,
           roleName: body.role_name,
@@ -375,7 +377,8 @@ test('execution fails closed when a direct Restricted Querier assignment leaves 
     models: [
       { id: 'model-shared-a', name: 'Core Analytics', connectionId: 'connection-a', kind: 'SHARED', deletedAt: null },
     ],
-    effectiveRoleName: 'QUERIER',
+    effectiveRoleName: 'MODELER',
+    effectiveSource: 'CONNECTION_BASE_ROLE',
   });
   const plan = parseIdentityImportCsv([
     'action,display_name,email,group,role,connection,model',
@@ -392,10 +395,10 @@ test('execution fails closed when a direct Restricted Querier assignment leaves 
   const roleResult = results.find((result) => result.stage === 'role');
   assert.ok(roleResult);
   assert.equal(roleResult.status, 'failed');
-  assert.match(roleResult.message, /accepted the direct Restricted Querier/i);
-  assert.match(roleResult.message, /broader inherited or base access/i);
-  assert.match(roleResult.message, /QUERIER/);
-  assert.match(roleResult.message, /do not retry automatically/i);
+  assert.match(roleResult.message, /verified the direct Restricted Querier \(QUERY_TOPICS\) assignment/i);
+  assert.match(roleResult.message, /MODELER from Connection Base Role/);
+  assert.match(roleResult.message, /grants broader access/);
+  assert.doesNotMatch(roleResult.message, /assignment outcome is unverified/i);
   assert.deepEqual(roleResult.rowNumbers, [2]);
   const assignmentRequests = requests.filter((request) => request.url === '/api/manage-users' && request.body.action === 'assign_model_role');
   assert.equal(assignmentRequests.length, 1);
@@ -413,7 +416,8 @@ test('preflight exposes broader effective access when the requested direct role 
       { id: 'model-shared-a', name: 'Core Analytics', connectionId: 'connection-a', kind: 'SHARED', deletedAt: null },
     ],
     currentDirectRoleName: 'QUERY_TOPICS',
-    effectiveRoleName: 'QUERIER',
+    effectiveRoleName: 'MODELER',
+    effectiveSource: 'Connection Base Role',
   });
   const plan = parseIdentityImportCsv([
     'action,display_name,email,group,role,connection,model',
@@ -427,18 +431,50 @@ test('preflight exposes broader effective access when the requested direct role 
   const preflight = await preflightIdentityImport(baseUrl, 'same-direct-broader-effective-key', plan, scope);
 
   assert.equal(preflight.roleChanges.length, 1);
-  assert.equal(preflight.roleChanges[0].disposition, 'noop');
+  assert.equal(preflight.roleChanges[0].disposition, 'conflict');
+  assert.equal(preflight.changes.conflicts, 1);
+  assert.equal(preflight.changes.roleAdds, 0);
+  assert.equal(preflight.issues.some(issue => issue.severity === 'error'), false);
   assert.match(preflight.roleChanges[0].message, /already assigned directly/i);
   assert.match(preflight.roleChanges[0].message, /more permissive than Restricted Querier/i);
+  assert.match(preflight.roleChanges[0].message, /MODELER from Connection Base Role/);
   assert.ok(preflight.issues.some((issue) => issue.severity === 'warning' && /more permissive than Restricted Querier/i.test(issue.message)));
 
   const results = await executeIdentityImport(baseUrl, 'same-direct-broader-effective-key', preflight, undefined, scope);
   const roleResult = results.find((result) => result.stage === 'role');
   assert.ok(roleResult);
-  assert.equal(roleResult.status, 'skipped');
+  assert.equal(roleResult.status, 'failed');
   assert.match(roleResult.message, /more permissive than Restricted Querier/i);
   const assignmentRequests = requests.filter((request) => request.url === '/api/manage-users' && request.body.action === 'assign_model_role');
   assert.equal(assignmentRequests.length, 0);
+});
+
+test('a confirmed direct assignment with missing effective evidence reports the policy gap separately', async (t) => {
+  const baseUrl = 'https://missing-effective-evidence.example.omniapp.co';
+  const requests = installIdentityImportApiMock(t, {
+    baseUrl,
+    connections: [{ id: 'connection-a', name: 'Warehouse A', deletedAt: null }],
+    models: [{ id: 'model-shared-a', name: 'Core Analytics', connectionId: 'connection-a', kind: 'SHARED', deletedAt: null }],
+    effectiveRoleName: 'MODELER',
+    effectiveSource: 'Unrecognized Provider Label',
+    omitResolvedAfterAssignment: true,
+  });
+  const plan = parseIdentityImportCsv([
+    'action,display_name,email,group,role,connection,model',
+    'add,Casey Doe,casey@example.com,,Restricted Querier,Warehouse A,Core Analytics',
+  ].join('\n'));
+  const scope = { key: 'missing-effective-evidence', label: 'Missing effective evidence' };
+  const preflight = await preflightIdentityImport(baseUrl, 'test-key', plan, scope);
+  const warning = preflight.issues.find(issue => issue.severity === 'warning');
+  assert.ok(warning);
+  assert.match(warning.message, /MODELER from an unrecognized assignment source/);
+  assert.doesNotMatch(warning.message, /Unrecognized Provider Label/);
+  const results = await executeIdentityImport(baseUrl, 'test-key', preflight, undefined, scope);
+  const role = results.find(result => result.stage === 'role');
+  assert.equal(role?.status, 'failed');
+  assert.match(role.message, /verified the direct Restricted Querier assignment/);
+  assert.match(role.message, /does not identify a unique effective role/);
+  assert.equal(requests.filter(request => request.body.action === 'assign_model_role').length, 1);
 });
 
 test('execution overwrites an existing direct No Access role with Restricted Querier', async (t) => {
@@ -522,7 +558,7 @@ test('execution does not report a same-base custom role as exact Restricted Quer
   assert.doesNotMatch(roleResult.message, /verified both direct and effective access/i);
   assert.match(roleResult.message, /CUSTOM_RESTRICTED \(base QUERY_TOPICS\)/);
   assert.match(roleResult.message, /custom effective policy remains in force/i);
-  assert.match(roleResult.message, /do not retry automatically/i);
+  assert.match(roleResult.message, /from Group Role/);
 });
 
 test('simple identity CSV requires quoted list cells and exact display identity for deprovisioning', () => {
