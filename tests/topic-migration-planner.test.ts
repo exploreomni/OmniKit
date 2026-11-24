@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { parse, stringify } from 'yaml';
+import { OmniClient } from '../server/services/omniClient';
+import { compareTopicMigrationBranch } from '../server/services/topicMigrationVerification';
 import type { TopicMigrationRequest } from '../shared/topicMigration';
 import { buildTopicMigrationAnalysis, inventoryMigrationTopics, topicMigrationSnapshotHash } from '../server/services/topicMigrationPlanner';
 
@@ -23,6 +25,66 @@ const analyze = (patch: Partial<Parameters<typeof buildTopicMigrationAnalysis>[0
 });
 const blockers = (plan: ReturnType<typeof analyze>) => plan.issues.filter((issue) => issue.severity === 'blocker');
 const titles = (plan: ReturnType<typeof analyze>) => plan.issues.map((issue) => issue.title).join('\n');
+
+test('grouped topic keeps the export path on review and readback while writing the basename with group_label', async () => {
+  const file = 'Example Domain/example.topic';
+  const { 'example.topic': topic, ...otherFiles } = baseSource();
+  const selected = { ...request, topicIds: [file] };
+  const baseline = { ...otherFiles };
+  const plan = analyze({ sourceFiles: { ...otherFiles, [file]: topic }, targetFiles: baseline, request: selected });
+  assert.deepEqual(blockers(plan), []);
+  const approved = plan.files.find(item => item.sourceFileName === file)!;
+  assert.equal(approved.status, 'create');
+  assert.equal(approved.writeFileName, 'example.topic');
+  assert.equal(parse(approved.proposed).group_label, 'Example Domain');
+
+  const branch: Record<string, string> = { ...baseline };
+  let writes = 0;
+  const client = new OmniClient({ baseUrl: 'https://93.184.216.34', label: 'Example destination', apiKey: 'fictional-group-test' }, {
+    fetchImpl: async (input, init) => {
+      const url = new URL(String(input));
+      assert.equal(url.pathname, '/api/v1/models/target/yaml');
+      if (init?.method === 'GET') {
+        const pattern = new RegExp(url.searchParams.get('fileName')!);
+        const files = Object.fromEntries(Object.entries(branch).filter(([key]) => pattern.test(key)));
+        return Response.json({ files, checksums: {} });
+      }
+      const body = JSON.parse(String(init?.body));
+      assert.equal(body.fileName, 'example.topic');
+      assert.equal(body.previousChecksum, undefined);
+      branch[parse(body.yaml).group_label + '/' + body.fileName] = body.yaml;
+      writes++;
+      return Response.json({ success: true, fileName: body.fileName });
+    },
+  });
+  const submit = () => client.updateModelYamlFiles({ modelId: 'target', branchId: 'branch', reviewedDestinationFiles: baseline,
+    files: [{ fileName: approved.fileName, yaml: approved.proposed, previousChecksum: approved.previousChecksum }] });
+  await submit();
+  const compare = () => compareTopicMigrationBranch({ files: plan.files, schemaMapText: '', baseline, actual: branch });
+  assert.equal(compare().verified, true);
+  assert.equal(compare().files.find(item => item.sourceFileName === file)?.submittedFileName, 'example.topic');
+  delete branch[file];
+  branch['Another Group/EXAMPLE.topic'] = topic;
+  await assert.rejects(submit(), /same topic name/);
+  assert.equal(writes, 1);
+  assert.equal(compare().verified, false);
+});
+
+test('grouped topic review rejects duplicate semantic identities and contradictory grouping', () => {
+  const file = 'Example Domain/example.topic';
+  const { 'example.topic': topic, ...otherFiles } = baseSource();
+  const selected = { ...request, topicIds: [file] };
+  const source = { ...otherFiles, [file]: topic };
+  const conflicts = [
+    analyze({ request: selected, sourceFiles: { ...source, 'Elsewhere/example.topic': topic } }),
+    analyze({ request: selected, sourceFiles: source, targetFiles: { 'example.topic': topic } }),
+    analyze({ request: selected, sourceFiles: { ...source, [file]: topic + 'group_label: Another Group\n' } }),
+  ];
+  for (const plan of conflicts) {
+    assert.ok(blockers(plan).some(issue => /same topic name|group_label disagree/.test(issue.message)));
+    assert.equal(plan.files.find(item => item.kind === 'topic')?.status, 'blocked');
+  }
+});
 
 test('destination preservation keeps complete destination definitions and adds complete missing source dependency fields', () => {
   const source = baseSource();

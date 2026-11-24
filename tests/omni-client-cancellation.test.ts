@@ -14,6 +14,57 @@ function client(signal: AbortSignal, fetchImpl: typeof fetch, apiKey = `syntheti
 }
 function response(body: unknown, status = 200) { return new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }); }
 
+test('reviewed YAML writes use the current branch checksum and omit it for confirmed new files', async () => {
+  const saved: Array<Record<string, unknown>> = [];
+  const existing = { 'existing.view': 'label: Destination' };
+  const api = client(new AbortController().signal, async (input, init) => {
+    const url = new URL(String(input));
+    assert.equal(url.pathname, '/api/v1/models/target/yaml');
+    if (init?.method === 'GET') {
+      assert.equal(url.searchParams.get('branchId'), 'review-branch');
+      assert.equal(url.searchParams.get('includeChecksums'), 'true');
+      return new RegExp(url.searchParams.get('fileName')!).test('existing.view')
+        ? response({ files: existing, checksums: { 'existing.view': 'branch-checksum' } })
+        : response({ files: {}, checksums: {} });
+    }
+    saved.push(JSON.parse(String(init?.body))); return response({ success: true });
+  });
+  await api.updateModelYamlFiles({ modelId: 'target', branchId: 'review-branch', reviewedDestinationFiles: existing, files: [
+    { fileName: 'existing.view', yaml: 'label: New', previousChecksum: 'source-checksum' },
+    { fileName: 'new.view', yaml: 'label: New', previousChecksum: 'unrelated-source-token' },
+  ] });
+  assert.equal(saved[0].previousChecksum, 'branch-checksum');
+  assert.equal(Object.hasOwn(saved[1], 'previousChecksum'), false);
+});
+
+test('reviewed YAML batch stops on drift, incomplete evidence or an Omni save conflict', async () => {
+  for (const problem of ['edited', 'created', 'deleted', 'no-checksum', 'malformed', 'concurrent-save', 'invalid-yaml']) {
+    let reads = 0, writes = 0;
+    const api = client(new AbortController().signal, async (_input, init) => {
+      if (init?.method === 'GET') {
+        reads++;
+        if (problem === 'malformed') return response({ other: {} });
+        return response({ files: problem === 'deleted' ? {} : { model: problem === 'edited' ? 'changed' : '{}' },
+          checksums: problem === 'no-checksum' || problem === 'deleted' ? {} : { model: 'live-branch-token' } });
+      }
+      writes++;
+      if (problem === 'concurrent-save') return response({ success: false, file_conflict_error: true, saveError: 'opaque details' }, 400);
+      return response({ success: false, saveError: "Unknown attribute 'confidential value'\napi_key: example-secret" }, 400);
+    });
+    const work = api.updateModelYamlFiles({ modelId: 'target', branchId: 'branch',
+      reviewedDestinationFiles: problem === 'created' ? {} : { model: '{}' },
+      files: [{ fileName: 'model', yaml: 'label: Example' }, { fileName: 'later.view', yaml: '{}' }] });
+    await assert.rejects(work, (error: Error) => {
+      assert.match(error.message, /model/);
+      if (problem === 'invalid-yaml') {
+        assert.match(error.message, /Unknown attribute/); assert.doesNotMatch(error.message, /confidential value|example-secret/);
+      } else if (problem !== 'malformed') assert.match(error.message, /MODEL_YAML_CONFLICT/);
+      return true;
+    });
+    assert.equal(reads, 1); assert.equal(writes, ['concurrent-save', 'invalid-yaml'].includes(problem) ? 1 : 0);
+  }
+});
+
 test('Blobby transport binds model and branch, preserves remote state, and never retries a submitted write', async () => {
   const requests: Array<{ path: string; method?: string; body?: unknown }> = [];
   const api = client(new AbortController().signal, async (input, init) => {

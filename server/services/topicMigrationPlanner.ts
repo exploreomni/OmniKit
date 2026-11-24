@@ -4,6 +4,7 @@ import { isAlias, isMap, isNode, isScalar, isSeq, parseDocument, visit } from 'y
 import type { TopicMigrationAnalysis, TopicMigrationDependency, TopicMigrationIssue, TopicMigrationRequest, TopicMigrationTopic } from '../../shared/topicMigration';
 import { previewDashboardRepairYaml } from './dashboardRepairYaml';
 import { applySchemaMapToYaml, parseSchemaMap } from './modelMigration/helpers';
+import { assertUniqueTopicExportKey, prepareTopicGroupYaml, topicYamlWriteFileName } from './modelMigration/topicFileIdentity';
 import { topicMigrationDestinationPath } from './topicMigrationVerification';
 import { reconcileTopicTableName, topicMigrationPhysicalTable, type TopicTableNameInventory } from './topicMigrationTableNames';
 import { reviewTopicMigrationSqlDialect } from './topicMigrationSqlDialect';
@@ -427,6 +428,11 @@ export function buildTopicMigrationAnalysis(input: {
       const candidate = candidates.get(file);
       if (candidate === undefined) throw new Error('The source dependency has no valid definition.');
       proposed = authoredSubset(sourceFiles[file], candidate, dep.kind, dep.fields, usedEdges.get(file));
+      if (dep.kind === 'topic') {
+        assertUniqueTopicExportKey(file, sourceFiles);
+        assertUniqueTopicExportKey(file, targetFiles);
+        proposed = prepareTopicGroupYaml(file, proposed);
+      }
       const beforeMapping = readYaml(proposed);
       const mapped = applySchemaMapToYaml(proposed, schemaRules);
       proposed = mapped.yaml;
@@ -513,8 +519,10 @@ export function buildTopicMigrationAnalysis(input: {
         proposed = ordinary.yaml;
       }
       const changed = before !== proposed;
+      const writeFileName = dep.kind === 'topic' ? topicYamlWriteFileName(destination, proposed) : destination;
       if (before !== null && changed && !input.targetChecksums?.[destination]) fail('validation', 'Destination checksum unavailable', 'An existing destination file needs its exact checksum before an additive branch write.', 'Refresh destination YAML with checksums.');
       analysis.files.push({ sourceFileName: file, fileName: destination, destinationFileName: destination, kind: dep.kind, topicIds: [...dep.topics].sort(), before, proposed,
+        ...(writeFileName !== destination ? { writeFileName } : {}),
         ...(tableNameCorrection ? { tableNameCorrection } : {}),
         ...(sqlDialectReview ? { sqlDialectReview } : {}),
         ...(preservationOption ? { preservationOption } : {}), ...(destinationPreservation ? { destinationPreservation } : {}),

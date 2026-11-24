@@ -90,7 +90,7 @@ function stagedJob(input: ModelMigrationJobInput, id: string): MigrationJob {
   // tenant mutations; these service tests stop at the job-creation boundary.
   consumeTopicMigrationSubmission(input);
   const job = { id, details: { topicMigration: input.topicMigration, retryInput: input } } as MigrationJob;
-  linkSubmittedTopicMigrationJob(job);
+  linkSubmittedTopicMigrationJob(job, input);
   return job;
 }
 

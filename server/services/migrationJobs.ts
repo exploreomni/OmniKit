@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import type { BranchPreparationBinding, TopicMigrationExecutionBinding } from '../../shared/topicMigration';
-import { assertTopicMigrationDispatch, assertTopicMigrationWriteAuthority, consumeTopicMigrationSubmission, linkSubmittedTopicMigrationJob } from './topicMigrationPlans';
+import { assertTopicMigrationDispatch, assertTopicMigrationWriteAuthority, reviewedTopicMigrationWrite, consumeTopicMigrationSubmission, linkSubmittedTopicMigrationJob } from './topicMigrationPlans';
 import { assertAdditiveDashboardRepairDispatch, dashboardRepairInstanceBoundaryHash } from './dashboardRepairRuntime';
 import type { ReviewedReconstructedTopics } from './dashboardTopicRepairEvidence';
 import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
@@ -7441,8 +7441,7 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
   const items: MigrationJobItem[] = (['model_translate', 'model_branch_create', 'model_yaml_write', 'model_branch_verify'] as const).map((kind) => ({
     id: randomUUID(), jobId, destinationId: target.id, destinationLabel: target.label,
     targetModelId: model.targetModelId, targetModelName: model.targetModelName, kind, status: 'pending',
-    details: { ...baseDetails, ...(kind === 'model_translate' ? { acceptedFileCount: model.acceptedFiles!.length } : {}),
-      ...(kind === 'model_yaml_write' ? { files: model.acceptedFiles } : {}) },
+    details: { ...baseDetails, ...(['model_translate', 'model_yaml_write'].includes(kind) ? { acceptedFileCount: model.acceptedFiles!.length } : {}) },
   }));
   const job: MigrationJob = { id: jobId, workflow: 'model', sourceId: source.id, sourceLabel: source.label,
     destinationIds: [target.id], targets: [{ id: target.id + ':' + model.targetModelId, destinationInstanceId: target.id,
@@ -7451,9 +7450,9 @@ export async function createModelMigrationJob(input: ModelMigrationJobInput): Pr
     status: 'pending', createdAt: Date.now(), items, details: { targetId: target.id, targetLabel: target.label,
       branchPreparation: input.branchPreparation, topicMigration: input.topicMigration,
       ...(input.dashboardRepair ? { dashboardRepair: input.dashboardRepair } : {}),
-      modelCount: 1, dashboardCount: 0, workbookCount: 0, mergeAfterValidation: false, retryInput: input } };
+      modelCount: 1, dashboardCount: 0, workbookCount: 0, mergeAfterValidation: false, fileEvidence: 'reviewed_plan_v1' } };
   insertJob(job);
-  linkSubmittedTopicMigrationJob(job);
+  linkSubmittedTopicMigrationJob(job, input);
   void runMigrationJob(job.id).catch(() => undefined);
   return getJob(job.id) || sanitizeJob(job);
 }
@@ -7807,27 +7806,11 @@ function detailString(details: Record<string, unknown> | undefined, key: string)
   return typeof value === 'string' ? value : '';
 }
 
-function detailFiles(details: Record<string, unknown> | undefined): ModelMigrationAcceptedFile[] {
-  const files = details?.files;
-  if (!Array.isArray(files)) return [];
-  return files
-    .filter((file): file is Record<string, unknown> => Boolean(file) && typeof file === 'object' && !Array.isArray(file))
-    .map((file) => ({
-      fileName: typeof file.fileName === 'string' ? file.fileName : '',
-      yaml: typeof file.yaml === 'string' ? file.yaml : '',
-      previousChecksum: typeof file.previousChecksum === 'string' ? file.previousChecksum : undefined,
-    }))
-    .filter((file) => file.fileName && file.yaml);
-}
-
-
 /** Deliberately excludes all content, validation, publication, cleanup, and post-action dispatch. */
 async function executeModelJob(job: MigrationJob): Promise<void> {
-  assertTopicMigrationWriteAuthority(job);
-  const input = modelMigrationInputFromJob(job);
-  const target = requireModelMigrationInstance(input.targetId, 'destination');
-  const sourceClient = new OmniClient(requireModelMigrationInstance(input.sourceId, 'source'));
-  const model = input.models[0];
+  const { model, branchName, files, destinationFiles } = reviewedTopicMigrationWrite(job);
+  const target = requireModelMigrationInstance(model.targetInstanceId, 'destination');
+  const sourceClient = new OmniClient(requireModelMigrationInstance(model.sourceInstanceId, 'source'));
   const targetClient = modelMigrationTargetClient(job, target, [model.targetModelId]);
   let branch: { branchId: string; branchName: string } | undefined;
   job.status = 'running';
@@ -7844,24 +7827,29 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         markAndPersistItem(item, 'succeeded');
       } else if (item.kind === 'model_branch_create') {
         await assertTopicMigrationDispatch(job, model.targetModelId, targetClient);
-        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient);
-        if (await targetClient.findModelBranch(model.targetModelId, model.branchName)) {
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { reviewedFiles: files });
+        if (await targetClient.findModelBranch(model.targetModelId, branchName)) {
           throw new Error('The approved review-branch name already exists. Prepare a fresh plan; an existing branch will not be reused.');
         }
         if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before branch creation.');
         dispatchDestinationModelMutationForItem(item);
-        const result = await targetClient.createModelBranch({ connectionId: model.targetConnectionId, baseModelId: model.targetModelId, branchName: model.branchName });
-        if (!result.id || result.name !== model.branchName) throw new Error('The created branch identity could not be verified. Reconcile it in Omni.');
+        const result = await targetClient.createModelBranch({ connectionId: model.targetConnectionId, baseModelId: model.targetModelId, branchName });
+        if (!result.id || result.name !== branchName) throw new Error('The created branch identity could not be verified. Reconcile it in Omni.');
         branch = { branchId: result.id, branchName: result.name };
         markAndPersistItem(item, 'succeeded', { details: { ...details, ...branch } });
       } else if (item.kind === 'model_yaml_write') {
         if (!branch) throw new Error('The approved destination branch is unavailable.');
         await assertTopicMigrationDispatch(job, model.targetModelId, targetClient, { branchId: branch.branchId });
-        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { branchId: branch.branchId });
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { reviewedFiles: files, branchId: branch.branchId });
         if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before the YAML write.');
         dispatchDestinationModelMutationForItem(item);
-        await targetClient.updateModelYamlFiles({ modelId: model.targetModelId, branchId: branch.branchId, files: detailFiles(details),
-          commitMessage: 'OmniKit reviewed additive branch preparation' });
+        await targetClient.updateModelYamlFiles({
+          modelId: model.targetModelId,
+          branchId: branch.branchId,
+          files,
+          reviewedDestinationFiles: destinationFiles,
+          commitMessage: 'OmniKit reviewed additive branch preparation',
+        });
         // A successful write response alone is not a receipt. Verification below must compare the full branch.
         markAndPersistItem(item, 'succeeded', { details: { ...details, ...branch } });
       } else if (item.kind === 'model_branch_verify') {
@@ -7869,7 +7857,7 @@ async function executeModelJob(job: MigrationJob): Promise<void> {
         const actualBranch = await targetClient.findModelBranch(model.targetModelId, branch.branchName);
         if (actualBranch?.id !== branch.branchId) throw new Error('The prepared branch identity changed. Reconcile it in Omni.');
         await assertTopicMigrationDispatch(job, model.targetModelId, targetClient, { branchId: branch.branchId, afterWrite: true });
-        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { branchId: branch.branchId, beforeMerge: true });
+        await assertAdditiveDashboardRepairDispatch(job, model.targetModelId, sourceClient, targetClient, { reviewedFiles: files, branchId: branch.branchId, beforeMerge: true });
         if (canceledJobs.has(job.id)) throw new Error('Branch preparation was canceled before verification completed.');
         markAndPersistItem(item, 'succeeded', { details: { ...details, modelId: model.targetModelId, ...branch, verifiedAt: Date.now() } });
         job.details = { ...job.details, branchReceipt: { modelId: model.targetModelId, ...branch } };

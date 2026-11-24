@@ -82,6 +82,8 @@ export interface TopicMigrationDependency {
 export interface TopicMigrationFile {
   sourceFileName: string;
   fileName: string;
+  /** Grouped topics are written by semantic basename and read back at their full export key. */
+  writeFileName?: string;
   /** Exact expected authored path after the explicitly reviewed namespace substitution. */
   destinationFileName?: string;
   kind: TopicMigrationDependency['kind'];
