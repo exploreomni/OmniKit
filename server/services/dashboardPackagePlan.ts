@@ -248,7 +248,9 @@ export async function prepareDashboardPackageTarget(intent: DashboardSafeCopyInt
     message: file.reason || 'An existing definition differs. Review the exact difference; it will not be overwritten.' });
   const requiresPr = model.pullRequestRequired === true || model.gitProtected === true || model.gitFollower === true;
   const preview: DashboardPackagePreview = { version: 1, fingerprint: '', requiresPr, bindingMappings,
-    documents: collection.packages.map(pkg => ({ sourceDocumentId: pkg.documentId, name: pkg.name, localModelCount: pkg.localModels.length }))
+    documents: collection.packages.map(pkg => ({ sourceDocumentId: pkg.documentId, name: pkg.name, localModelCount: pkg.localModels.length,
+      ...(intent.source.instanceId !== destination.instanceId && (pkg.exportPayload.dashboard as Record<string, unknown>).dashboardCustomTheme
+        ? { reviewCustomTheme: true } : {}) }))
       .sort((a, b) => a.sourceDocumentId.localeCompare(b.sourceDocumentId)),
     files: [...files.values()].sort((a, b) => a.fileName.localeCompare(b.fileName)),
     issues: [...new Map(issues.map(issue => [JSON.stringify(issue), issue])).values()]

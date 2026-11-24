@@ -24,6 +24,7 @@ export function DashboardPackageDetails({ summary, preview, onTransform, disable
       <ul className="mt-2 space-y-2">{summary.documents.map((document) => <li key={document.sourceDocumentId} className="rounded-card border border-border bg-white p-3 text-xs">
         <p className="break-words font-medium text-content-primary">{document.name}</p>
         <p className="mt-1 text-content-secondary">{document.localModelCount} workbook-local model{document.localModelCount === 1 ? '' : 's'} included</p>
+        {document.reviewCustomTheme && <p className="mt-1 text-amber-900">This dashboard uses an organization-specific theme. Omni may apply the destination default. After import, OmniKit will compare the theme and palettes. If they differ, apply the matching style to the existing copy and verify it again.</p>}
       </li>)}</ul>
     </section>
     <section aria-label="Destination changes">
