@@ -18,6 +18,7 @@ import {
   type UserModelRoleRecord,
 } from '../omniApi';
 import { parseCsvTable } from '../../utils/csvImport';
+import { isDirectUserModelRole } from '../../../shared/userModelRoleEvidence';
 import {
   IDENTITY_IMPORT_LIMITS,
   IDENTITY_NO_ASSIGNMENT_LABEL,
@@ -1005,8 +1006,20 @@ function addIssue(issues: IdentityImportIssue[], issue: IdentityImportIssue) {
   }
 }
 
-function directUserRole(role: UserModelRoleRecord): boolean {
-  return role.from?.type === 'USER' || role.from?.type === 'User Role';
+function effectiveRoleDescription(role: UserModelRoleRecord): string {
+  let source: string;
+  switch (role.from.type) {
+    case 'CONNECTION_BASE_ROLE':
+    case 'Connection Base Role': source = 'Connection Base Role'; break;
+    case 'GROUP':
+    case 'Group Role': source = 'Group Role'; break;
+    case 'USER':
+    case 'User Role': source = 'User Role'; break;
+    case 'Inherited from Org Role': source = 'Inherited from Org Role'; break;
+    default: source = 'an unrecognized assignment source';
+  }
+  const label = role.roleName === role.baseRole ? role.roleName : `${role.roleName} (base ${role.baseRole})`;
+  return `${label} from ${source}`;
 }
 
 type EffectiveRoleAssessment = {
@@ -1033,11 +1046,8 @@ function assessEffectiveRole(
   }
 
   const resolvedRole = resolvedRoles[0];
-  const normalizedBaseRole = normalizeIdentityModelRole(resolvedRole.baseRole)
-    || normalizeIdentityModelRole(resolvedRole.roleName);
-  const effectiveLabel = resolvedRole.roleName === resolvedRole.baseRole || !resolvedRole.baseRole
-    ? resolvedRole.roleName
-    : `${resolvedRole.roleName} (base ${resolvedRole.baseRole})`;
+  const normalizedBaseRole = normalizeIdentityModelRole(resolvedRole.baseRole);
+  const effectiveLabel = effectiveRoleDescription(resolvedRole);
   if (normalizedBaseRole === null) {
     return {
       kind: 'custom',
@@ -1050,7 +1060,7 @@ function assessEffectiveRole(
   if (effectiveRank > targetRank) {
     return {
       kind: 'broader',
-      message: `Inherited or base access resolves to ${effectiveLabel}, which is more permissive than ${identityModelRoleLabel(targetRoleName)}.`,
+      message: `Effective access is ${effectiveLabel}, which is more permissive than ${identityModelRoleLabel(targetRoleName)}.`,
     };
   }
   if (effectiveRank < targetRank) {
@@ -1059,7 +1069,7 @@ function assessEffectiveRole(
       message: `Effective access resolves to ${effectiveLabel}, below ${identityModelRoleLabel(targetRoleName)}.`,
     };
   }
-  if (resolvedRole.roleName === targetRoleName) {
+  if (resolvedRole.roleName === targetRoleName && resolvedRole.baseRole === targetRoleName) {
     return {
       kind: 'exact',
       message: `Effective access is exactly ${identityModelRoleLabel(targetRoleName)}.`,
@@ -1783,7 +1793,7 @@ export async function preflightIdentityImport(
       issues.push({ severity: 'error', rowNumber: target.rowNumbers[0], message: 'Role removal is not supported by Omni’s documented API. Remove the role from this remove row.' });
       continue;
     }
-    const directRoles = scopedRoles.filter(directUserRole);
+    const directRoles = scopedRoles.filter(isDirectUserModelRole);
     // Omni's connection-scoped read returns model-scoped rows, so it cannot
     // prove that a connection-wide assignment already exists. Re-submit the
     // documented idempotent CONNECTION_ADMIN assignment instead of inferring
@@ -1797,13 +1807,14 @@ export async function preflightIdentityImport(
       roleChanges.push({ ...target, currentEvidence, disposition: 'noop', message: `${identityModelRoleLabel(target.roleName)} is already assigned directly and is the verified effective role.` });
       continue;
     }
-    if (sameRole && (effectiveRole.kind === 'broader' || effectiveRole.kind === 'custom')) {
-      noOps += 1;
+    if (sameRole && (effectiveRole.kind === 'broader' || effectiveRole.kind === 'custom' || effectiveRole.kind === 'lower')) {
+      conflicts += 1;
+      const message = `${identityModelRoleLabel(target.roleName)} (${target.roleName}) is already assigned directly. ${effectiveRole.message} Review the effective grant in Omni. The import leaves this assignment in place.`;
       roleChanges.push({
         ...target,
         currentEvidence,
-        disposition: 'noop',
-        message: `${identityModelRoleLabel(target.roleName)} is already assigned directly, but ${effectiveRole.message}`,
+        disposition: 'conflict',
+        message,
       });
       issues.push({ severity: 'warning', rowNumber: target.rowNumbers[0], message: `${target.email}: ${effectiveRole.message}` });
       continue;
@@ -2160,9 +2171,9 @@ export async function executeIdentityImport(
   for (const change of fresh.roleChanges) {
     assertActive();
     const target = `${change.email} → ${change.connectionName}${change.modelName ? ` / ${change.modelName}` : ''}`;
-    begin('Roles', `Applying role change for ${target}...`);
+    begin('Roles', change.disposition === 'add' ? `Applying role change for ${target}...` : `Reviewing existing access for ${target}...`);
     if (change.disposition !== 'add') {
-      results.push({ status: change.disposition === 'unsupported' ? 'failed' : 'skipped', stage: 'role', field: 'role', target, message: change.message, rowNumbers: change.rowNumbers });
+      results.push({ status: change.disposition === 'noop' ? 'skipped' : 'failed', stage: 'role', field: 'role', target, message: change.message, rowNumbers: change.rowNumbers });
       report('Roles', target);
       continue;
     }
@@ -2184,26 +2195,30 @@ export async function executeIdentityImport(
         && (change.modelId ? role.modelId === change.modelId : true)
       ));
       if (resolvedRoles.length === 0 || (change.modelId && resolvedRoles.length !== 1)) {
-        throw new Error('Omni did not return unambiguous effective-role evidence after the direct assignment.');
+        results.push({ status: 'failed', stage: 'role', field: 'role', target, rowNumbers: change.rowNumbers,
+          message: `Omni verified the direct ${identityModelRoleLabel(change.roleName)} assignment. The returned evidence does not identify a unique effective role for the requested scope. Review access in Omni before making another change.` });
+        report('Roles', target);
+        continue;
       }
       const effectiveAccess = resolvedRoles.map((role) => {
-        const baseRole = normalizeIdentityModelRole(role.baseRole) || normalizeIdentityModelRole(role.roleName);
+        const baseRole = normalizeIdentityModelRole(role.baseRole);
         return {
-          label: role.roleName === role.baseRole ? role.roleName : `${role.roleName} (base ${role.baseRole})`,
+          label: effectiveRoleDescription(role),
           roleName: role.roleName,
+          baseRole: role.baseRole,
           rank: baseRole === null ? null : MODEL_ROLE_RANK[baseRole],
         };
       });
       const requestedRank = MODEL_ROLE_RANK[change.roleName];
       const effectiveLabels = [...new Set(effectiveAccess.map((role) => role.label))].join(', ');
       const exactEffectivePolicy = effectiveAccess.every((role) => (
-        role.rank === requestedRank && role.roleName === change.roleName
+        role.rank === requestedRank && role.roleName === change.roleName && role.baseRole === change.roleName
       ));
       if (!exactEffectivePolicy) {
         const policyMismatch = effectiveAccess.some((role) => role.rank === null)
           ? 'the effective role has an unrecognized or custom base policy'
           : effectiveAccess.some((role) => role.rank! > requestedRank)
-            ? 'broader inherited or base access still applies'
+            ? 'the effective role grants broader access'
             : effectiveAccess.some((role) => role.rank! < requestedRank)
               ? 'effective access remains below the requested role'
               : 'a custom effective policy remains in force';
@@ -2212,7 +2227,7 @@ export async function executeIdentityImport(
           stage: 'role',
           field: 'role',
           target,
-          message: `Omni accepted the direct ${identityModelRoleLabel(change.roleName)} assignment, but ${policyMismatch}: ${effectiveLabels}. The requested effective policy was not verified. Review connection and group access before another change; do not retry automatically.`,
+          message: `Omni verified the direct ${identityModelRoleLabel(change.roleName)} (${change.roleName}) assignment. Effective access is ${effectiveLabels}. The requested policy still needs review because ${policyMismatch}. Review the effective grant in Omni before making another change.`,
           rowNumbers: change.rowNumbers,
         });
         report('Roles', target);
