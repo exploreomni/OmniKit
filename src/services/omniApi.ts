@@ -1,4 +1,5 @@
 import { emitVaultLocked } from './vaultEvents';
+import { VAULT_API_KEY_REFERENCE_PREFIX } from './connectionGuards';
 import type { OmniUserAttributes } from '@/types';
 import { parseTopicInventoryResponse, type TopicInventoryRecord } from './topicsRequestState';
 import { allowsAutomaticRetry, CONNECTION_INVENTORY_REQUEST_POLICY, MODEL_INVENTORY_REQUEST_POLICY, type ApiRequestPolicy } from './apiRequestPolicy';
@@ -665,15 +666,20 @@ export async function getDocumentStateV2(
   documentId: string,
 ): Promise<OmniDocumentV2State> {
   const normalizedId = documentId.trim();
-  if (!normalizedId || normalizedId.includes('/') || normalizedId.includes('?') || normalizedId.includes('#')) {
+  if (!/^[a-z0-9_-]{2,48}$/i.test(normalizedId)) {
     throw new Error('A valid Omni document ID or slug is required.');
   }
-  return omniProxy<OmniDocumentV2State>(
-    baseUrl,
-    apiKey,
-    'GET',
-    `/v2/documents/${encodeURIComponent(normalizedId)}`,
+  const instanceId = apiKey.startsWith(VAULT_API_KEY_REFERENCE_PREFIX)
+    ? apiKey.slice(VAULT_API_KEY_REFERENCE_PREFIX.length) : '';
+  if (!instanceId) throw new Error('Select a saved Omni instance to read published document state.');
+  const params = new URLSearchParams({ identifier: normalizedId, expectedOrigin: new URL(baseUrl).origin });
+  const response = await safeFetch(
+    `/api/instances/${encodeURIComponent(instanceId)}/document-state?${params}`,
+    { method: 'GET' },
+    'Read published document state',
+    { deduplicate: false },
   );
+  return response.json();
 }
 
 export async function getModelYaml(

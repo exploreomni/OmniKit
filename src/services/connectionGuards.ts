@@ -1,7 +1,7 @@
 import type { ConnectionConfig } from '../types';
 import { sha256Text } from './contentHash';
 
-const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
+export const VAULT_API_KEY_REFERENCE_PREFIX = '__omnikit_vault_instance__:';
 
 function isVaultApiKeyReferenceForInstance(value: string, instanceId?: string): boolean {
   return Boolean(instanceId) && value === `${VAULT_API_KEY_REFERENCE_PREFIX}${instanceId}`;
