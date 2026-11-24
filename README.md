@@ -424,4 +424,4 @@ Not recommended without adding proper authentication, network controls, and oper
 The in-flight HTTP request to Omni continues until it finishes or times out, but the UI that was tracking progress is gone. Re-open the tab and check **History** — then re-run anything that didn't complete.
 
 **Do I need to restart the server after editing code?**
-No. Vite's HMR picks up UI changes instantly. Changes to files under `server/` trigger a plugin reload automatically.
+Vite applies UI changes automatically. Changing a backend module used by the API plugin reloads the dev server configuration and relocks the in-memory vault. Finish active migrations before updating those modules, then unlock the vault in OmniKit.

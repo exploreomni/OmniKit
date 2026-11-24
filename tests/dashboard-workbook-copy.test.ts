@@ -144,6 +144,13 @@ test('shared workbook readiness identifies implementation gaps without claiming 
 test('only provably empty authored roots are ignorable', () => {
   for (const yaml of ['', '# comment only', '{}', 'null']) assert.equal(dashboardWorkbookHasAuthoredDefinitions({ model: yaml }), false);
   for (const yaml of ['[]', 'false', 'dimensions: {}', 'sql: 1', 'bad: [']) assert.equal(dashboardWorkbookHasAuthoredDefinitions({ model: yaml }), true);
+  assert.equal(dashboardWorkbookHasAuthoredDefinitions({ model: '{}\n', relationships: '[]\n' }), false);
+  assert.equal(dashboardWorkbookHasAuthoredDefinitions({ model: ' {} # defaults\r\n', relationships: '# joins\r\n[ ]\r\n' }), false);
+  for (const yaml of ['- {join_from_view: orders}', '[null]', '!unrecognized []', 'bad: [']) {
+    assert.equal(dashboardWorkbookHasAuthoredDefinitions({ relationships: yaml }), true);
+  }
+  assert.equal(dashboardWorkbookHasAuthoredDefinitions({ 'other.view': '[]' }), true);
+  assert.equal(dashboardWorkbookHasAuthoredDefinitions({ relationships: '[]', model: 'access_grants: [internal]' }), true);
 });
 
 test('guarded lifecycle records each write, binds only draft workbook, verifies before publish and final readiness', async () => {

@@ -15,6 +15,7 @@ const destinationModel = 'b81e4679-1234-4abc-9def-000000000003';
 const destinationWorkbook = 'b81e4679-1234-4abc-9def-000000000004';
 const sourceQuery = 'b81e4679-1234-4abc-9def-000000000005';
 const destinationQuery = 'b81e4679-1234-4abc-9def-000000000006';
+const emptyExtension = { model: '{}\n', relationships: '[]\n' };
 const scope = {
   sourceInstanceId: 'source', destinationInstanceId: 'target', sourceIdentifier: 'source-app',
   destinationIdentifier: 'target-app', destinationModelId: destinationModel,
@@ -32,7 +33,7 @@ function scenario() {
     } } }, order: ['3'] },
   };
   const state = {
-    app, source, files: {} as Record<string, string>, queryFiles: {} as Record<string, string>,
+    app, source, files: { ...emptyExtension } as Record<string, string>, queryFiles: { ...emptyExtension } as Record<string, string>,
     exists: false, mismatch: false, writes: [] as OmniJsonRequest[], ambiguous: false, timedOut: false,
   };
   async function request(req: OmniJsonRequest): Promise<OmniJsonResponse> {
@@ -57,7 +58,7 @@ function scenario() {
     if (!state.exists) return { status: 404 };
     if (pathname.endsWith('/yaml')) {
       assert.ok([destinationQuery, destinationWorkbook].includes(pathname.split('/')[4]));
-      return { status: 200, data: { files: {} } };
+      return { status: 200, data: { files: emptyExtension } };
     }
     if (pathname.endsWith('/app')) return { status: 200, data: { ...state.app, html: state.mismatch ? 'different' : state.app.html } };
     return { status: 200, data: {
@@ -75,6 +76,8 @@ test('native App copy verifies published HTML, sandbox settings, named query key
   const { state, run } = scenario();
   const preview = await (await run('preview')).json();
   assert.equal(preview.status, 'preview');
+  assert.equal(preview.queryModelCount, 0);
+  assert.equal(preview.queryModelFileCount, 0);
   assert.deepEqual(preview.queryNames, ['My query']);
   assert.equal(state.writes.length, 0);
   assert.doesNotMatch(JSON.stringify(preview), /<html>|example\.count|test-only-key/);
@@ -100,7 +103,13 @@ test('App previews invalidate on source or destination scope change and block un
   assert.equal((await run('apply', { previewDigest: preview.previewDigest })).status, 409);
   state.files = { 'example.view': 'dimensions:\n  extra: {}' };
   assert.equal((await run('preview')).status, 422);
+  state.files = { ...emptyExtension, relationships: '- {join_from_view: orders}' };
+  assert.equal((await run('preview')).status, 422);
   state.files = {};
+  state.queryFiles = { relationships: '- {join_from_view: orders}' };
+  assert.equal((await run('preview')).status, 422);
+  state.queryFiles = { 'other.view': '[]' };
+  assert.equal((await run('preview')).status, 422);
   state.queryFiles = { 'model': 'access_grants: [unknown]' };
   assert.equal((await run('preview')).status, 422);
   state.queryFiles = {};
@@ -170,12 +179,12 @@ function authoredScenario() {
         owned.get(id)![body.fileName] = body.yaml;
         return ok({ success: true, fileName: body.fileName });
       }
-      if (id === workbook || id === draftWorkbook || id === mainWorkbook) return ok({ files: {} });
+      if (id === workbook || id === draftWorkbook || id === mainWorkbook) return ok({ files: emptyExtension });
       const sourceIndex = ids.source.indexOf(id), pubIndex = ids.published.indexOf(id);
-      if (sourceIndex >= 0) return ok({ files: sourceFiles[order[sourceIndex] as keyof typeof sourceFiles] });
-      if (pubIndex >= 0) return ok({ files: stages.changedPublishedYaml ? {} : owned.get(ids.draft[pubIndex]) });
+      if (sourceIndex >= 0) return ok({ files: { ...emptyExtension, ...sourceFiles[order[sourceIndex] as keyof typeof sourceFiles] } });
+      if (pubIndex >= 0) return ok({ files: { ...emptyExtension, ...(stages.changedPublishedYaml ? {} : owned.get(ids.draft[pubIndex])) } });
       assert.ok(owned.has(id));
-      return ok({ files: owned.get(id) });
+      return ok({ files: { ...emptyExtension, ...owned.get(id) } });
     }
     if (from) return ok(path.endsWith('/app') ? app : content('source'));
     if (req.method === 'GET' && path === target) return stages.exists ? ok(content(stages.published ? 'published' : 'scaffold')) : ok(null, 404);
@@ -218,6 +227,7 @@ function authoredScenario() {
 test('App copy restores two independent query-local measures and checks published bindings by stable key', async () => {
   const { writes, stages, run } = authoredScenario();
   const pre = await (await run('preview')).json();
+  assert.equal(pre.queryModelCount, 2);
   assert.equal(pre.queryModelFileCount, 2); assert.equal(writes.length, 0);
   const result = await (await run('apply', pre.previewDigest)).json();
   assert.equal(result.status, 'verified');

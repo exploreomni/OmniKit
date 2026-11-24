@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from 'node:util';
 import { parseDocument } from 'yaml';
 import { z } from 'zod';
+import { isEmptyModelExtensionRoot } from './modelExtensionYaml';
 
 type Files = Record<string, string>;
 export type QueryFiles = Record<string, Files>;
@@ -51,8 +52,9 @@ export function portableFiles(files: Files): Files {
   const result: Files = {};
   for (const [name, yaml] of Object.entries(files)) {
     const value: unknown = fieldDefinitions(yaml);
-    if (value == null || (record(value) && !Object.keys(value).length)) continue;
-    requireState(/^[\w-][\w.-]*\.view$/.test(name) && !name.includes('..') && record(value) && !containsPolicy(value)
+    if (isEmptyModelExtensionRoot(name, value)) continue;
+    requireState(/^[\w-][\w.-]*\.view$/.test(name) && !name.includes('..') && record(value)
+      && Object.keys(value).length > 0 && !containsPolicy(value)
       && Object.entries(value).every(([key, fields]) => ['dimensions', 'measures'].includes(key) && record(fields)),
     'Only query-local view files containing dimensions or measures can be copied. Review other definitions before migration.');
     result[name] = yaml;
