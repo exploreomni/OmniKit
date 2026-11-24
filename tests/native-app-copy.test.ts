@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import { apiMiddleware } from '../server/apiMiddleware';
 import { handleNativeAppCopy } from '../server/handlers/native-app-copy';
 import type { SavedInstance } from '../server/services/nativeVault';
-import type { OmniJsonRequest, OmniJsonResponse } from '../server/services/omniJsonTransport';
+import { readBoundedJson, type OmniJsonRequest, type OmniJsonResponse } from '../server/services/omniJsonTransport';
 
 const sourceModel = 'b81e4679-1234-4abc-9def-000000000001';
 const workbook = 'b81e4679-1234-4abc-9def-000000000002';
@@ -132,11 +132,12 @@ function authoredScenario() {
   const owned = new Map<string, Record<string, string>>([[ids.draft[0], {}]]);
   const bindings: Record<string, string> = { '5': ids.draft[0] };
   const stages = { exists: false, initialized: false, attached: false, published: false, wrongOwner: false,
-    unsupported: false, changedDraft: false, changedPublishedYaml: false, dropBindResponse: false };
+    unsupported: false, changedDraft: false, changedPublishedYaml: false, dropBindResponse: false, rebindDuringSave: false };
   const writes: Array<{ method: string; path: string; body: Record<string, unknown> }> = [];
   const order = ['5', '2'];
   function content(type: 'source' | 'draft' | 'published' | 'scaffold') {
-    const modelIds = type === 'source' ? ids.source : type === 'published' ? ids.published : order.map(k => bindings[k]);
+    const modelIds = type === 'source' ? ids.source : type === 'published' ? ids.published
+      : type === 'scaffold' ? [] : order.map(k => bindings[k]);
     return {
       name: 'Two queries', description: null, modelId: type === 'source' ? sourceModel : destinationModel,
       workbookModelId: type === 'source' ? workbook : type === 'draft' ? draftWorkbook : mainWorkbook,
@@ -166,8 +167,16 @@ function authoredScenario() {
     const body = req.body ? JSON.parse(req.body) : {};
     if (req.method !== 'GET') writes.push({ method: req.method, path, body });
     if (path === '/api/v1/models' && req.method === 'GET') {
+      if (searchParams.get('baseModelId')) {
+        assert.equal(searchParams.get('baseModelId'), draftWorkbook);
+        assert.equal(searchParams.get('modelKind'), 'QUERY');
+        const records = Array.from(owned.keys(), id => ({
+          id, deletedAt: null, modelKind: 'QUERY', baseModelId: draftWorkbook, connectionId,
+        }));
+        return ok({ records, pageInfo: { hasNextPage: false, nextCursor: null, pageSize: 100, totalRecords: records.length } });
+      }
       const id = searchParams.get('modelId')!;
-      const modelKind = id === destinationModel ? 'SHARED' : id === draftWorkbook ? 'WORKBOOK' : 'QUERY';
+      const modelKind = id === destinationModel ? 'SHARED' : [draftWorkbook, mainWorkbook].includes(id) ? 'WORKBOOK' : 'QUERY';
       const baseModelId = modelKind === 'WORKBOOK' ? destinationModel : from ? workbook : ids.published.includes(id)
         ? mainWorkbook : stages.wrongOwner ? destinationModel : draftWorkbook;
       return ok({ records: [{ id, deletedAt: null, modelKind, baseModelId, connectionId }] });
@@ -177,6 +186,7 @@ function authoredScenario() {
       if (req.method === 'POST') {
         assert.ok(owned.has(id));
         owned.get(id)![body.fileName] = body.yaml;
+        if (stages.rebindDuringSave) bindings['2'] = uuid(200);
         return ok({ success: true, fileName: body.fileName });
       }
       if (id === workbook || id === draftWorkbook || id === mainWorkbook) return ok({ files: emptyExtension });
@@ -184,7 +194,9 @@ function authoredScenario() {
       if (sourceIndex >= 0) return ok({ files: { ...emptyExtension, ...sourceFiles[order[sourceIndex] as keyof typeof sourceFiles] } });
       if (pubIndex >= 0) return ok({ files: { ...emptyExtension, ...(stages.changedPublishedYaml ? {} : owned.get(ids.draft[pubIndex])) } });
       assert.ok(owned.has(id));
-      return ok({ files: { ...emptyExtension, ...owned.get(id) } });
+      const files = { ...emptyExtension, ...owned.get(id) };
+      const checksums = Object.fromEntries(Object.entries(files).map(([name, yaml]) => [name, 'file-revision-' + yaml.length]));
+      return ok({ files, checksums });
     }
     if (from) return ok(path.endsWith('/app') ? app : content('source'));
     if (req.method === 'GET' && path === target) return stages.exists ? ok(content(stages.published ? 'published' : 'scaffold')) : ok(null, 404);
@@ -206,23 +218,83 @@ function authoredScenario() {
       assert.deepEqual(body, { baseModelId: draftWorkbook, connectionId, modelKind: 'QUERY' });
       owned.set(ids.draft[1], {}); return ok({ success: true, model: { id: ids.draft[1], modelKind: 'QUERY' } });
     }
-    if (path === draft + '/queries/2/query-model' && req.method === 'PUT') {
-      assert.deepEqual(body, { queryModelId: ids.draft[1] }); bindings['2'] = ids.draft[1];
+    if (path.startsWith(draft + '/queries/') && path.endsWith('/query-model') && req.method === 'PUT') {
+      const key = path.split('/').at(-2)!;
+      const id = ids.draft[order.indexOf(key)];
+      assert.deepEqual(body, { queryModelId: id }); bindings[key] = id;
       if (stages.dropBindResponse) throw new Error('Simulated response loss');
       return ok({ draftIdentifier: draftId, identifier: 'target-app' });
     }
-    if (path.endsWith('/drafts')) return ok([{ status: 'active', branch: null, identifier: stages.changedDraft ? 'different' : draftId,
-      publishedIdentifier: 'target-app', workbookModelId: draftWorkbook, draftOutOfDate: false }]);
+    if (path.endsWith('/drafts')) {
+      const rows = [{ status: 'active', branch: null, identifier: stages.changedDraft ? 'different' : draftId,
+        publishedIdentifier: 'target-app', workbookModelId: draftWorkbook, draftOutOfDate: false }];
+      const message = Object.assign(Readable.from([JSON.stringify(rows)]), { headers: { 'content-type': 'application/json' } });
+      return ok(await readBoundedJson(message as IncomingMessage, req.maximumResponseBytes, false, req.expectedRoot));
+    }
     if (path === target + '/draft/publish' && req.method === 'POST') {
       stages.published = true; return ok({ identifier: 'target-app' });
     }
     throw new Error('Unexpected route ' + path);
   }
-  const run = (action: string, previewDigest?: string) => handleNativeAppCopy(new Request('http://localhost/api/native-app-copy', {
-    method: 'POST', body: JSON.stringify({ ...scope, action, previewDigest }),
+  const run = (action: string, previewDigest?: string, extra = {}) => handleNativeAppCopy(new Request('http://localhost/api/native-app-copy', {
+    method: 'POST', body: JSON.stringify({ ...scope, action, previewDigest, ...extra }),
   }), { profile, request: transport });
-  return { writes, stages, run, sourceFiles };
+  function partialCopy() {
+    Object.assign(stages, { exists: true, initialized: true, attached: true });
+    delete bindings['5'];
+    owned.set(ids.draft[0], { ...sourceFiles['5'] });
+    return { recovery: {
+      draftIdentifier: draftId, draftWorkbookModelId: draftWorkbook, publishedWorkbookModelId: mainWorkbook,
+      queryModelIdsByKey: { '5': ids.draft[0] },
+    } };
+  }
+  return { writes, stages, run, sourceFiles, partialCopy };
 }
+
+test('recovery reuses the reviewed draft and its unbound query model without recreating the App', async () => {
+  const { run, writes, partialCopy } = authoredScenario();
+  const target = partialCopy();
+  assert.equal((await run('preview')).status, 409);
+  const preview = await (await run('preview', undefined, target)).json();
+  assert.equal(preview.status, 'preview', preview.error);
+  assert.deepEqual(preview.recovery, target.recovery);
+  assert.deepEqual(Object.fromEntries(preview.recoveryTabs.map((tab: { key: string; modelAction: string }) => [tab.key, tab.modelAction])),
+    { '5': 'bind_existing', '2': 'create_and_bind' });
+  assert.equal(writes.length, 0);
+  const result = await (await run('apply', preview.previewDigest, target)).json();
+  assert.equal(result.status, 'verified', result.error);
+  assert.equal(writes.filter(w => w.path === '/api/v1/models').length, 1);
+  assert.equal(writes.filter(w => w.path.endsWith('/yaml')).length, 1);
+  assert.equal(writes.filter(w => w.path.endsWith('/query-model')).length, 2);
+  assert.equal(writes.filter(w => w.path === '/api/v2/documents' || w.path.endsWith('/app') || w.path.endsWith('/draft')).length, 0);
+  assert.equal(writes.filter(w => w.path.endsWith('/draft/publish')).length, 1);
+  const count = writes.length;
+  assert.equal((await run('apply', preview.previewDigest, target)).status, 422);
+  assert.equal(writes.length, count);
+});
+
+test('recovery refuses a different published workbook, unreviewed query child or stale draft before writing', async () => {
+  const { run, writes, partialCopy, stages } = authoredScenario();
+  const target = partialCopy();
+  const preview = await (await run('preview', undefined, target)).json();
+  assert.equal(preview.status, 'preview', preview.error);
+  for (const changes of [{ publishedWorkbookModelId: workbook }, { queryModelIdsByKey: {} }]) {
+    assert.equal((await run('preview', undefined, { recovery: { ...target.recovery, ...changes } })).status, 422);
+  }
+  stages.changedDraft = true;
+  assert.equal((await run('apply', preview.previewDigest, target)).status, 422);
+  assert.equal(writes.length, 0);
+});
+
+test('a tab rebound during restoration keeps its new binding and the draft stays unpublished', async () => {
+  const { run, stages, writes } = authoredScenario();
+  const { previewDigest } = await (await run('preview')).json();
+  stages.rebindDuringSave = true;
+  const result = await run('apply', previewDigest);
+  assert.equal(result.status, 502);
+  assert.match((await result.json()).error, /bindings changed/);
+  assert.equal(writes.some(w => w.path.endsWith('/query-model') || w.path.endsWith('/publish')), false);
+});
 
 test('App copy restores two independent query-local measures and checks published bindings by stable key', async () => {
   const { writes, stages, run } = authoredScenario();
@@ -253,7 +325,12 @@ test('App copy gates authored files on destination capability, ownership, unchan
     stages[issue] = true;
     const response = await run('apply', pre.previewDigest);
     assert.equal(response.status, 502);
-    assert.equal((await response.json()).draftIdentifier, 'draft-test');
+    const failure = await response.json();
+    assert.equal(failure.draftIdentifier, 'draft-test');
+    assert.equal(failure.code, 'APP_COPY_UNVERIFIED');
+    assert.ok(failure.error.includes(failure.stage));
+    assert.match(failure.error, /destination target-app, draft draft-test/);
+    assert.doesNotMatch(failure.error, /Simulated response loss|test-only-key/);
     assert.equal(stages.published, issue === 'changedPublishedYaml');
     assert.equal((await run('apply', pre.previewDigest)).status, 409);
     assert.equal(writes.filter(w => w.path === '/api/v2/documents').length, 1);
